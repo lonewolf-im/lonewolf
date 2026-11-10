@@ -311,14 +311,14 @@ fn omitted_get_set_and_missing_account_errors_report_once_and_set_rolls_back() -
                         .map_err(|error| format!("{error:?}"))?;
                 } else {
                     let work = GetWork {
-                        account: fixture.registration.account().clone(),
+                        diagnostics: Diagnostics::Session(fixture.registration.account().clone()),
                         target_account: Some(target),
                         transaction: fixture.storage.begin_read().await?,
                         handler: handler.clone(),
                         discovery: Arc::new(Discovery::default()),
                         arena,
                         request,
-                        sender,
+                        sender: Some(sender),
                         response,
                         delivery: RouterDelivery::new(
                             &session.router,
@@ -334,10 +334,10 @@ fn omitted_get_set_and_missing_account_errors_report_once_and_set_rolls_back() -
                         .queue_iq_reply(
                             request,
                             sender,
-                            outcome.arena,
-                            outcome.response,
-                            outcome.reply,
-                            outcome.results,
+                            outcome.answer.arena,
+                            outcome.answer.response,
+                            outcome.answer.reply,
+                            outcome.answer.results,
                         )
                         .map_err(|error| format!("{error:?}"))?;
                 }
@@ -638,6 +638,97 @@ fn omitted_iq_error_envelope_allocation_failure_closes_without_retry_or_output()
         assert!(session.outbox.writer.bytes.is_empty());
         drop(session);
         router.shutdown().await?;
+        fixture.finish().await
+    })
+}
+
+struct LimitedAllocator {
+    limit: usize,
+    live: AtomicUsize,
+    rejected: AtomicUsize,
+}
+
+// Accepted blocks retain the global allocator's layout and ownership contract.
+unsafe impl ChunkAllocator for LimitedAllocator {
+    fn allocate(&self, layout: Layout) -> Result<Chunk, AllocationError> {
+        if self.live.fetch_add(1, Ordering::SeqCst) >= self.limit {
+            self.live.fetch_sub(1, Ordering::SeqCst);
+            self.rejected.fetch_add(1, Ordering::SeqCst);
+            return Err(AllocationError::Exhausted);
+        }
+        let result = GlobalChunkAllocator.allocate(layout);
+        if result.is_err() {
+            self.live.fetch_sub(1, Ordering::SeqCst);
+        }
+        result
+    }
+    unsafe fn deallocate(&self, chunk: Chunk) {
+        unsafe { GlobalChunkAllocator.deallocate(chunk) };
+        self.live.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn missing_handler_retains_response_arena_through_error_construction() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let fixture = Fixture::new(&[]).await?;
+        for limit in [2, 3] {
+            let allocator = Arc::new(LimitedAllocator {
+                limit,
+                live: AtomicUsize::new(0),
+                rejected: AtomicUsize::new(0),
+            });
+            let (router, mut session) = session(&fixture, allocator.clone()).await?;
+            let (request, sender, mut arena) =
+                request(allocator.clone(), "get", "id='missing-handler'", "").await?;
+            while arena.stats().used_bytes < 3650 {
+                arena.try_alloc(0_u8)?;
+            }
+            assert_eq!(arena.stats().chunk_count, 1);
+            assert_eq!(allocator.live.load(Ordering::SeqCst), 1);
+            let stage = Stage {
+                router: &session.router,
+                storage: &session.storage,
+                allocator: &session.allocator,
+                work: &session.work,
+            };
+            let origin = Origin::Session(&session.registration);
+            let disposition = crate::stages::ingress::iq::handle_request(
+                &stage,
+                &origin,
+                crate::stages::ingress::iq::IqInput::Owned {
+                    request,
+                    arena,
+                    sender,
+                },
+                Destination::Account,
+                IqRequestType::Get,
+                None,
+            )
+            .await
+            .map_err(|_| "request preparation failed")?;
+            let outcome = session.complete_iq(disposition).await;
+            if limit == 2 {
+                assert!(matches!(outcome, Err(CloseOutcome::InternalError)));
+                assert_eq!(allocator.rejected.load(Ordering::SeqCst), 1);
+                assert_eq!(allocator.live.load(Ordering::SeqCst), 0);
+                assert!(session.outbox.queue.is_empty());
+            } else {
+                assert!(outcome.is_ok());
+                assert_eq!(allocator.rejected.load(Ordering::SeqCst), 0);
+                assert_eq!(session.outbox.queue.len(), 1);
+                session
+                    .outbox
+                    .flush()
+                    .await
+                    .map_err(|error| format!("{error:?}"))?;
+                assert_eq!(session.outbox.writer.written.len(), 1);
+                assert!(session.outbox.writer.written[0].contains("service-unavailable"));
+            }
+            drop(session);
+            router.shutdown().await?;
+            assert_eq!(allocator.live.load(Ordering::SeqCst), 0);
+        }
         fixture.finish().await
     })
 }

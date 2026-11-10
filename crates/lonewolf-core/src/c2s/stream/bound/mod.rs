@@ -13,14 +13,17 @@ use std::time::Instant;
 use futures_channel::oneshot;
 use futures_util::FutureExt;
 use futures_util::future::{Either, Shared, join, select};
+#[cfg(test)]
 use lonewolf_extension::Effects;
-use lonewolf_extension::delivery::{Failure, FailureKind, HandlerError};
+use lonewolf_extension::delivery::HandlerError;
+#[cfg(test)]
+use lonewolf_extension::delivery::{Failure, FailureKind};
+#[cfg(test)]
 use lonewolf_extension::discovery::Discovery;
 #[cfg(test)]
-use lonewolf_extension::iq::IqDestinationRule;
+use lonewolf_extension::iq::{IqDestinationRule, IqHandler, IqReply, IqScope};
 use lonewolf_extension::iq::{
-    IqError, IqErrorPayload, IqHandler, IqReply, IqRequest, IqRequestType, IqScope, Requester,
-    SessionIqHandler, SessionIqReply, XmlSpace,
+    IqError, IqErrorPayload, IqRequest, IqRequestType, SessionIqHandler, SessionIqReply, XmlSpace,
 };
 use lonewolf_extension::message::{Backlog, MessageHandler};
 #[cfg(test)]
@@ -33,10 +36,12 @@ use lonewolf_extension::presence::{
     PresenceAudience, PresenceRequest, PresenceRequestType, PresenceSend, PresenceTransition,
     PresenceUpdate,
 };
+#[cfg(test)]
+use lonewolf_storage::RedbRead;
 use lonewolf_storage::account::{AccountError, AccountKey, AccountReads};
 use lonewolf_storage::offline::OfflineSequence;
 use lonewolf_storage::roster::{PendingSubscription, RosterJid};
-use lonewolf_storage::{RedbRead, RedbStorage, RedbWrite, Storage, StorageError, WriteTransaction};
+use lonewolf_storage::{RedbStorage, RedbWrite, Storage, StorageError, WriteTransaction};
 use lonewolf_util::arena::{Arena, ArenaConfig, ArenaRead, ChunkAllocator, HandleError};
 use lonewolf_xmpp::jid::{Jid, JidError, JidRef};
 use lonewolf_xmpp::parser::{ParseError, Parsed, ParserConfig, StreamEvent, XmppParser};
@@ -63,8 +68,12 @@ use crate::router::{
 };
 
 use crate::stages::ingress::Origin;
+use crate::stages::ingress::iq::{AnswerStanzas, IqAnswer, IqDisposition, IqInput};
+#[cfg(test)]
+use crate::stages::ingress::iq::{Diagnostics, GetWork};
 use crate::stages::ingress::message::{MessageDisposition, Reply};
-use crate::stages::iq::{IqTarget, iq_requester, iq_target, require_iq_account};
+#[cfg(test)]
+use crate::stages::iq::require_iq_account;
 use crate::stages::service::{self, ServiceOutcome, ServicePresenceLease};
 use crate::stages::{Stage, archive, ingress, observe, policy};
 
@@ -947,51 +956,11 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             }
             return Ok(());
         };
-        let response = Arena::try_new_in(Default::default(), self.allocator.clone())?;
-        let (handler, target_account) = {
-            let sender = route.sender.resolve(&arena)?;
-            let stanza = request.resolve(&arena)?;
-            let target = stanza.to()?.unwrap_or_else(|| sender.bare());
-            let payload = stanza
-                .children()?
-                .next()
-                .transpose()?
-                .ok_or(CloseOutcome::InternalError)?;
-            let scope = match route.destination {
-                Destination::Account => Some(IqScope::Account),
-                Destination::Server => Some(IqScope::Server),
-                Destination::Resource
-                | Destination::ServerResource
-                | Destination::Service
-                | Destination::Remote => None,
-            };
-            if kind == IqRequestType::Set
-                && scope == Some(IqScope::Account)
-                && let Some(handler) = self
-                    .router
-                    .iq_handlers(target.domainpart())
-                    .and_then(|registry| registry.find_session(payload.namespace(), payload.name()))
-                    .map(Arc::clone)
-            {
-                return self
-                    .handle_session_iq(request, route.sender, arena, response, handler)
-                    .await;
-            }
-            let handler = scope.and_then(|scope| {
-                self.router.iq_handlers(target.domainpart())?.find(
-                    scope,
-                    kind,
-                    payload.namespace(),
-                    payload.name(),
-                )
-            });
-            let target_account = match scope {
-                Some(IqScope::Account) => Some(AccountKey::try_from(target.bare())?),
-                Some(IqScope::Server) | None => None,
-            };
-            (handler.map(Arc::clone), target_account)
-        };
-        let Some(handler) = handler else {
+        if !matches!(
+            route.destination,
+            Destination::Account | Destination::Server
+        ) {
+            let _response = Arena::try_new_in(Default::default(), self.allocator.clone())?;
             let condition = if route.destination == Destination::Remote {
                 StanzaErrorCondition::RemoteServerNotFound
             } else {
@@ -1003,31 +972,91 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                 arena,
             });
             return Ok(());
+        }
+        let stage = Stage {
+            router: &self.router,
+            storage: &self.storage,
+            allocator: &self.allocator,
+            work: &self.work,
         };
-        match kind {
-            IqRequestType::Get => {
-                self.handle_iq_get(
-                    request,
-                    route.sender,
-                    arena,
-                    response,
-                    handler,
-                    target_account,
-                )
-                .await
+        let origin = Origin::Session(&self.registration);
+        let disposition = self
+            .outbox
+            .drain_until(
+                &self.registration,
+                ingress::iq::handle_request(
+                    &stage,
+                    &origin,
+                    IqInput::Owned {
+                        request,
+                        arena,
+                        sender: route.sender,
+                    },
+                    route.destination,
+                    kind,
+                    None,
+                ),
+            )
+            .await??;
+        if kind == IqRequestType::Get && matches!(&disposition, IqDisposition::Ordered(_)) {
+            #[cfg(feature = "test-support")]
+            crate::test_support::stream_event(
+                &self.registration.full_jid(),
+                crate::test_support::StreamProbeEvent::IqGetAdmitted,
+            );
+        }
+        self.complete_iq(disposition).await
+    }
+
+    async fn complete_iq(&mut self, disposition: IqDisposition<A>) -> Result<(), CloseOutcome> {
+        match disposition {
+            IqDisposition::Unavailable {
+                input: IqInput::Owned {
+                    request, mut arena, ..
+                },
+                condition,
+                response,
+            } => {
+                let stanza = iq::error_reply(&request, &mut arena, condition, None)?;
+                self.outbox.push(Output::Owned { stanza, arena });
+                drop(response);
+                Ok(())
             }
-            IqRequestType::Set => {
-                self.handle_iq_set(
-                    request,
-                    route.sender,
-                    arena,
-                    response,
-                    handler,
-                    target_account,
-                )
-                .await
+            IqDisposition::Unavailable { .. } => Err(CloseOutcome::InternalError),
+            IqDisposition::SessionIq {
+                handler,
+                request,
+                arena,
+                sender,
+                response,
+            } => {
+                self.handle_session_iq(request, sender, arena, response, handler)
+                    .await
+            }
+            IqDisposition::Answer(answer) => self.queue_iq_answer(answer),
+            IqDisposition::Ordered(mut pending) => {
+                self.outbox
+                    .drain_until(&self.registration, pending.turned())
+                    .await?;
+                let completed = pending
+                    .finished()
+                    .await
+                    .ok_or(CloseOutcome::InternalError)??;
+                self.outbox.delivered(completed.queued);
+                self.queue_iq_answer(completed.answer)
             }
         }
+    }
+
+    fn queue_iq_answer(&mut self, answer: IqAnswer<A>) -> Result<(), CloseOutcome> {
+        let origin = Origin::Session(&self.registration);
+        match ingress::iq::render_answer(&origin, &self.allocator, answer)? {
+            AnswerStanzas::One { stanza, arena } => {
+                self.outbox.push(Output::Owned { stanza, arena })
+            }
+            AnswerStanzas::Shared(stanzas) => self.outbox.routed(stanzas),
+        }
+        Ok(())
     }
 
     async fn handle_session_iq(
@@ -1152,6 +1181,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         }
     }
 
+    #[cfg(test)]
     async fn handle_iq_get(
         &mut self,
         request: Stanza,
@@ -1161,186 +1191,69 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         handler: Arc<dyn IqHandler<A, RedbStorage>>,
         target_account: Option<AccountKey>,
     ) -> Result<(), CloseOutcome> {
-        let registration = &self.registration;
-        let storage = &self.storage;
-        let router = &self.router;
-        let work_group = self.outbox.work;
-        let delivery = self.delivery();
-        let discovery = {
-            let sender = sender.resolve(&arena)?;
-            let stanza = request.resolve(&arena)?;
-            let target = stanza.to()?.unwrap_or_else(|| sender.bare());
-            Arc::clone(
-                router
-                    .discovery(target.domainpart())
-                    .ok_or(CloseOutcome::InternalError)?,
+        let stage = Stage {
+            router: &self.router,
+            storage: &self.storage,
+            allocator: &self.allocator,
+            work: &self.work,
+        };
+        let origin = Origin::Session(&self.registration);
+        let answer = IqAnswer {
+            request,
+            arena,
+            sender: Some(sender),
+            response,
+            reply: Ok(None),
+            results: Vec::new(),
+        };
+        let disposition = self
+            .outbox
+            .drain_until(
+                &self.registration,
+                ingress::iq::prepare_get(&stage, &origin, answer, handler, target_account),
             )
-        };
-        let prepare = async {
-            let (transaction, ticket) = Arc::clone(router.order())
-                .fix(
-                    target_account.iter().cloned().collect(),
-                    storage.begin_read(),
-                )
-                .await
-                .map_err(|error| {
-                    close_storage_failure(error, "iq_get_begin_read", registration.account())
-                })?;
-            let work = GetWork {
-                account: registration.account().clone(),
-                target_account,
-                transaction,
-                handler,
-                discovery,
-                arena,
-                request,
-                sender,
-                response,
-                delivery,
-            };
-            Ok::<_, CloseOutcome>(after_turn(
-                work_group.start(),
-                ticket,
-                Some(registration.mailbox()),
-                move |queued, ticket| async move {
-                    let result = work.run(queued).await;
-                    drop(ticket);
-                    result
-                },
-            ))
-        };
-        let mut pending = self.outbox.drain_until(registration, prepare).await??;
+            .await??;
         #[cfg(feature = "test-support")]
         crate::test_support::stream_event(
-            &registration.full_jid(),
+            &self.registration.full_jid(),
             crate::test_support::StreamProbeEvent::IqGetAdmitted,
         );
-        self.outbox
-            .drain_until(&self.registration, pending.turned())
-            .await?;
-        let outcome = pending
-            .finished()
-            .await
-            .ok_or(CloseOutcome::InternalError)??;
-        self.outbox.delivered(outcome.queued);
-        self.queue_iq_reply(
-            request,
-            sender,
-            outcome.arena,
-            outcome.response,
-            outcome.reply,
-            outcome.results,
-        )
+        self.complete_iq(disposition).await
     }
 
+    #[cfg(test)]
     async fn handle_iq_set(
         &mut self,
         request: Stanza,
         sender: Jid,
         arena: Arena<A>,
-        mut response: Arena<A>,
+        response: Arena<A>,
         handler: Arc<dyn IqHandler<A, RedbStorage>>,
         target_account: Option<AccountKey>,
     ) -> Result<(), CloseOutcome> {
-        let registration = &self.registration;
-        let storage = &self.storage;
-        let router = &self.router;
-        let work = self.outbox.work;
-        let delivery = self.delivery();
-        let discovery = {
-            let sender = sender.resolve(&arena)?;
-            let stanza = request.resolve(&arena)?;
-            let target = stanza.to()?.unwrap_or_else(|| sender.bare());
-            Arc::clone(
-                router
-                    .discovery(target.domainpart())
-                    .ok_or(CloseOutcome::InternalError)?,
+        let stage = Stage {
+            router: &self.router,
+            storage: &self.storage,
+            allocator: &self.allocator,
+            work: &self.work,
+        };
+        let origin = Origin::Session(&self.registration);
+        let answer = IqAnswer {
+            request,
+            arena,
+            sender: Some(sender),
+            response,
+            reply: Ok(None),
+            results: Vec::new(),
+        };
+        let disposition = self
+            .outbox
+            .drain_until(
+                &self.registration,
+                ingress::iq::prepare_set(&stage, &origin, answer, handler, target_account),
             )
-        };
-        let prepare = async {
-            let mut transaction = storage.begin_write().await.map_err(|error| {
-                close_storage_failure(error, "iq_set_begin_write", registration.account())
-            })?;
-            let reply = match require_iq_account(&transaction, target_account.as_ref()).await {
-                Err(error) => Err(error.into()),
-                Ok(()) => {
-                    let sender = sender.resolve(&arena)?;
-                    let stanza = request.resolve(&arena)?;
-                    let target = stanza.to()?.unwrap_or_else(|| sender.bare());
-                    let payload = stanza
-                        .children()?
-                        .next()
-                        .transpose()?
-                        .ok_or(CloseOutcome::InternalError)?;
-                    handler
-                        .set(
-                            IqRequest {
-                                sender,
-                                target,
-                                discovery: &discovery,
-                                sessions: &delivery,
-                                requester: None,
-                                lang: stanza.lang()?,
-                                space: stanza
-                                    .attribute("space", XML_NAMESPACE)?
-                                    .map(XmlSpace::from_attribute),
-                                payload,
-                            },
-                            &mut transaction,
-                            &delivery,
-                            &mut response,
-                        )
-                        .await
-                }
-            };
-            Ok::<_, CloseOutcome>(match reply {
-                Ok(IqReply {
-                    payload,
-                    effects,
-                    results,
-                }) => Ok((
-                    payload,
-                    results,
-                    commit_and_deliver(
-                        work.start(),
-                        Arc::clone(router.order()),
-                        transaction,
-                        effects,
-                        delivery,
-                        Some(registration.mailbox()),
-                        EffectsDiagnostics {
-                            identity: crate::delivery::EffectsIdentity::Account(
-                                registration.account().clone(),
-                            ),
-                            commit_operation: "iq_set_commit",
-                            delivery_operation: "iq_set_effects",
-                        },
-                    ),
-                )),
-                Err(error) => {
-                    drop(transaction);
-                    report_handler_failure(error.handler_error(), registration.account());
-                    Err(error)
-                }
-            })
-        };
-        let prepared = self.outbox.drain_until(registration, prepare).await??;
-        let (reply, results) = match prepared {
-            Ok((payload, results, mut committed)) => {
-                self.outbox
-                    .drain_until(registration, committed.turned())
-                    .await?;
-                let queued = committed
-                    .finished()
-                    .await
-                    .ok_or(CloseOutcome::InternalError)?
-                    .map_err(|_| CloseOutcome::InternalError)?;
-                self.outbox.delivered(queued);
-                (Ok(payload), results)
-            }
-            Err(error) => (Err(error), Vec::new()),
-        };
-        self.queue_iq_reply(request, sender, arena, response, reply, results)
+            .await??;
+        self.complete_iq(disposition).await
     }
 
     fn queue_iq_error(
@@ -1383,56 +1296,19 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         &mut self,
         request: Stanza,
         sender: Jid,
-        mut arena: Arena<A>,
-        mut response: Arena<A>,
+        arena: Arena<A>,
+        response: Arena<A>,
         reply: Result<Option<Element>, IqError>,
-        mut results: Vec<Stanza>,
+        results: Vec<Stanza>,
     ) -> Result<(), CloseOutcome> {
-        match reply {
-            Err(error) => self.queue_iq_error(request, sender, arena, error)?,
-            Ok(payload) => {
-                let sender_ref = sender.resolve(&arena)?;
-                for result in &results {
-                    if result.resolve(&response)?.to()?.map(|to| to.as_str())
-                        != Some(sender_ref.as_str())
-                    {
-                        tracing::error!(
-                            account_jid = ?self.registration.account().as_str(),
-                            operation = "iq_results",
-                            outcome = "misaddressed",
-                            "internal operation failed"
-                        );
-                        let reply = iq::error_reply(
-                            &request,
-                            &mut arena,
-                            StanzaErrorCondition::InternalServerError,
-                            Some(sender),
-                        )?;
-                        self.outbox.push(Output::Owned {
-                            stanza: reply,
-                            arena,
-                        });
-                        return Ok(());
-                    }
-                }
-                let reply = {
-                    let sender = sender.resolve(&arena)?;
-                    let stanza = request.resolve(&arena)?;
-                    iq::result_reply(&stanza, sender, payload, &mut response)?
-                };
-                if results.is_empty() {
-                    self.outbox.push(Output::Owned {
-                        stanza: reply,
-                        arena: response,
-                    });
-                } else {
-                    results.push(reply);
-                    self.outbox
-                        .routed(RoutedStanza::from_parts_shared(results, response));
-                }
-            }
-        }
-        Ok(())
+        self.queue_iq_answer(IqAnswer {
+            request,
+            arena,
+            sender: Some(sender),
+            response,
+            reply,
+            results,
+        })
     }
 
     async fn handle_presence(
@@ -2919,131 +2795,6 @@ async fn acknowledge_backlog<A: ChunkAllocator>(
         if watermark.get() <= through {
             return Ok(());
         }
-    }
-}
-
-struct GetWork<A: ChunkAllocator> {
-    account: AccountKey,
-    target_account: Option<AccountKey>,
-    transaction: RedbRead,
-    handler: Arc<dyn IqHandler<A, RedbStorage>>,
-    discovery: Arc<Discovery>,
-    arena: Arena<A>,
-    request: Stanza,
-    sender: Jid,
-    response: Arena<A>,
-    delivery: RouterDelivery<A>,
-}
-
-struct GetOutcome<A: ChunkAllocator> {
-    arena: Arena<A>,
-    response: Arena<A>,
-    reply: Result<Option<Element>, IqError>,
-    results: Vec<Stanza>,
-    /// Write these deliveries before the reply to preserve mailbox order.
-    queued: Vec<MailboxEntry<A>>,
-}
-
-impl<A: ChunkAllocator + Clone> GetWork<A> {
-    async fn run(self, queued: Vec<MailboxEntry<A>>) -> Result<GetOutcome<A>, CloseOutcome> {
-        let GetWork {
-            account,
-            target_account,
-            transaction,
-            handler,
-            discovery,
-            arena,
-            request,
-            sender,
-            mut response,
-            delivery,
-        } = self;
-        let reply = match iq_target(&transaction, target_account.as_ref()).await {
-            Err(error) => Err(error.into()),
-            Ok(iq_target) => {
-                let sender = sender.resolve(&arena)?;
-                let stanza = request.resolve(&arena)?;
-                let target = stanza.to()?.unwrap_or_else(|| sender.bare());
-                let payload = stanza
-                    .children()?
-                    .next()
-                    .transpose()?
-                    .ok_or(CloseOutcome::InternalError)?;
-                let requester = match iq_target {
-                    IqTarget::Server => Ok(None),
-                    IqTarget::Present => {
-                        let account = target_account.as_ref().ok_or(CloseOutcome::InternalError)?;
-                        iq_requester(delivery.router(), account, sender, &transaction)
-                            .await
-                            .map(Some)
-                    }
-                    IqTarget::Missing => {
-                        let account = target_account.as_ref().ok_or(CloseOutcome::InternalError)?;
-                        Ok(Some(if sender.bare().as_str() == account.as_str() {
-                            Requester::Owner
-                        } else {
-                            Requester::Other
-                        }))
-                    }
-                };
-                match requester {
-                    Err(error) => Err(error.into()),
-                    Ok(requester) => {
-                        let iq_request = IqRequest {
-                            sender,
-                            target,
-                            discovery: &discovery,
-                            sessions: &delivery,
-                            requester,
-                            lang: stanza.lang()?,
-                            space: stanza
-                                .attribute("space", XML_NAMESPACE)?
-                                .map(XmlSpace::from_attribute),
-                            payload,
-                        };
-                        match iq_target {
-                            IqTarget::Missing => handler
-                                .get_missing_account(iq_request, &mut response)
-                                .map(|payload| IqReply::new(payload, Effects::none())),
-                            IqTarget::Server | IqTarget::Present => {
-                                handler.get(iq_request, &transaction, &mut response).await
-                            }
-                        }
-                    }
-                }
-            }
-        };
-        drop(transaction);
-        let (reply, results) = match reply {
-            Ok(IqReply {
-                payload,
-                effects,
-                results,
-            }) => {
-                (effects.deliver)(&delivery).await.map_err(|_| {
-                    report_failure(
-                        Failure {
-                            kind: FailureKind::Delivery,
-                            operation: "iq_get_effects",
-                        },
-                        &account,
-                    );
-                    CloseOutcome::InternalError
-                })?;
-                (Ok(payload), results)
-            }
-            Err(error) => {
-                report_handler_failure(error.handler_error(), &account);
-                (Err(error), Vec::new())
-            }
-        };
-        Ok(GetOutcome {
-            arena,
-            response,
-            reply,
-            results,
-            queued,
-        })
     }
 }
 

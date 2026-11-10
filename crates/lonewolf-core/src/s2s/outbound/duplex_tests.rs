@@ -1162,7 +1162,8 @@ fn ready_batches_cooperate_with_shutdown_and_invalidation() -> TestResult {
 
 #[test]
 fn physical_whitespace_and_partial_xml_extend_duplex_idle_until_silence() -> TestResult {
-    use crate::s2s::stream::traffic::{CountingIo, test_support::Fragments};
+    use crate::s2s::stream::traffic::{S2sTrafficObserver, test_support::Fragments};
+    use crate::xml_stream::traffic::CountingIo;
     use tokio_util::compat::FuturesAsyncReadCompatExt;
     test(async {
         for outbound in [false, true] {
@@ -1172,10 +1173,9 @@ fn physical_whitespace_and_partial_xml_extend_duplex_idle_until_silence() -> Tes
             input.push(HEADER.as_bytes());
             let counted = CountingIo::new(
                 input.clone(),
-                Arc::clone(&f.remote.inner.metrics),
-                Direction::Outbound,
+                S2sTrafficObserver::new(Arc::clone(&f.remote.inner.metrics), Direction::Outbound),
             );
-            let activity = counted.activity();
+            let activity = counted.observer().activity();
             let mut reader = S2sReader::new(
                 tokio::io::BufReader::new(counted.compat()),
                 &S2sReaderLimits {
@@ -1247,7 +1247,8 @@ fn physical_whitespace_and_partial_xml_extend_duplex_idle_until_silence() -> Tes
 
 #[test]
 fn incomplete_ready_reads_cooperate_before_shutdown_or_invalidation() -> TestResult {
-    use crate::s2s::stream::traffic::{CountingIo, test_support::Fragments};
+    use crate::s2s::stream::traffic::{S2sTrafficObserver, test_support::Fragments};
+    use crate::xml_stream::traffic::CountingIo;
     use tokio_util::compat::FuturesAsyncReadCompatExt;
     test(async {
         for invalidate in [false, true] {
@@ -1257,10 +1258,9 @@ fn incomplete_ready_reads_cooperate_before_shutdown_or_invalidation() -> TestRes
             input.push(HEADER.as_bytes());
             let counted = CountingIo::new(
                 input.clone(),
-                Arc::clone(&f.remote.inner.metrics),
-                Direction::Outbound,
+                S2sTrafficObserver::new(Arc::clone(&f.remote.inner.metrics), Direction::Outbound),
             );
-            let activity = counted.activity();
+            let activity = counted.observer().activity();
             let mut reader = S2sReader::new(
                 tokio::io::BufReader::new(counted.compat()),
                 &S2sReaderLimits {

@@ -586,8 +586,6 @@ where
     reason
 }
 
-/// Builds the detached task that drives one outbound link.
-///
 /// The link state is boxed so spawning moves only a pointer. Unoptimized builds copy a spawned
 /// future through many frames, and the inline state overflows a worker stack.
 pub(super) fn task<A: ChunkAllocator + Clone + 'static>(
@@ -1782,9 +1780,10 @@ mod tests {
     fn physical_whitespace_and_partial_xml_extend_outbound_idle_until_silence()
     -> Result<(), Box<dyn std::error::Error>> {
         use crate::s2s::stream::traffic::{
-            CountingIo,
+            S2sTrafficObserver,
             test_support::{Clock, Fragments},
         };
+        use crate::xml_stream::traffic::CountingIo;
         use tokio_util::compat::FuturesAsyncReadCompatExt;
         run(async {
             let manager = manager(S2sLimits {
@@ -1800,10 +1799,9 @@ mod tests {
             input.push(b"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:server' version='1.0'>");
             let counted = CountingIo::new(
                 input.clone(),
-                Arc::clone(&manager.inner.metrics),
-                Direction::Outbound,
+                S2sTrafficObserver::new(Arc::clone(&manager.inner.metrics), Direction::Outbound),
             );
-            let activity = counted.activity();
+            let activity = counted.observer().activity();
             let mut reader = S2sReader::new(
                 tokio::io::BufReader::new(counted.compat()),
                 &S2sReaderLimits {

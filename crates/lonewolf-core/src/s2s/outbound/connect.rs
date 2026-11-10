@@ -27,9 +27,10 @@ use crate::s2s::dns::{ResolveError, Resolved, ResolvedVia, Resolver};
 use crate::s2s::log_domain;
 use crate::s2s::metrics::{AuthOutcome, BidiOutcome, Direction, DnsOutcome, S2sMetrics};
 use crate::s2s::revocation::{CheckPhase, PeerRevocation, RevocationStatus, RevocationVerdict};
-use crate::s2s::stream::traffic::CountingIo;
+use crate::s2s::stream::traffic::S2sTrafficObserver;
 use crate::s2s::stream::{self, Features, S2sError, S2sReader, S2sReaderLimits, S2sWriter};
 use crate::s2s::{ConnectionSocket, NEXT_S2S_CONNECTION_ID};
+use crate::xml_stream::traffic::CountingIo;
 
 const TLS_NAMESPACE: &str = "urn:ietf:params:xml:ns:xmpp-tls";
 const SASL_NAMESPACE: &str = "urn:ietf:params:xml:ns:xmpp-sasl";
@@ -650,8 +651,11 @@ async fn negotiate<A: ChunkAllocator + Clone>(
         return Err(EstablishError::Tls("alpn").into());
     }
     let certificates = tls.get_ref().1.peer_certificates().map(<[_]>::to_vec);
-    let counted = CountingIo::new(tls, Arc::clone(&context.metrics), Direction::Outbound);
-    let activity = counted.activity();
+    let counted = CountingIo::new(
+        tls,
+        S2sTrafficObserver::new(Arc::clone(&context.metrics), Direction::Outbound),
+    );
+    let activity = counted.observer().activity();
     let (input, output) = counted.split();
     flow.connection = Some(Connection::Tls(
         match state {

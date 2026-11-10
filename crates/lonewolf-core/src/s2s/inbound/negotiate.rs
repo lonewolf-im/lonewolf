@@ -25,8 +25,9 @@ use crate::s2s::log_domain;
 use crate::s2s::metrics::{AuthOutcome, BidiOutcome, Direction, S2sMetrics, TransportAttempt};
 use crate::s2s::outbound::RemoteRouter;
 use crate::s2s::revocation::{CheckPhase, RevocationStatus, RevocationVerdict};
-use crate::s2s::stream::traffic::CountingIo;
+use crate::s2s::stream::traffic::S2sTrafficObserver;
 use crate::s2s::stream::{self, Auth, S2sError, S2sReader, S2sWriter, SaslFailure};
+use crate::xml_stream::traffic::CountingIo;
 
 const TLS_NAMESPACE: &str = "urn:ietf:params:xml:ns:xmpp-tls";
 const SASL_NAMESPACE: &str = "urn:ietf:params:xml:ns:xmpp-sasl";
@@ -34,7 +35,7 @@ const CLOSE_GRACE: Duration = Duration::from_secs(5);
 
 type PlainInput = Compat<Pin<Box<AsyncReadStream<TcpStream>>>>;
 type PlainOutput = Pin<Box<AsyncStream<TcpStream>>>;
-type TlsTransport = CountingIo<futures_rustls::server::TlsStream<PlainOutput>>;
+type TlsTransport = CountingIo<futures_rustls::server::TlsStream<PlainOutput>, S2sTrafficObserver>;
 type TlsInput = BufReader<Compat<ReadHalf<TlsTransport>>>;
 type TlsOutput = WriteHalf<TlsTransport>;
 
@@ -472,8 +473,11 @@ async fn run<A: ChunkAllocator + Clone>(
             )
         })
     });
-    let counted = CountingIo::new(tls, Arc::clone(&settings.metrics), Direction::Inbound);
-    let activity = counted.activity();
+    let counted = CountingIo::new(
+        tls,
+        S2sTrafficObserver::new(Arc::clone(&settings.metrics), Direction::Inbound),
+    );
+    let activity = counted.observer().activity();
     let (input, output) = counted.split();
     *connection = Some(Connection::Tls(
         match state {

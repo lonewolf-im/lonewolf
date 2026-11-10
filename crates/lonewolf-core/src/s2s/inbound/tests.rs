@@ -1172,9 +1172,10 @@ fn selected_reset_flushes_before_release_despite_existing_invalidation() -> Test
 #[test]
 fn physical_whitespace_and_partial_xml_extend_inbound_idle_until_silence() -> TestResult {
     use crate::s2s::stream::traffic::{
-        CountingIo,
+        S2sTrafficObserver,
         test_support::{Clock, Fragments},
     };
+    use crate::xml_stream::traffic::CountingIo;
     use tokio_util::compat::FuturesAsyncReadCompatExt;
     Runtime::new()?.block_on(async {
         let mut fixture = Fixture::new()?;
@@ -1184,10 +1185,9 @@ fn physical_whitespace_and_partial_xml_extend_inbound_idle_until_silence() -> Te
         input.push(HEADER.as_bytes());
         let counted = CountingIo::new(
             input.clone(),
-            Arc::clone(&fixture.settings.metrics),
-            Direction::Inbound,
+            S2sTrafficObserver::new(Arc::clone(&fixture.settings.metrics), Direction::Inbound),
         );
-        let activity = counted.activity();
+        let activity = counted.observer().activity();
         let mut reader = S2sReader::new(
             tokio::io::BufReader::new(counted.compat()),
             &fixture.settings.reader_limits,

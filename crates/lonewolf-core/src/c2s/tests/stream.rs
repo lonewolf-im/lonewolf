@@ -464,7 +464,7 @@ fn blocked_certificate_preparation_cancels_without_losing_completed_tls()
                 .config,
         )
         .accept(super::renegotiation::RecordGuard::new(
-            super::traffic::CountingIo::new(
+            crate::xml_stream::traffic::CountingIo::new(
                 Box::pin(AsyncStream::new(socket.clone())),
                 crate::c2s::metrics::C2sWorkerMetrics::detached(),
             ),

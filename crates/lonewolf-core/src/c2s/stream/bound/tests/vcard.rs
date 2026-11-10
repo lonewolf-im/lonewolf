@@ -17,14 +17,14 @@ fn get_work(fixture: &Fixture, transaction: RedbRead) -> TestResult<GetWork<Glob
     .child(payload)?
     .build()?;
     Ok(GetWork {
-        account: fixture.registration.account().clone(),
+        diagnostics: Diagnostics::Session(fixture.registration.account().clone()),
         target_account: Some(fixture.registration.account().clone()),
         transaction,
         handler: Arc::new(VCard::new(Default::default())),
         discovery: Arc::new(Discovery::default()),
         arena,
         request,
-        sender,
+        sender: Some(sender),
         response: Arena::try_new(Default::default())?,
         delivery: RouterDelivery::new(
             &fixture.router.handle(),
@@ -52,22 +52,22 @@ fn vcard_get_keeps_account_and_card_snapshot_during_deletion_and_recreation() ->
         deletion.commit().await?;
         let missing = get_work(&fixture,fixture.storage.begin_read().await?)?;
         let outcome = fixed.run(Vec::new()).await.map_err(|e|format!("{e:?}"))?;
-        let payload = outcome.reply.map_err(|e|format!("{e:?}"))?.ok_or("missing snapshot payload")?;
-        let root = payload.resolve(&outcome.response)?;
+        let payload = outcome.answer.reply.map_err(|e|format!("{e:?}"))?.ok_or("missing snapshot payload")?;
+        let root = payload.resolve(&outcome.answer.response)?;
         assert_eq!(root.child("FN","vcard-temp")?.ok_or("missing FN")?.text()?,Some("snapshot old"));
-        assert!(outcome.results.is_empty());
+        assert!(outcome.answer.results.is_empty());
         let mut recreated = fixture.storage.begin_write().await?;
         recreated.create_account(NewAccount {key:owner.clone(),credentials:credentials()}).await?;
         recreated.replace_vcard(owner,"<vCard xmlns='vcard-temp' xml:lang='' xml:space='default'><FN>new account</FN></vCard>",VCardQuota::default()).await?;
         recreated.commit().await?;
         let missing = missing.run(Vec::new()).await.map_err(|e|format!("{e:?}"))?;
-        let error = missing.reply.err().ok_or("missing account accepted")?;
+        let error = missing.answer.reply.err().ok_or("missing account accepted")?;
         assert_eq!(error.condition(),StanzaErrorCondition::ServiceUnavailable);
         assert_eq!(error.payload(),lonewolf_extension::iq::IqErrorPayload::Omit);
-        assert!(missing.results.is_empty());
+        assert!(missing.answer.results.is_empty());
         let fresh = get_work(&fixture,fixture.storage.begin_read().await?)?.run(Vec::new()).await.map_err(|e|format!("{e:?}"))?;
-        let payload = fresh.reply.map_err(|e|format!("{e:?}"))?.ok_or("missing new card")?;
-        assert_eq!(payload.resolve(&fresh.response)?.child("FN","vcard-temp")?.ok_or("missing FN")?.text()?,Some("new account"));
+        let payload = fresh.answer.reply.map_err(|e|format!("{e:?}"))?.ok_or("missing new card")?;
+        assert_eq!(payload.resolve(&fresh.answer.response)?.child("FN","vcard-temp")?.ok_or("missing FN")?.text()?,Some("new account"));
         assert!(fixture.storage.begin_read().await?.vcard(owner).await?.ok_or("missing durable card")?.xml.contains("new account"));
         fixture.finish().await
     })

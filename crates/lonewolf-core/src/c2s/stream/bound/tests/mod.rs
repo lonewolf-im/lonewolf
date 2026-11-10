@@ -2499,13 +2499,13 @@ fn detached_iq_get_reports_handler_and_effect_failures_after_requester_cancellat
                 .await?;
             let work = GetWork {
                 target_account: Some(account.clone()),
-                account,
+                diagnostics: Diagnostics::Session(account),
                 transaction,
                 handler,
                 discovery: Arc::new(Discovery::default()),
                 arena,
                 request,
-                sender,
+                sender: Some(sender),
                 response: Arena::try_new(Default::default())?,
                 delivery: RouterDelivery::new(
                     &fixture.router.handle(),
@@ -2653,14 +2653,14 @@ fn account_get_work(
     .child(payload)?
     .build()?;
     Ok(GetWork {
-        account: fixture.registration.account().clone(),
+        diagnostics: Diagnostics::Session(fixture.registration.account().clone()),
         target_account: Some(fixture.registration.account().clone()),
         transaction,
         handler,
         discovery: Arc::new(Discovery::default()),
         arena,
         request,
-        sender,
+        sender: Some(sender),
         response: Arena::try_new(Default::default())?,
         delivery: RouterDelivery::new(
             &fixture.router.handle(),
@@ -2691,7 +2691,7 @@ fn iq_account_guard_and_get_handler_share_the_fixed_snapshot_across_deletion() -
             .run(Vec::new())
             .await
             .map_err(|error| format!("{error:?}"))?;
-        assert!(matches!(outcome.reply, Ok(None)));
+        assert!(matches!(outcome.answer.reply, Ok(None)));
         assert_eq!(handler.0.load(Ordering::SeqCst), 1);
         let (transaction, ticket) = fixture
             .router
@@ -2706,10 +2706,10 @@ fn iq_account_guard_and_get_handler_share_the_fixed_snapshot_across_deletion() -
             .await
             .map_err(|error| format!("{error:?}"))?;
         assert!(matches!(
-            outcome.reply,
+            outcome.answer.reply,
             Err(error) if error == HandlerError::Stanza(StanzaErrorCondition::ServiceUnavailable).into()
         ));
-        assert!(outcome.results.is_empty());
+        assert!(outcome.answer.results.is_empty());
         assert_eq!(handler.0.load(Ordering::SeqCst), 1);
         fixture.finish().await
     })
@@ -2918,19 +2918,19 @@ fn iq_context_reaches_get_set_and_missing_account_handlers() -> TestResult {
                     assert!(reply.contains("type=\"result\""), "{reply}");
                 } else {
                     let work = GetWork {
-                        account: fixture.registration.account().clone(),
+                        diagnostics: Diagnostics::Session(fixture.registration.account().clone()),
                         target_account: Some(target),
                         transaction: fixture.storage.begin_read().await?,
                         handler: handler.clone(),
                         discovery: Arc::new(Discovery::default()),
                         arena,
                         request,
-                        sender,
+                        sender: Some(sender),
                         response,
                         delivery: RouterDelivery::new(&fixture.router.handle(), &GlobalChunkAllocator, Some(&fixture.registration)),
                     };
                     let outcome = work.run(Vec::new()).await.map_err(|error| format!("{path}: {error:?}"))?;
-                    assert!(matches!(outcome.reply, Ok(None)));
+                    assert!(matches!(outcome.answer.reply, Ok(None)));
                 }
                 assert_eq!(handler.calls.load(Ordering::SeqCst), 1, "{path}");
             }

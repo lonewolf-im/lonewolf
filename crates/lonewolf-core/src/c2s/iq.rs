@@ -9,7 +9,7 @@ use lonewolf_xmpp::stanza::{
 
 use super::stream::CloseOutcome;
 use crate::router::{Destination, Registration, RouterHandle};
-pub(super) use crate::stages::iq::{ReplyError, error_reply_omitting_payload, result_reply};
+pub(super) use crate::stages::iq::{ReplyError, error_reply_omitting_payload};
 
 impl From<ReplyError> for CloseOutcome {
     fn from(_: ReplyError) -> Self {

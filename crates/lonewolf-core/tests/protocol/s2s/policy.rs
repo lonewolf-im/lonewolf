@@ -63,3 +63,62 @@ fn messages_follow_inbound_policy_over_federation() -> TestResult {
     bob.close()?;
     pair.stop()
 }
+
+#[test]
+fn iq_requests_follow_inbound_policy_over_federation() -> TestResult {
+    let mut pair = FederatedPair::start(
+        "a.test",
+        "b.test",
+        PairOptions {
+            a_extensions: "'roster'".into(),
+            b_extensions: "'roster', 'test-policy', 'ping'".into(),
+            ..PairOptions::default()
+        },
+    )?;
+    for user in ["spammer", "rejecter", "alice"] {
+        pair.a.create_account(user, PASSWORD)?;
+    }
+    pair.b.create_account("bob", PASSWORD)?;
+    let mut spammer = pair.a.connect("spammer", PASSWORD, "desk")?;
+    let mut rejecter = pair.a.connect("rejecter", PASSWORD, "desk")?;
+    let mut alice = pair.a.connect("alice", PASSWORD, "desk")?;
+    let mut bob = pair.b.connect("bob", PASSWORD, "phone")?;
+    for (client, from, id) in [
+        (&mut spammer, "spammer@a.test/desk", "dropped"),
+        (&mut rejecter, "rejecter@a.test/desk", "rejected"),
+    ] {
+        client.send(&format!(
+            "<iq type='get' id='{id}' to='bob@b.test'><ping xmlns='urn:xmpp:ping'/></iq>"
+        ))?;
+        stanza_error(
+            &iq_reply(client, id, "error", "bob@b.test", from)?,
+            "service-unavailable",
+        )?;
+    }
+    crate::support::federation::subscribe_mutually(
+        &mut alice,
+        "alice@a.test",
+        &mut bob,
+        "bob@b.test",
+    )?;
+    alice.send("<iq type='get' id='allowed' to='bob@b.test'><ping xmlns='urn:xmpp:ping'/></iq>")?;
+    assert!(
+        iq_reply(
+            &mut alice,
+            "allowed",
+            "result",
+            "bob@b.test",
+            "alice@a.test/desk"
+        )?
+        .children
+        .is_empty()
+    );
+    alice.send("<presence type='unavailable'/>")?;
+    alice.expect_xml("<presence xmlns='jabber:client' from='alice@a.test/desk' to='alice@a.test' type='unavailable'/>")?;
+    bob.expect_xml("<presence xmlns='jabber:client' from='alice@a.test/desk' to='bob@b.test' type='unavailable' xml:lang='en'/>")?;
+    spammer.close()?;
+    rejecter.close()?;
+    alice.close()?;
+    bob.close()?;
+    pair.stop()
+}

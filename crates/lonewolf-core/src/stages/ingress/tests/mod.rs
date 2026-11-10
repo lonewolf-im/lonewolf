@@ -30,6 +30,7 @@ use crate::router::{Admitted, Router, RouterHandle};
 use crate::stages::Stage;
 use crate::stages::message::DeliveryOutcome;
 
+mod iq;
 mod message;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;

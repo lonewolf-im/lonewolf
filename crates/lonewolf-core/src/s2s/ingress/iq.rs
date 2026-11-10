@@ -2,30 +2,22 @@
 
 use std::sync::Arc;
 
-use lonewolf_extension::Effects;
-use lonewolf_extension::delivery::{Failure, FailureKind, HandlerError};
-use lonewolf_extension::discovery::Discovery;
+use lonewolf_extension::delivery::HandlerError;
 use lonewolf_extension::iq::{
-    IqDestinationRule, IqError, IqErrorPayload, IqHandler, IqReply, IqRequest, IqRequestType,
-    IqScope, Requester, XmlSpace,
+    IqDestinationRule, IqError, IqErrorPayload, IqRequestType, Requester,
 };
 use lonewolf_extension::policy::{Direction, Verdict};
+use lonewolf_storage::Storage;
 use lonewolf_storage::account::AccountKey;
-use lonewolf_storage::{RedbRead, RedbStorage, Storage};
 use lonewolf_util::arena::{Arena, ChunkAllocator};
-use lonewolf_xmpp::stanza::{IqType, Stanza, StanzaErrorCondition, StanzaErrorText, XML_NAMESPACE};
+use lonewolf_xmpp::stanza::{IqType, StanzaErrorCondition, StanzaErrorText};
 
 use super::{InboundPeer, IngressContext, IngressFailure, reply_error};
-use crate::delivery::{
-    EffectsDiagnostics, EffectsIdentity, RouterDelivery, after_turn, commit_and_deliver,
-    storage_failure,
-};
+use crate::delivery::storage_failure;
 use crate::router::{Destination, RoutedStanza, RouterError};
 use crate::stages::ingress::Origin;
-use crate::stages::iq::{
-    IqTarget, ReplyError, error_reply_omitting_payload, iq_requester, iq_target,
-    require_iq_account, result_reply,
-};
+use crate::stages::ingress::iq::{self as ingress_iq, AnswerStanzas, IqDisposition, IqInput};
+use crate::stages::iq::{ReplyError, error_reply_omitting_payload, iq_requester};
 use crate::stages::{Stage, policy};
 
 impl From<ReplyError> for IngressFailure {
@@ -185,144 +177,45 @@ pub(crate) async fn handle<A: ChunkAllocator + Clone + 'static>(
     let Some(kind) = request_type else {
         return Ok(());
     };
-    let scope = match destination {
-        Destination::Account => IqScope::Account,
-        Destination::Server => IqScope::Server,
+    match destination {
+        Destination::Account | Destination::Server => {}
         Destination::Remote => return Err(IngressFailure),
         _ => return unavailable(context, &routed, StanzaErrorCondition::ServiceUnavailable),
-    };
-    let payload = view
-        .children()
-        .map_err(|_| IngressFailure)?
-        .next()
-        .transpose()
-        .map_err(|_| IngressFailure)?
-        .ok_or(IngressFailure)?;
-    let handler = context
-        .router
-        .iq_handlers(target.domainpart())
-        .and_then(|registry| registry.find(scope, kind, payload.namespace(), payload.name()))
-        .map(Arc::clone);
-    let Some(handler) = handler else {
-        return unavailable(context, &routed, StanzaErrorCondition::ServiceUnavailable);
-    };
-    let discovery = Arc::clone(
-        context
-            .router
-            .discovery(target.domainpart())
-            .ok_or(IngressFailure)?,
-    );
-    let delivery = RouterDelivery::new(&context.router, &context.allocator, None);
-    let mut arena = Arena::try_new_in(Default::default(), context.allocator.clone())
-        .map_err(|_| IngressFailure)?;
-    let request = view.clone_in(&mut arena).map_err(|_| IngressFailure)?;
-    let mut response = Arena::try_new_in(Default::default(), context.allocator.clone())
-        .map_err(|_| IngressFailure)?;
-    let (reply, response) = match kind {
-        IqRequestType::Get => {
-            let (transaction, ticket) = Arc::clone(context.router.order())
-                .fix(
-                    account.iter().cloned().collect(),
-                    context.storage.begin_read(),
-                )
-                .await
-                .map_err(|error| {
-                    origin.report(
-                        storage_failure(error, "iq_get_begin_read"),
-                        account.as_ref(),
-                    );
-                    IngressFailure
-                })?;
-            let work = GetWork {
-                request,
-                arena,
-                account,
-                domain: peer.local.clone(),
-                transaction,
-                handler,
-                discovery,
-                delivery,
-                response,
-            };
-            let pending = after_turn::<A, _, _, _>(
-                context.work.start(),
-                ticket,
-                None,
-                move |_, ticket| async move {
-                    let result = work.run().await;
-                    drop(ticket);
-                    result
-                },
-            );
-            pending.finished().await.ok_or(IngressFailure)??
+    }
+    let disposition = ingress_iq::handle_request(
+        &stage,
+        &origin,
+        IqInput::Routed(routed),
+        destination,
+        kind,
+        account,
+    )
+    .await?;
+    let answer = match disposition {
+        IqDisposition::Unavailable {
+            input: IqInput::Routed(routed),
+            condition,
+            ..
+        } => return unavailable(context, &routed, condition),
+        IqDisposition::Unavailable { .. } | IqDisposition::SessionIq { .. } => {
+            return Err(IngressFailure);
         }
-        IqRequestType::Set => {
-            let mut transaction = context.storage.begin_write().await.map_err(|error| {
-                origin.report(
-                    storage_failure(error, "iq_set_begin_write"),
-                    account.as_ref(),
-                );
-                IngressFailure
-            })?;
-            let reply = match require_iq_account(&transaction, account.as_ref()).await {
-                Err(error) => Err(error.into()),
-                Ok(()) => {
-                    handler
-                        .set(
-                            iq_request(&request, &arena, &discovery, &delivery, None)?,
-                            &mut transaction,
-                            &delivery,
-                            &mut response,
-                        )
-                        .await
-                }
-            };
-            match reply {
-                Ok(reply) => {
-                    let pending = commit_and_deliver(
-                        context.work.start(),
-                        Arc::clone(context.router.order()),
-                        transaction,
-                        reply.effects,
-                        delivery,
-                        None,
-                        EffectsDiagnostics {
-                            identity: account.map_or_else(
-                                || EffectsIdentity::Server(peer.local.clone()),
-                                EffectsIdentity::Account,
-                            ),
-                            commit_operation: "iq_set_commit",
-                            delivery_operation: "iq_set_effects",
-                        },
-                    );
-                    pending
-                        .finished()
-                        .await
-                        .ok_or(IngressFailure)?
-                        .map_err(|_| IngressFailure)?;
-                    (
-                        Ok(IqReply {
-                            payload: reply.payload,
-                            effects: Effects::none(),
-                            results: reply.results,
-                        }),
-                        response,
-                    )
-                }
-                Err(error) => {
-                    drop(transaction);
-                    if let Some(failure) = error.handler_error().failure() {
-                        origin.report(failure, account.as_ref());
-                    }
-                    (Err(error), response)
-                }
+        IqDisposition::Answer(answer) => answer,
+        IqDisposition::Ordered(pending) => pending.finished().await.ok_or(IngressFailure)??.answer,
+    };
+    match ingress_iq::render_answer(&origin, &context.allocator, answer)? {
+        AnswerStanzas::One { stanza, arena } => {
+            let _ = context
+                .router
+                .route_remote(RoutedStanza::from_parts(stanza, arena));
+        }
+        AnswerStanzas::Shared(stanzas) => {
+            for stanza in stanzas {
+                let _ = context.router.route_remote(stanza);
             }
         }
-    };
-    match reply {
-        Err(error) => emit_error(context, &routed, error),
-        Ok(reply) => emit_reply(context, &routed, reply, response),
     }
+    Ok(())
 }
 
 fn unavailable<A: ChunkAllocator + Clone + 'static>(
@@ -351,141 +244,6 @@ fn policy_reply<A: ChunkAllocator + Clone + 'static>(
             text.unwrap_or_else(|| condition.default_text()),
         ),
         Verdict::Allow | Verdict::Drop => Ok(()),
-    }
-}
-
-fn iq_request<'a, A: ChunkAllocator + Clone>(
-    request: &'a Stanza,
-    arena: &'a Arena<A>,
-    discovery: &'a Discovery,
-    delivery: &'a RouterDelivery<A>,
-    requester: Option<Requester>,
-) -> Result<IqRequest<'a, A>, IngressFailure> {
-    let view = request.resolve(arena).map_err(|_| IngressFailure)?;
-    Ok(IqRequest {
-        sender: view
-            .from()
-            .map_err(|_| IngressFailure)?
-            .ok_or(IngressFailure)?,
-        target: view
-            .to()
-            .map_err(|_| IngressFailure)?
-            .ok_or(IngressFailure)?,
-        discovery,
-        sessions: delivery,
-        requester,
-        lang: view.lang().map_err(|_| IngressFailure)?,
-        space: view
-            .attribute("space", XML_NAMESPACE)
-            .map_err(|_| IngressFailure)?
-            .map(XmlSpace::from_attribute),
-        payload: view
-            .children()
-            .map_err(|_| IngressFailure)?
-            .next()
-            .transpose()
-            .map_err(|_| IngressFailure)?
-            .ok_or(IngressFailure)?,
-    })
-}
-
-struct GetWork<A: ChunkAllocator> {
-    request: Stanza,
-    arena: Arena<A>,
-    account: Option<AccountKey>,
-    domain: Box<str>,
-    transaction: RedbRead,
-    handler: Arc<dyn IqHandler<A, RedbStorage>>,
-    discovery: Arc<Discovery>,
-    delivery: RouterDelivery<A>,
-    response: Arena<A>,
-}
-
-impl<A: ChunkAllocator + Clone> GetWork<A> {
-    async fn run(mut self) -> Result<(Result<IqReply<A>, IqError>, Arena<A>), IngressFailure> {
-        let reply = match iq_target(&self.transaction, self.account.as_ref()).await {
-            Err(error) => Err(error.into()),
-            Ok(target) => {
-                let requester = match target {
-                    IqTarget::Server => Ok(None),
-                    IqTarget::Missing => Ok(Some(Requester::Other)),
-                    IqTarget::Present => iq_requester(
-                        self.delivery.router(),
-                        self.account.as_ref().ok_or(IngressFailure)?,
-                        self.request
-                            .resolve(&self.arena)
-                            .map_err(|_| IngressFailure)?
-                            .from()
-                            .map_err(|_| IngressFailure)?
-                            .ok_or(IngressFailure)?,
-                        &self.transaction,
-                    )
-                    .await
-                    .map(Some),
-                };
-                match requester {
-                    Err(error) => Err(error.into()),
-                    Ok(requester) => {
-                        let request = iq_request(
-                            &self.request,
-                            &self.arena,
-                            &self.discovery,
-                            &self.delivery,
-                            requester,
-                        )?;
-                        match target {
-                            IqTarget::Missing => self
-                                .handler
-                                .get_missing_account(request, &mut self.response)
-                                .map(|payload| IqReply::new(payload, Effects::none())),
-                            _ => {
-                                self.handler
-                                    .get(request, &self.transaction, &mut self.response)
-                                    .await
-                            }
-                        }
-                    }
-                }
-            }
-        };
-        drop(self.transaction);
-        let sender = self
-            .request
-            .resolve(&self.arena)
-            .map_err(|_| IngressFailure)?
-            .from()
-            .map_err(|_| IngressFailure)?
-            .ok_or(IngressFailure)?;
-        let origin: Origin<'_, A> = Origin::Remote {
-            local: &self.domain,
-            remote: sender.domainpart(),
-        };
-        let reply = match reply {
-            Ok(reply) => {
-                (reply.effects.deliver)(&self.delivery).await.map_err(|_| {
-                    origin.report(
-                        Failure {
-                            kind: FailureKind::Delivery,
-                            operation: "iq_get_effects",
-                        },
-                        self.account.as_ref(),
-                    );
-                    IngressFailure
-                })?;
-                Ok(IqReply {
-                    payload: reply.payload,
-                    results: reply.results,
-                    effects: Effects::none(),
-                })
-            }
-            Err(error) => {
-                if let Some(failure) = error.handler_error().failure() {
-                    origin.report(failure, self.account.as_ref());
-                }
-                Err(error)
-            }
-        };
-        Ok((reply, self.response))
     }
 }
 
@@ -528,48 +286,4 @@ fn emit_error<A: ChunkAllocator + Clone + 'static>(
             Ok(())
         }
     }
-}
-
-fn emit_reply<A: ChunkAllocator + Clone + 'static>(
-    context: &IngressContext<A>,
-    routed: &RoutedStanza<A>,
-    reply: IqReply<A>,
-    mut response: Arena<A>,
-) -> Result<(), IngressFailure> {
-    let view = routed.resolve().map_err(|_| IngressFailure)?;
-    let sender = view
-        .from()
-        .map_err(|_| IngressFailure)?
-        .ok_or(IngressFailure)?;
-    if reply.results.iter().any(|result| {
-        result
-            .resolve(&response)
-            .ok()
-            .and_then(|view| view.to().ok().flatten())
-            .map(|to| to.as_str())
-            != Some(sender.as_str())
-    }) {
-        return unavailable(context, routed, StanzaErrorCondition::InternalServerError);
-    }
-    let mut original = Arena::try_new_in(Default::default(), context.allocator.clone())
-        .map_err(|_| IngressFailure)?;
-    let request = view.clone_in(&mut original).map_err(|_| IngressFailure)?;
-    let final_reply = result_reply(
-        &request.resolve(&original).map_err(|_| IngressFailure)?,
-        sender,
-        reply.payload,
-        &mut response,
-    )?;
-    if reply.results.is_empty() {
-        let _ = context
-            .router
-            .route_remote(RoutedStanza::from_parts(final_reply, response));
-    } else {
-        let mut results = reply.results;
-        results.push(final_reply);
-        for result in RoutedStanza::from_parts_shared(results, response) {
-            let _ = context.router.route_remote(result);
-        }
-    }
-    Ok(())
 }

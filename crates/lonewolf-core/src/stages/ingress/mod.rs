@@ -12,6 +12,7 @@ use crate::delivery::{report_failure, report_server_failure};
 use crate::router::Registration;
 
 pub(crate) mod checks;
+pub(crate) mod iq;
 pub(crate) mod message;
 
 pub(crate) enum Origin<'o, A: ChunkAllocator> {

@@ -21,7 +21,6 @@ pub(crate) struct Parties {
     pub(crate) recipient: Option<AccountKey>,
 }
 
-#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) fn parties<A: ChunkAllocator + Clone>(
     router: &RouterHandle<A>,
     origin: &Origin<'_, A>,
@@ -36,7 +35,7 @@ pub(crate) fn parties<A: ChunkAllocator + Clone>(
         .sender()
         .is_some_and(|sender| sender.as_str() == to.bare().as_str());
     let recipient_needed = local_recipient
-        && (!router.policies(to.domainpart()).is_empty()
+        && ((!same_account && !router.policies(to.domainpart()).is_empty())
             || (kind == StanzaKind::Message
                 && (router.archive_handler(to.domainpart()).is_some()
                     || !router.message_observers(to.domainpart()).is_empty())));
@@ -62,13 +61,12 @@ pub(crate) fn policy_applies<A: ChunkAllocator + Clone>(
             || (parties.local_recipient && !router.policies(to.domainpart()).is_empty()))
 }
 
-#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) enum Snapshot<'t> {
     Fresh,
+    #[cfg_attr(not(test), expect(dead_code))]
     Ordered(&'t RedbRead),
 }
 
-#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) async fn check<A: ChunkAllocator + Clone>(
     stage: &Stage<'_, A>,
     origin: &Origin<'_, A>,
@@ -106,7 +104,6 @@ pub(crate) async fn check<A: ChunkAllocator + Clone>(
     }
 }
 
-#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) async fn observe_message<A: ChunkAllocator + Clone>(
     stage: &Stage<'_, A>,
     origin: &Origin<'_, A>,

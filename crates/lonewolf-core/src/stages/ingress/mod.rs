@@ -12,17 +12,18 @@ use crate::delivery::{report_failure, report_server_failure};
 use crate::router::Registration;
 
 pub(crate) mod checks;
+pub(crate) mod message;
 
 pub(crate) enum Origin<'o, A: ChunkAllocator> {
-    #[cfg_attr(not(test), expect(dead_code))]
     Session(&'o Registration<A>),
     Remote {
         local: &'o str,
         #[expect(dead_code)]
         remote: &'o str,
     },
-    #[cfg_attr(not(test), expect(dead_code))]
-    Service { domain: &'o str },
+    Service {
+        domain: &'o str,
+    },
 }
 
 impl<'o, A: ChunkAllocator + Clone> Origin<'o, A> {

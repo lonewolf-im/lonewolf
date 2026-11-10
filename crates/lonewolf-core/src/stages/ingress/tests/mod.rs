@@ -30,6 +30,8 @@ use crate::router::{Admitted, Router, RouterHandle};
 use crate::stages::Stage;
 use crate::stages::message::DeliveryOutcome;
 
+mod message;
+
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 #[derive(Debug, PartialEq)]
@@ -50,6 +52,7 @@ struct Observation {
 
 #[derive(Default)]
 struct Recorder {
+    observers: bool,
     policies: PlMutex<Vec<PolicyCall>>,
     observations: PlMutex<Vec<Observation>>,
 }
@@ -73,7 +76,9 @@ impl Extension<GlobalChunkAllocator, RedbStorage> for Recorder {
             lonewolf_extension::iq::IqDestinationRule::SenderBare,
         )?;
         slots.policy(self.clone());
-        slots.message_observer(self);
+        if self.observers {
+            slots.message_observer(self);
+        }
         Ok(())
     }
 }
@@ -122,9 +127,16 @@ struct Fixture {
 
 impl Fixture {
     fn new(enabled: bool) -> TestResult<Self> {
+        Self::with_observers(enabled, true)
+    }
+
+    fn with_observers(enabled: bool, observers: bool) -> TestResult<Self> {
         let directory = tempfile::tempdir()?;
         let storage = RedbStorage::open(directory.path().join("lonewolf.dat"))?;
-        let recorder = Arc::new(Recorder::default());
+        let recorder = Arc::new(Recorder {
+            observers,
+            ..Recorder::default()
+        });
         let mut extensions = Extensions::default();
         extensions.register(recorder.clone())?;
         let router = Router::new(
@@ -465,4 +477,62 @@ fn destination_error_uses_authenticated_account_before_stamping() -> TestResult 
     );
     Runtime::new()?.block_on(fixture.router.shutdown())?;
     Ok(())
+}
+
+#[test]
+fn same_account_with_only_policy_routes_without_a_recipient_key_or_policy_calls() -> TestResult {
+    use crate::router::metrics::MessageOutcome as MetricOutcome;
+    use crate::stages::ingress::message::{MessageDisposition, handle};
+
+    Runtime::new()?.block_on(async {
+        let fixture = Fixture::with_observers(true, false)?;
+        assert!(!fixture.handle.policies("localhost").is_empty());
+        assert!(fixture.handle.archive_handler("localhost").is_none());
+        assert!(fixture.handle.message_observers("localhost").is_empty());
+        let owner = account("alice@localhost")?;
+        let resource_limit = NonZeroUsize::new(2).ok_or("resource limit")?;
+        let sender = fixture
+            .handle
+            .register(&owner, Some("phone"), resource_limit)
+            .await?;
+        let recipient = fixture
+            .handle
+            .register(&owner, Some("tablet"), resource_limit)
+            .await?;
+        let origin = Origin::Session(&sender);
+        let routed = stanza("alice@localhost/phone", "alice@localhost/tablet")?;
+        let view = routed.resolve()?;
+        let parties = parties(
+            &fixture.handle,
+            &origin,
+            view.to()?.ok_or("recipient")?,
+            StanzaKind::Message,
+        )
+        .map_err(|_| "parties failed")?;
+        assert!(parties.same_account);
+        assert!(parties.recipient.is_none());
+        let mut expected = String::new();
+        view.write_xml(&mut expected)?;
+        let disposition = handle(&fixture.stage(), &origin, routed, MessageType::Chat)
+            .await
+            .map_err(|_| "pipeline failed")?;
+        assert!(matches!(disposition, MessageDisposition::Done));
+        assert!(fixture.recorder.policies.lock().is_empty());
+        assert!(fixture.recorder.observations.lock().is_empty());
+        let delivered = recipient.take_queued();
+        assert_eq!(delivered.len(), 1);
+        let mut actual = String::new();
+        delivered[0].stanza.resolve()?.write_xml(&mut actual)?;
+        assert_eq!(actual, expected);
+        for outcome in MetricOutcome::ALL {
+            assert_eq!(
+                fixture.handle.metrics().messages(outcome),
+                u64::from(outcome == MetricOutcome::Routed)
+            );
+        }
+        drop(recipient);
+        drop(sender);
+        fixture.router.shutdown().await?;
+        Ok(())
+    })
 }

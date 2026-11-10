@@ -9,6 +9,7 @@ mod lifecycle;
 mod limits;
 mod messages;
 mod negotiation;
+mod policy;
 mod presence;
 mod revocation_fetch;
 mod revocation_file;

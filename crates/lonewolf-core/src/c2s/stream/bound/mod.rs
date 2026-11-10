@@ -62,8 +62,9 @@ use crate::router::{
     RouterHandle, ServiceRoute, SessionHandle,
 };
 
+use crate::stages::ingress::Origin;
+use crate::stages::ingress::message::{MessageDisposition, Reply};
 use crate::stages::iq::{IqTarget, iq_requester, iq_target, require_iq_account};
-use crate::stages::message::{self, DeliveryOutcome};
 use crate::stages::service::{self, ServiceOutcome, ServicePresenceLease};
 use crate::stages::{Stage, archive, ingress, observe, policy};
 
@@ -1764,228 +1765,26 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             allocator: &self.allocator,
             work: &self.work,
         };
-        let verdict = {
-            let view = routed.resolve()?;
-            let to = view.to()?.ok_or(CloseOutcome::InternalError)?;
-            let from = view.from()?.ok_or(CloseOutcome::InternalError)?;
-            let sender = self.registration.account();
-            let local_recipient = matches!(
-                self.router.destination(to),
-                Destination::Account | Destination::Resource
-            );
-            if to.bare().as_str() == sender.as_str()
-                || (self.router.policies(sender.domain()).is_empty()
-                    && (!local_recipient || self.router.policies(to.domainpart()).is_empty()))
-            {
-                Verdict::Allow
-            } else {
-                let recipient = if local_recipient {
-                    Some(AccountKey::try_from(to.bare())?)
-                } else {
-                    None
-                };
-                let checks = [
-                    policy::Check {
-                        account: sender,
-                        direction: Direction::Outbound,
-                        peer: to,
-                    },
-                    policy::Check {
-                        account: recipient.as_ref().unwrap_or(sender),
-                        direction: Direction::Inbound,
-                        peer: from,
-                    },
-                ];
-                let checks = &checks[..if recipient.is_some() { 2 } else { 1 }];
-                self.outbox
-                    .drain_until(
-                        &self.registration,
-                        policy::evaluate(&stage, view.stanza_type(), checks),
-                    )
-                    .await??
+        let origin = Origin::Session(&self.registration);
+        let disposition = self
+            .outbox
+            .drain_until(
+                &self.registration,
+                ingress::message::handle(&stage, &origin, routed, kind),
+            )
+            .await??;
+        match disposition {
+            MessageDisposition::Done => Ok(()),
+            MessageDisposition::Reply(Reply::Built(reply)) => {
+                self.outbox.push(Output::Routed(reply));
+                Ok(())
             }
-        };
-        match verdict {
-            Verdict::Allow => {}
-            Verdict::Reject {
+            MessageDisposition::Reply(Reply::Error {
+                stanza,
                 condition,
                 application,
                 text,
-            } => {
-                return self.reply_rejection_with_text(
-                    &routed,
-                    condition,
-                    application,
-                    text.unwrap_or_else(|| condition.default_text()),
-                );
-            }
-            Verdict::Drop => return Ok(()),
-        }
-        let archived = {
-            let view = routed.resolve()?;
-            let to = view.to()?.ok_or(CloseOutcome::InternalError)?;
-            let local_recipient = matches!(
-                self.router.destination(to),
-                Destination::Account | Destination::Resource
-            );
-            let archive_needed = self
-                .router
-                .archive_handler(self.registration.account().domain())
-                .is_some()
-                || (local_recipient && self.router.archive_handler(to.domainpart()).is_some());
-            if archive_needed {
-                let recipient = if local_recipient {
-                    Some(AccountKey::try_from(to.bare())?)
-                } else {
-                    None
-                };
-                self.outbox
-                    .drain_until(
-                        &self.registration,
-                        archive::archive(
-                            &stage,
-                            routed,
-                            Some(self.registration.account()),
-                            recipient.as_ref(),
-                        ),
-                    )
-                    .await??
-            } else {
-                archive::ArchiveStep::Accepted(archive::Archived {
-                    stanza: routed,
-                    sent: None,
-                    received: None,
-                })
-            }
-        };
-        let archive::Archived {
-            stanza: routed,
-            sent,
-            received,
-        } = match archived {
-            archive::ArchiveStep::Accepted(archived) => archived,
-            archive::ArchiveStep::Rejected {
-                stanza,
-                condition,
-                text,
-            } => {
-                return self.reply_rejection_with_text(&stanza, condition, None, text);
-            }
-        };
-        let observed = {
-            let view = routed.resolve()?;
-            let to = view.to()?.ok_or(CloseOutcome::InternalError)?;
-            let local_recipient = matches!(
-                self.router.destination(to),
-                Destination::Account | Destination::Resource
-            );
-            if !self
-                .router
-                .message_observers(self.registration.account().domain())
-                .is_empty()
-                || (local_recipient && !self.router.message_observers(to.domainpart()).is_empty())
-            {
-                let recipient = if local_recipient {
-                    Some(AccountKey::try_from(to.bare())?)
-                } else {
-                    None
-                };
-                Some((routed.clone(), recipient))
-            } else {
-                None
-            }
-        };
-        let outcome = self
-            .outbox
-            .drain_until(&self.registration, message::deliver(&stage, routed, kind))
-            .await??;
-        let rejection = match (&observed, &outcome) {
-            (
-                Some(_),
-                DeliveryOutcome::Rejected {
-                    stanza,
-                    condition,
-                    text,
-                },
-            ) => Some(self.rejection_reply(stanza, *condition, None, *text)?),
-            _ => None,
-        };
-        if let Some((observed, recipient)) = observed {
-            let sender = self.registration.session_id();
-            let admitted = match &outcome {
-                DeliveryOutcome::Routed { admitted } | DeliveryOutcome::Stored { admitted } => {
-                    admitted.as_slice()
-                }
-                DeliveryOutcome::Discarded | DeliveryOutcome::Rejected { .. } => &[],
-            };
-            let same_account = recipient.as_ref() == Some(self.registration.account());
-            let combined = if same_account {
-                let mut holders = Vec::with_capacity(1 + admitted.len());
-                holders.push(sender);
-                holders.extend_from_slice(admitted);
-                holders
-            } else {
-                Vec::new()
-            };
-            let delivery = self.delivery();
-            self.outbox
-                .drain_until(&self.registration, async {
-                    let outcome = MessageOutcome::from(&outcome);
-                    observe::message(
-                        &stage,
-                        &delivery,
-                        MessageEvent {
-                            account: self.registration.account(),
-                            role: MessageRole::Sent,
-                            stanza: &observed,
-                            outcome,
-                            archived: sent,
-                            holders: if same_account {
-                                &combined
-                            } else {
-                                std::slice::from_ref(&sender)
-                            },
-                            rejection: rejection.as_ref(),
-                        },
-                    )
-                    .await;
-                    if matches!(outcome, MessageOutcome::Routed | MessageOutcome::Stored)
-                        && let Some(recipient) = recipient.as_ref()
-                    {
-                        observe::message(
-                            &stage,
-                            &delivery,
-                            MessageEvent {
-                                account: recipient,
-                                role: MessageRole::Received,
-                                stanza: &observed,
-                                outcome,
-                                archived: received,
-                                holders: if same_account { &combined } else { admitted },
-                                rejection: None,
-                            },
-                        )
-                        .await;
-                    }
-                })
-                .await?;
-        }
-        match outcome {
-            DeliveryOutcome::Rejected {
-                stanza,
-                condition,
-                text,
-            } => {
-                if let Some(reply) = rejection {
-                    self.outbox.push(Output::Routed(reply));
-                    Ok(())
-                } else {
-                    self.reply_rejection_with_text(&stanza, condition, None, text)
-                }
-            }
-            DeliveryOutcome::Routed { .. }
-            | DeliveryOutcome::Stored { .. }
-            | DeliveryOutcome::Discarded => Ok(()),
+            }) => self.reply_rejection_with_text(&stanza, condition, application, text),
         }
     }
 

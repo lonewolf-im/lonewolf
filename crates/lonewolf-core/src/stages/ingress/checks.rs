@@ -35,7 +35,7 @@ pub(crate) fn parties<A: ChunkAllocator + Clone>(
         .sender()
         .is_some_and(|sender| sender.as_str() == to.bare().as_str());
     let recipient_needed = local_recipient
-        && (!router.policies(to.domainpart()).is_empty()
+        && ((!same_account && !router.policies(to.domainpart()).is_empty())
             || (kind == StanzaKind::Message
                 && (router.archive_handler(to.domainpart()).is_some()
                     || !router.message_observers(to.domainpart()).is_empty())));

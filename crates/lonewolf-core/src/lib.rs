@@ -44,6 +44,8 @@ mod shutdown;
 mod stages;
 mod storage;
 #[cfg(test)]
+mod test_allocator;
+#[cfg(test)]
 mod test_ports;
 #[cfg(feature = "test-support")]
 #[doc(hidden)]

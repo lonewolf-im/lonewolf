@@ -152,7 +152,7 @@ fn mixed_srv_failover_keeps_modes_and_one_aggregate_authentication() -> TestResu
             "direct_bad_handshake" => {
                 let (mut socket, _) = first.accept_client_hello("b.test")?;
                 socket.write_all(b"not a TLS record")?;
-                socket.shutdown(std::net::Shutdown::Both)?;
+                drop(socket);
                 "tls_failure"
             }
             _ => {

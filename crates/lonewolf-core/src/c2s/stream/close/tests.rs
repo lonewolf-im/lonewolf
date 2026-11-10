@@ -16,7 +16,7 @@ use lonewolf_xmpp::parser::{ParserConfig, XmppParser};
 
 use super::*;
 use crate::c2s::stream::header::ClientHeader;
-use crate::c2s::stream::stanza_rate::StanzaLimiter;
+use crate::xml_stream::limiter::StanzaLimiter;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 type TestReader = Reader<GlobalChunkAllocator, std::io::Cursor<Vec<u8>>>;

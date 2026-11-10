@@ -8,6 +8,14 @@ use compio::time::timeout;
 
 use super::*;
 
+struct Observer(Cell<usize>);
+
+impl ReadObserver for Observer {
+    fn rate_limited(&self) {
+        self.0.set(self.0.get() + 1);
+    }
+}
+
 type TestResult = Result<(), Box<dyn Error>>;
 
 #[test]
@@ -37,15 +45,29 @@ fn acquisition_waits_for_refill_after_the_burst_and_survives_cancellation() -> T
             NonZeroUsize::new(20).ok_or("invalid rate")?,
             NonZeroUsize::new(2).ok_or("invalid burst")?,
         );
-        assert!(!limiter.acquire().await);
-        assert!(!limiter.acquire().await);
+        let mode = Cell::new(ReadMode::Open);
+        let observer = Observer(Cell::new(0));
+        limiter.acquire(&mode, &observer).await;
+        limiter.acquire(&mode, &observer).await;
+        assert_eq!(observer.0.get(), 0);
         assert!(
-            timeout(Duration::from_millis(10), limiter.acquire())
+            timeout(Duration::from_millis(10), limiter.acquire(&mode, &observer))
                 .await
                 .is_err()
         );
-        assert!(timeout(Duration::from_millis(200), limiter.acquire()).await?);
-        assert!(timeout(Duration::from_millis(200), limiter.acquire()).await?);
+        assert_eq!(observer.0.get(), 1);
+        timeout(
+            Duration::from_millis(200),
+            limiter.acquire(&mode, &observer),
+        )
+        .await?;
+        assert_eq!(observer.0.get(), 2);
+        timeout(
+            Duration::from_millis(200),
+            limiter.acquire(&mode, &observer),
+        )
+        .await?;
+        assert_eq!(observer.0.get(), 3);
         Ok(())
     })
 }

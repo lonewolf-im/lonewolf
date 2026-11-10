@@ -689,7 +689,7 @@ fn session(
     socket: compio::net::TcpStream,
 ) -> TestResult<super::super::session::Session<lonewolf_util::arena::GlobalChunkAllocator>> {
     use super::super::session::{ClosingInput, ReadMode, Session};
-    use super::super::stanza_rate::StanzaLimiter;
+    use crate::xml_stream::limiter::StanzaLimiter;
     use futures_util::FutureExt as _;
     use futures_util::io::AsyncReadExt as _;
     use lonewolf_util::arena::{ArenaConfig, GlobalChunkAllocator};
@@ -795,7 +795,7 @@ impl tokio::io::AsyncRead for ErrorInput {
 fn real_parser_preserves_only_the_exact_detection_marker_as_tls_failure() -> TestResult {
     use super::super::outcome::CloseOutcome;
     use super::super::session::Reader;
-    use super::super::stanza_rate::StanzaLimiter;
+    use crate::xml_stream::limiter::StanzaLimiter;
     use lonewolf_util::arena::{ArenaConfig, GlobalChunkAllocator};
     use lonewolf_xmpp::parser::{ParserConfig, XmppParser};
     use std::num::NonZeroUsize;

@@ -5,7 +5,9 @@ use lonewolf_xmpp::parser::StreamEvent;
 use lonewolf_xmpp::stanza::{NodeRef, STREAM_NAMESPACE};
 use lonewolf_xmpp::stream::{STREAM_ERROR_NAMESPACE, StreamError, StreamErrorCondition};
 
+pub(crate) mod limiter;
 pub(crate) mod parse;
+pub(crate) mod reader;
 
 pub(crate) const STREAM_FOOTER: &str = "</stream:stream>";
 

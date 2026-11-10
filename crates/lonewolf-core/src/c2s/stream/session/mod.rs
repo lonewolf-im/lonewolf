@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::cell::Cell;
-use std::future::{Future, poll_fn};
 use std::io;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -25,12 +24,14 @@ use super::header::{
 };
 use super::outcome::CloseOutcome;
 use super::renegotiation::RecordGuard;
-use super::stanza_rate::StanzaLimiter;
 use super::traffic::CountingIo;
 use crate::c2s::metrics::{C2sWorkerMetrics, RateLimit};
 use crate::hosts::Hosts;
 use crate::router::RoutedStanza;
+use crate::xml_stream::limiter::StanzaLimiter;
 use crate::xml_stream::peer_stream_error;
+pub(super) use crate::xml_stream::reader::ReadMode;
+use crate::xml_stream::reader::{ReadObserver, XmlReader};
 
 pub(super) const IO_BUFFER_BYTES: usize = 4_096;
 
@@ -49,20 +50,18 @@ pub(super) struct Session<A: ChunkAllocator> {
 }
 
 pub(super) struct Reader<A: ChunkAllocator, R = XmlInput> {
-    ready: Option<ReadState<A, R>>,
-    pending: Option<PendingRead<A, R>>,
+    inner: XmlReader<A, R, C2sWorkerMetrics>,
     closing: Rc<Cell<ReadMode>>,
-    failed: bool,
 }
 
-struct ReadState<A: ChunkAllocator, R> {
-    parser: XmppParser<R, A>,
-    stanzas: StanzaLimiter,
-    metrics: C2sWorkerMetrics,
+impl ReadObserver for C2sWorkerMetrics {
+    fn stanza_parsed(&self, kind: StanzaKind) {
+        self.stanza_received(kind);
+    }
+    fn rate_limited(&self) {
+        self.rate_limited(RateLimit::IncomingStanzasPerConnection);
+    }
 }
-
-type ReadResult<A, R> = (ReadState<A, R>, Result<Option<StreamEvent<A>>, ParseError>);
-type PendingRead<A, R> = Pin<Box<dyn Future<Output = ReadResult<A, R>>>>;
 
 pub(super) struct Writer<W = TlsWriter> {
     output: Option<BufWriter<W>>,
@@ -70,13 +69,6 @@ pub(super) struct Writer<W = TlsWriter> {
     metrics: C2sWorkerMetrics,
     intact: bool,
     open: bool,
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-pub(super) enum ReadMode {
-    Open,
-    Closing,
-    AbandonParser,
 }
 
 pub(super) struct ClosingInput<R> {
@@ -266,95 +258,19 @@ impl<A: ChunkAllocator + Clone, R: AsyncBufRead + Unpin + 'static> Reader<A, R> 
         metrics: C2sWorkerMetrics,
     ) -> Self {
         Self {
-            ready: Some(ReadState {
-                parser,
-                stanzas,
-                metrics,
-            }),
-            pending: None,
+            inner: XmlReader::new(parser, stanzas, Rc::clone(&closing), metrics),
             closing,
-            failed: false,
         }
     }
 
     fn restart(&mut self) -> Result<(), ParseError> {
-        let Some(state) = self.ready.take() else {
-            return Err(ParseError::ParserFailed);
-        };
-        let (parser, result) = match state.parser.try_restart() {
-            Ok(parser) => (parser, Ok(())),
-            Err((parser, error)) => (parser, Err(error)),
-        };
-        self.ready = Some(ReadState {
-            parser,
-            stanzas: state.stanzas,
-            metrics: state.metrics,
-        });
-        self.failed |= result.is_err();
-        result
+        self.inner.restart()
     }
-
     async fn read_event(&mut self) -> Result<Option<StreamEvent<A>>, ParseError> {
-        if self.pending.is_none() {
-            let Some(mut state) = self.ready.take() else {
-                return Err(ParseError::ParserFailed);
-            };
-            let closing = Rc::clone(&self.closing);
-            self.pending = Some(Box::pin(async move {
-                let event = {
-                    let mut next = std::pin::pin!(state.parser.next_event());
-                    poll_fn(|cx| {
-                        if closing.get() == ReadMode::AbandonParser {
-                            Poll::Ready(Err(ParseError::ParserFailed))
-                        } else {
-                            next.as_mut().poll(cx)
-                        }
-                    })
-                    .await
-                };
-                let kind = match &event {
-                    Ok(Some(StreamEvent::Stanza(parsed))) => parsed
-                        .value()
-                        .resolve(parsed.arena())
-                        .ok()
-                        .map(|stanza| stanza.kind()),
-                    Ok(Some(StreamEvent::RejectedStanza(parsed))) => Some(parsed.value().kind()),
-                    _ => None,
-                };
-                if let Some(kind) = kind {
-                    state.metrics.stanza_received(kind);
-                    let waited = {
-                        let mut acquire = std::pin::pin!(state.stanzas.acquire());
-                        poll_fn(|cx| {
-                            if closing.get() != ReadMode::Open {
-                                Poll::Ready(false)
-                            } else {
-                                acquire.as_mut().poll(cx)
-                            }
-                        })
-                        .await
-                    };
-                    if waited {
-                        state
-                            .metrics
-                            .rate_limited(RateLimit::IncomingStanzasPerConnection);
-                    }
-                }
-                (state, event)
-            }));
-        }
-        let Some(pending) = &mut self.pending else {
-            return Err(ParseError::ParserFailed);
-        };
-        let (state, result) = pending.await;
-        self.pending = None;
-        self.ready = Some(state);
-        self.failed = result.is_err();
-        result
+        self.inner.read_event().await
     }
-
     pub(super) fn is_failed(&self) -> bool {
-        self.failed
+        self.inner.is_failed()
     }
 
     pub(super) fn closing(&mut self) {
@@ -362,17 +278,14 @@ impl<A: ChunkAllocator + Clone, R: AsyncBufRead + Unpin + 'static> Reader<A, R> 
     }
 
     pub(super) async fn take_input(&mut self) -> Result<R, CloseOutcome> {
-        if self.pending.is_some() {
-            self.closing.set(ReadMode::AbandonParser);
-            let _ = self.read_event().await;
-        }
-        self.ready
-            .take()
-            .map(|state| state.parser.into_inner())
-            .ok_or(CloseOutcome::InternalError)
+        self.inner
+            .take_parts()
+            .await
+            .map(|(parser, _, _)| parser.into_inner())
+            .map_err(|_| CloseOutcome::InternalError)
     }
 
-    /// Each complete stanza consumes one token before its caller can process it.
+    /// Open streams consume one token per complete stanza.
     pub(super) async fn next_event(&mut self) -> Result<Option<StreamEvent<A>>, CloseOutcome> {
         match self.read_event().await {
             Ok(event) => Ok(event),

@@ -2,14 +2,11 @@
 
 use std::cell::Cell;
 use std::fmt::Write as _;
-use std::future::{Future, poll_fn};
 use std::io;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::task::Poll;
-use std::time::Instant;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -18,7 +15,6 @@ use compio::net::TcpStream;
 use futures_util::io::{AsyncWrite, AsyncWriteExt as _, BufWriter};
 use lonewolf_util::arena::{Arena, ArenaConfig, ArenaRead, ChunkAllocator, HandleError};
 use lonewolf_util::rate_limited_reader::{RateLimitState, RateLimitedReader};
-use lonewolf_util::token_bucket::TokenBucket;
 use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::parser::{ParseError, Parsed, ParserConfig, StreamEvent, XmppParser};
 use lonewolf_xmpp::stanza::{
@@ -31,7 +27,9 @@ use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt as _};
 
 use super::metrics::{InboundLimit, S2sMetrics};
 use crate::config::limits::{ByteRate, EventRate};
+use crate::xml_stream::limiter::StanzaLimiter;
 use crate::xml_stream::parse::{ParseFailure, classify_parse_error};
+use crate::xml_stream::reader::{ReadMode, ReadObserver, XmlReader};
 use crate::xml_stream::{
     STREAM_FOOTER, escape_attribute, peer_stream_error, stream_error_xml, version_components,
 };
@@ -319,30 +317,28 @@ pub(crate) struct S2sReaderLimits {
 }
 
 pub(crate) struct S2sReader<A: ChunkAllocator, R> {
-    ready: Option<ReadState<A, R>>,
-    pending: Option<PendingRead<A, R>>,
-    abandon: Rc<Cell<bool>>,
+    inner: XmlReader<A, RateLimitedReader<R>, S2sReadObserver>,
+    max_stanza_bytes: NonZeroUsize,
     activity: Option<traffic::ConnectionActivity>,
 }
 
-struct ReadState<A: ChunkAllocator, R> {
-    parser: XmppParser<RateLimitedReader<R>, A>,
-    max_stanza_bytes: NonZeroUsize,
-    stanzas: EventRate,
-    bucket: TokenBucket,
-    metrics: Option<Arc<S2sMetrics>>,
+struct S2sReadObserver(Option<Arc<S2sMetrics>>);
+
+impl ReadObserver for S2sReadObserver {
+    fn rate_limited(&self) {
+        if let Some(metrics) = &self.0 {
+            metrics.rate_limited(InboundLimit::IncomingStanzasPerConnection);
+        }
+    }
 }
 
 pub(crate) struct S2sReaderState {
     max_stanza_bytes: NonZeroUsize,
     xml: RateLimitState,
-    stanzas: EventRate,
-    bucket: TokenBucket,
+    limiter: StanzaLimiter,
     metrics: Option<Arc<S2sMetrics>>,
 }
 
-type PendingRead<A, R> =
-    Pin<Box<dyn Future<Output = (ReadState<A, R>, Result<Option<StreamEvent<A>>, ParseError>)>>>;
 type PlainInput = Compat<Pin<Box<AsyncReadStream<TcpStream>>>>;
 
 impl<A: ChunkAllocator + Clone> S2sReader<A, PlainInput> {
@@ -381,8 +377,7 @@ impl<A: ChunkAllocator + Clone, R: AsyncBufRead + Unpin + 'static> S2sReader<A, 
             S2sReaderState {
                 max_stanza_bytes: limits.max_stanza_bytes,
                 xml,
-                stanzas: limits.stanzas.clone(),
-                bucket: TokenBucket::new(limits.stanzas.burst, Instant::now()),
+                limiter: StanzaLimiter::new(limits.stanzas.per_second, limits.stanzas.burst),
                 metrics,
             },
             allocator,
@@ -390,23 +385,22 @@ impl<A: ChunkAllocator + Clone, R: AsyncBufRead + Unpin + 'static> S2sReader<A, 
     }
 
     pub(crate) fn from_state(input: R, state: S2sReaderState, allocator: A) -> Self {
-        Self {
-            ready: Some(ReadState {
-                parser: XmppParser::new(
-                    RateLimitedReader::from_state(input, state.xml),
-                    ParserConfig {
-                        max_stanza_bytes: state.max_stanza_bytes,
-                        arena: ArenaConfig::default(),
-                    },
-                    allocator,
-                ),
+        let parser = XmppParser::new(
+            RateLimitedReader::from_state(input, state.xml),
+            ParserConfig {
                 max_stanza_bytes: state.max_stanza_bytes,
-                stanzas: state.stanzas,
-                bucket: state.bucket,
-                metrics: state.metrics,
-            }),
-            pending: None,
-            abandon: Rc::new(Cell::new(false)),
+                arena: ArenaConfig::default(),
+            },
+            allocator,
+        );
+        Self {
+            inner: XmlReader::new(
+                parser,
+                state.limiter,
+                Rc::new(Cell::new(ReadMode::Open)),
+                S2sReadObserver(state.metrics),
+            ),
+            max_stanza_bytes: state.max_stanza_bytes,
             activity: None,
         }
     }
@@ -421,70 +415,10 @@ impl<A: ChunkAllocator + Clone, R: AsyncBufRead + Unpin + 'static> S2sReader<A, 
     }
 
     pub(crate) async fn next_event(&mut self) -> Result<Option<StreamEvent<A>>, S2sError> {
-        if self.pending.is_none() {
-            let mut state = self.ready.take().ok_or(S2sError::Internal)?;
-            let abandon = Rc::clone(&self.abandon);
-            self.pending = Some(Box::pin(async move {
-                let event = {
-                    let mut next = std::pin::pin!(state.parser.next_event());
-                    poll_fn(|cx| {
-                        if abandon.get() {
-                            Poll::Ready(Err(ParseError::ParserFailed))
-                        } else {
-                            next.as_mut().poll(cx)
-                        }
-                    })
-                    .await
-                };
-                if matches!(
-                    event,
-                    Ok(Some(
-                        StreamEvent::Stanza(_) | StreamEvent::RejectedStanza(_)
-                    ))
-                ) {
-                    let mut reported = false;
-                    loop {
-                        if abandon.get() {
-                            break;
-                        }
-                        state.bucket.replenish(
-                            state.stanzas.per_second,
-                            state.stanzas.burst,
-                            Instant::now(),
-                        );
-                        if state.bucket.available() != 0 {
-                            state.bucket.consume(1);
-                            break;
-                        }
-                        let mut wait = std::pin::pin!(compio::time::sleep(
-                            state.bucket.refill_delay(state.stanzas.per_second)
-                        ));
-                        poll_fn(|cx| {
-                            if abandon.get() {
-                                Poll::Ready(())
-                            } else {
-                                let result = wait.as_mut().poll(cx);
-                                if result.is_pending() && !reported {
-                                    if let Some(metrics) = &state.metrics {
-                                        metrics.rate_limited(
-                                            InboundLimit::IncomingStanzasPerConnection,
-                                        );
-                                    }
-                                    reported = true;
-                                }
-                                result
-                            }
-                        })
-                        .await;
-                    }
-                }
-                (state, event)
-            }));
+        if !self.inner.has_input() {
+            return Err(S2sError::Internal);
         }
-        let (state, result) = self.pending.as_mut().ok_or(S2sError::Internal)?.await;
-        self.pending = None;
-        self.ready = Some(state);
-        let event = result.map_err(S2sError::from)?;
+        let event = self.inner.read_event().await.map_err(S2sError::from)?;
         if let Some(event) = &event
             && let Some(condition) = peer_stream_error(event)?
         {
@@ -494,14 +428,10 @@ impl<A: ChunkAllocator + Clone, R: AsyncBufRead + Unpin + 'static> S2sReader<A, 
     }
 
     pub(crate) fn restart(&mut self) -> Result<(), S2sError> {
-        let mut state = self.ready.take().ok_or(S2sError::Internal)?;
-        let (parser, result) = match state.parser.try_restart() {
-            Ok(parser) => (parser, Ok(())),
-            Err((parser, error)) => (parser, Err(error.into())),
-        };
-        state.parser = parser;
-        self.ready = Some(state);
-        result
+        if !self.inner.has_ready_state() {
+            return Err(S2sError::Internal);
+        }
+        self.inner.restart().map_err(S2sError::from)
     }
 
     /// Call once after a TLS reader returns `StreamEvent::StreamEnd`.
@@ -516,26 +446,21 @@ impl<A: ChunkAllocator + Clone, R: AsyncBufRead + Unpin + 'static> S2sReader<A, 
     }
 
     pub(crate) async fn take_input(&mut self) -> Result<(R, S2sReaderState), S2sError> {
-        if self.pending.is_some() {
-            self.abandon.set(true);
-            let _ = self.next_event().await;
-        }
-        self.ready
-            .take()
-            .map(|state| {
-                let (input, xml) = state.parser.into_inner().into_parts();
-                (
-                    input,
-                    S2sReaderState {
-                        max_stanza_bytes: state.max_stanza_bytes,
-                        xml,
-                        stanzas: state.stanzas,
-                        bucket: state.bucket,
-                        metrics: state.metrics,
-                    },
-                )
-            })
-            .ok_or(S2sError::Internal)
+        let (parser, limiter, observer) = self
+            .inner
+            .take_parts()
+            .await
+            .map_err(|_| S2sError::Internal)?;
+        let (input, xml) = parser.into_inner().into_parts();
+        Ok((
+            input,
+            S2sReaderState {
+                max_stanza_bytes: self.max_stanza_bytes,
+                xml,
+                limiter,
+                metrics: observer.0,
+            },
+        ))
     }
 }
 

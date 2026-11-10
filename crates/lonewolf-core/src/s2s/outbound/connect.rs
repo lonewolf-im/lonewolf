@@ -27,9 +27,10 @@ use crate::s2s::dns::{ResolveError, Resolved, ResolvedVia, Resolver};
 use crate::s2s::log_domain;
 use crate::s2s::metrics::{AuthOutcome, BidiOutcome, Direction, DnsOutcome, S2sMetrics};
 use crate::s2s::revocation::{CheckPhase, PeerRevocation, RevocationStatus, RevocationVerdict};
-use crate::s2s::stream::traffic::CountingIo;
+use crate::s2s::stream::traffic::{ConnectionActivity, S2sByteObserver};
 use crate::s2s::stream::{self, Features, S2sError, S2sReader, S2sReaderLimits, S2sWriter};
 use crate::s2s::{ConnectionSocket, NEXT_S2S_CONNECTION_ID};
+use crate::xml_stream::traffic::ObservedIo;
 
 const TLS_NAMESPACE: &str = "urn:ietf:params:xml:ns:xmpp-tls";
 const SASL_NAMESPACE: &str = "urn:ietf:params:xml:ns:xmpp-sasl";
@@ -636,7 +637,10 @@ async fn negotiate<A: ChunkAllocator + Clone>(
     let tls = TlsConnector::from(Arc::clone(&setup.config))
         .connect(
             setup.identity.clone(),
-            Box::pin(AsyncStream::new(socket.0.clone())),
+            Box::pin(AsyncStream::new(ObservedIo::new(
+                socket.0.clone(),
+                S2sByteObserver::new(Arc::clone(&context.metrics), Direction::Outbound),
+            ))),
         )
         .await
         .map_err(tls_failure)?;
@@ -650,22 +654,22 @@ async fn negotiate<A: ChunkAllocator + Clone>(
         return Err(EstablishError::Tls("alpn").into());
     }
     let certificates = tls.get_ref().1.peer_certificates().map(<[_]>::to_vec);
-    let counted = CountingIo::new(tls, Arc::clone(&context.metrics), Direction::Outbound);
-    let activity = counted.activity();
+    let counted = ObservedIo::new(tls, ConnectionActivity::new(Instant::now()));
+    let activity = counted.observer().clone();
     let (input, output) = counted.split();
-    flow.connection = Some(Connection::Tls(
-        match state {
-            Some(state) => S2sReader::from_state(BufReader::new(input.compat()), state, allocator),
-            None => S2sReader::new(
-                BufReader::new(input.compat()),
-                &limits,
-                allocator,
-                Some(Arc::clone(&context.metrics)),
-            ),
-        }
-        .with_activity(activity),
-        S2sWriter::new(output),
-    ));
+    let reader = match state {
+        Some(state) => S2sReader::from_state(BufReader::new(input.compat()), state, allocator),
+        None => S2sReader::new(
+            BufReader::new(input.compat()),
+            &limits,
+            allocator,
+            Some(Arc::clone(&context.metrics)),
+        ),
+    }
+    .with_activity(activity);
+    #[cfg(feature = "test-support")]
+    let reader = reader.with_transport_direction(Direction::Outbound);
+    flow.connection = Some(Connection::Tls(reader, S2sWriter::new(output)));
     flow.send_header(&header).await?;
     flow.header(remote).await?;
     let offered = features(flow.expected().await?)?;

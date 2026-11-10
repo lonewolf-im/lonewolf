@@ -8,6 +8,7 @@ use lonewolf_xmpp::stream::{STREAM_ERROR_NAMESPACE, StreamError, StreamErrorCond
 pub(crate) mod limiter;
 pub(crate) mod parse;
 pub(crate) mod reader;
+pub(crate) mod traffic;
 
 pub(crate) const STREAM_FOOTER: &str = "</stream:stream>";
 

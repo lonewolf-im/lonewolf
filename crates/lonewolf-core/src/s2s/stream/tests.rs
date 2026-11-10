@@ -1235,3 +1235,79 @@ fn restart_distinguishes_pending_extracted_and_ready_failed_parsers() -> TestRes
         Ok(())
     })
 }
+
+#[cfg(feature = "test-support")]
+#[test]
+fn transport_end_receipt_requires_consumed_eof_and_cannot_repeat() -> TestResult {
+    use crate::s2s::metrics::Direction;
+    use tokio::io::{AsyncRead, ReadBuf};
+
+    struct Input {
+        bytes: io::Cursor<Vec<u8>>,
+        tail: usize,
+    }
+    impl AsyncRead for Input {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            output: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if self.bytes.position() < self.bytes.get_ref().len() as u64 {
+                return Pin::new(&mut self.bytes).poll_read(cx, output);
+            }
+            match self.tail {
+                0 => Poll::Ready(Ok(())),
+                1 => {
+                    output.put_slice(b"x");
+                    Poll::Ready(Ok(()))
+                }
+                2 => Poll::Ready(Err(io::ErrorKind::ConnectionReset.into())),
+                _ => Poll::Pending,
+            }
+        }
+    }
+    Runtime::new()?.block_on(async {
+        for direction in [Direction::Inbound, Direction::Outbound] {
+            for tail in 0..4 {
+                let metrics = S2sMetrics::new(1);
+                let mut reader = S2sReader::new(
+                    BufReader::new(Input {
+                        bytes: io::Cursor::new(format!("{HEADER}</stream:stream>").into_bytes()),
+                        tail,
+                    }),
+                    &limits(),
+                    GlobalChunkAllocator,
+                    Some(Arc::clone(&metrics)),
+                )
+                .with_transport_direction(direction);
+                assert!(matches!(
+                    success(reader.next_event().await)?,
+                    Some(StreamEvent::StreamStart { .. })
+                ));
+                assert!(matches!(
+                    success(reader.next_event().await)?,
+                    Some(StreamEvent::StreamEnd)
+                ));
+                if tail == 3 {
+                    assert!(poll!(pin!(reader.read_transport_end())).is_pending());
+                } else if tail == 0 {
+                    success(reader.read_transport_end().await)?;
+                } else {
+                    assert!(matches!(
+                        reader.read_transport_end().await,
+                        Err(S2sError::Io)
+                    ));
+                }
+                let mut expected = [0; 2];
+                expected[direction as usize] = u64::from(tail == 0);
+                assert_eq!(metrics.shutdown_state().transport_ends, expected);
+                assert!(matches!(
+                    reader.read_transport_end().await,
+                    Err(S2sError::Internal)
+                ));
+                assert_eq!(metrics.shutdown_state().transport_ends, expected);
+            }
+        }
+        Ok(())
+    })
+}

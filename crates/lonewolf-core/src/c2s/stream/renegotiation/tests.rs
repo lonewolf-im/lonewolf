@@ -754,7 +754,7 @@ fn tls_detection_during_first_header_and_sasl_restart_skips_rejection_xml() -> T
                 Ok(())
             });
             let mut transport = TlsAcceptor::from(fixture.server)
-                .accept(super::RecordGuard::new(crate::c2s::stream::traffic::CountingIo::new(Box::pin(AsyncStream::new(socket.clone())), crate::c2s::metrics::C2sWorkerMetrics::detached()), socket.clone()))
+                .accept(super::RecordGuard::new(Box::pin(AsyncStream::new(crate::xml_stream::traffic::ObservedIo::new(socket.clone(), crate::c2s::metrics::C2sWorkerMetrics::detached()))), socket.clone()))
                 .await?;
             let version = transport.get_ref().1.protocol_version();
             transport.get_mut().0.handshake_complete(version);
@@ -878,10 +878,12 @@ fn tls_close_preserves_detection_and_phase_timeout_precedence() -> TestResult {
             });
             let mut transport = TlsAcceptor::from(fixture.server)
                 .accept(super::RecordGuard::new(
-                    crate::c2s::stream::traffic::CountingIo::new(
-                        Box::pin(AsyncStream::new(socket.clone())),
-                        crate::c2s::metrics::C2sWorkerMetrics::detached(),
-                    ),
+                    Box::pin(AsyncStream::new(
+                        crate::xml_stream::traffic::ObservedIo::new(
+                            socket.clone(),
+                            crate::c2s::metrics::C2sWorkerMetrics::detached(),
+                        ),
+                    )),
                     socket.clone(),
                 ))
                 .await?;

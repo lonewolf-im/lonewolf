@@ -109,7 +109,10 @@ fn transport_metrics_admission_rejection_does_not_create_an_attempt_for_either_m
     fixture.stop()
 }
 
-fn client_hello(mut socket: TcpStream, config: Arc<rustls::ClientConfig>) -> TestResult<TcpStream> {
+fn client_hello(
+    mut socket: crate::support::wire::WireIo<TcpStream>,
+    config: Arc<rustls::ClientConfig>,
+) -> TestResult<crate::support::wire::WireIo<TcpStream>> {
     let mut connection = rustls::ClientConnection::new(config, "a.test".try_into()?)?;
     while connection.wants_write() {
         connection.write_tls(&mut socket)?;
@@ -142,6 +145,8 @@ fn transport_metrics_inbound_cancellation_before_and_during_each_tls_mode_releas
             };
             socket.set_read_timeout(Some(TIMEOUT))?;
             socket.set_write_timeout(Some(TIMEOUT))?;
+            let socket = crate::support::wire::WireIo::new(socket);
+            let counters = socket.counters();
             let mut socket = if during {
                 client_hello(socket, fixture.client_config()?)?
             } else {
@@ -206,6 +211,17 @@ fn transport_metrics_inbound_cancellation_before_and_during_each_tls_mode_releas
                 .stop_with_s2s_state()?
                 .ok_or("missing shutdown receipt")?;
             reader.join().map_err(|_| "peer reader panicked")??;
+            let totals = counters.snapshot();
+            if during {
+                assert_eq!(state.received_bytes, [totals.written, 0]);
+                assert_eq!(state.sent_bytes[1], 0);
+                assert!(totals.read > 0);
+                assert!(state.sent_bytes[0] <= totals.read);
+            } else {
+                assert_eq!(state.received_bytes, [0; 2]);
+                assert_eq!(state.sent_bytes, [0; 2]);
+            }
+            assert_eq!(state.transport_ends, [0; 2]);
             let mut cancelled = [[0; 2]; 2];
             cancelled[0][slot] = 1;
             assert_eq!(state.transport_cancelled, cancelled);

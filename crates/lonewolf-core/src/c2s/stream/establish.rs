@@ -29,10 +29,10 @@ use super::renegotiation::RecordGuard;
 use super::session::{
     ClosingInput, IO_BUFFER_BYTES, ReadMode, Reader, Session, TlsTransport, Writer, namespace_error,
 };
-use super::traffic::CountingIo;
 use crate::hosts::Hosts;
 use crate::hosts::client_identity::VerifiedClient;
 use crate::xml_stream::limiter::StanzaLimiter;
+use crate::xml_stream::traffic::ObservedIo;
 
 pub(super) const STARTTLS_NAMESPACE: &str = "urn:ietf:params:xml:ns:xmpp-tls";
 pub(super) const STARTTLS_FEATURES: &str = "<stream:features><starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'><required/></starttls></stream:features>";
@@ -198,10 +198,10 @@ pub(super) async fn establish<A: ChunkAllocator + Clone>(
             let acceptor = TlsAcceptor::from(handshake.config);
             acceptor
                 .accept(RecordGuard::new(
-                    CountingIo::new(
-                        Box::pin(AsyncStream::new(transport.clone())),
+                    Box::pin(AsyncStream::new(ObservedIo::new(
+                        transport.clone(),
                         settings.metrics.clone(),
-                    ),
+                    ))),
                     transport,
                 ))
                 .await
@@ -243,10 +243,10 @@ async fn accept_direct<A: ChunkAllocator>(
     settings: &StreamSettings<A>,
 ) -> Result<AcceptedTls, CloseOutcome> {
     let io = RecordGuard::new(
-        CountingIo::new(
-            Box::pin(AsyncStream::new(transport.clone())),
+        Box::pin(AsyncStream::new(ObservedIo::new(
+            transport.clone(),
             settings.metrics.clone(),
-        ),
+        ))),
         transport,
     );
     let accepted = LazyConfigAcceptor::new(rustls::server::Acceptor::default(), io)

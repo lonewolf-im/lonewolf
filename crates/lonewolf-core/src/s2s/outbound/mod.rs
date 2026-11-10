@@ -28,20 +28,25 @@ use super::metrics::{
     AdmissionReason, ConnectionGauge, DropReason, LinkSnapshot, LinkStats, S2sMetrics,
 };
 use super::revocation::{PeerRevocation, PeerVerification, RevocationVerdict};
-use super::stream::traffic::CountingIo;
+use super::stream::traffic::{ConnectionActivity, S2sByteObserver};
 use super::stream::{S2sReader, S2sWriter};
 use crate::config::limits::S2sLimits;
 use crate::delivery::{WorkGroup, WorkGuard, WorkHandle};
 use crate::hosts::{Hosts, peer_identity::PeerTrust};
 use crate::router::RouterHandle;
+use crate::xml_stream::traffic::ObservedIo;
 
 mod bidi;
 pub(crate) mod connect;
 pub(crate) mod duplex;
 pub(crate) use bidi::BidiRegistration;
 
-type ClientTlsTransport =
-    CountingIo<futures_rustls::client::TlsStream<Pin<Box<AsyncStream<TcpStream>>>>>;
+type ClientTlsTransport = ObservedIo<
+    futures_rustls::client::TlsStream<
+        Pin<Box<AsyncStream<ObservedIo<TcpStream, S2sByteObserver>>>>,
+    >,
+    ConnectionActivity,
+>;
 type ClientTlsInput = BufReader<Compat<ReadHalf<ClientTlsTransport>>>;
 type ClientTlsOutput = WriteHalf<ClientTlsTransport>;
 

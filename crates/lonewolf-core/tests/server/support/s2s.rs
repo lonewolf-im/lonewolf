@@ -23,6 +23,8 @@ pub const AUTH: &str =
     "<auth xmlns='urn:ietf:params:xml:ns:xmpp-sasl' mechanism='EXTERNAL'>=</auth>";
 pub const HEADER: &str = "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:server' version='1.0' to='local.test' from='peer.test'>";
 pub type Peer = rustls::StreamOwned<rustls::ClientConnection, TcpStream>;
+pub type CountedPeer =
+    rustls::StreamOwned<rustls::ClientConnection, super::wire::WireIo<TcpStream>>;
 
 struct Signer {
     key: SigningKey<P256>,
@@ -240,6 +242,14 @@ pub fn start_tls_with_limits(
     maximum: u32,
     idle: u32,
 ) -> Result<(Peer, String)> {
+    let (tcp, first) = start_tls_plain(address, maximum, idle)?;
+    let conn = rustls::ClientConnection::new(config, ServerName::try_from("local.test")?)?;
+    let mut tls = rustls::StreamOwned::new(conn, tcp);
+    tls.conn.complete_io(&mut tls.sock)?;
+    Ok((tls, first))
+}
+
+fn start_tls_plain(address: SocketAddr, maximum: u32, idle: u32) -> Result<(TcpStream, String)> {
     let limits = format!(
         "<limits xmlns='urn:xmpp:stream-limits:0'><max-bytes>{maximum}</max-bytes><idle-seconds>{idle}</idle-seconds></limits>"
     );
@@ -258,18 +268,29 @@ pub fn start_tls_with_limits(
         until(&mut tcp, "/>")?,
         "<proceed xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>"
     );
+    Ok((tcp, first))
+}
+
+pub fn start_tls_counted(
+    address: SocketAddr,
+    config: Arc<rustls::ClientConfig>,
+) -> Result<(CountedPeer, String)> {
+    let (tcp, first) = start_tls_plain(address, 524288, 600)?;
     let conn = rustls::ClientConnection::new(config, ServerName::try_from("local.test")?)?;
-    let mut tls = rustls::StreamOwned::new(conn, tcp);
+    let mut tls = rustls::StreamOwned::new(conn, super::wire::WireIo::new(tcp));
     tls.conn.complete_io(&mut tls.sock)?;
     Ok((tls, first))
 }
 
-pub fn external(peer: &mut Peer, header: &str) -> Result<String> {
+pub fn external<T: Read + Write>(
+    peer: &mut rustls::StreamOwned<rustls::ClientConnection, T>,
+    header: &str,
+) -> Result<String> {
     external_with_limits(peer, header, 524288, 600)
 }
 
-pub fn external_with_limits(
-    peer: &mut Peer,
+pub fn external_with_limits<T: Read + Write>(
+    peer: &mut rustls::StreamOwned<rustls::ClientConnection, T>,
     header: &str,
     maximum: u32,
     idle: u32,
@@ -288,11 +309,19 @@ pub fn external_with_limits(
     Ok(header)
 }
 
-pub fn success(peer: &mut Peer, auth: &str) -> Result<String> {
+pub fn success<T: Read + Write>(
+    peer: &mut rustls::StreamOwned<rustls::ClientConnection, T>,
+    auth: &str,
+) -> Result<String> {
     success_with_limits(peer, auth, 524288, 600)
 }
 
-pub fn success_with_limits(peer: &mut Peer, auth: &str, maximum: u32, idle: u32) -> Result<String> {
+pub fn success_with_limits<T: Read + Write>(
+    peer: &mut rustls::StreamOwned<rustls::ClientConnection, T>,
+    auth: &str,
+    maximum: u32,
+    idle: u32,
+) -> Result<String> {
     let limits = format!(
         "<limits xmlns='urn:xmpp:stream-limits:0'><max-bytes>{maximum}</max-bytes><idle-seconds>{idle}</idle-seconds></limits>"
     );
@@ -310,7 +339,9 @@ pub fn success_with_limits(peer: &mut Peer, auth: &str, maximum: u32, idle: u32)
     Ok(header)
 }
 
-pub fn close(peer: &mut Peer) -> Result {
+pub fn close<T: Read + Write>(
+    peer: &mut rustls::StreamOwned<rustls::ClientConnection, T>,
+) -> Result {
     peer.write_all(FOOTER.as_bytes())?;
     assert_eq!(until(peer, FOOTER)?, FOOTER);
     peer.conn.send_close_notify();

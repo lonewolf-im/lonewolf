@@ -46,6 +46,9 @@ pub(crate) fn s2s_crl_public_destinations_only() -> bool {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct S2sShutdownState {
+    pub transport_ends: [u64; 2],
+    pub received_bytes: [u64; 2],
+    pub sent_bytes: [u64; 2],
     pub dropped_shutdown: u64,
     pub dropped_connection_lost: u64,
     pub queued_stanzas: u64,

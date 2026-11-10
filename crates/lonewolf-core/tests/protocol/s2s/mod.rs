@@ -15,6 +15,7 @@ mod revocation_fetch;
 mod revocation_file;
 mod subscriptions;
 mod transport_metrics;
+mod wire_metrics;
 
 use std::sync::{Arc, atomic::Ordering};
 use std::thread;

@@ -9,13 +9,14 @@ use std::time::Instant;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rustls::pki_types::ServerName;
 
+use super::super::wire::{WireIo, WireSnapshot};
 use super::super::xml::{CloseTransport, Element, XmlStream};
 use super::super::{SASL_NAMESPACE, TIMEOUT, TLS_NAMESPACE, TestResult};
 
 enum PeerTransport {
     Plain(TcpStream),
-    Client(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
-    Server(Box<rustls::StreamOwned<rustls::ServerConnection, TcpStream>>),
+    Client(Box<rustls::StreamOwned<rustls::ClientConnection, WireIo<TcpStream>>>),
+    Server(Box<rustls::StreamOwned<rustls::ServerConnection, WireIo<TcpStream>>>),
 }
 impl Read for PeerTransport {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
@@ -106,8 +107,9 @@ impl RawS2sPeer {
         to: &str,
         config: Arc<rustls::ClientConfig>,
     ) -> TestResult<Self> {
-        let mut socket = TcpStream::connect_timeout(&address, TIMEOUT)?;
+        let socket = TcpStream::connect_timeout(&address, TIMEOUT)?;
         configure(&socket)?;
+        let mut socket = WireIo::new(socket);
         let mut connection =
             rustls::ClientConnection::new(config, ServerName::try_from(to.to_owned())?)?;
         while connection.is_handshaking() {
@@ -144,6 +146,14 @@ impl RawS2sPeer {
                 peer.open_protected(&header, expected_to)?;
                 Ok(peer)
             }
+        }
+    }
+
+    pub fn tls_totals(&mut self) -> TestResult<WireSnapshot> {
+        match self.stream.transport() {
+            PeerTransport::Plain(_) => Err("peer has no TLS transport".into()),
+            PeerTransport::Client(stream) => Ok(stream.sock.counters().snapshot()),
+            PeerTransport::Server(stream) => Ok(stream.sock.counters().snapshot()),
         }
     }
 
@@ -192,6 +202,13 @@ impl RawS2sPeer {
         };
         Ok(socket)
     }
+    pub fn into_plain_socket(self) -> TestResult<TcpStream> {
+        match self.stream.into_inner().into_inner() {
+            PeerTransport::Plain(socket) => Ok(socket),
+            _ => Err("peer already uses TLS".into()),
+        }
+    }
+
     pub fn start_tls(self, config: Arc<rustls::ClientConfig>) -> TestResult<Self> {
         let header = opening(&self.from, &self.to);
         let expected_to = self.from.clone();
@@ -213,7 +230,8 @@ impl RawS2sPeer {
         let connection =
             rustls::ClientConnection::new(config, ServerName::try_from(self.to.clone())?)?;
         self.stream = XmlStream::new(PeerTransport::Client(Box::new(rustls::StreamOwned::new(
-            connection, socket,
+            connection,
+            WireIo::new(socket),
         ))));
         let response = self.stream.open_with(header)?;
         assert_eq!(
@@ -432,25 +450,11 @@ impl RawS2sListener {
         &self,
         domain: &str,
     ) -> TestResult<(TcpStream, rustls::server::Accepted)> {
-        let mut socket = self.accept_socket()?;
+        let socket = self.accept_socket()?;
         let mut first = [0];
         assert_eq!(socket.peek(&mut first)?, 1);
         assert_eq!(first, [22]);
-        let mut acceptor = rustls::server::Acceptor::default();
-        loop {
-            if acceptor.read_tls(&mut socket)? == 0 {
-                return Err("connection ended before ClientHello".into());
-            }
-            if let Some(accepted) = acceptor.accept().map_err(|(error, _)| error)? {
-                let hello = accepted.client_hello();
-                assert_eq!(hello.server_name(), Some(domain));
-                assert_eq!(
-                    hello.alpn().ok_or("missing ALPN")?.collect::<Vec<_>>(),
-                    [b"xmpp-server".as_slice()]
-                );
-                return Ok((socket, accepted));
-            }
-        }
+        client_hello(socket, domain)
     }
 
     pub fn accept_until_proceed(&self, from: &str, to: &str) -> TestResult<RawS2sPeer> {
@@ -499,7 +503,11 @@ impl RawS2sListener {
         bidi: bool,
     ) -> TestResult<(RawS2sPeer, bool)> {
         let (socket, connection) = if self.direct_tls {
-            let (mut socket, accepted) = self.accept_client_hello(from)?;
+            let socket = self.accept_socket()?;
+            let mut first = [0];
+            assert_eq!(socket.peek(&mut first)?, 1);
+            assert_eq!(first, [22]);
+            let (mut socket, accepted) = client_hello(WireIo::new(socket), from)?;
             let connection = match accepted.into_connection(config) {
                 Ok(connection) => connection,
                 Err((error, mut alert)) => {
@@ -513,7 +521,7 @@ impl RawS2sListener {
             let PeerTransport::Plain(socket) = peer.stream.into_inner().into_inner() else {
                 return Err("expected plain peer transport".into());
             };
-            (socket, rustls::ServerConnection::new(config)?)
+            (WireIo::new(socket), rustls::ServerConnection::new(config)?)
         };
         let mut stream = XmlStream::new(PeerTransport::Server(Box::new(rustls::StreamOwned::new(
             connection, socket,
@@ -694,4 +702,22 @@ fn assert_header(header: &Element, from: &str, to: &str) {
     assert_eq!(header.attribute("from"), Some(from), "{header:?}");
     assert_eq!(header.attribute("to"), Some(to), "{header:?}");
     assert_eq!(header.attribute("version"), Some("1.0"), "{header:?}");
+}
+
+fn client_hello<T: Read>(mut socket: T, domain: &str) -> TestResult<(T, rustls::server::Accepted)> {
+    let mut acceptor = rustls::server::Acceptor::default();
+    loop {
+        if acceptor.read_tls(&mut socket)? == 0 {
+            return Err("connection ended before ClientHello".into());
+        }
+        if let Some(accepted) = acceptor.accept().map_err(|(error, _)| error)? {
+            let hello = accepted.client_hello();
+            assert_eq!(hello.server_name(), Some(domain));
+            assert_eq!(
+                hello.alpn().ok_or("missing ALPN")?.collect::<Vec<_>>(),
+                [b"xmpp-server".as_slice()]
+            );
+            return Ok((socket, accepted));
+        }
+    }
 }

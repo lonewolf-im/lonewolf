@@ -583,6 +583,7 @@ fn missing_remote_handler_keeps_routed_request_without_an_arena_allocation() -> 
             input: IqInput::Routed(stanza),
             response,
             condition,
+            ..
         } = disposition
         else {
             return Err("unexpected disposition".into());
@@ -601,6 +602,476 @@ fn missing_remote_handler_keeps_routed_request_without_an_arena_allocation() -> 
             "bob@localhost"
         );
         router.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[derive(Default)]
+struct EarlyErrorAllocator {
+    calls: AtomicUsize,
+    live: AtomicUsize,
+    fail_at: AtomicUsize,
+}
+
+// Accepted blocks retain the global allocator's layout and ownership contract.
+unsafe impl ChunkAllocator for EarlyErrorAllocator {
+    fn allocate(&self, layout: Layout) -> Result<Chunk, AllocationError> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if call == self.fail_at.load(Ordering::SeqCst) {
+            return Err(AllocationError::Exhausted);
+        }
+        let chunk = GlobalChunkAllocator.allocate(layout)?;
+        self.live.fetch_add(1, Ordering::SeqCst);
+        Ok(chunk)
+    }
+    unsafe fn deallocate(&self, chunk: Chunk) {
+        unsafe { GlobalChunkAllocator.deallocate(chunk) };
+        self.live.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn early_routed_rejection_keeps_both_arenas_and_exact_xml() -> TestResult {
+    use crate::stages::ingress::iq::{RoutedIqError, render_routed_omitted_error};
+    let allocator = Arc::new(EarlyErrorAllocator::default());
+    let (request, arena, _) = request(
+        allocator.clone(),
+        "alice@remote.test/desk",
+        "bob@localhost",
+        "private-payload",
+    )?;
+    let source = RoutedStanza::from_parts(request, arena);
+    let before = allocator.calls.load(Ordering::SeqCst);
+    let RoutedIqError { stanza, retained_source } = render_routed_omitted_error(
+        &allocator, &source, lonewolf_xmpp::stanza::StanzaErrorCondition::Forbidden,
+        lonewolf_xmpp::stanza::StanzaErrorText::Static("This operation requires an omitted destination or your authenticated bare JID without a resource."),
+    ).map_err(|_| "early reply failed")?;
+    assert_eq!(allocator.calls.load(Ordering::SeqCst) - before, 2);
+    assert_eq!(allocator.live.load(Ordering::SeqCst), 3);
+    assert_eq!(retained_source.stats().chunk_count, 1);
+    let mut xml = String::new();
+    stanza.resolve()?.write_xml(&mut xml)?;
+    assert_eq!(
+        xml,
+        r#"<iq xmlns="jabber:client" from="bob@localhost" to="alice@remote.test/desk" id="request" type="error"><error type="auth"><forbidden xmlns="urn:ietf:params:xml:ns:xmpp-stanzas"/><text xmlns="urn:ietf:params:xml:ns:xmpp-stanzas" xml:lang="en">This operation requires an omitted destination or your authenticated bare JID without a resource.</text></error></iq>"#
+    );
+    assert_eq!(
+        source.resolve()?.to()?.ok_or("source to")?.as_str(),
+        "bob@localhost"
+    );
+    drop(retained_source);
+    assert_eq!(allocator.live.load(Ordering::SeqCst), 2);
+    drop(stanza);
+    assert_eq!(allocator.live.load(Ordering::SeqCst), 1);
+    drop(source);
+    assert_eq!(allocator.live.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
+#[test]
+fn early_routed_rejection_allocation_failures_release_only_temporary_arenas() -> TestResult {
+    use crate::stages::ingress::iq::render_routed_omitted_error;
+    for failed_allocation in [1, 2] {
+        let allocator = Arc::new(EarlyErrorAllocator::default());
+        let (request, arena, _) = request(
+            allocator.clone(),
+            "alice@remote.test/desk",
+            "bob@localhost",
+            "private-payload",
+        )?;
+        let source = RoutedStanza::from_parts(request, arena);
+        let before = allocator.calls.load(Ordering::SeqCst);
+        allocator
+            .fail_at
+            .store(before + failed_allocation, Ordering::SeqCst);
+        let result = render_routed_omitted_error(
+            &allocator,
+            &source,
+            lonewolf_xmpp::stanza::StanzaErrorCondition::Forbidden,
+            lonewolf_xmpp::stanza::StanzaErrorCondition::Forbidden.default_text(),
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            allocator.calls.load(Ordering::SeqCst) - before,
+            failed_allocation
+        );
+        assert_eq!(allocator.live.load(Ordering::SeqCst), 1);
+        assert_eq!(source.resolve()?.id()?, Some("request"));
+        drop(source);
+        assert_eq!(allocator.live.load(Ordering::SeqCst), 0);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct BorrowedPolicyCall {
+    account: String,
+    address: usize,
+    direction: lonewolf_extension::policy::Direction,
+    peer: String,
+}
+
+struct ForwardingPolicy {
+    verdict: lonewolf_extension::policy::Verdict,
+    calls: PlMutex<Vec<BorrowedPolicyCall>>,
+}
+
+impl<A: ChunkAllocator + Clone + 'static> Extension<A, RedbStorage> for ForwardingPolicy {
+    fn name(&self) -> &'static str {
+        "forwarding-policy"
+    }
+
+    fn register(
+        self: Arc<Self>,
+        _: &str,
+        slots: &mut Slots<'_, A, RedbStorage>,
+    ) -> Result<(), RegistrationError> {
+        slots.policy(self.clone());
+        slots.presence(
+            lonewolf_extension::presence::PresenceRequestType::Available,
+            self,
+        )
+    }
+}
+
+impl lonewolf_extension::policy::PolicyHandler<RedbStorage> for ForwardingPolicy {
+    fn check<'a>(
+        &'a self,
+        request: lonewolf_extension::policy::PolicyRequest<'a>,
+        _: &'a RedbRead,
+    ) -> lonewolf_extension::policy::PolicyFuture<'a> {
+        Box::pin(async move {
+            self.calls.lock().push(BorrowedPolicyCall {
+                account: request.account.as_str().into(),
+                address: std::ptr::from_ref(request.account) as usize,
+                direction: request.direction,
+                peer: request.peer.as_str().into(),
+            });
+            Ok(
+                if request.direction == lonewolf_extension::policy::Direction::Outbound {
+                    lonewolf_extension::policy::Verdict::Allow
+                } else {
+                    self.verdict
+                },
+            )
+        })
+    }
+}
+
+impl<A: ChunkAllocator> lonewolf_extension::presence::PresenceHandler<A, RedbStorage>
+    for ForwardingPolicy
+{
+    fn visibility<'a>(
+        &'a self,
+        _: &'a lonewolf_storage::account::AccountKey,
+        _: lonewolf_xmpp::jid::JidRef<'a>,
+        _: &'a RedbRead,
+    ) -> lonewolf_extension::presence::PresenceFuture<'a, bool> {
+        Box::pin(async { Ok(true) })
+    }
+}
+
+#[test]
+fn remote_origin_forwards_full_jid_iq_without_an_extra_arena() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let directory = tempfile::tempdir()?;
+        let storage = RedbStorage::open(directory.path().join("lonewolf.dat"))?;
+        let allocator = Arc::new(CountingAllocator::default());
+        let policy = Arc::new(ForwardingPolicy {
+            verdict: lonewolf_extension::policy::Verdict::Allow,
+            calls: PlMutex::default(),
+        });
+        let mut extensions = Extensions::default();
+        extensions.register(policy.clone())?;
+        let router = Router::new(
+            Hosts::new(&Config::default().hosts, None)?,
+            LocalRouter::new(allocator.clone()),
+        )
+        .with_extensions(BTreeMap::from([(
+            "localhost".into(),
+            extensions.enable_host("localhost", ["forwarding-policy"])?,
+        )]));
+        let handle = router.handle();
+        let phone = handle
+            .register(&account("bob@localhost")?, Some("phone"), NonZeroUsize::MIN)
+            .await?;
+        let work = WorkGroup::new();
+        let worker = work.handle();
+        let stage = Stage {
+            router: &handle,
+            storage: &storage,
+            allocator: &allocator,
+            work: &worker,
+        };
+        let (stanza, arena, _) = request(
+            allocator.clone(),
+            "alice@remote.test/desk",
+            "bob@localhost/phone",
+            "payload",
+        )?;
+        let routed = RoutedStanza::from_parts(stanza, arena);
+        let mut expected = String::new();
+        routed.resolve()?.write_xml(&mut expected)?;
+        let before = allocator.0.load(Ordering::SeqCst);
+        let disposition = super::super::iq::handle(
+            &stage,
+            &Origin::Remote {
+                local: "localhost",
+                remote: "remote.test",
+            },
+            IqInput::Routed(routed),
+            Destination::Resource,
+            IqType::Get,
+        )
+        .await
+        .map_err(|_| "forward failed")?;
+        assert!(matches!(disposition, IqDisposition::Done));
+        assert_eq!(allocator.0.load(Ordering::SeqCst), before);
+        let delivered = phone.recv().await.ok_or("forwarded request")?;
+        let mut actual = String::new();
+        delivered.stanza.resolve()?.write_xml(&mut actual)?;
+        assert_eq!(actual, expected);
+        assert_eq!(policy.calls.lock().len(), 1);
+        drop((delivered, phone));
+        router.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn owned_policy_rejection_borrows_authenticated_sender_and_preserves_request_arena() -> TestResult {
+    Runtime::new()?.block_on(async {
+        use lonewolf_extension::policy::{Direction, Verdict};
+        use lonewolf_xmpp::stanza::StanzaErrorCondition;
+        let directory = tempfile::tempdir()?;
+        let storage = RedbStorage::open(directory.path().join("lonewolf.dat"))?;
+        let allocator = Arc::new(CountingAllocator::default());
+        let policy = Arc::new(ForwardingPolicy {
+            verdict: Verdict::Reject {
+                condition: StanzaErrorCondition::ServiceUnavailable,
+                application: None,
+                text: None,
+            },
+            calls: PlMutex::default(),
+        });
+        let mut extensions = Extensions::default();
+        extensions.register(policy.clone())?;
+        let router = Router::new(
+            Hosts::new(&Config::default().hosts, None)?,
+            LocalRouter::new(allocator.clone()),
+        )
+        .with_extensions(BTreeMap::from([(
+            "localhost".into(),
+            extensions.enable_host("localhost", ["forwarding-policy"])?,
+        )]));
+        let handle = router.handle();
+        let session = handle
+            .register(
+                &account("alice@localhost")?,
+                Some("desk"),
+                NonZeroUsize::MIN,
+            )
+            .await?;
+        let work = WorkGroup::new();
+        let worker = work.handle();
+        let stage = Stage {
+            router: &handle,
+            storage: &storage,
+            allocator: &allocator,
+            work: &worker,
+        };
+        for raw_from in [Some("mallory@remote.test/spoof"), None] {
+            for (target, destination) in [
+                ("bob@localhost", Destination::Account),
+                ("bob@localhost/phone", Destination::Resource),
+            ] {
+                policy.calls.lock().clear();
+                let (stanza, mut arena, _) =
+                    request(allocator.clone(), "alice@localhost/desk", target, "payload")?;
+                let sender = Jid::parse_in("alice@localhost/desk", &mut arena)?;
+                let raw = raw_from
+                    .map(|from| Jid::parse_in(from, &mut arena))
+                    .transpose()?;
+                let stanza = stanza.derive_in(&mut arena)?.from(raw)?.build()?;
+                let used = arena.stats().used_bytes;
+                let before = allocator.0.load(Ordering::SeqCst);
+                let disposition = super::super::iq::handle(
+                    &stage,
+                    &Origin::Session(&session),
+                    IqInput::Owned {
+                        request: stanza,
+                        arena,
+                        sender,
+                    },
+                    destination,
+                    IqType::Get,
+                )
+                .await
+                .map_err(|_| "policy failed")?;
+                let IqDisposition::PolicyRejected {
+                    input: IqInput::Owned { request, arena, .. },
+                    ..
+                } = disposition
+                else {
+                    return Err("owned rejection lost".into());
+                };
+                assert_eq!(allocator.0.load(Ordering::SeqCst), before);
+                assert_eq!(arena.stats().used_bytes, used);
+                assert_eq!(
+                    request.resolve(&arena)?.from()?.map(|from| from.as_str()),
+                    raw_from
+                );
+                let calls = policy.calls.lock();
+                assert_eq!(calls.len(), 2);
+                assert_eq!(calls[0].account, "alice@localhost");
+                assert_eq!(calls[0].direction, Direction::Outbound);
+                assert_eq!(calls[0].peer, target);
+                assert_eq!(calls[1].account, "bob@localhost");
+                assert_eq!(calls[1].direction, Direction::Inbound);
+                assert_eq!(calls[1].peer, "alice@localhost/desk");
+            }
+        }
+        policy.calls.lock().clear();
+        let (stanza, mut arena, sender) = request(
+            allocator.clone(),
+            "alice@localhost/desk",
+            "alice@localhost",
+            "",
+        )?;
+        let stanza = stanza
+            .derive_in(&mut arena)?
+            .to(None)?
+            .from(None)?
+            .build()?;
+        let disposition = super::super::iq::handle(
+            &stage,
+            &Origin::Session(&session),
+            IqInput::Owned {
+                request: stanza,
+                arena,
+                sender,
+            },
+            Destination::Account,
+            IqType::Get,
+        )
+        .await
+        .map_err(|_| "own account failed")?;
+        assert!(matches!(disposition, IqDisposition::Unavailable { .. }));
+        assert!(policy.calls.lock().is_empty());
+        drop(session);
+        router.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn borrowed_policy_checks_reuse_target_key_and_authenticated_inbound_peer() -> TestResult {
+    Runtime::new()?.block_on(async {
+        use lonewolf_extension::policy::Direction;
+        let directory = tempfile::tempdir()?;
+        let storage = RedbStorage::open(directory.path().join("lonewolf.dat"))?;
+        let policy = Arc::new(ForwardingPolicy {
+            verdict: lonewolf_extension::policy::Verdict::Allow,
+            calls: PlMutex::default(),
+        });
+        let mut extensions = Extensions::default();
+        extensions.register(policy.clone())?;
+        let router = Router::new(
+            Hosts::new(&Config::default().hosts, None)?,
+            LocalRouter::new(GlobalChunkAllocator),
+        )
+        .with_extensions(BTreeMap::from([(
+            "localhost".into(),
+            extensions.enable_host("localhost", ["forwarding-policy"])?,
+        )]));
+        let handle = router.handle();
+        let source = account("alice@localhost")?;
+        let target = account("bob@localhost")?;
+        let (stanza, mut arena, sender) = request(
+            GlobalChunkAllocator,
+            "alice@localhost/desk",
+            "bob@localhost/phone",
+            "",
+        )?;
+        let spoof = Jid::parse_in("mallory@remote.test/spoof", &mut arena)?;
+        let stanza = stanza.derive_in(&mut arena)?.from(Some(spoof))?.build()?;
+        let verdict = super::super::checks::check_from(
+            &handle,
+            &storage,
+            Some(&source),
+            Some(&target),
+            &stanza.resolve(&arena)?,
+            Some(sender.resolve(&arena)?),
+            super::super::checks::Snapshot::Fresh,
+        )
+        .await
+        .map_err(|_| "check failed")?;
+        assert_eq!(verdict, lonewolf_extension::policy::Verdict::Allow);
+        {
+            let calls = policy.calls.lock();
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[0].direction, Direction::Outbound);
+            assert_eq!(calls[1].direction, Direction::Inbound);
+            assert_eq!(calls[1].peer, "alice@localhost/desk");
+            assert_eq!(calls[0].address, std::ptr::from_ref(&source) as usize);
+            assert_eq!(calls[1].address, std::ptr::from_ref(&target) as usize);
+        }
+        router.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn unsupported_remote_iq_responses_are_silent() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let fixture = Fixture::new(false)?;
+        for destination in [
+            Destination::Remote,
+            Destination::Service,
+            Destination::ServerResource,
+        ] {
+            for kind in [IqType::Result, IqType::Error] {
+                let (stanza, mut arena, sender) = request(
+                    GlobalChunkAllocator,
+                    "alice@remote.test/desk",
+                    "localhost/unsupported",
+                    "",
+                )?;
+                let stanza = if kind == IqType::Error {
+                    let target = Jid::parse_in("localhost/unsupported", &mut arena)?;
+                    let condition = lonewolf_xmpp::stanza::StanzaErrorCondition::ServiceUnavailable;
+                    stanza
+                        .error_reply_described_in(
+                            &mut arena,
+                            condition,
+                            None,
+                            condition.default_text(),
+                        )?
+                        .from(Some(sender))?
+                        .to(Some(target))?
+                        .build()?
+                } else {
+                    stanza
+                        .derive_in(&mut arena)?
+                        .stanza_type(StanzaType::Iq(kind))
+                        .build()?
+                };
+                let disposition = super::super::iq::handle(
+                    &fixture.stage(),
+                    &Origin::Remote {
+                        local: "localhost",
+                        remote: "remote.test",
+                    },
+                    IqInput::Routed(RoutedStanza::from_parts(stanza, arena)),
+                    destination,
+                    kind,
+                )
+                .await
+                .map_err(|_| "response failed")?;
+                assert!(matches!(disposition, IqDisposition::Done));
+            }
+        }
+        fixture.router.shutdown().await?;
         Ok(())
     })
 }

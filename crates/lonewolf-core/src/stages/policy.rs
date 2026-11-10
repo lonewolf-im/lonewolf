@@ -3,7 +3,7 @@
 use lonewolf_extension::policy::{Direction, PolicyRequest, Verdict};
 use lonewolf_extension::presence::PresenceAudience;
 use lonewolf_storage::account::AccountKey;
-use lonewolf_storage::{RedbRead, Storage};
+use lonewolf_storage::{RedbRead, RedbStorage, Storage};
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::{Jid, JidRef};
 use lonewolf_xmpp::stanza::{PresenceType, StanzaType};
@@ -23,20 +23,29 @@ pub(crate) async fn evaluate<A: ChunkAllocator + Clone>(
     kind: StanzaType,
     checks: &[Check<'_>],
 ) -> Result<Verdict, StageFailure> {
+    evaluate_with(stage.router, stage.storage, kind, checks).await
+}
+
+pub(crate) async fn evaluate_with<A: ChunkAllocator + Clone>(
+    router: &RouterHandle<A>,
+    storage: &RedbStorage,
+    kind: StanzaType,
+    checks: &[Check<'_>],
+) -> Result<Verdict, StageFailure> {
     if checks
         .iter()
-        .all(|check| stage.router.policies(check.account.domain()).is_empty())
+        .all(|check| router.policies(check.account.domain()).is_empty())
     {
         return Ok(Verdict::Allow);
     }
-    let transaction = stage.storage.begin_read().await.map_err(|error| {
+    let transaction = storage.begin_read().await.map_err(|error| {
         report_failure(
             storage_failure(error, "policy_begin_read"),
             checks[0].account,
         );
         StageFailure
     })?;
-    evaluate_in(stage.router, &transaction, kind, checks).await
+    evaluate_in(router, &transaction, kind, checks).await
 }
 
 pub(crate) async fn evaluate_in<A: ChunkAllocator + Clone>(

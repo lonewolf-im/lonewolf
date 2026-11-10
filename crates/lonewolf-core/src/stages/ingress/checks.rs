@@ -3,9 +3,9 @@
 use lonewolf_extension::archive::ArchiveId;
 use lonewolf_extension::observer::{MessageEvent, MessageOutcome, MessageRole};
 use lonewolf_extension::policy::{Direction, Verdict};
-use lonewolf_storage::RedbRead;
 use lonewolf_storage::account::AccountKey;
-use lonewolf_util::arena::{ChunkAllocator, SharedArena};
+use lonewolf_storage::{RedbRead, RedbStorage};
+use lonewolf_util::arena::{ArenaRead, ChunkAllocator};
 use lonewolf_xmpp::jid::JidRef;
 use lonewolf_xmpp::stanza::{RoutedStanza, StanzaKind, StanzaRef};
 
@@ -63,14 +63,13 @@ pub(crate) fn policy_applies<A: ChunkAllocator + Clone>(
 
 pub(crate) enum Snapshot<'t> {
     Fresh,
-    #[cfg_attr(not(test), expect(dead_code))]
     Ordered(&'t RedbRead),
 }
 
-pub(crate) async fn check<A: ChunkAllocator + Clone>(
+pub(crate) async fn check<A: ChunkAllocator + Clone, R: ArenaRead>(
     stage: &Stage<'_, A>,
     origin: &Origin<'_, A>,
-    view: &StanzaRef<'_, SharedArena<A>>,
+    view: &StanzaRef<'_, R>,
     parties: &Parties,
     snapshot: Snapshot<'_>,
 ) -> Result<Verdict, StageFailure> {
@@ -78,28 +77,66 @@ pub(crate) async fn check<A: ChunkAllocator + Clone>(
     if !policy_applies(stage.router, origin, to, parties) {
         return Ok(Verdict::Allow);
     }
-    let from = view.from()?.ok_or(StageFailure)?;
-    let Some(account) = origin.sender().or(parties.recipient.as_ref()) else {
+    check_from(
+        stage.router,
+        stage.storage,
+        origin.sender(),
+        parties.recipient.as_ref(),
+        view,
+        None,
+        snapshot,
+    )
+    .await
+}
+
+pub(crate) async fn check_from<A: ChunkAllocator + Clone, R: ArenaRead>(
+    router: &RouterHandle<A>,
+    storage: &RedbStorage,
+    source: Option<&AccountKey>,
+    recipient: Option<&AccountKey>,
+    view: &StanzaRef<'_, R>,
+    authenticated_from: Option<JidRef<'_>>,
+    snapshot: Snapshot<'_>,
+) -> Result<Verdict, StageFailure> {
+    let to = view
+        .to()?
+        .or_else(|| {
+            (view.kind() == StanzaKind::Iq)
+                .then_some(authenticated_from)
+                .flatten()
+                .map(|sender| sender.bare())
+        })
+        .ok_or(StageFailure)?;
+    if source.is_some_and(|source| source.as_str() == to.bare().as_str())
+        || (source.is_none_or(|source| router.policies(source.domain()).is_empty())
+            && recipient.is_none_or(|recipient| router.policies(recipient.domain()).is_empty()))
+    {
+        return Ok(Verdict::Allow);
+    }
+    let from = match authenticated_from {
+        Some(sender) => sender,
+        None => view.from()?.ok_or(StageFailure)?,
+    };
+    let Some(account) = source.or(recipient) else {
         return Ok(Verdict::Allow);
     };
     let checks = [
         policy::Check {
-            account,
+            account: source.unwrap_or(account),
             direction: Direction::Outbound,
             peer: to,
         },
         policy::Check {
-            account: parties.recipient.as_ref().unwrap_or(account),
+            account: recipient.unwrap_or(account),
             direction: Direction::Inbound,
             peer: from,
         },
     ];
-    let checks = &checks
-        [usize::from(origin.sender().is_none())..if parties.recipient.is_some() { 2 } else { 1 }];
+    let checks = &checks[usize::from(source.is_none())..if recipient.is_some() { 2 } else { 1 }];
     match snapshot {
-        Snapshot::Fresh => policy::evaluate(stage, view.stanza_type(), checks).await,
+        Snapshot::Fresh => policy::evaluate_with(router, storage, view.stanza_type(), checks).await,
         Snapshot::Ordered(transaction) => {
-            policy::evaluate_in(stage.router, transaction, view.stanza_type(), checks).await
+            policy::evaluate_in(router, transaction, view.stanza_type(), checks).await
         }
     }
 }

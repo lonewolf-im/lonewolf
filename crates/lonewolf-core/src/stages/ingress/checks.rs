@@ -54,11 +54,23 @@ pub(crate) fn policy_applies<A: ChunkAllocator + Clone>(
     to: JidRef<'_>,
     parties: &Parties,
 ) -> bool {
-    !parties.same_account
-        && (origin
-            .sender()
-            .is_some_and(|sender| !router.policies(sender.domain()).is_empty())
-            || (parties.local_recipient && !router.policies(to.domainpart()).is_empty()))
+    policy_applies_for(
+        router,
+        origin.sender().map(|sender| sender.domain()),
+        parties.same_account,
+    ) || policy_applies_for(
+        router,
+        parties.local_recipient.then_some(to.domainpart()),
+        parties.same_account,
+    )
+}
+
+pub(crate) fn policy_applies_for<A: ChunkAllocator + Clone>(
+    router: &RouterHandle<A>,
+    domain: Option<&str>,
+    same_account: bool,
+) -> bool {
+    !same_account && domain.is_some_and(|domain| !router.policies(domain).is_empty())
 }
 
 pub(crate) enum Snapshot<'t> {

@@ -559,10 +559,17 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                 work: &self.work,
             };
             self.outbox
-                .drain_until(
-                    &self.registration,
-                    policy::evaluate(&stage, view.stanza_type(), &checks),
-                )
+                .drain_until(&self.registration, async {
+                    if ingress::checks::policy_applies_for(
+                        stage.router,
+                        Some(self.registration.account().domain()),
+                        false,
+                    ) {
+                        policy::evaluate(&stage, view.stanza_type(), &checks).await
+                    } else {
+                        Ok(Verdict::Allow)
+                    }
+                })
                 .await??
         };
         match verdict {
@@ -1695,11 +1702,14 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
 
         let (policy_sender, policy_target) = presence_addresses(&routed)?;
         let account = self.registration.account();
-        let policy_applies = policy_target.as_str() != account.as_str();
-        let outbound_policy = policy_applies && !self.router.policies(account.domain()).is_empty();
-        let inbound_policy = policy_applies
-            && self.router.destination(policy_target) == Destination::Account
-            && !self.router.policies(policy_target.domainpart()).is_empty();
+        let same_account = policy_target.as_str() == account.as_str();
+        let outbound_policy =
+            ingress::checks::policy_applies_for(&self.router, Some(account.domain()), same_account);
+        let inbound_domain = (!same_account
+            && self.router.destination(policy_target) == Destination::Account)
+            .then_some(policy_target.domainpart());
+        let inbound_policy =
+            ingress::checks::policy_applies_for(&self.router, inbound_domain, same_account);
         let policy_snapshot = if outbound_policy || inbound_policy {
             let read = async {
                 self.storage.begin_read().await.map_err(|error| {

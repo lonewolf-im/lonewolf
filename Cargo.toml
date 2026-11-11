@@ -18,6 +18,10 @@ resolver = "3"
 [profile.test.package."*"]
 opt-level = 1
 
+# SCRAM key derivation compiles into this crate and dominates authentication test time when unoptimized.
+[profile.test.package.lonewolf-auth]
+opt-level = 1
+
 [workspace.package]
 version = "0.2.0"
 edition = "2024"

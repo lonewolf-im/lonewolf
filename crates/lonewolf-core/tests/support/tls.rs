@@ -165,7 +165,7 @@ impl ClientCertificates {
         )
     }
 
-    pub fn configure_with_anchor_expiry(
+    fn configure_with_anchor_expiry(
         directory: &Path,
         expires: time::OffsetDateTime,
     ) -> TestResult<Self> {

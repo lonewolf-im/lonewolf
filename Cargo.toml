@@ -15,7 +15,7 @@ members = [
 ]
 resolver = "3"
 
-[profile.test]
+[profile.test.package."*"]
 opt-level = 1
 
 [workspace.package]

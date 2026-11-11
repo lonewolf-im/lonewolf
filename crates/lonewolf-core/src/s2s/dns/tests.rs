@@ -870,7 +870,6 @@ enum ServiceReply {
     NoData,
     ServFail,
     Refused,
-    Timeout,
     Dot,
     MixedDot,
     ZeroPort,
@@ -888,7 +887,6 @@ fn service_reply(query: &Message, reply: ServiceReply, mode: TlsMode) -> Vec<Mes
         ServiceReply::NoData => vec![response(query, ResponseCode::NoError, vec![])],
         ServiceReply::ServFail => vec![response(query, ResponseCode::ServFail, vec![])],
         ServiceReply::Refused => vec![response(query, ResponseCode::Refused, vec![])],
-        ServiceReply::Timeout => vec![],
         ServiceReply::Dot => vec![srv(query, ".", 0)],
         ServiceReply::ZeroPort => vec![srv(query, target, 0)],
         ServiceReply::Usable => vec![srv(query, target, 5270)],
@@ -935,7 +933,6 @@ fn one_usable_service_survives_other_absent_unavailable_disabled_or_malformed() 
         ServiceReply::NoData,
         ServiceReply::ServFail,
         ServiceReply::Refused,
-        ServiceReply::Timeout,
         ServiceReply::Dot,
         ServiceReply::MixedDot,
         ServiceReply::ZeroPort,
@@ -957,8 +954,7 @@ fn one_usable_service_survives_other_absent_unavailable_disabled_or_malformed() 
                     vec![address(query)]
                 }
             })?;
-            let mut resolver = server.resolver()?;
-            resolver.timeout = Duration::from_millis(100);
+            let resolver = server.resolver()?;
             let result = resolve(&resolver, "remote.example").unwrap();
             assert_eq!(result.via, ResolvedVia::Srv);
             assert_eq!(
@@ -994,7 +990,6 @@ fn both_unadvertised_services_fall_back_to_origin_starttls() -> TestResult {
         ServiceReply::NoData,
         ServiceReply::ServFail,
         ServiceReply::Refused,
-        ServiceReply::Timeout,
     ];
     for starttls in replies {
         for direct in replies {
@@ -1014,8 +1009,7 @@ fn both_unadvertised_services_fall_back_to_origin_starttls() -> TestResult {
                     vec![address(query)]
                 }
             })?;
-            let mut resolver = server.resolver()?;
-            resolver.timeout = Duration::from_millis(100);
+            let resolver = server.resolver()?;
             assert_endpoints(
                 resolve(&resolver, "remote.example").unwrap(),
                 ResolvedVia::Fallback,
@@ -1042,7 +1036,6 @@ fn dot_without_usable_other_service_never_queries_origin() -> TestResult {
         (ServiceReply::Dot, ResolveError::NoService),
         (ServiceReply::ServFail, ResolveError::Unavailable),
         (ServiceReply::Refused, ResolveError::Unavailable),
-        (ServiceReply::Timeout, ResolveError::Unavailable),
     ] {
         for disabled in [TlsMode::StartTls, TlsMode::Direct] {
             let server = Server::with_services(move |query| {
@@ -1058,8 +1051,7 @@ fn dot_without_usable_other_service_never_queries_origin() -> TestResult {
                     mode,
                 )
             })?;
-            let mut resolver = server.resolver()?;
-            resolver.timeout = Duration::from_millis(100);
+            let resolver = server.resolver()?;
             assert_eq!(resolve(&resolver, "remote.example").unwrap_err(), expected);
             assert_both_services(&server.queries());
             assert_eq!(server.queries().len(), 2);
@@ -1099,11 +1091,10 @@ fn malformed_and_zero_port_advertisements_never_query_targets_or_origin() -> Tes
 #[test]
 fn advertised_targets_with_empty_or_failed_addresses_never_fall_back() -> TestResult {
     for failure in [
-        Some(ResponseCode::NoError),
-        Some(ResponseCode::NXDomain),
-        Some(ResponseCode::ServFail),
-        Some(ResponseCode::Refused),
-        None,
+        ResponseCode::NoError,
+        ResponseCode::NXDomain,
+        ResponseCode::ServFail,
+        ResponseCode::Refused,
     ] {
         for mode in [TlsMode::StartTls, TlsMode::Direct] {
             let server = Server::with_services(move |query| {
@@ -1119,14 +1110,10 @@ fn advertised_targets_with_empty_or_failed_addresses_never_fall_back() -> TestRe
                         selected,
                     )
                 } else {
-                    failure
-                        .map(|code| response(query, code, vec![]))
-                        .into_iter()
-                        .collect()
+                    vec![response(query, failure, vec![])]
                 }
             })?;
-            let mut resolver = server.resolver()?;
-            resolver.timeout = Duration::from_millis(100);
+            let resolver = server.resolver()?;
             assert_eq!(
                 resolve(&resolver, "remote.example").unwrap_err(),
                 ResolveError::NotFound

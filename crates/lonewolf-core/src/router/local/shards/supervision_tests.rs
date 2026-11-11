@@ -157,6 +157,8 @@ fn active_tagged_callback_panic_cleans_up_without_aborting() -> TestResult {
             "--nocapture",
         ])
         .env("LONEWOLF_ROUTER_PANIC_TEST", "1")
+        // The panic hook runs with the shard locked, and symbolizing a backtrace can outlast the fixture timeout.
+        .env("RUST_BACKTRACE", "0")
         .output()?;
     assert!(
         output.status.success(),

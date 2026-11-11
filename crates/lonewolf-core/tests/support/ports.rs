@@ -20,6 +20,7 @@ fn reusable_socket(address: SocketAddr) -> io::Result<Socket> {
     Ok(socket)
 }
 
+/// Do not bind a reserved address in the test process before a server binds it, because a concurrent spawn can inherit that socket and keep the port in use.
 pub struct PortReservation {
     _accepted: TcpStream,
     _keeper: TcpStream,
@@ -47,6 +48,42 @@ pub fn reserve_loopback_address(loopback: IpAddr) -> io::Result<(PortReservation
         _keeper: keeper,
     };
     Ok((reservation, address))
+}
+
+/// Waits until connections to `address` are refused.
+///
+/// The probe connects instead of binding so that the test process never owns a socket on the address.
+pub fn wait_until_released(address: SocketAddr, deadline: Instant) -> io::Result<()> {
+    loop {
+        let probe = Socket::new(
+            Domain::for_address(address),
+            Type::STREAM,
+            Some(Protocol::TCP),
+        )?;
+        probe.set_linger(Some(Duration::ZERO))?;
+        let timeout = deadline
+            .saturating_duration_since(Instant::now())
+            .clamp(Duration::from_millis(1), Duration::from_millis(100));
+        match probe.connect_timeout(&address.into(), timeout) {
+            Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => return Ok(()),
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::ConnectionReset
+                ) => {}
+            Err(error) => return Err(error),
+        }
+        drop(probe);
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                format!("listener {address} remains in use after the cleanup deadline"),
+            ));
+        }
+        std::thread::sleep((deadline - now).min(Duration::from_millis(5)));
+    }
 }
 
 pub fn bind_released_listener(address: SocketAddr, deadline: Instant) -> io::Result<Socket> {

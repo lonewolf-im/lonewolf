@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::cell::Cell;
+use std::pin::pin;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
@@ -63,7 +64,7 @@ pub(super) async fn establish<A: ChunkAllocator + Clone>(
         let accepted = super::run_phase(
             context.phase_deadline,
             CloseOutcome::EstablishmentTimeout,
-            context.interrupt(accept_direct(transport, hosts, settings)),
+            pin!(context.interrupt(accept_direct(transport, hosts, settings))),
         )
         .await;
         return match accepted {
@@ -106,7 +107,7 @@ pub(super) async fn establish<A: ChunkAllocator + Clone>(
     let plain = super::run_phase(
         context.phase_deadline,
         CloseOutcome::EstablishmentTimeout,
-        context.interrupt(async {
+        pin!(context.interrupt(async {
             let header = match reader.next_event().await {
                 Ok(Some(StreamEvent::StreamStart {
                     header,
@@ -166,7 +167,7 @@ pub(super) async fn establish<A: ChunkAllocator + Clone>(
                     Err(namespace_error(&event).unwrap_or(CloseOutcome::UnsupportedInput))
                 }
             }
-        }),
+        })),
     )
     .await;
     let (selected_host, handshake) = match plain {
@@ -180,7 +181,7 @@ pub(super) async fn establish<A: ChunkAllocator + Clone>(
     let rate_state = match super::run_phase(
         context.phase_deadline,
         CloseOutcome::EstablishmentTimeout,
-        reader.take_input(),
+        pin!(reader.take_input()),
     )
     .await
     {
@@ -194,7 +195,7 @@ pub(super) async fn establish<A: ChunkAllocator + Clone>(
     let transport = super::run_phase(
         context.phase_deadline,
         CloseOutcome::EstablishmentTimeout,
-        context.interrupt(async {
+        pin!(context.interrupt(async {
             let acceptor = TlsAcceptor::from(handshake.config);
             acceptor
                 .accept(RecordGuard::new(
@@ -206,7 +207,7 @@ pub(super) async fn establish<A: ChunkAllocator + Clone>(
                 ))
                 .await
                 .map_err(|_| CloseOutcome::TlsFailure)
-        }),
+        })),
     )
     .await;
     let transport = match transport {
@@ -344,7 +345,7 @@ async fn complete_tls<A: ChunkAllocator + Clone>(
     let opened = super::run_phase(
         context.phase_deadline,
         CloseOutcome::EstablishmentTimeout,
-        context.interrupt(async {
+        pin!(context.interrupt(async {
             let header = session.read_header(hosts).await?;
             if header.host != session.host() {
                 return Err(session
@@ -371,7 +372,7 @@ async fn complete_tls<A: ChunkAllocator + Clone>(
                 .ok_or(CloseOutcome::NoAuthenticationMechanism)?;
             session.writer.send(features).await?;
             Ok(header)
-        }),
+        })),
     )
     .await;
     let header = match opened {
@@ -399,7 +400,7 @@ pub(super) async fn prepare_tls<T>(
     let result = super::run_phase(
         context.phase_deadline,
         CloseOutcome::EstablishmentTimeout,
-        context.interrupt(preparation(transport)),
+        pin!(context.interrupt(preparation(transport))),
     )
     .await;
     match result {

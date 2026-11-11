@@ -100,7 +100,7 @@ pub(super) async fn bind_resource<A: ChunkAllocator + Clone>(
     let result = super::run_phase(
         context.phase_deadline,
         CloseOutcome::BindingTimeout,
-        context.interrupt(async {
+        pin!(context.interrupt(async {
             if restart.is_err() {
                 return Err(session
                     .writer
@@ -127,7 +127,7 @@ pub(super) async fn bind_resource<A: ChunkAllocator + Clone>(
                 Some(monitor) => monitor.interrupt(operation).await,
                 None => operation.await,
             }
-        }),
+        })),
     )
     .await;
     let (registration, resource_requested) = match result {

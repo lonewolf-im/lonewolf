@@ -17,7 +17,7 @@ use std::future::Future;
 use std::net::Shutdown;
 use std::num::NonZeroUsize;
 use std::panic::AssertUnwindSafe;
-use std::pin::pin;
+use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -324,13 +324,13 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
             let authenticated = run_phase(
                 context.phase_deadline,
                 CloseOutcome::AuthenticationTimeout,
-                context.interrupt(authenticate(
+                pin!(context.interrupt(authenticate(
                     &mut established,
                     &auth,
                     settings.auth_mechanisms,
                     settings.authentication_retries.get(),
                     &settings.metrics,
-                )),
+                ))),
             )
             .await;
             let (account, mechanism) = match authenticated {
@@ -376,30 +376,32 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
     }
 }
 
-async fn finish_phases(
-    phases: impl Future<Output = Result<CloseOutcome, CloseOutcome>>,
-    close_control: &TcpStream,
-    metrics: &C2sWorkerMetrics,
-) -> CloseOutcome {
-    match AssertUnwindSafe(phases).catch_unwind().await {
-        Ok(Ok(outcome) | Err(outcome)) => outcome,
-        Err(_) => {
-            metrics.connection_panicked();
-            let _ = SockRef::from(close_control).shutdown(Shutdown::Both);
-            release_deferred();
-            tracing::error!("connection task panicked");
-            CloseOutcome::InternalError
-        }
-    }
+// An async fn would store the phases future twice, once as its argument and once inside the awaited wrapper.
+fn finish_phases<'a>(
+    phases: impl Future<Output = Result<CloseOutcome, CloseOutcome>> + 'a,
+    close_control: &'a TcpStream,
+    metrics: &'a C2sWorkerMetrics,
+) -> impl Future<Output = CloseOutcome> + 'a {
+    AssertUnwindSafe(phases)
+        .catch_unwind()
+        .map(move |result| match result {
+            Ok(Ok(outcome) | Err(outcome)) => outcome,
+            Err(_) => {
+                metrics.connection_panicked();
+                let _ = SockRef::from(close_control).shutdown(Shutdown::Both);
+                release_deferred();
+                tracing::error!("connection task panicked");
+                CloseOutcome::InternalError
+            }
+        })
 }
 
 async fn run_phase<T>(
     deadline: Option<Instant>,
     timeout_outcome: CloseOutcome,
-    phase: impl Future<Output = Result<T, CloseOutcome>>,
+    phase: Pin<&mut impl Future<Output = Result<T, CloseOutcome>>>,
 ) -> Result<T, CloseOutcome> {
-    let mut phase = pin!(phase);
-    match close::before_deadline(deadline.unwrap_or_else(Instant::now), phase.as_mut()).await {
+    match close::before_deadline(deadline.unwrap_or_else(Instant::now), phase).await {
         Ok(result) => result,
         Err(_) => Err(timeout_outcome),
     }

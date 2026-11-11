@@ -12,10 +12,11 @@ use compio::io::compat::AsyncStream;
 use compio::net::TcpStream;
 use futures_channel::oneshot;
 use futures_util::FutureExt;
-use futures_util::future::{BoxFuture, Either, Shared, select};
+use futures_util::future::{BoxFuture, Either, Shared};
 use futures_util::io::{ReadHalf, WriteHalf};
 use lonewolf_storage::RedbStorage;
 use lonewolf_util::arena::ChunkAllocator;
+use lonewolf_util::race::race;
 use lonewolf_xmpp::stanza::RoutedStanza;
 use parking_lot::Mutex as PlMutex;
 use rustls::pki_types::CertificateDer;
@@ -594,11 +595,14 @@ fn draw_jitter(mut fill: impl FnMut(&mut [u8]) -> bool) -> u16 {
     }
 }
 
-async fn stopping<F: std::future::Future>(stop: Stop, work: F) -> Option<F::Output> {
-    match select(stop, std::pin::pin!(work)).await {
+fn stopping<F: std::future::Future>(
+    stop: Stop,
+    work: F,
+) -> impl std::future::Future<Output = Option<F::Output>> {
+    race(stop, work).map(|result| match result {
         Either::Left(_) => None,
-        Either::Right((value, _)) => Some(value),
-    }
+        Either::Right(value) => Some(value),
+    })
 }
 
 impl<A: ChunkAllocator> Inner<A> {

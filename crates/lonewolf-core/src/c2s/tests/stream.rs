@@ -205,10 +205,14 @@ fn elapsed_and_overflowed_phase_deadlines_leave_transport_with_the_close_owner()
             ] {
                 let (mut socket, mut peer) = phase_socket_pair().await?;
                 let polled = Cell::new(false);
-                let result = run_phase(deadline, outcome, async {
-                    polled.set(true);
-                    Ok(())
-                })
+                let result = run_phase(
+                    deadline,
+                    outcome,
+                    pin!(async {
+                        polled.set(true);
+                        Ok(())
+                    }),
+                )
                 .await;
                 assert_eq!(result, Err(outcome));
                 assert!(!polled.get());
@@ -236,18 +240,15 @@ fn phase_work_ready_after_expiry_is_not_polled_again() -> io::Result<()> {
             let deadline = Instant::now() + Duration::from_millis(20);
             let ready = Cell::new(false);
             let polls = Cell::new(0);
-            let mut phase = std::pin::pin!(run_phase(
-                Some(deadline),
-                outcome,
-                std::future::poll_fn(|_| {
-                    polls.set(polls.get() + 1);
-                    if ready.get() {
-                        std::task::Poll::Ready(Ok(()))
-                    } else {
-                        std::task::Poll::Pending
-                    }
-                })
-            ));
+            let operation = pin!(std::future::poll_fn(|_| {
+                polls.set(polls.get() + 1);
+                if ready.get() {
+                    std::task::Poll::Ready(Ok(()))
+                } else {
+                    std::task::Poll::Pending
+                }
+            }));
+            let mut phase = pin!(run_phase(Some(deadline), outcome, operation));
             assert!(futures_util::poll!(phase.as_mut()).is_pending());
             assert_eq!(polls.get(), 1);
             std::thread::sleep(
@@ -277,7 +278,7 @@ fn timely_phase_results_keep_the_socket_open() -> io::Result<()> {
                 run_phase(
                     Some(deadline),
                     CloseOutcome::BindingTimeout,
-                    std::future::ready(result)
+                    pin!(std::future::ready(result))
                 )
                 .await,
                 result

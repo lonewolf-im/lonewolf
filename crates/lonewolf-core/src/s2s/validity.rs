@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::cell::Cell;
+use std::convert::Infallible;
 use std::future::{Future, poll_fn};
 use std::pin::pin;
 use std::rc::Rc;
@@ -9,6 +10,7 @@ use std::time::{Duration, SystemTime};
 use futures_channel::oneshot;
 use futures_util::FutureExt;
 use futures_util::future::{Either, LocalBoxFuture, Shared, select};
+use lonewolf_util::race::race;
 
 use super::metrics::{Direction, StreamClose};
 use super::revocation::{FetchSignal, RevocationSource, RevocationVerdict};
@@ -299,26 +301,29 @@ impl ValidityMonitor {
     }
 }
 
-pub(super) async fn supervise<T>(
+pub(super) fn supervise<'a, T>(
     monitor: Option<ValidityMonitor>,
-    log: MonitorLog<'_>,
+    log: MonitorLog<'a>,
     timeout: Duration,
-    work: impl Future<Output = T>,
-) -> T {
-    let _report = monitor.as_ref().map(|monitor| MonitorReport {
+    work: impl Future<Output = T> + 'a,
+) -> impl Future<Output = T> + 'a {
+    let report = monitor.as_ref().map(|monitor| MonitorReport {
         state: Rc::clone(&monitor.state),
         log,
     });
-    let monitoring = async {
-        match monitor {
-            Some(monitor) => monitor.run(log, timeout).await,
-            None => std::future::pending().await,
+    let monitoring = async move {
+        if let Some(monitor) = monitor {
+            monitor.run(log, timeout).await;
         }
+        std::future::pending::<Infallible>().await
     };
-    match select(pin!(work), pin!(monitoring)).await {
-        Either::Left((result, _)) => result,
-        Either::Right(_) => std::future::pending().await,
-    }
+    race(work, monitoring).map(move |result| {
+        drop(report);
+        match result {
+            Either::Left(output) => output,
+            Either::Right(never) => match never {},
+        }
+    })
 }
 
 #[cfg(test)]

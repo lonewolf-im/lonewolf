@@ -1629,6 +1629,7 @@ dependencies = [
  "futures-util",
  "nix",
  "parking_lot 0.13.0",
+ "pin-project-lite",
  "tokio",
 ]
 

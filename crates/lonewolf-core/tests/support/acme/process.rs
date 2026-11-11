@@ -400,27 +400,8 @@ ca_certificates_path = {:?}
         self.child.as_mut().ok_or("missing child")?.kill()?;
         let status = self.wait_exit()?;
         assert!(!status.success());
-        let deadline = Instant::now() + TIMEOUT;
-        loop {
-            let probe = socket2::Socket::new(
-                socket2::Domain::for_address(self.challenge),
-                socket2::Type::STREAM,
-                None,
-            )?;
-            probe.set_reuse_address(true)?;
-            match probe.bind(&self.challenge.into()) {
-                Ok(()) => break,
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::AddrInUse
-                        && Instant::now() < deadline =>
-                {
-                    thread::sleep(Duration::from_millis(5))
-                }
-                Err(error) => {
-                    return Err(format!("post-kill challenge listener still owned: {error}").into());
-                }
-            }
-        }
+        ports::wait_until_released(self.challenge, Instant::now() + TIMEOUT)
+            .map_err(|error| format!("post-kill challenge listener still owned: {error}"))?;
         let socket = self.path().join("run/lonewolf/admin.sock");
         if socket.try_exists()? {
             fs::remove_file(socket)?;

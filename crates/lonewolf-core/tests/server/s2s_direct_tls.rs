@@ -154,14 +154,7 @@ fn direct_tls_startup_validation_and_late_bind_failure_complete_rollback() -> Re
                 .join("run/lonewolf/admin.sock")
                 .exists()
         );
-        let socket = socket2::Socket::new(
-            socket2::Domain::IPV4,
-            socket2::Type::STREAM,
-            Some(socket2::Protocol::TCP),
-        )?;
-        socket.set_reuse_address(true)?;
-        socket.bind(&c2s.into())?;
-        socket.listen(128)?;
+        ports::wait_until_released(c2s, Instant::now() + TIMEOUT)?;
     }
     for _ in 0..2 {
         let mut server = Server::start(&base, 2)?;

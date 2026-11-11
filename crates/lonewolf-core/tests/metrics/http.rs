@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+#[allow(dead_code)]
 #[path = "../support/ports.rs"]
 mod ports;
 

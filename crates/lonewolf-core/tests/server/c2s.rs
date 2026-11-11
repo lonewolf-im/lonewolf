@@ -5,6 +5,7 @@ mod process;
 
 use process::{Server, TIMEOUT, field, request};
 
+#[allow(dead_code)]
 #[path = "../support/ports.rs"]
 mod ports;
 

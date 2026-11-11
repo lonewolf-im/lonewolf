@@ -1008,9 +1008,8 @@ fn sigterm(stage: AcmeStage) -> TestResult {
     assert!(server.stop(nix::sys::signal::Signal::SIGTERM)?.success());
     assert!(start.elapsed() < std::time::Duration::from_secs(30));
     let old = server.records()?;
-    let addresses = [server.address, server.challenge];
-    for address in addresses {
-        let _listener = ports::bind_released_listener(
+    for address in [server.address, server.challenge] {
+        ports::wait_until_released(
             address,
             std::time::Instant::now() + std::time::Duration::from_secs(2),
         )?;

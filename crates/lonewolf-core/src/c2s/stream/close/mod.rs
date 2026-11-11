@@ -4,14 +4,16 @@ use std::cell::Cell;
 use std::future::{Future, poll_fn};
 use std::io;
 use std::net::Shutdown;
-use std::pin::pin;
+use std::pin::{Pin, pin};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use compio::net::TcpStream;
+use futures_util::FutureExt as _;
 use futures_util::future::{Either, LocalBoxFuture, Shared, select};
 use futures_util::io::{AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use lonewolf_util::arena::ChunkAllocator;
+use lonewolf_util::race::race;
 use lonewolf_xmpp::parser::StreamEvent;
 use socket2::SockRef;
 use tokio::io::AsyncBufRead;
@@ -87,22 +89,21 @@ impl CloseContext {
         let _ = SockRef::from(&self.socket).shutdown(Shutdown::Both);
     }
 
-    pub(super) async fn interrupt<T>(
+    pub(super) fn interrupt<T>(
         &self,
         future: impl Future<Output = Result<T, CloseOutcome>>,
-    ) -> Result<T, CloseOutcome> {
-        match select(pin!(self.shutdown.clone()), pin!(future)).await {
+    ) -> impl Future<Output = Result<T, CloseOutcome>> {
+        race(self.shutdown.clone(), future).map(|result| match result {
             Either::Left(_) => Err(CloseOutcome::SystemShutdown),
-            Either::Right((result, _)) => result,
-        }
+            Either::Right(result) => result,
+        })
     }
 
     pub(super) async fn until<T>(
         &self,
         deadline: Instant,
-        future: impl Future<Output = T>,
+        mut future: Pin<&mut impl Future<Output = T>>,
     ) -> Result<T, ()> {
-        let mut future = pin!(future);
         let first = {
             let wait = pin!(before_deadline(deadline, future.as_mut()));
             match select(pin!(self.shutdown.clone()), wait).await {
@@ -146,25 +147,28 @@ pub(super) async fn finish<A: ChunkAllocator + Clone>(
     let outcome = reason.outcome();
     let stage = Cell::new("xml");
     let result = context
-        .until(deadline, async {
-            let mut state = CloseState::Open;
-            if !xml(reader, writer, reason).await? {
-                return Ok(outcome);
-            }
-            transition(&mut state, CloseState::FooterSent);
-            stage.set("transport");
-            let input = reader.take_input().await?;
-            let read = input.into_inner().into_inner().into_inner();
-            let write = writer.take_output()?;
-            let mut transport = read
-                .reunite(write)
-                .map_err(|_| CloseOutcome::InternalError)?;
-            transition(&mut state, CloseState::TlsClosing);
-            stage.set("tls");
-            shutdown_tls(&mut transport).await?;
-            transition(&mut state, CloseState::Closed);
-            Ok(outcome)
-        })
+        .until(
+            deadline,
+            pin!(async {
+                let mut state = CloseState::Open;
+                if !xml(reader, writer, reason).await? {
+                    return Ok(outcome);
+                }
+                transition(&mut state, CloseState::FooterSent);
+                stage.set("transport");
+                let input = reader.take_input().await?;
+                let read = input.into_inner().into_inner().into_inner();
+                let write = writer.take_output()?;
+                let mut transport = read
+                    .reunite(write)
+                    .map_err(|_| CloseOutcome::InternalError)?;
+                transition(&mut state, CloseState::TlsClosing);
+                stage.set("tls");
+                shutdown_tls(&mut transport).await?;
+                transition(&mut state, CloseState::Closed);
+                Ok(outcome)
+            }),
+        )
         .await;
     context.abort();
     completed(result, outcome, stage.get())
@@ -177,9 +181,10 @@ pub(super) async fn finish_tls(
 ) -> CloseOutcome {
     let deadline = context.deadline_for(outcome);
     let result = context
-        .until(deadline, async {
-            shutdown_tls(transport).await.map(|()| outcome)
-        })
+        .until(
+            deadline,
+            pin!(async { shutdown_tls(transport).await.map(|()| outcome) }),
+        )
         .await;
     context.abort();
     completed(result, outcome, "tls")
@@ -218,19 +223,22 @@ where
     let can_drain = writer.is_open() && writer.is_intact();
     let stage = Cell::new("xml");
     let result = context
-        .until(deadline, async {
-            if !xml(reader, writer, reason).await? || !can_drain {
-                return Ok(outcome);
-            }
-            stage.set("transport");
-            let mut input = reader.take_input().await?;
-            SockRef::from(&context.socket)
-                .shutdown(Shutdown::Write)
-                .map_err(|_| CloseOutcome::TransportError)?;
-            stage.set("drain");
-            drain_plain(&mut input).await?;
-            Ok(outcome)
-        })
+        .until(
+            deadline,
+            pin!(async {
+                if !xml(reader, writer, reason).await? || !can_drain {
+                    return Ok(outcome);
+                }
+                stage.set("transport");
+                let mut input = reader.take_input().await?;
+                SockRef::from(&context.socket)
+                    .shutdown(Shutdown::Write)
+                    .map_err(|_| CloseOutcome::TransportError)?;
+                stage.set("drain");
+                drain_plain(&mut input).await?;
+                Ok(outcome)
+            }),
+        )
         .await;
     context.abort();
     completed(result, outcome, stage.get())

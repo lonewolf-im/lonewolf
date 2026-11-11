@@ -196,7 +196,7 @@ pub(super) async fn negotiate<A: ChunkAllocator + Clone>(
     let mut close_deadline = None;
     let mut cancelled = false;
     let result = {
-        let flow = run(
+        let flow = pin!(run(
             tcp,
             settings,
             &mut connection,
@@ -204,7 +204,7 @@ pub(super) async fn negotiate<A: ChunkAllocator + Clone>(
             &mut peer_footer,
             &mut footer_sent,
             &mut response_from,
-        );
+        ));
         match select(
             pin!(shutdown),
             pin!(compio::time::timeout_at(deadline, flow)),

@@ -306,6 +306,7 @@ async fn remote_credential_and_target_failures_keep_partial_evidence() -> TestRe
     let credentials = directory.path().join("credentials.json");
     let mut config = config(2)?;
     config.measurement.connect_concurrency = 1;
+    config.measurement.setup_timeout_ms = 30_000;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
     config.target = TargetConfig::Remote {
@@ -325,7 +326,10 @@ async fn remote_credential_and_target_failures_keep_partial_evidence() -> TestRe
         Ok::<_, std::io::Error>(())
     });
     let report = run(config, &directory.path().join("after_accounts")).await?;
-    peer.await??;
+    // A run that ends without connecting leaves the peer waiting on an accept forever.
+    peer.abort();
+    peer.await
+        .map_err(|_| "run ended without connecting to the peer")??;
     assert_eq!(report.status, RunStatus::Failed);
     assert_eq!(report.counters, CounterReport::default());
     let setup = report

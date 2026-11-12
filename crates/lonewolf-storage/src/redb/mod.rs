@@ -8,6 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
+use ::redb::backends::FileBackend;
 use ::redb::{
     Database, Durability, ReadTransaction as RedbReadTransaction, ReadableDatabase,
     WriteTransaction as RedbWriteTransaction,
@@ -109,8 +110,9 @@ impl RedbStorage {
         options.read(true).write(true).create(true).truncate(false);
         options.mode(0o600);
         let file = options.open(path).map_err(storage_error)?;
+        let backend = FileBackend::new(file).map_err(storage_error)?;
         let database = Database::builder()
-            .create_file(file)
+            .create_with_backend(backend)
             .map_err(storage_error)?;
         Self::new(database)
     }

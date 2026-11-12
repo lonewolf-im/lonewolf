@@ -14,6 +14,7 @@ use futures_util::task::AtomicWaker;
 use graviola::hashing::{Hash, Sha256};
 use lonewolf_util::blocking::BlockingExecutor;
 use parking_lot::Mutex as PlMutex;
+use redb::backends::FileBackend;
 use redb::{
     Database, Durability, ReadableDatabase, ReadableTable, TableDefinition, WriteTransaction,
 };
@@ -131,8 +132,9 @@ impl StateStore {
                 if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 {
                     return Err(StateError::UnsafePath);
                 }
+                let backend = FileBackend::new(file).map_err(backend_error)?;
                 let database = Database::builder()
-                    .create_file(file)
+                    .create_with_backend(backend)
                     .map_err(backend_error)?;
                 let mut namespace = [0; 32];
                 namespace.copy_from_slice(Sha256::hash(directory_url.as_bytes()).as_ref());

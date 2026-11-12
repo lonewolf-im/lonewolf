@@ -688,7 +688,7 @@ fn initializes_only_acme_tables_without_rewriting_account_records() -> TestResul
         .create_new(true)
         .mode(0o600)
         .open(&path)?;
-    let database = Database::builder().create_file(file)?;
+    let database = Database::builder().create_with_backend(FileBackend::new(file)?)?;
     let transaction = begin_write(&database)?;
     transaction
         .open_table(SENTINEL)?

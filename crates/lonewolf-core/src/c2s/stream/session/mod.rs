@@ -326,7 +326,14 @@ impl<W: AsyncWrite + Unpin> Writer<W> {
             .ok_or(CloseOutcome::InternalError)
     }
 
+    /// `xml` must not switch protocols, so a stream error may follow it after a cancelled flush.
     pub(super) async fn send(&mut self, xml: &str) -> Result<(), CloseOutcome> {
+        self.queue_complete(xml).await?;
+        self.flush().await
+    }
+
+    /// Use for elements after which the peer leaves the current XML stream.
+    pub(super) async fn send_protocol_switch(&mut self, xml: &str) -> Result<(), CloseOutcome> {
         self.intact = false;
         self.queue(xml).await?;
         self.flush().await?;
@@ -340,12 +347,15 @@ impl<W: AsyncWrite + Unpin> Writer<W> {
         xml: &str,
         kind: StanzaKind,
     ) -> Result<(), CloseOutcome> {
+        self.send(xml).await?;
+        self.metrics.stanza_sent(kind);
+        Ok(())
+    }
+
+    async fn queue_complete(&mut self, xml: &str) -> Result<(), CloseOutcome> {
         self.intact = false;
         self.queue(xml).await?;
-        // A stanza never switches protocols, so a stream error may follow it after a cancelled flush.
         self.intact = true;
-        self.flush().await?;
-        self.metrics.stanza_sent(kind);
         Ok(())
     }
 
@@ -391,9 +401,8 @@ impl<W: AsyncWrite + Unpin> Writer<W> {
             header.client_content_namespace,
             ResponseVersion::Current,
         )?;
-        self.send(&xml).await?;
-        self.open = true;
-        Ok(())
+        self.queue_complete(&xml).await?;
+        self.flush_header().await
     }
 
     pub(super) async fn reject_header(
@@ -407,11 +416,18 @@ impl<W: AsyncWrite + Unpin> Writer<W> {
             Ok(header) => header,
             Err(outcome) => return outcome,
         };
-        if let Err(outcome) = self.send(&header).await {
+        if let Err(outcome) = self.queue_complete(&header).await {
             return outcome;
         }
+        self.flush_header().await.err().unwrap_or(outcome)
+    }
+
+    /// A queued header opens the stream even if its flush is cancelled.
+    async fn flush_header(&mut self) -> Result<(), CloseOutcome> {
         self.open = true;
-        outcome
+        let flushed = self.flush().await;
+        self.open = flushed.is_ok();
+        flushed
     }
 
     pub(super) async fn flush(&mut self) -> Result<(), CloseOutcome> {

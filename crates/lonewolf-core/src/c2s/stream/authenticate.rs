@@ -384,7 +384,7 @@ impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
             validity.valid_until,
             self.session
                 .writer
-                .send("<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>"),
+                .send_protocol_switch("<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>"),
         )
         .await?;
         self.client_validity = Some(validity);
@@ -490,7 +490,8 @@ impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
                 {
                     return Err(CloseOutcome::InvalidFrom);
                 }
-                self.send_sasl("success", &final_message).await?;
+                let xml = sasl_xml("success", &final_message)?;
+                self.session.writer.send_protocol_switch(&xml).await?;
                 return Ok(Attempt::Authenticated(
                     account,
                     SaslMechanism::Scram(mechanism),
@@ -546,13 +547,17 @@ impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
     }
 
     async fn send_sasl(&mut self, kind: &'static str, message: &str) -> Result<(), CloseOutcome> {
-        let mut xml = String::with_capacity(message.len() * 4 / 3 + 96);
-        write!(xml, "<{kind} xmlns='{SASL_NAMESPACE}'>")
-            .map_err(|_| CloseOutcome::InternalError)?;
-        STANDARD.encode_string(message, &mut xml);
-        write!(xml, "</{kind}>").map_err(|_| CloseOutcome::InternalError)?;
+        let xml = sasl_xml(kind, message)?;
         self.session.writer.send(&xml).await
     }
+}
+
+fn sasl_xml(kind: &'static str, message: &str) -> Result<String, CloseOutcome> {
+    let mut xml = String::with_capacity(message.len() * 4 / 3 + 96);
+    write!(xml, "<{kind} xmlns='{SASL_NAMESPACE}'>").map_err(|_| CloseOutcome::InternalError)?;
+    STANDARD.encode_string(message, &mut xml);
+    write!(xml, "</{kind}>").map_err(|_| CloseOutcome::InternalError)?;
+    Ok(xml)
 }
 
 fn finish_scram(

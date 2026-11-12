@@ -161,6 +161,105 @@ fn stream_error_follows_a_stanza_whose_flush_was_cancelled() -> TestResult {
     })
 }
 
+type Written = Rc<RefCell<Vec<u8>>>;
+
+fn partial_writer() -> (Writer<PartialWriter>, Written, Rc<Cell<usize>>) {
+    let bytes = Rc::new(RefCell::new(Vec::new()));
+    let allowance = Rc::new(Cell::new(usize::MAX));
+    let writer = Writer::new(
+        PartialWriter {
+            bytes: Rc::clone(&bytes),
+            allowance: Rc::clone(&allowance),
+        },
+        "localhost".into(),
+        crate::c2s::metrics::C2sWorkerMetrics::detached(),
+    );
+    (writer, bytes, allowance)
+}
+
+async fn close_with_shutdown(writer: &mut Writer<PartialWriter>) -> TestResult<bool> {
+    let (mut input, _, _) =
+        probe_reader(format!("{HEADER}</stream:stream>").into_bytes(), Tail::Eof);
+    Ok(xml(
+        &mut input,
+        writer,
+        CloseReason::Local(CloseOutcome::SystemShutdown),
+    )
+    .await
+    .map_err(|outcome| format!("{outcome:?}"))?)
+}
+
+const SHUTDOWN_ERROR: &str = "<stream:error><system-shutdown xmlns='urn:ietf:params:xml:ns:xmpp-streams'/></stream:error></stream:stream>";
+
+#[test]
+fn stream_error_follows_a_negotiation_element_whose_flush_was_cancelled() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let (mut writer, bytes, allowance) = partial_writer();
+        writer
+            .send_header(&header())
+            .await
+            .map_err(|outcome| format!("{outcome:?}"))?;
+        bytes.borrow_mut().clear();
+        allowance.set(0);
+        let challenge =
+            "<challenge xmlns='urn:ietf:params:xml:ns:xmpp-sasl'>cj1ub25jZQ==</challenge>";
+        let mut send = Box::pin(writer.send(challenge));
+        assert!(poll!(send.as_mut()).is_pending());
+        drop(send);
+        assert!(writer.is_intact());
+        allowance.set(usize::MAX);
+        assert!(close_with_shutdown(&mut writer).await?);
+        assert_eq!(
+            String::from_utf8(bytes.borrow().clone())?,
+            format!("{challenge}{SHUTDOWN_ERROR}")
+        );
+        Ok(())
+    })
+}
+
+#[test]
+fn stream_error_follows_a_header_whose_flush_was_cancelled() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let (mut writer, bytes, allowance) = partial_writer();
+        allowance.set(0);
+        let header = header();
+        let mut send = Box::pin(writer.send_header(&header));
+        assert!(poll!(send.as_mut()).is_pending());
+        drop(send);
+        assert!(writer.is_open());
+        assert!(writer.is_intact());
+        allowance.set(usize::MAX);
+        assert!(close_with_shutdown(&mut writer).await?);
+        let output = String::from_utf8(bytes.borrow().clone())?;
+        assert!(output.contains("<stream:stream "), "{output}");
+        assert!(output.ends_with(SHUTDOWN_ERROR), "{output}");
+        Ok(())
+    })
+}
+
+#[test]
+fn protocol_switch_whose_flush_was_cancelled_suppresses_the_stream_error() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let (mut writer, bytes, allowance) = partial_writer();
+        writer
+            .send_header(&header())
+            .await
+            .map_err(|outcome| format!("{outcome:?}"))?;
+        bytes.borrow_mut().clear();
+        allowance.set(0);
+        let mut send = Box::pin(
+            writer.send_protocol_switch("<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>"),
+        );
+        assert!(poll!(send.as_mut()).is_pending());
+        drop(send);
+        assert!(!writer.is_intact());
+        allowance.set(usize::MAX);
+        assert!(close_with_shutdown(&mut writer).await?);
+        assert!(!String::from_utf8_lossy(&bytes.borrow()).contains("stream:error"));
+        Ok(())
+    })
+}
+
 #[test]
 fn interrupted_stanza_serialization_never_appends_or_flushes_a_footer() -> TestResult {
     Runtime::new()?.block_on(async {
@@ -312,7 +411,7 @@ fn timeout_during_starttls_proceed_flush_never_appends_plaintext_after_proceed()
             crate::c2s::stream::run_phase(
                 Some(deadline),
                 CloseOutcome::EstablishmentTimeout,
-                pin!(writer.send(crate::c2s::stream::establish::STARTTLS_PROCEED))
+                pin!(writer.send_protocol_switch(crate::c2s::stream::establish::STARTTLS_PROCEED))
             )
             .await,
             Err(CloseOutcome::EstablishmentTimeout)

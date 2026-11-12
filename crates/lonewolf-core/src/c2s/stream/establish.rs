@@ -152,7 +152,7 @@ pub(super) async fn establish<A: ChunkAllocator + Clone>(
                         writer.send(STARTTLS_FAILURE).await?;
                         return Err(CloseOutcome::StartTlsRejected);
                     };
-                    writer.send(STARTTLS_PROCEED).await?;
+                    writer.send_protocol_switch(STARTTLS_PROCEED).await?;
                     Ok((header.host, handshake))
                 }
                 Some(StreamEvent::Element(element)) if is_starttls_element(&element) => {

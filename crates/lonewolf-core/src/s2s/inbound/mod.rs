@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::future::Future;
-use std::io;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -187,17 +186,8 @@ impl S2sListeners {
             .await
             .map(Self)
     }
-    pub(crate) fn addresses(&self) -> &[SocketAddr] {
-        self.0.addresses()
-    }
-    pub(crate) fn stop(&mut self, deadline: Instant) {
-        self.0.stop(deadline);
-    }
-    pub(crate) async fn failure(&mut self) -> io::Error {
-        self.0.failure().await
-    }
-    pub(crate) async fn join(&mut self) -> io::Result<()> {
-        self.0.join().await
+    pub(crate) fn into_inner(self) -> ListenerSet {
+        self.0
     }
 }
 

@@ -118,6 +118,7 @@ async fn rejected_connection_metrics(
                 },
             )
             .await
+            .result
         })
         .await?;
     let mut client = TcpStream::connect(readiness.await?).await?;
@@ -295,6 +296,7 @@ fn workers_own_distinct_sockets_on_the_same_port() -> TestResult {
                         },
                     )
                     .await
+                    .result
                 })
                 .await?;
             let (bound, descriptor, owner) = readiness.await?;
@@ -396,6 +398,7 @@ fn unauthenticated_capacity_is_shared_across_listeners() -> TestResult {
                             },
                         )
                         .await
+                        .result
                     },
                 )
                 .await?;
@@ -473,7 +476,7 @@ fn explicit_stop_closes_all_listeners_without_stopping_workers() -> TestResult {
         );
         listeners.stop(Instant::now() + TIMEOUT);
         while let Some(result) = listeners.0.test_tasks().next().await {
-            result??;
+            result?.result?;
         }
         for index in 0..handle.worker_count() {
             let task = handle
@@ -585,7 +588,10 @@ fn listener_failures_reach_the_supervisor() -> TestResult {
             dispatcher
                 .handle()
                 .dispatch_at(0, |_| async {
-                    Err(io::Error::new(io::ErrorKind::BrokenPipe, "listener failed"))
+                    crate::connection::ListenerOutcome::from(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "listener failed",
+                    )))
                 })
                 .await?,
         );
@@ -612,12 +618,16 @@ fn fatal_listener_notification_precedes_connection_drain() -> TestResult {
             dispatcher
                 .handle()
                 .dispatch_at(0, move |_| async move {
-                    report
-                        .try_send(io::Error::new(io::ErrorKind::BrokenPipe, "listener failed"))
-                        .map_err(io::Error::other)?;
-                    let _ = stopped.await;
-                    let _ = drained.send(());
-                    Ok(())
+                    let result = async {
+                        report
+                            .try_send(io::Error::new(io::ErrorKind::BrokenPipe, "listener failed"))
+                            .map_err(io::Error::other)?;
+                        let _ = stopped.await;
+                        let _ = drained.send(());
+                        Ok(())
+                    }
+                    .await;
+                    crate::connection::ListenerOutcome::from(result)
                 })
                 .await?,
         );

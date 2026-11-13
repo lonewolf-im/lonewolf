@@ -252,6 +252,49 @@ impl Element {
         })
     }
 
+    #[cfg(test)]
+    pub(super) fn shares_storage_with(
+        self,
+        other: Self,
+        arena: &impl ArenaRead,
+    ) -> Result<bool, HandleError> {
+        Ok(std::ptr::eq(arena.get(self.data)?, arena.get(other.data)?))
+    }
+
+    pub(super) fn rescope_shared_in<A: ChunkAllocator>(
+        self,
+        from: &str,
+        to: Handle<str>,
+        arena: &mut Arena<A>,
+        copies: &mut NamespaceCopies,
+    ) -> Result<Element, BuildError> {
+        let data = *arena.get(self.data)?;
+        if arena.get(data.name.namespace)? != from {
+            return Ok(self);
+        }
+        let namespaces = data.namespaces.rescope_shared_in(from, to, arena, copies)?;
+        let mut children = SliceBuilder::from_slice(data.children);
+        for index in 0..data.children.get(arena)?.len() {
+            if let Node::Element(child) = data.children.get(arena)?[index] {
+                let rescoped = child.rescope_shared_in(from, to, arena, copies)?;
+                if !std::ptr::eq(arena.get(rescoped.data)?, arena.get(child.data)?) {
+                    children.set(index, Node::Element(rescoped), arena)?;
+                }
+            }
+        }
+        Ok(Self {
+            data: arena.try_alloc(ElementData {
+                name: Name {
+                    local: data.name.local,
+                    namespace: to,
+                },
+                namespaces,
+                children: children.finish(),
+                ..data
+            })?,
+        })
+    }
+
     /// Shares unchanged storage. Edits do not alter the source element.
     ///
     /// # Errors

@@ -805,3 +805,259 @@ fn write_as_needs_no_arena() -> TestResult {
     assert_eq!(writer.flushes, 0);
     Ok(())
 }
+
+#[test]
+fn derive_in_place_matches_rescope_for_the_corpus() -> TestResult {
+    for target in [StanzaNamespace::Client, StanzaNamespace::Server] {
+        let cases = corpus()?;
+        assert_eq!(cases.len(), 40);
+        for mut case in cases {
+            let expected = oracle(&case, target)?;
+            let source_namespace = case.stanza.resolve(&case.arena)?.namespace();
+            let actual = case.stanza.rescope_derive_in(target, &mut case.arena);
+            match (expected, actual) {
+                (Err(expected), Err(actual)) => {
+                    assert_eq!(actual, expected, "{} -> {target:?}", case.name)
+                }
+                (Ok(expected), Ok(actual)) => {
+                    assert_eq!(
+                        snapshot(actual, &case.arena)?,
+                        expected,
+                        "{} {source_namespace:?} -> {target:?}",
+                        case.name
+                    );
+                }
+                (expected, actual) => panic!(
+                    "{} {source_namespace:?} -> {target:?}: expected {expected:?}, actual error {:?}",
+                    case.name,
+                    actual.err()
+                ),
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn derive_in_place_shares_foreign_subtrees() -> TestResult {
+    let mut case = corpus()?
+        .into_iter()
+        .find(|case| {
+            case.name == "chat_body_thread_extension"
+                && case
+                    .stanza
+                    .resolve(&case.arena)
+                    .is_ok_and(|view| view.namespace() == StanzaNamespace::Server)
+        })
+        .ok_or("missing corpus fixture")?;
+    let view = case.stanza.resolve(&case.arena)?;
+    let body = view
+        .child("body", SERVER_NAMESPACE)?
+        .ok_or("missing body")?
+        .handle();
+    let receipts = view
+        .child("request", "urn:xmpp:receipts")?
+        .ok_or("missing receipts")?
+        .handle();
+    let original = snapshot(case.stanza, &case.arena)?;
+    let stanza = case
+        .stanza
+        .rescope_derive_in(StanzaNamespace::Client, &mut case.arena)?;
+    let view = stanza.resolve(&case.arena)?;
+    assert!(
+        receipts.shares_storage_with(
+            view.child("request", "urn:xmpp:receipts")?
+                .ok_or("missing receipts")?
+                .handle(),
+            &case.arena
+        )?
+    );
+    assert!(
+        !body.shares_storage_with(
+            view.child("body", CLIENT_NAMESPACE)?
+                .ok_or("missing body")?
+                .handle(),
+            &case.arena
+        )?
+    );
+    assert_eq!(snapshot(case.stanza, &case.arena)?, original);
+
+    let (stanza, arena) = parse_stream_stanza(
+        StanzaNamespace::Server,
+        "<iq from='a@example.org/r' to='b@example.net' type='get' id='query-1'><query xmlns='urn:query'><body xmlns='jabber:server'>unchanged</body></query></iq>",
+    )?;
+    let case = Case {
+        name: "foreign_query",
+        stanza,
+        arena,
+    };
+    let expected = oracle(&case, StanzaNamespace::Client)??;
+    let Case {
+        stanza, mut arena, ..
+    } = case;
+    let original = snapshot(stanza, &arena)?;
+    let derived = stanza.rescope_derive_in(StanzaNamespace::Client, &mut arena)?;
+    assert!(std::ptr::eq(
+        arena.get(stanza.data)?.children.get(&arena)?,
+        arena.get(derived.data)?.children.get(&arena)?,
+    ));
+    assert_eq!(snapshot(derived, &arena)?, expected);
+    assert_eq!(snapshot(stanza, &arena)?, original);
+    Ok(())
+}
+
+#[derive(Default)]
+struct CountingAllocator {
+    allocations: std::sync::atomic::AtomicUsize,
+}
+
+unsafe impl ChunkAllocator for CountingAllocator {
+    fn allocate(&self, layout: Layout) -> Result<Chunk, AllocationError> {
+        let chunk = GlobalChunkAllocator.allocate(layout)?;
+        self.allocations.fetch_add(1, Ordering::Relaxed);
+        Ok(chunk)
+    }
+
+    unsafe fn deallocate(&self, chunk: Chunk) {
+        unsafe { GlobalChunkAllocator.deallocate(chunk) };
+    }
+}
+
+#[test]
+fn derive_in_place_needs_no_new_chunk() -> TestResult {
+    let input = concat!(
+        "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:server'>",
+        "<message from='a@example.org/r' to='b@example.net' type='chat'><body>Hello</body>",
+        "<request xmlns='urn:xmpp:receipts'/></message>"
+    );
+    assert!(input.len() < 1024);
+    let allocator = Arc::new(CountingAllocator::default());
+    let (stanza, mut arena) = futures_executor::block_on(async {
+        let mut parser = XmppParser::new(
+            input.as_bytes(),
+            ParserConfig {
+                max_stanza_bytes: NonZeroUsize::new(1024).ok_or("zero limit")?,
+                arena: ArenaConfig::default(),
+            },
+            allocator.clone(),
+        );
+        assert!(matches!(
+            parser.next_event().await?,
+            Some(StreamEvent::StreamStart { .. })
+        ));
+        let Some(StreamEvent::Stanza(parsed)) = parser.next_event().await? else {
+            return Err("expected stanza".into());
+        };
+        Ok::<_, Box<dyn std::error::Error>>(parsed.into_parts())
+    })?;
+    let before = arena.stats();
+    assert_eq!(before.reserved_bytes, 4096);
+    assert_eq!(before.chunk_count, 1);
+    assert!(before.used_bytes < before.reserved_bytes);
+    let allocations = allocator.allocations.load(Ordering::Relaxed);
+    let unchanged = stanza.rescope_derive_in(StanzaNamespace::Server, &mut arena)?;
+    assert!(std::ptr::eq(
+        arena.get(stanza.data)?,
+        arena.get(unchanged.data)?
+    ));
+    assert_eq!(arena.stats(), before);
+    assert_eq!(allocator.allocations.load(Ordering::Relaxed), allocations);
+    let derived = stanza.rescope_derive_in(StanzaNamespace::Client, &mut arena)?;
+    assert_eq!(allocator.allocations.load(Ordering::Relaxed), allocations);
+    assert_eq!(arena.stats().reserved_bytes, before.reserved_bytes);
+    let mut destination = Arena::try_new_in(ArenaConfig::default(), allocator.clone())?;
+    let copied = stanza
+        .resolve(&arena)?
+        .rescope_in(StanzaNamespace::Client, &mut destination)?;
+    let after_copy = allocator.allocations.load(Ordering::Relaxed);
+    assert!(after_copy > allocations);
+    assert_eq!(snapshot(derived, &arena)?, snapshot(copied, &destination)?);
+    Ok(())
+}
+
+#[test]
+fn derive_in_place_fits_the_source_arena_limit() -> TestResult {
+    use std::fmt::Write as _;
+
+    let mut input = String::with_capacity(100_000);
+    input.push_str(concat!(
+        "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:server'>",
+        "<message from='example.org' to='example.net'"
+    ));
+    for index in 0..120 {
+        write!(input, " xmlns:n{index}='urn:test:{index}'")?;
+    }
+    input.push('>');
+    for _ in 0..1024 {
+        input.push_str(concat!(
+            "<body/>",
+            "<extension xmlns='urn:test:extension'><body xmlns='jabber:server'/></extension>"
+        ));
+    }
+    input.push_str("</message>");
+    let (stanza, mut arena) = futures_executor::block_on(async {
+        let mut parser = XmppParser::new(
+            input.as_bytes(),
+            ParserConfig {
+                max_stanza_bytes: NonZeroUsize::new(input.len()).ok_or("zero limit")?,
+                arena: ArenaConfig::default(),
+            },
+            GlobalChunkAllocator,
+        );
+        assert!(matches!(
+            parser.next_event().await?,
+            Some(StreamEvent::StreamStart { .. })
+        ));
+        let Some(StreamEvent::Stanza(parsed)) = parser.next_event().await? else {
+            return Err("expected stanza".into());
+        };
+        Ok::<_, Box<dyn std::error::Error>>(parsed.into_parts())
+    })?;
+    let before = arena.stats();
+    let original = snapshot(stanza, &arena)?;
+    let derived = stanza.rescope_derive_in(StanzaNamespace::Client, &mut arena)?;
+    let view = derived.resolve(&arena)?;
+    assert_eq!(view.namespace(), StanzaNamespace::Client);
+    assert_eq!(view.children()?.count(), 2048);
+    for child in view.children()? {
+        let child = child?;
+        if child.name() == "body" {
+            assert_eq!(child.namespace(), CLIENT_NAMESPACE);
+        } else {
+            assert_eq!(child.namespace(), "urn:test:extension");
+            assert!(child.child("body", SERVER_NAMESPACE)?.is_some());
+        }
+    }
+    assert!(arena.stats().used_bytes > before.used_bytes);
+    assert!(arena.stats().reserved_bytes <= ArenaConfig::default().max_reserved_bytes.get());
+    let case = Case {
+        name: "shared_bindings",
+        stanza,
+        arena,
+    };
+    assert_eq!(
+        snapshot(derived, &case.arena)?,
+        oracle(&case, StanzaNamespace::Client)??
+    );
+    assert_eq!(snapshot(stanza, &case.arena)?, original);
+    Ok(())
+}
+
+#[test]
+fn derive_in_place_rejects_another_arena() -> TestResult {
+    let (stanza, arena) = parse_stream_stanza(
+        StanzaNamespace::Server,
+        "<presence from='example.org' to='example.net'/>",
+    )?;
+    let mut other = Arena::try_new(ArenaConfig::default())?;
+    for target in [StanzaNamespace::Client, StanzaNamespace::Server] {
+        let before = other.stats();
+        assert_eq!(
+            stanza.rescope_derive_in(target, &mut other).err(),
+            Some(BuildError::Access(HandleError::WrongArena))
+        );
+        assert_eq!(other.stats(), before);
+    }
+    assert_eq!(stanza.resolve(&arena)?.namespace(), StanzaNamespace::Server);
+    Ok(())
+}

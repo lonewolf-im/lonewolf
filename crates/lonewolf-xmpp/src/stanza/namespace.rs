@@ -33,7 +33,39 @@ struct Binding {
 
 #[derive(Default)]
 pub(super) struct NamespaceCopies {
-    copied: HashMap<*const Binding, Handle<Binding>>,
+    inline: SmallVec<[(*const Binding, Handle<Binding>); 8]>,
+    copied: Option<HashMap<*const Binding, Handle<Binding>>>,
+}
+
+impl NamespaceCopies {
+    fn get(&self, original: *const Binding) -> Option<Handle<Binding>> {
+        match &self.copied {
+            Some(copied) => copied.get(&original).copied(),
+            None => self
+                .inline
+                .iter()
+                .find_map(|(source, copied)| (*source == original).then_some(*copied)),
+        }
+    }
+
+    fn insert(&mut self, original: *const Binding, copied: Handle<Binding>) {
+        if let Some(map) = &mut self.copied {
+            map.insert(original, copied);
+        } else if let Some((_, value)) = self
+            .inline
+            .iter_mut()
+            .find(|(source, _)| *source == original)
+        {
+            *value = copied;
+        } else if self.inline.len() < 8 {
+            self.inline.push((original, copied));
+        } else {
+            let mut map = HashMap::with_capacity(9);
+            map.extend(self.inline.drain(..));
+            map.insert(original, copied);
+            self.copied = Some(map);
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -122,6 +154,45 @@ impl NamespaceContext {
         self.copy_in(source, arena, copies, Some((from, to)))
     }
 
+    pub(super) fn rescope_shared_in<A: ChunkAllocator>(
+        self,
+        from: &str,
+        to: Handle<str>,
+        arena: &mut Arena<A>,
+        copies: &mut NamespaceCopies,
+    ) -> Result<Self, BuildError> {
+        let mut missing = SmallVec::<[Handle<Binding>; 8]>::new();
+        let mut current = self;
+        let mut result = Self::default();
+        while let Some(handle) = current.0 {
+            let binding = arena.get(handle)?;
+            if let Some(copied) = copies.get(std::ptr::from_ref(binding)) {
+                result = Self(Some(copied));
+                break;
+            }
+            missing.push(handle);
+            current = binding.parent;
+        }
+        for handle in missing.into_iter().rev() {
+            let original = std::ptr::from_ref(arena.get(handle)?);
+            let binding = *arena.get(handle)?;
+            let namespace =
+                if arena.get(binding.prefix)?.is_empty() && arena.get(binding.namespace)? == from {
+                    to
+                } else {
+                    binding.namespace
+                };
+            let copied = arena.try_alloc(Binding {
+                parent: result,
+                prefix: binding.prefix,
+                namespace,
+            })?;
+            copies.insert(original, copied);
+            result = Self(Some(copied));
+        }
+        Ok(result)
+    }
+
     fn copy_in<A: ChunkAllocator>(
         self,
         source: &impl ArenaRead,
@@ -134,8 +205,8 @@ impl NamespaceContext {
         let mut result = Self::default();
         while let Some(handle) = current.0 {
             let original = std::ptr::from_ref(source.get(handle)?);
-            if let Some(copied) = copies.copied.get(&original) {
-                result = Self(Some(*copied));
+            if let Some(copied) = copies.get(original) {
+                result = Self(Some(copied));
                 break;
             }
             missing.push(handle);
@@ -151,7 +222,7 @@ impl NamespaceContext {
             };
             result.bind(prefix, namespace, arena)?;
             if let Some(copied) = result.0 {
-                copies.copied.insert(std::ptr::from_ref(binding), copied);
+                copies.insert(std::ptr::from_ref(binding), copied);
             }
         }
         Ok(result)
@@ -472,6 +543,46 @@ mod tests {
     use crate::stanza::{CLIENT_NAMESPACE, SERVER_NAMESPACE};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn shared_context_copies_reuse_bindings_across_inline_promotion() -> TestResult {
+        let mut arena = Arena::try_new(ArenaConfig::default())?;
+        let to = arena.try_alloc_str(CLIENT_NAMESPACE)?;
+        let mut context = NamespaceContext::default();
+        context.bind("", SERVER_NAMESPACE, &mut arena)?;
+        let mut copies = NamespaceCopies::default();
+        for index in 0..64 {
+            context.bind("c", SERVER_NAMESPACE, &mut arena)?;
+            let copied =
+                context.rescope_shared_in(SERVER_NAMESPACE, to, &mut arena, &mut copies)?;
+            let repeated =
+                context.rescope_shared_in(SERVER_NAMESPACE, to, &mut arena, &mut copies)?;
+            let original = context.0.ok_or("missing source binding")?;
+            let head = copied.0.ok_or("missing copied binding")?;
+            let repeated = repeated.0.ok_or("missing repeated binding")?;
+            assert!(std::ptr::eq(arena.get(head)?, arena.get(repeated)?));
+            assert!(!std::ptr::eq(arena.get(head)?, arena.get(original)?));
+            let view = ContextView {
+                context: copied,
+                rescope: None,
+            };
+            assert_eq!(view.resolve("", &arena)?, Some(CLIENT_NAMESPACE));
+            assert_eq!(view.resolve("c", &arena)?, Some(SERVER_NAMESPACE));
+            assert!(std::ptr::eq(
+                arena.get(arena.get(head)?.prefix)?,
+                arena.get(arena.get(original)?.prefix)?
+            ));
+            if index < 7 {
+                assert!(copies.copied.is_none());
+                assert!(!copies.inline.spilled());
+            } else {
+                assert_eq!(copies.copied.as_ref().map(HashMap::len), Some(index + 2));
+                assert!(copies.inline.is_empty());
+                assert!(!copies.inline.spilled());
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn shared_heads_emit_declarations_when_substitution_changes() -> TestResult {

@@ -334,6 +334,46 @@ impl Stanza {
         })
     }
 
+    /// Re-scopes like [`StanzaRef::rescope_in`] inside the arena that owns this stanza.
+    ///
+    /// Returns the same validation errors, [`BuildError::Access`] for another arena,
+    /// or [`BuildError::Allocation`] if allocation fails.
+    pub fn rescope_derive_in<A: ChunkAllocator>(
+        &self,
+        namespace: StanzaNamespace,
+        arena: &mut Arena<A>,
+    ) -> Result<Stanza, BuildError> {
+        let data = *arena.get(self.data)?;
+        if data.header.namespace == namespace {
+            return Ok(*self);
+        }
+        let from = data.header.namespace.as_str();
+        let to = arena.try_alloc_str(namespace.as_str())?;
+        let mut copies = NamespaceCopies::default();
+        let namespaces = data
+            .namespaces
+            .rescope_shared_in(from, to, arena, &mut copies)?;
+        let mut children = SliceBuilder::from_slice(data.children);
+        for index in 0..data.children.get(arena)?.len() {
+            let child = data.children.get(arena)?[index];
+            if child.resolve(arena)?.namespace() == from {
+                let rescoped = child.rescope_shared_in(from, to, arena, &mut copies)?;
+                children.set(index, rescoped, arena)?;
+            }
+        }
+        StanzaBuilder {
+            arena,
+            header: Header {
+                namespace,
+                ..data.header
+            },
+            namespaces,
+            attributes: AttributesBuilder::from_slice(data.attributes),
+            children,
+        }
+        .build()
+    }
+
     /// Shares unchanged storage. Edits do not alter the source stanza.
     ///
     /// # Errors

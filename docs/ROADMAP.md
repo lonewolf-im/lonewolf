@@ -59,13 +59,14 @@ numbers or require unrelated features to ship together.
 
 ## Current development foundation
 
-The workspace version is 0.2.0. The [release notes](https://github.com/lonewolf-im/lonewolf/releases/tag/v0.2.0) describe
-the changes since v0.1.0. Development releases do not imply full server compliance.
+The workspace version is 0.3.0. The [release notes](https://github.com/lonewolf-im/lonewolf/releases/tag/v0.3.0) describe
+the changes since v0.2.0. Development releases do not imply full server compliance.
 
-The foundation includes local routing, roster and subscriptions, presence,
-offline storage and replay, STARTTLS, authentication, resource binding, and
-bounded connection limits. Logical sessions, transport ownership, and typed
-extension boundaries provide the starting points for later features.
+The foundation includes local and federated routing, roster and subscriptions,
+presence, offline storage and replay, STARTTLS and direct TLS, authentication,
+resource binding, and bounded connection limits. Logical sessions, transport
+ownership, and typed extension boundaries provide the starting points for later
+features.
 
 The RFC baseline is [RFC 6120](https://www.rfc-editor.org/rfc/rfc6120.html),
 [RFC 6121](https://www.rfc-editor.org/rfc/rfc6121.html),
@@ -85,7 +86,11 @@ tests and explicit policy choices. The completed [C2S tracker
 #136](https://github.com/lonewolf-im/lonewolf/issues/136), [RFC audit tracker
 #301](https://github.com/lonewolf-im/lonewolf/issues/301), and [extension tracker
 #234](https://github.com/lonewolf-im/lonewolf/issues/234) are starting evidence;
-they do not establish S2S or extension compliance.
+they do not establish S2S or extension compliance. The completed [federation
+tracker #542](https://github.com/lonewolf-im/lonewolf/issues/542), [bidirectional
+streams tracker #647](https://github.com/lonewolf-im/lonewolf/issues/647), and
+[direct TLS tracker #710](https://github.com/lonewolf-im/lonewolf/issues/710)
+record the additional federation and transport evidence.
 
 ## Desktop discovery, profiles, and synchronization
 
@@ -112,9 +117,11 @@ Milestone completion criteria:
 
 ## Basic desktop IM
 
-Implement authenticated federation and components, then built-in MUC and upload
-services. Federation must cover messages, IQs, subscriptions, presence, and
-service domains, including their certificate identities and error behavior.
+Version 0.3.0 includes authenticated federation for messages, IQs, subscriptions,
+presence, and registered service domains, with bidirectional streams and peer
+certificate revocation checks. See the [standards reference](STANDARDS.md#federation)
+for certificate requirements and delivery limits. Components, built-in MUC and
+upload services remain to be implemented.
 
 | XEP | Required scope | Basis |
 | --- | --- | --- |
@@ -161,8 +168,10 @@ Milestone completion criteria:
 
 ## Advanced desktop IM
 
-Implement capabilities and PEP before avatars and bookmarks. Extend MAM to room
-archives with room-specific access rules.
+Version 0.3.0 includes direct TLS (XEP-0368) and Private XML Storage (XEP-0049),
+which clients can use for legacy bookmarks. These features do not establish the
+full milestone. Implement capabilities and PEP before avatars and bookmarks.
+Extend MAM to room archives with room-specific access rules.
 
 | XEP | Required scope | Basis |
 | --- | --- | --- |
@@ -329,8 +338,8 @@ Release gate:
 Create a tracker for each feature or architectural milestone, with ordered
 sub-issues, dependencies, routing labels, and acceptance criteria. A release may
 span several trackers or ship completed features from a tracker whose broader
-milestone remains open. Discovery is the next planned implementation milestone;
-the order may change when feature dependencies permit it.
+milestone remains open. Components, rooms and uploads remain in the Basic
+desktop IM milestone; the order may change when feature dependencies permit it.
 
 Define each release's scope and verification checks for the features and
 dependencies it includes. Verify their interaction with existing supported

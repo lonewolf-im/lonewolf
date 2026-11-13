@@ -15,9 +15,9 @@ meant to be easy to set up, cheap to run, and able to grow into a cluster when y
 need one.
 
 > [!NOTE]
-> Lonewolf is early, pre-1.0 software. Today it hosts chat between accounts on
-> the domains you run. Federation with other XMPP servers is in progress, and
-> clustering comes later.
+> Lonewolf is early, pre-1.0 software. It hosts chat on your domains and
+> federates with other XMPP servers through certificate-authenticated TLS.
+> Clustering comes later.
 >
 > Most of Lonewolf's code, tests and docs are written with AI coding agents. The
 > maintainer sets the design and scope and reviews the changes.
@@ -34,13 +34,14 @@ need one.
 
 ## What works today
 
-- Chat between accounts on any domain you host, with several devices per account
+- Chat on your hosted domains and with users on other XMPP servers, with several
+  devices per account
 - Contact lists, presence subscriptions, and offline messages that keep their
   original timestamps
 - Message copies across your devices (Carbons), service discovery, vCard
-  profiles and ping
-- STARTTLS, SCRAM login with channel binding, and optional client-certificate
-  login
+  profiles, ping, software version queries and private client settings
+- STARTTLS and direct TLS, SCRAM login with channel binding, and optional
+  client-certificate login
 - TLS certificates from your own files or from Let's Encrypt
 - Account management with `lonewolfctl`, Prometheus metrics, structured logs and
   graceful shutdown
@@ -51,10 +52,9 @@ its limits.
 
 ## What's next
 
-Federation with other XMPP servers is being built on `main` but isn't in a
-release yet. After that, the [roadmap to 1.0](docs/ROADMAP.md) covers, in order:
+The [roadmap to 1.0](docs/ROADMAP.md) covers, in order:
 
-1. Group chats, file upload and the rest of basic desktop IM
+1. External components, group chats, file upload and the rest of basic desktop IM
 2. Message archives, Stream Management, blocking, avatars and bookmarks
 3. PostgreSQL storage and clustering
 4. Mobile and web support
@@ -71,7 +71,7 @@ a system linker, and an [XMPP client](https://xmpp.org/software/) to chat with.
 ### 1. Build it
 
 ```sh
-git clone https://github.com/lonewolf-im/lonewolf.git
+git clone --branch v0.3.0 https://github.com/lonewolf-im/lonewolf.git
 cd lonewolf
 cargo build --release --locked -p lonewolf -p lonewolfctl
 ```
@@ -164,6 +164,25 @@ This replaces the default `localhost` host with `example.com` and listens on all
 IPv4 interfaces. Relative paths are resolved from the directory you start the
 server in.
 
+### Federation and direct TLS
+
+A host with a configured certificate and a public DNS name federates by default,
+opening the server listener on `0.0.0.0:5269`. Publish an `_xmpp-server._tcp` SRV
+record for your domain and allow incoming TCP connections to that endpoint.
+Peers need a trusted certificate for their XMPP domain and SASL EXTERNAL;
+Server Dialback is not supported. The built-in `localhost` host stays local.
+Set `s2s.enabled = false` to disable federation globally, or
+`hosts.<domain>.federation = false` to keep one host local.
+
+For a dedicated direct-TLS endpoint, set `tls_mode = "direct"` in a
+`c2s.listeners` or `s2s.listeners` table and choose its address and port. These
+listener arrays replace their defaults, so include STARTTLS entries too if you
+want both modes. Publish `_xmpps-client._tcp` or `_xmpps-server._tcp` SRV records
+for the direct-TLS endpoints. Clients must send SNI for a configured host;
+servers must name a federating host or a registered service with a covering
+certificate. See the [configuration reference](examples/lonewolf.toml) and
+[federation rules](docs/STANDARDS.md#federation) for trust and delivery limits.
+
 ### Let's Encrypt
 
 To have Lonewolf get and renew the certificate for you, replace the file paths
@@ -187,6 +206,28 @@ listen = ["127.0.0.1:8080"]
 The certificates and ACME account live in `./data/lonewolf/acme.redb`, so keep it
 on durable storage. To test against Let's Encrypt's staging server first, see
 `directory_url` in the config reference.
+
+## Upgrading to v0.3.0
+
+Stop the server and back up its database and ACME state before upgrading. See the
+[v0.3.0 release notes](https://github.com/lonewolf-im/lonewolf/releases/tag/v0.3.0)
+for the full changes since v0.2.0.
+
+- Hosts with configured certificates and public DNS names now federate by
+  default. Use the opt-outs above if you want to keep them local.
+- Federation downloads CA-published CRLs over plain HTTP by default. Set
+  `s2s.tls.fetch_crls = false` to disable downloads. A configured
+  `s2s.tls.crls_path` uses only the local file. Downloaded checks reject verified
+  revocations and allow peers when revocation status is unknown.
+- The default client stanza limit is now 256 KiB, down from 512 KiB. Set
+  `limits.c2s.default.max_stanza_bytes` if your clients need a larger limit.
+- Account creation and password changes write SHA-512 credentials even when
+  SHA-512 login is disabled. Older binaries cannot read those account records.
+  Keep a backup from before those writes for rollback. Existing accounts need
+  a password replacement before opt-in SHA-512 login can work; see the
+  [authentication reference](docs/STANDARDS.md#core-protocols).
+- The benchmark executable and crate are now named `lonewolfbench`. Update
+  scripts that used `lonewolf-bench`.
 
 ## Managing accounts
 

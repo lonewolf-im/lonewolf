@@ -7,7 +7,7 @@
   <Project>
     <name>Lonewolf</name>
     <shortdesc xml:lang="en">A standalone XMPP server written in Rust</shortdesc>
-    <description xml:lang="en">Lonewolf is a self-hosted XMPP server written in Rust. It runs as a single binary with embedded storage, so there's no database to set up. It's still early: today it handles chat between accounts on the domains you run, and federation with other servers is on the way. Opt-in SCRAM-SHA-512 and SCRAM-SHA-512-PLUS implement expired Internet-Draft draft-melnikov-scram-sha-512-05, not an RFC or an IANA-registered SASL mechanism. SHA-512 authentication is not in a release yet.</description>
+    <description xml:lang="en">Lonewolf is a self-hosted XMPP server written in Rust. It runs as a single binary with embedded storage, so there's no database to set up. It supports chat on hosted domains and certificate-authenticated federation with other XMPP servers, including bidirectional streams and direct TLS. It remains pre-1.0 software. Opt-in SCRAM-SHA-512 and SCRAM-SHA-512-PLUS implement expired Internet-Draft draft-melnikov-scram-sha-512-05, not an RFC or an IANA-registered SASL mechanism.</description>
     <created>2026-09-17</created>
 
     <homepage rdf:resource="https://github.com/lonewolf-im/lonewolf"/>
@@ -34,6 +34,14 @@
         <browse rdf:resource="https://github.com/lonewolf-im/lonewolf"/>
       </GitRepository>
     </repository>
+
+    <release>
+      <Version>
+        <revision>0.3.0</revision>
+        <created>2026-11-13</created>
+        <file-release rdf:resource="https://github.com/lonewolf-im/lonewolf/archive/refs/tags/v0.3.0.tar.gz"/>
+      </Version>
+    </release>
 
     <release>
       <Version>
@@ -73,7 +81,6 @@
         <xmpp:status>complete</xmpp:status>
         <xmpp:version>2.5.0</xmpp:version>
         <xmpp:since>0.2.0</xmpp:since>
-        <xmpp:note xml:lang="en">Federation support is not in a release yet.</xmpp:note>
       </xmpp:SupportedXep>
     </implements>
     <implements>
@@ -81,7 +88,8 @@
         <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0049.html"/>
         <xmpp:status>complete</xmpp:status>
         <xmpp:version>1.2</xmpp:version>
-        <xmpp:note xml:lang="en">Stores private XML for the account owner's own clients, with per-account limits. Requests from other users and federated servers are refused, and so are reserved namespaces. Not in a release yet.</xmpp:note>
+        <xmpp:since>0.3.0</xmpp:since>
+        <xmpp:note xml:lang="en">Stores private XML for the account owner's own clients, with per-account limits. Requests from other users and federated servers are refused, and so are reserved namespaces.</xmpp:note>
       </xmpp:SupportedXep>
     </implements>
     <implements>
@@ -90,7 +98,7 @@
         <xmpp:status>partial</xmpp:status>
         <xmpp:version>1.3.0</xmpp:version>
         <xmpp:since>0.2.0</xmpp:since>
-        <xmpp:note xml:lang="en">Public vCards for local and federated users. Only owners can edit them; contents are not validated. Federation support is not in a release yet.</xmpp:note>
+        <xmpp:note xml:lang="en">Public vCards for local and federated users. Only owners can edit them; contents are not validated.</xmpp:note>
       </xmpp:SupportedXep>
     </implements>
     <implements>
@@ -98,7 +106,8 @@
         <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0092.html"/>
         <xmpp:status>complete</xmpp:status>
         <xmpp:version>1.1</xmpp:version>
-        <xmpp:note xml:lang="en">Answers for served domains, including queries from federated servers. The operating system is shared only when enabled. Not in a release yet.</xmpp:note>
+        <xmpp:since>0.3.0</xmpp:since>
+        <xmpp:note xml:lang="en">Answers for served domains, including queries from federated servers. The operating system is shared only when enabled.</xmpp:note>
       </xmpp:SupportedXep>
     </implements>
     <implements>
@@ -115,7 +124,7 @@
         <xmpp:status>partial</xmpp:status>
         <xmpp:version>1.2</xmpp:version>
         <xmpp:since>0.1.0</xmpp:since>
-        <xmpp:note xml:lang="en">Certificate login for clients and servers. S2S requires serverAuth certificates and checks revocation with CRLs downloaded from peer certificates or read from a configured file; unknown revocation status with downloaded CRLs does not block peers. Server-to-server support is not in a release yet.</xmpp:note>
+        <xmpp:note xml:lang="en">Certificate login for clients and servers. S2S requires serverAuth certificates and checks revocation with CRLs downloaded from peer certificates or read from a configured file; unknown revocation status with downloaded CRLs does not block peers.</xmpp:note>
       </xmpp:SupportedXep>
     </implements>
     <implements>
@@ -124,7 +133,7 @@
         <xmpp:status>partial</xmpp:status>
         <xmpp:version>2.0.1</xmpp:version>
         <xmpp:since>0.2.0</xmpp:since>
-        <xmpp:note xml:lang="en">Answers pings but never sends its own. Federation support is not in a release yet.</xmpp:note>
+        <xmpp:note xml:lang="en">Answers pings but never sends its own.</xmpp:note>
       </xmpp:SupportedXep>
     </implements>
     <implements>
@@ -141,7 +150,7 @@
         <xmpp:status>partial</xmpp:status>
         <xmpp:version>1.0.1</xmpp:version>
         <xmpp:since>0.2.0</xmpp:since>
-        <xmpp:note xml:lang="en">Copies local and federated messages across sessions that enable Carbons. Private group-chat messages receive no special handling. Federation support is not in a release yet.</xmpp:note>
+        <xmpp:note xml:lang="en">Copies local and federated messages across sessions that enable Carbons. Private group-chat messages receive no special handling.</xmpp:note>
       </xmpp:SupportedXep>
     </implements>
     <implements>
@@ -149,7 +158,8 @@
         <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0288.html"/>
         <xmpp:status>partial</xmpp:status>
         <xmpp:version>1.0.1</xmpp:version>
-        <xmpp:note xml:lang="en">Bidirectional streams with certificate authentication and limits-bearing requests for one domain pair per connection, on connections in either direction. Server Dialback and additional domains on a shared connection are not supported. Not in a release yet.</xmpp:note>
+        <xmpp:since>0.3.0</xmpp:since>
+        <xmpp:note xml:lang="en">Bidirectional streams with certificate authentication and limits-bearing requests for one domain pair per connection, on connections in either direction. Server Dialback and additional domains on a shared connection are not supported.</xmpp:note>
       </xmpp:SupportedXep>
     </implements>
     <implements>
@@ -166,7 +176,8 @@
         <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0368.html"/>
         <xmpp:status>complete</xmpp:status>
         <xmpp:version>1.1.0</xmpp:version>
-        <xmpp:note xml:lang="en">Outbound federation discovers STARTTLS and direct TLS together through SRV records, or uses explicit routes. Dedicated direct-TLS client listeners select configured hosts through SNI; direct-TLS federation listeners also accept registered services with covering certificates. Not in a release yet.</xmpp:note>
+        <xmpp:since>0.3.0</xmpp:since>
+        <xmpp:note xml:lang="en">Outbound federation discovers STARTTLS and direct TLS together through SRV records, or uses explicit routes. Dedicated direct-TLS client listeners select configured hosts through SNI; direct-TLS federation listeners also accept registered services with covering certificates.</xmpp:note>
       </xmpp:SupportedXep>
     </implements>
     <implements>
@@ -182,7 +193,8 @@
         <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0478.html"/>
         <xmpp:status>partial</xmpp:status>
         <xmpp:version>0.2.0</xmpp:version>
-        <xmpp:note xml:lang="en">S2S feature and bidi limits advertisements with per-connection peer byte limits. C2S announcements are not supported. Peer idle advice does not trigger keepalives. Not in a release yet.</xmpp:note>
+        <xmpp:since>0.3.0</xmpp:since>
+        <xmpp:note xml:lang="en">S2S feature and bidi limits advertisements with per-connection peer byte limits. C2S announcements are not supported. Peer idle advice does not trigger keepalives.</xmpp:note>
       </xmpp:SupportedXep>
     </implements>
   </Project>

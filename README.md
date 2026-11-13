@@ -15,9 +15,9 @@ meant to be easy to set up, cheap to run, and able to grow into a cluster when y
 need one.
 
 > [!NOTE]
-> Lonewolf is early, pre-1.0 software. Today it hosts chat between accounts on
-> the domains you run. Federation with other XMPP servers is in progress, and
-> clustering comes later.
+> Lonewolf is early, pre-1.0 software. It hosts chat on your domains and
+> federates with other XMPP servers through certificate-authenticated TLS.
+> Clustering comes later.
 >
 > Most of Lonewolf's code, tests and docs are written with AI coding agents. The
 > maintainer sets the design and scope and reviews the changes.
@@ -34,13 +34,14 @@ need one.
 
 ## What works today
 
-- Chat between accounts on any domain you host, with several devices per account
+- Chat on your hosted domains and with users on other XMPP servers, with several
+  devices per account
 - Contact lists, presence subscriptions, and offline messages that keep their
   original timestamps
 - Message copies across your devices (Carbons), service discovery, vCard
-  profiles and ping
-- STARTTLS, SCRAM login with channel binding, and optional client-certificate
-  login
+  profiles, ping, software version queries and private client settings
+- STARTTLS and direct TLS, SCRAM login with channel binding, and optional
+  client-certificate login
 - TLS certificates from your own files or from Let's Encrypt
 - Account management with `lonewolfctl`, Prometheus metrics, structured logs and
   graceful shutdown
@@ -51,10 +52,9 @@ its limits.
 
 ## What's next
 
-Federation with other XMPP servers is being built on `main` but isn't in a
-release yet. After that, the [roadmap to 1.0](docs/ROADMAP.md) covers, in order:
+The [roadmap to 1.0](docs/ROADMAP.md) covers, in order:
 
-1. Group chats, file upload and the rest of basic desktop IM
+1. External components, group chats, file upload and the rest of basic desktop IM
 2. Message archives, Stream Management, blocking, avatars and bookmarks
 3. PostgreSQL storage and clustering
 4. Mobile and web support
@@ -71,7 +71,7 @@ a system linker, and an [XMPP client](https://xmpp.org/software/) to chat with.
 ### 1. Build it
 
 ```sh
-git clone https://github.com/lonewolf-im/lonewolf.git
+git clone --branch v0.3.0 https://github.com/lonewolf-im/lonewolf.git
 cd lonewolf
 cargo build --release --locked -p lonewolf -p lonewolfctl
 ```

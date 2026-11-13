@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::io;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -216,15 +216,18 @@ impl Listeners {
             .await
             .map(Self)
     }
-    pub(crate) fn addresses(&self) -> &[SocketAddr] {
-        self.0.addresses()
+    pub(crate) fn into_inner(self) -> ListenerSet {
+        self.0
     }
+    #[cfg(test)]
     pub(crate) fn stop(&mut self, deadline: Instant) {
         self.0.stop(deadline);
     }
+    #[cfg(test)]
     pub(crate) async fn failure(&mut self) -> io::Error {
         self.0.failure().await
     }
+    #[cfg(test)]
     pub(crate) async fn join(&mut self) -> io::Result<()> {
         self.0.join().await
     }

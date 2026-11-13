@@ -214,7 +214,10 @@ fn fatal_accept_is_reported_before_a_pending_connection_drains() -> TestResult {
                 )
                 .await;
                 let closed = listener.close().await;
-                result.and(closed)
+                Ok::<_, io::Error>(ListenerOutcome {
+                    result: result.result.and(closed),
+                    drain_deadline_exceeded: result.drain_deadline_exceeded,
+                })
             })
             .await?;
         let address = readiness.await?;
@@ -224,7 +227,12 @@ fn fatal_accept_is_reported_before_a_pending_connection_drains() -> TestResult {
         let mut task = Box::pin(task);
         assert!(poll!(task.as_mut()).is_pending());
         stop.send(Instant::now()).map_err(|_| "stop dropped")?;
-        assert_eq!(task.await?.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+        let outcome = task.await??;
+        assert!(outcome.drain_deadline_exceeded);
+        assert_eq!(
+            outcome.result.unwrap_err().kind(),
+            io::ErrorKind::BrokenPipe
+        );
         dispatcher.shutdown(TIMEOUT).await?;
         Ok(())
     }))?
@@ -250,6 +258,7 @@ fn deadline_errors_keep_each_protocols_exact_text() -> TestResult {
                 .unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::TimedOut);
             assert_eq!(error.to_string(), message);
+            assert!(is_drain_deadline(&error));
         }
         Ok(())
     })
@@ -362,6 +371,109 @@ fn bound_registrations_follow_worker_bind_close_and_startup_rollback() -> TestRe
             }
             dispatcher.shutdown(TIMEOUT).await?;
         }
+        Ok(())
+    }))?
+}
+
+#[test]
+fn ordinary_timeouts_do_not_claim_listener_drain_exhaustion() {
+    for message in [
+        "c2s connections exceeded shutdown deadline",
+        "s2s listener shutdown timed out",
+    ] {
+        let error = io::Error::new(io::ErrorKind::TimedOut, message);
+        assert!(!is_drain_deadline(&error));
+    }
+}
+
+#[test]
+fn later_worker_deadline_survives_an_earlier_join_error() -> TestResult {
+    Runtime::new()?.block_on(compio::time::timeout(TIMEOUT, async {
+        let dispatcher = dispatcher()?;
+        let (stop, _stopped) = oneshot::channel();
+        let mut listeners = ListenerSet::with_test_channels(
+            ListenerKind::C2s,
+            stop,
+            async_channel::bounded(1).1,
+            1,
+        );
+        let (first, ready) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        listeners.test_tasks().push(
+            dispatcher
+                .handle()
+                .dispatch_at(0, move |_| async move {
+                    let _ = first.send(());
+                    ListenerOutcome::from(Err(io::Error::other("earlier worker error")))
+                })
+                .await?,
+        );
+        listeners.test_tasks().push(
+            dispatcher
+                .handle()
+                .dispatch_at(0, move |_| async move {
+                    let _ = released.await;
+                    ListenerOutcome {
+                        result: Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            DrainDeadline(ListenerKind::C2s),
+                        )),
+                        drain_deadline_exceeded: true,
+                    }
+                })
+                .await?,
+        );
+        {
+            let mut joined = pin!(listeners.join());
+            assert!(poll!(joined.as_mut()).is_pending());
+            ready.await?;
+            release.send(()).map_err(|_| "worker gate dropped")?;
+            assert_eq!(
+                joined.await.unwrap_err().to_string(),
+                "earlier worker error"
+            );
+        }
+        assert!(listeners.drain_deadline_exceeded());
+        listeners.join().await?;
+        assert!(listeners.drain_deadline_exceeded());
+        dispatcher.shutdown(TIMEOUT).await?;
+        Ok(())
+    }))?
+}
+
+#[test]
+fn failure_consumption_preserves_deadline_metadata_for_join() -> TestResult {
+    Runtime::new()?.block_on(compio::time::timeout(TIMEOUT, async {
+        let dispatcher = dispatcher()?;
+        for marked in [false, true] {
+            let (stop, _stopped) = oneshot::channel();
+            let mut listeners = ListenerSet::with_test_channels(
+                ListenerKind::S2s,
+                stop,
+                async_channel::bounded(1).1,
+                1,
+            );
+            listeners.test_tasks().push(
+                dispatcher
+                    .handle()
+                    .dispatch_at(0, move |_| async move {
+                        ListenerOutcome {
+                            result: Err(io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "s2s listener shutdown timed out",
+                            )),
+                            drain_deadline_exceeded: marked,
+                        }
+                    })
+                    .await?,
+            );
+            assert_eq!(listeners.failure().await.kind(), io::ErrorKind::TimedOut);
+            assert_eq!(listeners.drain_deadline_exceeded(), marked);
+            listeners.join().await?;
+            listeners.join().await?;
+            assert_eq!(listeners.drain_deadline_exceeded(), marked);
+        }
+        dispatcher.shutdown(TIMEOUT).await?;
         Ok(())
     }))?
 }

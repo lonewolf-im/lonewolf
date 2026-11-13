@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::fmt;
 use std::future::{Future, pending};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -80,14 +81,49 @@ impl std::error::Error for StartError {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct ListenerOutcome {
+    pub(crate) result: io::Result<()>,
+    pub(crate) drain_deadline_exceeded: bool,
+}
+
+impl From<io::Result<()>> for ListenerOutcome {
+    fn from(result: io::Result<()>) -> Self {
+        Self {
+            result,
+            drain_deadline_exceeded: false,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DrainDeadline(ListenerKind);
+
+impl fmt::Display for DrainDeadline {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self.0 {
+            ListenerKind::C2s => "c2s connections exceeded shutdown deadline",
+            ListenerKind::S2s => "s2s listener shutdown timed out",
+        })
+    }
+}
+impl std::error::Error for DrainDeadline {}
+
+fn is_drain_deadline(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|source| source.is::<DrainDeadline>())
+}
+
 pub(crate) struct ListenerSet {
     kind: ListenerKind,
     stop: Option<oneshot::Sender<Instant>>,
-    tasks: FuturesUnordered<Task<io::Result<()>>>,
+    tasks: FuturesUnordered<Task<ListenerOutcome>>,
     failures: async_channel::Receiver<io::Error>,
     addresses: Vec<SocketAddr>,
     listener_count: usize,
     worker_count: usize,
+    drain_deadline_exceeded: bool,
 }
 
 impl ListenerSet {
@@ -117,6 +153,7 @@ impl ListenerSet {
             addresses: Vec::with_capacity(specs.len()),
             listener_count: specs.len(),
             worker_count: dispatcher.worker_count(),
+            drain_deadline_exceeded: false,
         };
         let started: io::Result<()> = async {
             for (listener_id, mut spec) in specs.into_iter().enumerate() {
@@ -133,7 +170,7 @@ impl ListenerSet {
                     });
                     let task = dispatcher
                         .dispatch_at(worker_id, move |context| async move {
-                            let result = async {
+                            let result: io::Result<ListenerOutcome> = async {
                                 let listener = bind(address).await?;
                                 let bound = listener.local_addr()?;
                                 let _registration = handler.listener_bound(ListenerSlot {
@@ -141,20 +178,34 @@ impl ListenerSet {
                                     worker_id,
                                 });
                                 if ready.send(bound).is_err() {
-                                    return Ok(());
+                                    return Ok(ListenerOutcome::from(Ok(())));
                                 }
-                                run_listener(listener, context, control, kind, listener_id, handler)
-                                    .await
+                                Ok(run_listener(
+                                    listener,
+                                    context,
+                                    control,
+                                    kind,
+                                    listener_id,
+                                    handler,
+                                )
+                                .await)
                             }
                             .await;
-                            result.map_err(|error| listener_error(listener_id, worker_id, error))
+                            let mut outcome = match result {
+                                Ok(outcome) => outcome,
+                                Err(error) => ListenerOutcome::from(Err(error)),
+                            };
+                            outcome.result = outcome
+                                .result
+                                .map_err(|error| listener_error(listener_id, worker_id, error));
+                            outcome
                         })
                         .await
                         .map_err(|error| listener_error(listener_id, worker_id, error))?;
                     match readiness.await {
                         Ok(bound) => address = bound,
                         Err(_) => {
-                            task.await.map_err(io::Error::other)??;
+                            task.await.map_err(io::Error::other)?.result?;
                             return Err(io::Error::other(match kind {
                                 ListenerKind::C2s => {
                                     "c2s listener stopped before reporting readiness"
@@ -212,12 +263,17 @@ impl ListenerSet {
             Either::Right((task, _)) => task,
         };
         match task {
-            Some(Ok(Err(error))) => error,
+            Some(Ok(outcome)) => {
+                self.drain_deadline_exceeded |= outcome.drain_deadline_exceeded;
+                match outcome.result {
+                    Err(error) => error,
+                    Ok(()) => io::Error::other(match self.kind {
+                        ListenerKind::C2s => "c2s listener stopped unexpectedly",
+                        ListenerKind::S2s => "s2s listener stopped unexpectedly",
+                    }),
+                }
+            }
             Some(Err(error)) => io::Error::other(error),
-            Some(Ok(Ok(()))) => io::Error::other(match self.kind {
-                ListenerKind::C2s => "c2s listener stopped unexpectedly",
-                ListenerKind::S2s => "s2s listener stopped unexpectedly",
-            }),
             None => pending().await,
         }
     }
@@ -225,7 +281,14 @@ impl ListenerSet {
     pub(crate) async fn join(&mut self) -> io::Result<()> {
         let mut result = Ok(());
         while let Some(task) = self.tasks.next().await {
-            result = result.and(task.map_err(io::Error::other).and_then(|result| result));
+            let current = match task {
+                Ok(outcome) => {
+                    self.drain_deadline_exceeded |= outcome.drain_deadline_exceeded;
+                    outcome.result
+                }
+                Err(error) => Err(io::Error::other(error)),
+            };
+            result = result.and(current);
         }
         for listener_id in 0..std::mem::take(&mut self.listener_count) {
             match self.kind {
@@ -243,6 +306,9 @@ impl ListenerSet {
         }
         result
     }
+    pub(crate) fn drain_deadline_exceeded(&self) -> bool {
+        self.drain_deadline_exceeded
+    }
     #[cfg(test)]
     pub(crate) fn with_test_channels(
         kind: ListenerKind,
@@ -258,10 +324,11 @@ impl ListenerSet {
             addresses: Vec::new(),
             listener_count: 0,
             worker_count,
+            drain_deadline_exceeded: false,
         }
     }
     #[cfg(test)]
-    pub(crate) fn test_tasks(&mut self) -> &mut FuturesUnordered<Task<io::Result<()>>> {
+    pub(crate) fn test_tasks(&mut self) -> &mut FuturesUnordered<Task<ListenerOutcome>> {
         &mut self.tasks
     }
 }
@@ -286,7 +353,7 @@ pub(crate) async fn run_listener<H: AcceptHandler>(
     kind: ListenerKind,
     listener_id: usize,
     handler: H,
-) -> io::Result<()> {
+) -> ListenerOutcome {
     let worker_id = context.worker.index;
     let result = run_listener_with_accept(
         &listener,
@@ -307,7 +374,10 @@ pub(crate) async fn run_listener<H: AcceptHandler>(
             tracing::debug!(listener_id, worker_id, "s2s TCP worker listener stopped")
         }
     }
-    result.and(closed)
+    ListenerOutcome {
+        result: result.result.and(closed),
+        drain_deadline_exceeded: result.drain_deadline_exceeded,
+    }
 }
 
 async fn run_listener_with_accept<H, F>(
@@ -318,7 +388,7 @@ async fn run_listener_with_accept<H, F>(
     listener_id: usize,
     handler: H,
     mut accept_next: impl FnMut() -> F,
-) -> io::Result<()>
+) -> ListenerOutcome
 where
     H: AcceptHandler,
     F: Future<Output = io::Result<(TcpStream, SocketAddr)>>,
@@ -336,13 +406,19 @@ where
         ListenerKind::C2s => tracing::debug!(
             listener_id,
             worker_id,
-            port = listener.local_addr()?.port(),
+            port = match listener.local_addr() {
+                Ok(address) => address.port(),
+                Err(error) => return ListenerOutcome::from(Err(error)),
+            },
             "c2s TCP worker listener started"
         ),
         ListenerKind::S2s => tracing::debug!(
             listener_id,
             worker_id,
-            port = listener.local_addr()?.port(),
+            port = match listener.local_addr() {
+                Ok(address) => address.port(),
+                Err(error) => return ListenerOutcome::from(Err(error)),
+            },
             "s2s TCP worker listener started"
         ),
     }
@@ -437,7 +513,11 @@ where
     })
     .await;
     handler.active_connections(0);
-    result.and(drained)
+    let drain_deadline_exceeded = drained.as_ref().err().is_some_and(is_drain_deadline);
+    ListenerOutcome {
+        result: result.and(drained),
+        drain_deadline_exceeded,
+    }
 }
 
 pub(crate) async fn drain_connections<F: Future<Output = ()>, S: Unpin>(
@@ -452,15 +532,7 @@ pub(crate) async fn drain_connections<F: Future<Output = ()>, S: Unpin>(
         }
     })
     .await
-    .map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::TimedOut,
-            match kind {
-                ListenerKind::C2s => "c2s connections exceeded shutdown deadline",
-                ListenerKind::S2s => "s2s listener shutdown timed out",
-            },
-        )
-    })
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, DrainDeadline(kind)))
 }
 
 enum ListenerEvent {

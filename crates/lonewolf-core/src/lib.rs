@@ -33,6 +33,7 @@ mod connection;
 mod delivery;
 mod error;
 pub mod hosts;
+mod lifecycle;
 mod logging;
 mod metrics;
 mod order;
@@ -55,6 +56,7 @@ mod xml_stream;
 use config::Config;
 pub use error::RunError;
 use hosts::Hosts;
+use lifecycle::{ServiceJoin, Serving};
 pub use router::RouterFailure;
 use router::local::LocalRouter;
 use router::{Router, ServiceRoute};
@@ -179,10 +181,7 @@ fn run_internal(
         runtime.block_on(async {
             let mut stop_signal = pin!(shutdown::wait());
             let mut acme = None;
-            let mut listeners = None;
-            let mut s2s_listeners = None;
-            let mut remote = None;
-            let mut router = None;
+            let mut serving = Serving::new();
             #[cfg(feature = "test-support")]
             let mut observed_s2s_metrics = None;
             #[cfg(feature = "test-support")]
@@ -197,7 +196,7 @@ fn run_internal(
                 .await?
                 {
                     Some(loaded) => acme = loaded,
-                    None => return Ok(()),
+                    None => return Ok(None),
                 }
                 let storage = stores.storage(account_store)?;
                 for factory in lonewolf_extension::builtin(build.version) {
@@ -313,7 +312,7 @@ fn run_internal(
                         trust: Arc::clone(&trust),
                         revocation: s2s::revocation::PeerRevocation::new(&config.s2s, &config.limits.s2s, trust, Arc::clone(&resolver), Arc::clone(metrics), recheck_interval).map_err(|error| RunError::S2s(io::Error::other(error)))?,
                     };
-                    remote = Some(s2s::outbound::RemoteRouter::new(
+                    serving.remote = Some(s2s::outbound::RemoteRouter::new(
                         hosts.clone(),
                         peers.clone(),
                         resolver,
@@ -329,7 +328,7 @@ fn run_internal(
                     None
                 };
                 for domain in services.keys() {
-                    if remote.is_some() && hosts.certificate_host_for(domain).is_some() {
+                    if serving.remote.is_some() && hosts.certificate_host_for(domain).is_some() {
                         tracing::info!(service_domain = %domain, "s2s service domain federates");
                     } else {
                         tracing::info!(service_domain = %domain, "s2s service domain cannot federate");
@@ -346,17 +345,17 @@ fn run_internal(
                 let serving_router = Router::new(hosts.clone(), local)
                     .with_extensions(enabled_extensions)
                     .with_services(services);
-                let serving_router = if let Some(remote) = &remote {
+                let serving_router = if let Some(remote) = &serving.remote {
                     serving_router.with_remote(remote.clone())
                 } else {
                     serving_router
                 };
-                let serving_router = router.insert(serving_router);
+                let serving_router = serving.router.insert(serving_router);
                 serving_router.register_metrics(server_metrics.registry());
                 let router_handle = serving_router.handle();
                 let deletion_router = router_handle.clone();
                 let deletion_storage = storage.clone();
-                let listeners = listeners.insert(
+                serving.c2s = Some(
                     c2s::Listeners::start(
                         &config.c2s,
                         &config.limits.c2s,
@@ -371,10 +370,10 @@ fn run_internal(
                     .map_err(|failure| {
                         shutdown_deadline = Some(failure.deadline);
                         RunError::C2s(failure.error)
-                    })?,
+                    })?.into_inner(),
                 );
                 if let (Some(metrics), Some(peers)) = (s2s_metrics, s2s_peers) {
-                    s2s_listeners = Some(
+                    serving.s2s = Some(
                         s2s::inbound::S2sListeners::start(
                             &config.s2s,
                             &config.limits.s2s,
@@ -392,7 +391,7 @@ fn run_internal(
                         .map_err(|failure| {
                             shutdown_deadline = Some(failure.deadline);
                             RunError::S2s(failure.error)
-                        })?,
+                        })?.into_inner(),
                     );
                 }
                 let registry = server_metrics.into_registry();
@@ -400,15 +399,13 @@ fn run_internal(
                 if s2s_shutdown_state.is_some() {
                     observed_registry = Some(Arc::clone(&registry));
                 }
-                run_services(
+                Ok(Some(run_services(
                     BackgroundServices {
                         admin,
                         metrics: metrics_server.map(|server| (server, registry)),
                         acme: acme.as_mut(),
                     },
-                    listeners,
-                    s2s_listeners.as_mut(),
-                    serving_router,
+                    &mut serving,
                     &mut shutdown_deadline,
                     stop_signal.as_mut(),
                     account_deletion::run(
@@ -418,58 +415,31 @@ fn run_internal(
                         &stanza_pool,
                     ),
                 )
-                .await
+                .await))
             }
             .await;
             let deadline =
                 shutdown_deadline.unwrap_or_else(|| Instant::now() + WORKER_SHUTDOWN_GRACE);
-            if let Err(RunError::Acme { phase, .. }) = &result {
+            let failure = match &result {
+                Err(error) => Some(error),
+                Ok(Some(services)) => services.primary.as_ref().err(),
+                Ok(None) => None,
+            };
+            if let Some(RunError::Acme { phase, .. }) = failure {
                 tracing::error!(phase, "ACME service failed");
             }
-            if let Some(router) = &router {
-                router.stop();
-            }
-            if let Some(remote) = &remote {
-                remote.stop();
-            }
-            if let Some(listeners) = listeners.as_mut() {
-                listeners.stop(deadline);
-            }
-            if let Some(listeners) = s2s_listeners.as_mut() {
-                listeners.stop(deadline);
-            }
-            let s2s_stopped = match s2s_listeners.as_mut() {
-                Some(listeners) => compio::time::timeout_at(deadline, listeners.join())
-                    .await
-                    .unwrap_or_else(|_| Err(shutdown_timeout()))
-                    .map_err(RunError::S2s),
-                None => Ok(()),
-            };
-            let acme_stopped = match acme.as_mut() {
-                Some(acme) => acme.drain(deadline).await,
-                None => Ok(()),
-            };
-            let listeners_stopped = match listeners {
-                Some(mut listeners) => {
-                    listeners.stop(deadline);
-                    compio::time::timeout_at(deadline, listeners.join())
-                        .await
-                        .unwrap_or_else(|_| Err(shutdown_timeout()))
-                        .map_err(RunError::C2s)
+            serving.stop(deadline);
+            let joined = serving.join(deadline, async {
+                match acme.as_mut() {
+                    Some(acme) => acme.drain(deadline).await,
+                    None => Ok(()),
                 }
-                None => Ok(()),
-            };
-            let remote_stopped = match &remote {
-                Some(remote) => remote.join(deadline).await.map_err(RunError::S2s),
-                None => Ok(()),
-            };
-            let router_stopped = match router {
-                Some(router) => compio::time::timeout_at(deadline, router.shutdown())
-                    .await
-                    .unwrap_or_else(|_| Err(shutdown_timeout()))
-                    .map_err(RunError::RouterShutdown),
-                None => Ok(()),
-            };
+            }).await;
+            if let Ok(Some(services)) = &result
+                && let Some(phase) = joined.acme_service_failure_phase(services)
+            {
+                tracing::error!(phase, "ACME service failed");
+            }
             let stopped = dispatcher
                 .shutdown_at(deadline)
                 .await
@@ -477,13 +447,10 @@ fn run_internal(
             if stopped.is_ok() {
                 tracing::info!("core dispatcher stopped");
             }
-            result
-                .and(stopped)
-                .and(listeners_stopped)
-                .and(s2s_stopped)
-                .and(remote_stopped)
-                .and(router_stopped)
-                .and(acme_stopped)?;
+            match result {
+                Ok(Some(services)) => joined.normal(services, stopped),
+                other => joined.startup(other.map(|_| ()), stopped),
+            }?;
             #[cfg(feature = "test-support")]
             if let Some(destination) = s2s_shutdown_state
                 && let Some(metrics) = observed_s2s_metrics
@@ -528,24 +495,22 @@ struct BackgroundServices<'a> {
 
 async fn run_services<A: ChunkAllocator + Clone>(
     background: BackgroundServices<'_>,
-    listeners: &mut c2s::Listeners,
-    mut s2s_listeners: Option<&mut s2s::inbound::S2sListeners>,
-    router: &mut Router<A>,
+    serving: &mut Serving<A>,
     shutdown_deadline: &mut Option<Instant>,
     stop_signal: impl Future<Output = io::Result<()>>,
     deletions: impl Future<Output = ()>,
-) -> Result<(), RunError> {
-    let remote = router.handle().remote_router().cloned();
+) -> ServiceJoin {
     let BackgroundServices {
         admin,
         metrics,
         acme,
     } = background;
     let readiness = readiness::message(
-        listeners.addresses(),
-        s2s_listeners
+        serving
+            .c2s
             .as_ref()
-            .map(|listeners| listeners.addresses()),
+            .map_or(&[], |listeners| listeners.addresses()),
+        serving.s2s.as_ref().map(|listeners| listeners.addresses()),
         metrics.as_ref().map(|(server, _)| server.local_addr()),
     );
     let (stop_metrics, metrics_stopped) = oneshot::channel::<()>();
@@ -589,6 +554,9 @@ async fn run_services<A: ChunkAllocator + Clone>(
         }
     });
     let (primary, services_done) = {
+        let router = &mut serving.router;
+        let listeners = &mut serving.c2s;
+        let s2s_listeners = &mut serving.s2s;
         let external_shutdown = async {
             readiness::notify(&readiness);
             tracing::info!("waiting for stop signal... (press Ctrl+C to stop the server)");
@@ -600,7 +568,13 @@ async fn run_services<A: ChunkAllocator + Clone>(
                             None => pending().await,
                         }
                     };
-                    match select(pin!(listeners.failure()), pin!(s2s_failure)).await {
+                    let c2s_failure = async {
+                        match listeners.as_mut() {
+                            Some(listeners) => listeners.failure().await,
+                            None => pending().await,
+                        }
+                    };
+                    match select(pin!(c2s_failure), pin!(s2s_failure)).await {
                         Either::Left((error, _)) => RunError::C2s(error),
                         Either::Right((error, _)) => RunError::S2s(error),
                     }
@@ -610,7 +584,13 @@ async fn run_services<A: ChunkAllocator + Clone>(
                     Either::Right((error, _)) => Err(error),
                 }
             };
-            match select(pin!(router.failure()), pin!(external)).await {
+            let router_failure = async {
+                match router.as_mut() {
+                    Some(router) => router.failure().await,
+                    None => pending().await,
+                }
+            };
+            match select(pin!(router_failure), pin!(external)).await {
                 Either::Left((failure, _)) => {
                     tracing::error!(
                         component = "router",
@@ -633,23 +613,21 @@ async fn run_services<A: ChunkAllocator + Clone>(
             Either::Right((result, _)) => (result, false),
         }
     };
-    let router_failure = match router.state() {
-        router::RouterState::Failed(failure) => Some(failure),
-        _ => None,
-    };
-    router.stop();
-    if let Some(remote) = &remote {
-        remote.stop();
-    }
+    let router_failure = serving.router_failure();
     let deadline = Instant::now() + WORKER_SHUTDOWN_GRACE;
     *shutdown_deadline = Some(deadline);
-    listeners.stop(deadline);
-    if let Some(listeners) = s2s_listeners.as_mut() {
-        listeners.stop(deadline);
-    }
+    serving.stop(deadline);
     let _ = stop_acme.send(deadline);
     drop(stop_admin);
     drop(stop_metrics);
+    let mut outcome = ServiceJoin {
+        primary,
+        admin: Ok(()),
+        metrics: Ok(()),
+        acme: Ok(()),
+        drain: Ok(()),
+        router_failure,
+    };
     let drain = async {
         let services = async {
             if !services_done && admin_enabled {
@@ -673,29 +651,14 @@ async fn run_services<A: ChunkAllocator + Clone>(
                 Ok(())
             }
         };
-        let s2s = async {
-            match s2s_listeners.as_mut() {
-                Some(listeners) => listeners.join().await.map_err(RunError::S2s),
-                None => Ok(()),
-            }
-        };
-        let ((((services, listeners), metrics), acme), s2s) = join(
-            join(join(join(services, listeners.join()), metrics), acme),
-            s2s,
-        )
-        .await;
-        let remote = match &remote {
-            Some(remote) => remote.join(deadline).await.map_err(RunError::S2s),
-            None => Ok(()),
-        };
-        services
-            .and(remote)
-            .and(listeners.map_err(RunError::C2s))
-            .and(s2s)
-            .and(metrics)
-            .and(acme)
+        let ((admin, metrics), acme) = join(join(services, metrics), acme).await;
+        outcome.admin = admin;
+        outcome.metrics = metrics;
+        outcome.acme = acme;
+        Ok(())
     };
-    primary.and(drain_services_until(deadline, router_failure, drain).await)
+    outcome.drain = drain_services_until(deadline, router_failure, drain).await;
+    outcome
 }
 
 async fn drain_services_until(

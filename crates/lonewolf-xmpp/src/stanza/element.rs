@@ -6,7 +6,7 @@ use futures_util::io::{AsyncWrite, AsyncWriteExt};
 use lonewolf_util::arena::{Arena, ArenaRead, ChunkAllocator, Handle, HandleError};
 use smallvec::SmallVec;
 
-use super::namespace::{NamespaceContext, NamespaceCopies, Prefix};
+use super::namespace::{ContextView, NamespaceContext, NamespaceCopies, Prefix, Rescope};
 use super::storage::{SliceBuilder, StoredSlice};
 use super::{AsyncWriteError, BuildError, MAX_ELEMENT_DEPTH, MAX_ELEMENT_NODES, WriteError, xml};
 
@@ -104,6 +104,7 @@ struct WriteFrame<'a> {
     element: Element,
     namespace: Option<&'a str>,
     namespaces: NamespaceContext,
+    rescope: Option<Rescope<'a>>,
     next_child: usize,
 }
 
@@ -429,7 +430,7 @@ impl<'a, R: ArenaRead> ElementRef<'a, R> {
     /// [`WriteError::Output`] if the destination rejects a write. Either error
     /// can leave partial XML in `output`.
     pub fn write_xml(&self, output: &mut impl fmt::Write) -> Result<(), WriteError> {
-        self.write_in(output, None, None)
+        self.write_in(output, None, None, None)
     }
 
     /// Writes XML without flushing the destination.
@@ -441,7 +442,7 @@ impl<'a, R: ArenaRead> ElementRef<'a, R> {
         &self,
         output: &mut W,
     ) -> Result<(), AsyncWriteError> {
-        self.write_in_async(output, None, None).await
+        self.write_in_async(output, None, None, None).await
     }
 
     pub(super) fn size(&self) -> (usize, usize) {
@@ -452,46 +453,41 @@ impl<'a, R: ArenaRead> ElementRef<'a, R> {
         &self,
         output: &mut impl fmt::Write,
         parent_namespace: Option<&str>,
-        parent_context: Option<NamespaceContext>,
+        parent_context: Option<ContextView<'_>>,
+        rescope: Option<Rescope<'_>>,
     ) -> Result<(), WriteError> {
-        let prefix = self
-            .data
-            .namespaces
-            .element_prefix(self.namespace, self.arena)?;
+        let namespaces = ContextView {
+            context: self.data.namespaces,
+            rescope,
+        };
+        let effective_namespace = rescope.map_or(self.namespace, |rescope| rescope.to);
+        let prefix = namespaces.element_prefix(effective_namespace, self.arena)?;
         output.write_char('<')?;
         prefix.write(output)?;
         output.write_str(self.name)?;
-        self.data.namespaces.write(
+        namespaces.write(
             self.arena,
             output,
             prefix,
-            self.namespace,
+            effective_namespace,
             parent_namespace,
             parent_context,
         )?;
-        write_attributes(
-            self.data.attributes,
-            self.data.namespaces,
-            prefix,
-            self.arena,
-            output,
-        )?;
+        write_attributes(self.data.attributes, namespaces, prefix, self.arena, output)?;
         let children = self.data.children.get(self.arena)?;
         if children.is_empty() {
             output.write_str("/>")?;
             return Ok(());
         }
         output.write_char('>')?;
-        let namespace = self.data.namespaces.child_default(
-            prefix,
-            self.namespace,
-            parent_namespace,
-            self.arena,
-        )?;
+        let namespace =
+            namespaces.child_default(prefix, effective_namespace, parent_namespace, self.arena)?;
         for child in self.children()? {
             match child? {
                 NodeRef::Element(element) => {
-                    element.write_in(output, namespace, Some(self.data.namespaces))?
+                    let child_rescope =
+                        rescope.filter(|rescope| element.namespace() == rescope.from);
+                    element.write_in(output, namespace, Some(namespaces), child_rescope)?
                 }
                 NodeRef::Text(text) => xml::escape(output, text, false)?,
             }
@@ -503,21 +499,23 @@ impl<'a, R: ArenaRead> ElementRef<'a, R> {
         Ok(())
     }
 
-    pub(super) async fn write_in_async<W: AsyncWrite + Unpin>(
+    pub(super) async fn write_in_async<'n, W: AsyncWrite + Unpin>(
         &self,
         output: &mut W,
-        parent_namespace: Option<&'a str>,
-        parent_context: Option<NamespaceContext>,
+        parent_namespace: Option<&'n str>,
+        parent_context: Option<ContextView<'n>>,
+        rescope: Option<Rescope<'n>>,
     ) -> Result<(), AsyncWriteError> {
-        let mut frames = SmallVec::<[WriteFrame<'a>; 8]>::new();
+        let mut frames = SmallVec::<[WriteFrame<'_>; 8]>::new();
         let root = self.handle.resolve(self.arena)?;
         let (has_children, namespace) =
-            write_start_async(&root, output, parent_namespace, parent_context).await?;
+            write_start_async(&root, output, parent_namespace, parent_context, rescope).await?;
         if has_children {
             frames.push(WriteFrame {
                 element: self.handle,
                 namespace,
                 namespaces: root.data.namespaces,
+                rescope,
                 next_child: 0,
             });
         }
@@ -530,14 +528,26 @@ impl<'a, R: ArenaRead> ElementRef<'a, R> {
                 match child {
                     Node::Element(child) => {
                         let view = child.resolve(self.arena)?;
-                        let (has_children, child_namespace) =
-                            write_start_async(&view, output, namespace, Some(frame.namespaces))
-                                .await?;
+                        let child_rescope = frame
+                            .rescope
+                            .filter(|rescope| view.namespace() == rescope.from);
+                        let (has_children, child_namespace) = write_start_async(
+                            &view,
+                            output,
+                            namespace,
+                            Some(ContextView {
+                                context: frame.namespaces,
+                                rescope: frame.rescope,
+                            }),
+                            child_rescope,
+                        )
+                        .await?;
                         if has_children {
                             frames.push(WriteFrame {
                                 element: *child,
                                 namespace: child_namespace,
                                 namespaces: view.data.namespaces,
+                                rescope: child_rescope,
                                 next_child: 0,
                             });
                         }
@@ -547,7 +557,7 @@ impl<'a, R: ArenaRead> ElementRef<'a, R> {
                     }
                 }
             } else {
-                write_end_async(&element, output).await?;
+                write_end_async(&element, output, frame.rescope).await?;
                 frames.pop();
             }
         }
@@ -559,30 +569,31 @@ async fn write_start_async<'a, R: ArenaRead, W: AsyncWrite + Unpin>(
     element: &ElementRef<'a, R>,
     output: &mut W,
     parent_namespace: Option<&'a str>,
-    parent_context: Option<NamespaceContext>,
+    parent_context: Option<ContextView<'a>>,
+    rescope: Option<Rescope<'a>>,
 ) -> Result<(bool, Option<&'a str>), AsyncWriteError> {
-    let prefix = element
-        .data
-        .namespaces
-        .element_prefix(element.namespace, element.arena)?;
+    let namespaces = ContextView {
+        context: element.data.namespaces,
+        rescope,
+    };
+    let effective_namespace = rescope.map_or(element.namespace, |rescope| rescope.to);
+    let prefix = namespaces.element_prefix(effective_namespace, element.arena)?;
     output.write_all(b"<").await?;
     prefix.write_async(output).await?;
     output.write_all(element.name.as_bytes()).await?;
-    element
-        .data
-        .namespaces
+    namespaces
         .write_async(
             element.arena,
             output,
             prefix,
-            element.namespace,
+            effective_namespace,
             parent_namespace,
             parent_context,
         )
         .await?;
     write_attributes_async(
         element.data.attributes,
-        element.data.namespaces,
+        namespaces,
         prefix,
         element.arena,
         output,
@@ -593,26 +604,27 @@ async fn write_start_async<'a, R: ArenaRead, W: AsyncWrite + Unpin>(
         return Ok((false, None));
     }
     output.write_all(b">").await?;
-    let namespace = element.data.namespaces.child_default(
-        prefix,
-        element.namespace,
-        parent_namespace,
-        element.arena,
-    )?;
+    let namespace =
+        namespaces.child_default(prefix, effective_namespace, parent_namespace, element.arena)?;
     Ok((true, namespace))
 }
 
 async fn write_end_async<R: ArenaRead, W: AsyncWrite + Unpin>(
     element: &ElementRef<'_, R>,
     output: &mut W,
+    rescope: Option<Rescope<'_>>,
 ) -> Result<(), AsyncWriteError> {
     output.write_all(b"</").await?;
-    element
-        .data
-        .namespaces
-        .element_prefix(element.namespace, element.arena)?
-        .write_async(output)
-        .await?;
+    ContextView {
+        context: element.data.namespaces,
+        rescope,
+    }
+    .element_prefix(
+        rescope.map_or(element.namespace, |rescope| rescope.to),
+        element.arena,
+    )?
+    .write_async(output)
+    .await?;
     output.write_all(element.name.as_bytes()).await?;
     output.write_all(b">").await?;
     Ok(())
@@ -840,7 +852,7 @@ pub(super) fn attributes<'a>(
 
 pub(super) fn write_attributes(
     values: StoredSlice<Attribute>,
-    namespaces: NamespaceContext,
+    namespaces: ContextView<'_>,
     element_prefix: Prefix<'_>,
     arena: &impl ArenaRead,
     output: &mut impl fmt::Write,
@@ -870,7 +882,7 @@ pub(super) fn write_attributes(
 
 pub(super) async fn write_attributes_async<W: AsyncWrite + Unpin>(
     values: StoredSlice<Attribute>,
-    namespaces: NamespaceContext,
+    namespaces: ContextView<'_>,
     element_prefix: Prefix<'_>,
     arena: &impl ArenaRead,
     output: &mut W,

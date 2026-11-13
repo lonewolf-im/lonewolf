@@ -27,7 +27,7 @@ pub use incoming::{RejectedStanza, StanzaRejection};
 pub use routed::RoutedStanza;
 
 use element::{Attribute, AttributesBuilder, ElementFrame};
-use namespace::{NamespaceContext, NamespaceCopies};
+use namespace::{ContextView, NamespaceContext, NamespaceCopies};
 use storage::{SliceBuilder, StoredSlice};
 
 pub const CLIENT_NAMESPACE: &str = "jabber:client";
@@ -740,7 +740,10 @@ impl<'a, R: ArenaRead> StanzaRef<'a, R> {
         }
         element::write_attributes(
             self.data.attributes,
-            self.data.namespaces,
+            ContextView {
+                context: self.data.namespaces,
+                rescope: None,
+            },
             prefix,
             self.arena,
             output,
@@ -757,7 +760,15 @@ impl<'a, R: ArenaRead> StanzaRef<'a, R> {
             self.arena,
         )?;
         for child in self.children()? {
-            child?.write_in(output, namespace, Some(self.data.namespaces))?;
+            child?.write_in(
+                output,
+                namespace,
+                Some(ContextView {
+                    context: self.data.namespaces,
+                    rescope: None,
+                }),
+                None,
+            )?;
         }
         output.write_str("</")?;
         prefix.write(output)?;
@@ -810,7 +821,10 @@ impl<'a, R: ArenaRead> StanzaRef<'a, R> {
         }
         element::write_attributes_async(
             self.data.attributes,
-            self.data.namespaces,
+            ContextView {
+                context: self.data.namespaces,
+                rescope: None,
+            },
             prefix,
             self.arena,
             output,
@@ -829,7 +843,15 @@ impl<'a, R: ArenaRead> StanzaRef<'a, R> {
         )?;
         for child in self.children()? {
             child?
-                .write_in_async(output, namespace, Some(self.data.namespaces))
+                .write_in_async(
+                    output,
+                    namespace,
+                    Some(ContextView {
+                        context: self.data.namespaces,
+                        rescope: None,
+                    }),
+                    None,
+                )
                 .await?;
         }
         output.write_all(b"</").await?;

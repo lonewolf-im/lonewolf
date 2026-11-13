@@ -18,7 +18,7 @@ use lonewolf_util::rate_limited_reader::{RateLimitState, RateLimitedReader};
 use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::parser::{ParseError, Parsed, ParserConfig, StreamEvent, XmppParser};
 use lonewolf_xmpp::stanza::{
-    AsyncWriteError, Element, NodeRef, SERVER_NAMESPACE, StanzaRef, XML_NAMESPACE,
+    AsyncWriteError, Element, NodeRef, SERVER_NAMESPACE, StanzaNamespace, StanzaRef, XML_NAMESPACE,
 };
 use lonewolf_xmpp::stream::StreamErrorCondition;
 use oxilangtag::LanguageTag;
@@ -530,7 +530,7 @@ impl<W: AsyncWrite + Unpin> S2sWriter<W> {
         stanza: &StanzaRef<'_, R>,
     ) -> Result<(), S2sError> {
         stanza
-            .write_xml_async(&mut self.output)
+            .write_xml_async_as(StanzaNamespace::Server, &mut self.output)
             .await
             .map_err(|error| match error {
                 AsyncWriteError::Access(_) => S2sError::Internal,

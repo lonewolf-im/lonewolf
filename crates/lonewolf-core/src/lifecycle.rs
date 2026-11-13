@@ -3,6 +3,7 @@
 use std::future::Future;
 use std::time::Instant;
 
+use futures_util::FutureExt as _;
 use lonewolf_util::arena::ChunkAllocator;
 
 use crate::connection::ListenerSet;
@@ -104,11 +105,14 @@ async fn join_listeners(
 ) -> ListenerJoin {
     match listeners {
         Some(listeners) => {
-            let result = compio::time::timeout_at(deadline, listeners.join()).await;
-            let drain_deadline_exceeded = result.is_err() || listeners.drain_deadline_exceeded();
+            let result = futures_util::select_biased! {
+                result = listeners.join().fuse() => Some(result),
+                _ = compio::time::sleep_until(deadline).fuse() => None,
+            };
+            let drain_deadline_exceeded = result.is_none() || listeners.drain_deadline_exceeded();
             ListenerJoin {
                 result: result
-                    .unwrap_or_else(|_| Err(shutdown_timeout()))
+                    .unwrap_or_else(|| Err(shutdown_timeout()))
                     .map_err(error),
                 drain_deadline_exceeded,
             }

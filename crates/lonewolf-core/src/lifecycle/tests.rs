@@ -264,45 +264,118 @@ fn ready_listener_deadline_overrides_cleanup_errors_but_preserves_primary() {
 
 #[test]
 fn listener_only_outer_deadline_maps_global_drain_after_backgrounds_finish() -> TestResult {
-    Runtime::new()?.block_on(async {
-        let dispatcher = CoreDispatcher::new(std::num::NonZeroUsize::MIN, std::num::NonZeroUsize::MIN)?;
-        for failure in [None, Some(RouterFailure { shard_id: 4 })] {
-            let (stop, _stopped) = oneshot::channel();
-            let mut listeners = ListenerSet::with_test_channels(ListenerKind::C2s, stop, async_channel::bounded(1).1, 1);
-            let (release, gate) = oneshot::channel();
-            listeners.test_tasks().push(dispatcher.handle().dispatch_at(0, move |_| async move { let _ = gate.await; ListenerOutcome::from(Ok(())) }).await?);
-            let late = join_listeners(Some(&mut listeners), Instant::now(), RunError::C2s).await;
-            assert!(late.drain_deadline_exceeded);
-            let mut cleanup = joined();
-            cleanup.c2s = late;
-            let mut services = service_join();
-            services.router_failure = failure;
-            let result = cleanup.normal(services, Ok(()));
-            if let Some(failure) = failure { assert!(matches!(result, Err(RunError::RouterFailed(actual)) if actual==failure)); }
-            else { assert!(matches!(result, Err(RunError::DispatcherShutdown(error)) if error.kind()==io::ErrorKind::TimedOut)); }
-            release.send(()).map_err(|_| "listener gate dropped")?;
-            listeners.join().await?;
+    Runtime::new()?.block_on(compio::time::timeout(TIMEOUT, async {
+        let dispatcher =
+            CoreDispatcher::new(std::num::NonZeroUsize::MIN, std::num::NonZeroUsize::MIN)?;
+        for kind in [ListenerKind::C2s, ListenerKind::S2s] {
+            let error: fn(io::Error) -> RunError = match kind {
+                ListenerKind::C2s => RunError::C2s,
+                ListenerKind::S2s => RunError::S2s,
+            };
+            for failure in [None, Some(RouterFailure { shard_id: 4 })] {
+                let (stop, _stopped) = oneshot::channel();
+                let mut listeners =
+                    ListenerSet::with_test_channels(kind, stop, async_channel::bounded(1).1, 1);
+                let (release, gate) = oneshot::channel();
+                listeners.test_tasks().push(
+                    dispatcher.handle().dispatch_at(0, move |_| async move {
+                        let _ = gate.await;
+                        ListenerOutcome::from(Ok(()))
+                    }).await?,
+                );
+                let late = join_listeners(Some(&mut listeners), Instant::now(), error).await;
+                assert!(late.drain_deadline_exceeded);
+                assert!(matches!(&late.result, Err(RunError::C2s(error) | RunError::S2s(error)) if error.kind() == io::ErrorKind::TimedOut));
+                let mut cleanup = joined();
+                match kind {
+                    ListenerKind::C2s => cleanup.c2s = late,
+                    ListenerKind::S2s => cleanup.s2s = late,
+                }
+                let mut services = service_join();
+                services.router_failure = failure;
+                let result = cleanup.normal(services, Ok(()));
+                if let Some(failure) = failure {
+                    assert!(matches!(result, Err(RunError::RouterFailed(actual)) if actual == failure));
+                } else {
+                    assert!(matches!(result, Err(RunError::DispatcherShutdown(error)) if error.kind() == io::ErrorKind::TimedOut));
+                }
+                release.send(()).map_err(|_| "listener gate dropped")?;
+                listeners.join().await?;
+            }
         }
         dispatcher.shutdown(TIMEOUT).await?;
         Ok(())
-    })
+    }))?
 }
 
 #[test]
 fn ready_listener_join_does_not_infer_exhaustion_from_the_clock() -> TestResult {
-    Runtime::new()?.block_on(async {
-        let (stop, _stopped) = oneshot::channel();
-        let mut listeners = ListenerSet::with_test_channels(
-            ListenerKind::C2s,
-            stop,
-            async_channel::bounded(1).1,
-            1,
-        );
-        let result = join_listeners(Some(&mut listeners), Instant::now(), RunError::C2s).await;
-        assert!(result.result.is_ok());
-        assert!(!result.drain_deadline_exceeded);
+    Runtime::new()?.block_on(compio::time::timeout(TIMEOUT, async {
+        let dispatcher =
+            CoreDispatcher::new(std::num::NonZeroUsize::MIN, std::num::NonZeroUsize::MIN)?;
+        for kind in [ListenerKind::C2s, ListenerKind::S2s] {
+            let error: fn(io::Error) -> RunError = match kind {
+                ListenerKind::C2s => RunError::C2s,
+                ListenerKind::S2s => RunError::S2s,
+            };
+            for outcome in [
+                None,
+                Some(ListenerOutcome::from(Ok(()))),
+                Some(ListenerOutcome::from(Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "ordinary timeout",
+                )))),
+                Some(ListenerOutcome {
+                    result: Err(io::Error::new(io::ErrorKind::TimedOut, "marked deadline")),
+                    drain_deadline_exceeded: true,
+                }),
+            ] {
+                let expected_error = outcome.as_ref().and_then(|outcome| {
+                    outcome.result.as_ref().err().map(|error| error.to_string())
+                });
+                let expected_deadline = outcome
+                    .as_ref()
+                    .is_some_and(|outcome| outcome.drain_deadline_exceeded);
+                let (stop, _stopped) = oneshot::channel();
+                let mut listeners =
+                    ListenerSet::with_test_channels(kind, stop, async_channel::bounded(1).1, 1);
+                if let Some(outcome) = outcome {
+                    let (completed, ready) = oneshot::channel();
+                    listeners.test_tasks().push(
+                        dispatcher
+                            .handle()
+                            .dispatch_at(0, move |_| async move {
+                                // This task runs after the dispatcher publishes the listener result.
+                                compio::runtime::spawn(async move {
+                                    let _ = completed.send(());
+                                })
+                                .detach();
+                                outcome
+                            })
+                            .await?,
+                    );
+                    ready.await?;
+                }
+                let result = join_listeners(Some(&mut listeners), Instant::now(), error).await;
+                match expected_error {
+                    None => assert!(result.result.is_ok()),
+                    Some(expected) => match result.result {
+                        Err(RunError::C2s(error) | RunError::S2s(error)) => {
+                            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+                            assert_eq!(error.to_string(), expected);
+                        }
+                        other => panic!("wrong ready listener result: {other:?}"),
+                    },
+                }
+                assert_eq!(result.drain_deadline_exceeded, expected_deadline);
+                let repeated = join_listeners(Some(&mut listeners), Instant::now(), error).await;
+                assert!(repeated.result.is_ok());
+                assert_eq!(repeated.drain_deadline_exceeded, expected_deadline);
+            }
+        }
+        dispatcher.shutdown(TIMEOUT).await?;
         Ok(())
-    })
+    }))?
 }
 
 #[test]

@@ -10,6 +10,7 @@ use std::time::SystemTime;
 use futures_channel::mpsc;
 use futures_util::{Stream, poll, ready};
 use lonewolf_util::arena::{AllocationError, Chunk, GlobalChunkAllocator};
+use lonewolf_xmpp::stanza::StanzaNamespace;
 use tokio::io::{AsyncRead, ReadBuf};
 
 use super::*;
@@ -231,6 +232,13 @@ impl<A: ChunkAllocator + Clone + 'static> Fixture<A> {
         })
     }
     async fn queue(&self, count: usize) -> TestResult<LinkQueue<A>> {
+        self.queue_with_invalid_tail(count, false).await
+    }
+    async fn queue_with_invalid_tail(
+        &self,
+        count: usize,
+        invalid_tail: bool,
+    ) -> TestResult<LinkQueue<A>> {
         let (sender, receiver) = async_channel::bounded(count.max(1));
         let counters = Arc::new(QueueCounters::default());
         let handle = LinkHandle {
@@ -240,7 +248,26 @@ impl<A: ChunkAllocator + Clone + 'static> Fixture<A> {
         // The payload must exceed the writer buffer to pause stanza serialization.
         let body = "x".repeat(8192);
         for index in 0..count {
-            let source = stanza_in(&format!("<message from='v@localhost' to='u@remote.test/r' id='{index}'><body>{}</body></message>", body), self.context.allocator.clone()).await?;
+            let missing_address = invalid_tail && index + 1 == count;
+            let to = if missing_address {
+                ""
+            } else {
+                " to='u@remote.test/r'"
+            };
+            let source = stanza_in(
+                &format!(
+                    "<message from='v@localhost'{to} id='{index}'><body>{}</body></message>",
+                    body
+                ),
+                self.context.allocator.clone(),
+            )
+            .await?;
+            if missing_address {
+                assert!(matches!(
+                    source.resolve()?.validate_rescope(StanzaNamespace::Server),
+                    Err(lonewolf_xmpp::stanza::BuildError::MissingServerAddresses)
+                ));
+            }
             let bytes = stanza_bytes(&source).ok_or("stanza size")?;
             handle
                 .enqueue(source, bytes, &self.remote.inner.limits)
@@ -965,7 +992,7 @@ fn transport_failure_during_discard_flush_preserves_terminal_accounting() -> Tes
     test(async {
         let allocator = ControlledAllocator::default();
         let f = Fixture::new(allocator.clone())?;
-        let mut queue = f.queue(2).await?;
+        let mut queue = f.queue_with_invalid_tail(2, true).await?;
         let (input, mut reader) = f.reader().await?;
         let output = Output::default();
         output.pause_write();

@@ -8,7 +8,9 @@ use std::task::{Context, Poll};
 use futures_util::io::AsyncWrite;
 use lonewolf_util::arena::{ArenaRead, ChunkAllocator, HandleError};
 use lonewolf_xmpp::parser::Parsed;
-use lonewolf_xmpp::stanza::{AsyncWriteError, Element, ElementRef, NodeRef, StanzaRef};
+use lonewolf_xmpp::stanza::{
+    AsyncWriteError, Element, ElementRef, NodeRef, StanzaNamespace, StanzaRef,
+};
 use lonewolf_xmpp::stream::StreamErrorCondition;
 
 use super::{BIDI_NAMESPACE, S2sError};
@@ -222,7 +224,10 @@ pub(crate) async fn stanza_fits<R: ArenaRead>(
         remaining: maximum,
         exceeded: false,
     };
-    match stanza.write_xml_async(&mut sink).await {
+    match stanza
+        .write_xml_async_as(StanzaNamespace::Server, &mut sink)
+        .await
+    {
         Ok(()) => Ok(true),
         Err(AsyncWriteError::Access(_)) => Err(S2sError::Internal),
         Err(AsyncWriteError::Output(_)) if sink.exceeded => Ok(false),

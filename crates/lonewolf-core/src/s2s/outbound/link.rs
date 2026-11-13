@@ -7,7 +7,6 @@ use std::time::{Duration, Instant, SystemTime};
 
 use futures_util::future::{Either, select};
 use futures_util::io::AsyncWrite;
-use lonewolf_util::arena::Arena;
 use lonewolf_xmpp::parser::StreamEvent;
 use lonewolf_xmpp::stanza::{StanzaErrorCondition, StanzaKind, StanzaNamespace};
 use lonewolf_xmpp::stream::StreamErrorCondition;
@@ -101,19 +100,11 @@ pub(super) async fn write<A: ChunkAllocator + Clone, W: AsyncWrite + Unpin>(
     flush: bool,
     buffered: &mut bool,
 ) -> Result<WriteOutcome, StreamClose> {
-    let prepared = (|| {
-        let mut arena =
-            Arena::try_new_in(Default::default(), inner.allocator.clone()).map_err(|_| ())?;
-        let source = queued.stanza.resolve().map_err(|_| ())?;
-        let copy = source
-            .rescope_in(StanzaNamespace::Server, &mut arena)
-            .map_err(|_| ())?;
-        Ok::<_, ()>((arena, copy))
-    })();
-    let prepared = prepared.ok();
-    let view = prepared
-        .as_ref()
-        .and_then(|(arena, copy)| copy.resolve(arena).ok());
+    let view = queued
+        .stanza
+        .resolve()
+        .ok()
+        .filter(|view| view.validate_rescope(StanzaNamespace::Server).is_ok());
     let Some(view) = view else {
         let outcome = discard(inner, queued, validity)?;
         if flush {
@@ -772,7 +763,7 @@ mod tests {
     use std::task::{Context, Poll};
 
     use futures_util::poll;
-    use lonewolf_util::arena::GlobalChunkAllocator;
+    use lonewolf_util::arena::{Arena, GlobalChunkAllocator};
 
     use super::super::manager_tests::{manager, message, render, run, stanza};
     use super::*;
@@ -1037,6 +1028,101 @@ mod tests {
         super::super::manager_tests::stanza_in(&format!("<message from='alice@localhost/desk' to='bob@remote.test' id='{id}'><body>{id}</body></message>"), allocator).await
     }
 
+    async fn invalid_server_stanza(
+        id: &str,
+        allocator: ControlledAllocator,
+    ) -> Result<RoutedStanza<ControlledAllocator>, Box<dyn std::error::Error>> {
+        let stanza = super::super::manager_tests::stanza_in(
+            &format!("<message from='alice@localhost/desk' id='{id}'><body>{id}</body></message>"),
+            allocator,
+        )
+        .await?;
+        assert!(matches!(
+            stanza.resolve()?.validate_rescope(StanzaNamespace::Server),
+            Err(lonewolf_xmpp::stanza::BuildError::MissingServerAddresses)
+        ));
+        Ok(stanza)
+    }
+
+    #[test]
+    fn outbound_write_needs_no_arena_from_the_link_allocator()
+    -> Result<(), Box<dyn std::error::Error>> {
+        run(async {
+            let allocator = ControlledAllocator::default();
+            let manager = super::super::manager_tests::manager_with_allocator(
+                S2sLimits::default(),
+                allocator.clone(),
+            )?;
+            let task = manager
+                .admit(
+                    "localhost",
+                    "remote.test",
+                    controlled_stanza("no-copy", allocator.clone()).await?,
+                )
+                .map_err(|error| format!("{error:?}"))?
+                .ok_or("launch")?;
+            let mut queued = task.queue.receiver.recv().await?;
+            let mut arena = Arena::try_new(Default::default())?;
+            let scoped = queued
+                .stanza
+                .resolve()?
+                .rescope_in(StanzaNamespace::Server, &mut arena)?;
+            let mut expected = Vec::new();
+            scoped
+                .resolve(&arena)?
+                .write_xml_async(&mut expected)
+                .await?;
+            let calls = Arc::new(PlMutex::new(Calls {
+                accepts: true,
+                ..Default::default()
+            }));
+            let mut writer = S2sWriter::new(ControlledWriter(Arc::clone(&calls)));
+            writer.update_peer_limits(Some(crate::s2s::stream::limits::StreamLimits {
+                max_bytes: Some(expected.len().try_into()?),
+                idle_seconds: None,
+            }));
+            let validity = LinkValidity::fixed(SystemTime::now() + Duration::from_secs(60));
+            let mut buffered = false;
+            allocator.exhausted.store(true, Ordering::Relaxed);
+            let outcome = write(
+                &mut writer,
+                &mut queued,
+                &manager.inner,
+                &validity,
+                true,
+                &mut buffered,
+            )
+            .await;
+            let metrics = render(&manager.inner.metrics)?;
+            assert!(
+                matches!(
+                    outcome,
+                    Ok(WriteOutcome::Written {
+                        kind: StanzaKind::Message,
+                        ..
+                    })
+                ),
+                "expected Written under allocator exhaustion; discarded={}, metrics={metrics}",
+                matches!(outcome, Ok(WriteOutcome::Discarded))
+            );
+            assert_eq!(calls.lock().output, expected);
+            assert_eq!(calls.lock().flushes, 1);
+            assert!(!buffered);
+            assert!(queued.reservation.is_none());
+            assert_eq!(task.queue.counters.count.load(Ordering::Relaxed), 0);
+            assert_eq!(task.queue.counters.bytes.load(Ordering::Relaxed), 0);
+            assert!(metrics.contains("s2s_stanzas_sent_total{kind=\"message\"} 1"));
+            assert!(!metrics.contains("s2s_dropped_stanzas_total{reason=\"internal_error\"} 1"));
+            drop(queued);
+            assert_eq!(allocator.live.load(Ordering::Relaxed), 0);
+            drop(task);
+            manager
+                .join(Instant::now() + Duration::from_secs(5))
+                .await?;
+            Ok(())
+        })
+    }
+
     #[test]
     fn preparation_failure_discards_once_and_the_fifo_tail_uses_the_same_writer()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1050,7 +1136,7 @@ mod tests {
                 .admit(
                     "localhost",
                     "remote.test",
-                    controlled_stanza("failed-head", allocator.clone()).await?,
+                    invalid_server_stanza("failed-head", allocator.clone()).await?,
                 )
                 .map_err(|error| format!("{error:?}"))?
                 .ok_or("launch")?;
@@ -1162,7 +1248,7 @@ mod tests {
                 .admit(
                     "localhost",
                     "remote.test",
-                    controlled_stanza("failed-last", allocator.clone()).await?,
+                    invalid_server_stanza("failed-last", allocator.clone()).await?,
                 )
                 .map_err(|error| format!("{error:?}"))?;
             let calls = Arc::new(PlMutex::new(Calls {
@@ -1241,7 +1327,7 @@ mod tests {
                     .admit(
                         "localhost",
                         "remote.test",
-                        controlled_stanza("failed-head", allocator.clone()).await?,
+                        invalid_server_stanza("failed-head", allocator.clone()).await?,
                     )
                     .map_err(|error| format!("{error:?}"))?
                     .ok_or("launch")?;
@@ -1682,7 +1768,7 @@ mod tests {
                     .admit(
                         "localhost",
                         "remote.test",
-                        controlled_stanza("retained-head", allocator.clone()).await?,
+                        invalid_server_stanza("retained-head", allocator.clone()).await?,
                     )
                     .map_err(|error| format!("{error:?}"))?
                     .ok_or("launch")?;
@@ -1878,15 +1964,10 @@ mod tests {
                     .map_err(|error| format!("{error:?}"))?
                     .ok_or("launch")?;
                 let mut head = task.queue.receiver.recv().await?;
-                let mut arena = Arena::try_new(Default::default())?;
-                let scoped = head
-                    .stanza
-                    .resolve()?
-                    .rescope_in(StanzaNamespace::Server, &mut arena)?;
                 let mut exact = Vec::new();
-                scoped
-                    .resolve(&arena)?
-                    .write_xml_async(&mut exact)
+                head.stanza
+                    .resolve()?
+                    .write_xml_async_as(StanzaNamespace::Server, &mut exact)
                     .await
                     .map_err(|error| format!("{error:?}"))?;
                 let maximum: u32 = (exact.len() - usize::from(!fits)).try_into()?;

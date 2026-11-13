@@ -27,7 +27,7 @@ pub use incoming::{RejectedStanza, StanzaRejection};
 pub use routed::RoutedStanza;
 
 use element::{Attribute, AttributesBuilder, ElementFrame};
-use namespace::{ContextView, NamespaceContext, NamespaceCopies};
+use namespace::{ContextView, NamespaceContext, NamespaceCopies, Rescope};
 use storage::{SliceBuilder, StoredSlice};
 
 pub const CLIENT_NAMESPACE: &str = "jabber:client";
@@ -699,6 +699,34 @@ impl<'a, R: ArenaRead> StanzaRef<'a, R> {
             .map(|original| original.or_else(|| self.stanza_type().as_str()))
     }
 
+    /// Checks re-scoping without copying or allocating arena storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns the validation errors from [`Self::rescope_in`], excluding allocation errors.
+    pub fn validate_rescope(&self, namespace: StanzaNamespace) -> Result<(), BuildError> {
+        if namespace == self.namespace() {
+            return Ok(());
+        }
+        validate_stanza(
+            Header {
+                namespace,
+                ..self.data.header
+            },
+            self.data.children.get(self.arena)?,
+            self.arena,
+            self.rescope(namespace),
+            |_| Ok(()),
+        )
+    }
+
+    fn rescope(&self, namespace: StanzaNamespace) -> Option<Rescope<'static>> {
+        (namespace != self.namespace()).then_some(Rescope {
+            from: self.namespace().as_str(),
+            to: namespace.as_str(),
+        })
+    }
+
     /// Writes namespace declarations without requiring an enclosing stream.
     ///
     /// # Errors
@@ -707,22 +735,30 @@ impl<'a, R: ArenaRead> StanzaRef<'a, R> {
     /// [`WriteError::Output`] if the destination rejects a write. Either error
     /// can leave partial XML in `output`.
     pub fn write_xml(&self, output: &mut impl fmt::Write) -> Result<(), WriteError> {
+        self.write_xml_as(self.namespace(), output)
+    }
+
+    /// Writes the bytes of [`Self::rescope_in`] without copying; call [`Self::validate_rescope`] first.
+    ///
+    /// # Errors
+    ///
+    /// Access or output errors can leave partial XML; this method does not validate.
+    pub fn write_xml_as(
+        &self,
+        namespace: StanzaNamespace,
+        output: &mut impl fmt::Write,
+    ) -> Result<(), WriteError> {
+        let rescope = self.rescope(namespace);
+        let namespaces = ContextView {
+            context: self.data.namespaces,
+            rescope,
+        };
         let name = self.kind().as_str();
-        let prefix = self
-            .data
-            .namespaces
-            .element_prefix(self.namespace().as_str(), self.arena)?;
+        let prefix = namespaces.element_prefix(namespace.as_str(), self.arena)?;
         output.write_char('<')?;
         prefix.write(output)?;
         output.write_str(name)?;
-        self.data.namespaces.write(
-            self.arena,
-            output,
-            prefix,
-            self.namespace().as_str(),
-            None,
-            None,
-        )?;
+        namespaces.write(self.arena, output, prefix, namespace.as_str(), None, None)?;
         if let Some(jid) = self.from()? {
             xml::attribute(output, "from", jid.as_str())?;
         }
@@ -738,37 +774,17 @@ impl<'a, R: ArenaRead> StanzaRef<'a, R> {
         if let Some(lang) = self.lang()? {
             xml::attribute(output, "xml:lang", lang)?;
         }
-        element::write_attributes(
-            self.data.attributes,
-            ContextView {
-                context: self.data.namespaces,
-                rescope: None,
-            },
-            prefix,
-            self.arena,
-            output,
-        )?;
+        element::write_attributes(self.data.attributes, namespaces, prefix, self.arena, output)?;
         if self.data.children.get(self.arena)?.is_empty() {
             output.write_str("/>")?;
             return Ok(());
         }
         output.write_char('>')?;
-        let namespace = self.data.namespaces.child_default(
-            prefix,
-            self.namespace().as_str(),
-            None,
-            self.arena,
-        )?;
+        let namespace = namespaces.child_default(prefix, namespace.as_str(), None, self.arena)?;
         for child in self.children()? {
-            child?.write_in(
-                output,
-                namespace,
-                Some(ContextView {
-                    context: self.data.namespaces,
-                    rescope: None,
-                }),
-                None,
-            )?;
+            let child = child?;
+            let child_rescope = rescope.filter(|rescope| child.namespace() == rescope.from);
+            child.write_in(output, namespace, Some(namespaces), child_rescope)?;
         }
         output.write_str("</")?;
         prefix.write(output)?;
@@ -785,24 +801,31 @@ impl<'a, R: ArenaRead> StanzaRef<'a, R> {
         &self,
         output: &mut W,
     ) -> Result<(), AsyncWriteError> {
+        self.write_xml_async_as(self.namespace(), output).await
+    }
+
+    /// Writes the re-scoped bytes without copying or flushing; call [`Self::validate_rescope`] first.
+    ///
+    /// # Errors
+    ///
+    /// Access or I/O errors can leave partial XML; this method does not validate.
+    pub async fn write_xml_async_as<W: AsyncWrite + Unpin>(
+        &self,
+        namespace: StanzaNamespace,
+        output: &mut W,
+    ) -> Result<(), AsyncWriteError> {
+        let rescope = self.rescope(namespace);
+        let namespaces = ContextView {
+            context: self.data.namespaces,
+            rescope,
+        };
         let name = self.kind().as_str();
-        let prefix = self
-            .data
-            .namespaces
-            .element_prefix(self.namespace().as_str(), self.arena)?;
+        let prefix = namespaces.element_prefix(namespace.as_str(), self.arena)?;
         output.write_all(b"<").await?;
         prefix.write_async(output).await?;
         output.write_all(name.as_bytes()).await?;
-        self.data
-            .namespaces
-            .write_async(
-                self.arena,
-                output,
-                prefix,
-                self.namespace().as_str(),
-                None,
-                None,
-            )
+        namespaces
+            .write_async(self.arena, output, prefix, namespace.as_str(), None, None)
             .await?;
         if let Some(jid) = self.from()? {
             xml::attribute_async(output, "from", jid.as_str()).await?;
@@ -821,10 +844,7 @@ impl<'a, R: ArenaRead> StanzaRef<'a, R> {
         }
         element::write_attributes_async(
             self.data.attributes,
-            ContextView {
-                context: self.data.namespaces,
-                rescope: None,
-            },
+            namespaces,
             prefix,
             self.arena,
             output,
@@ -835,23 +855,12 @@ impl<'a, R: ArenaRead> StanzaRef<'a, R> {
             return Ok(());
         }
         output.write_all(b">").await?;
-        let namespace = self.data.namespaces.child_default(
-            prefix,
-            self.namespace().as_str(),
-            None,
-            self.arena,
-        )?;
+        let namespace = namespaces.child_default(prefix, namespace.as_str(), None, self.arena)?;
         for child in self.children()? {
-            child?
-                .write_in_async(
-                    output,
-                    namespace,
-                    Some(ContextView {
-                        context: self.data.namespaces,
-                        rescope: None,
-                    }),
-                    None,
-                )
+            let child = child?;
+            let child_rescope = rescope.filter(|rescope| child.namespace() == rescope.from);
+            child
+                .write_in_async(output, namespace, Some(namespaces), child_rescope)
                 .await?;
         }
         output.write_all(b"</").await?;
@@ -1024,46 +1033,66 @@ impl<A: ChunkAllocator> StanzaBuilder<'_, A> {
     }
 
     fn validate(&self) -> Result<(), BuildError> {
-        if self.header.namespace == StanzaNamespace::Server
-            && (self.header.from.is_none() || self.header.to.is_none())
-        {
-            return Err(BuildError::MissingServerAddresses);
-        }
-        let children = self.children.as_slice(self.arena)?;
         let mut nodes = 1;
-        let mut errors = 0;
-        for (index, child) in children.iter().enumerate() {
-            let child = child.resolve(self.arena)?;
-            let (depth, count) = child.size();
-            nodes += count;
-            if depth >= MAX_ELEMENT_DEPTH || nodes > MAX_ELEMENT_NODES {
-                return Err(BuildError::TreeLimitExceeded);
-            }
-            if child.name() == "error" && child.namespace() == self.header.namespace.as_str() {
-                errors += 1;
-                if index + 1 != children.len() {
-                    return Err(BuildError::InvalidErrorPayload);
+        validate_stanza(
+            self.header,
+            self.children.as_slice(self.arena)?,
+            self.arena,
+            None,
+            |child| {
+                let (depth, count) = child.size();
+                nodes += count;
+                if depth >= MAX_ELEMENT_DEPTH || nodes > MAX_ELEMENT_NODES {
+                    return Err(BuildError::TreeLimitExceeded);
                 }
-            }
-        }
-        if errors != usize::from(self.header.stanza_type.is_error()) {
-            return Err(BuildError::InvalidErrorPayload);
-        }
-        if let StanzaType::Iq(iq_type) = self.header.stanza_type {
-            if self.header.id.is_none() {
-                return Err(BuildError::MissingIqId);
-            }
-            let payloads = children.len() - errors;
-            let valid = match iq_type {
-                IqType::Get | IqType::Set => payloads == 1,
-                IqType::Result | IqType::Error => payloads <= 1,
-            };
-            if !valid {
-                return Err(BuildError::InvalidIqPayload);
-            }
-        }
-        Ok(())
+                Ok(())
+            },
+        )
     }
+}
+
+fn validate_stanza<R: ArenaRead>(
+    header: Header,
+    children: &[Element],
+    arena: &R,
+    rescope: Option<Rescope<'_>>,
+    mut validate_child: impl FnMut(&ElementRef<'_, R>) -> Result<(), BuildError>,
+) -> Result<(), BuildError> {
+    if header.namespace == StanzaNamespace::Server && (header.from.is_none() || header.to.is_none())
+    {
+        return Err(BuildError::MissingServerAddresses);
+    }
+    let mut errors = 0;
+    for (index, child) in children.iter().enumerate() {
+        let child = child.resolve(arena)?;
+        validate_child(&child)?;
+        let namespace = rescope
+            .filter(|rescope| child.namespace() == rescope.from)
+            .map_or(child.namespace(), |rescope| rescope.to);
+        if child.name() == "error" && namespace == header.namespace.as_str() {
+            errors += 1;
+            if index + 1 != children.len() {
+                return Err(BuildError::InvalidErrorPayload);
+            }
+        }
+    }
+    if errors != usize::from(header.stanza_type.is_error()) {
+        return Err(BuildError::InvalidErrorPayload);
+    }
+    if let StanzaType::Iq(iq_type) = header.stanza_type {
+        if header.id.is_none() {
+            return Err(BuildError::MissingIqId);
+        }
+        let payloads = children.len() - errors;
+        let valid = match iq_type {
+            IqType::Get | IqType::Set => payloads == 1,
+            IqType::Result | IqType::Error => payloads <= 1,
+        };
+        if !valid {
+            return Err(BuildError::InvalidIqPayload);
+        }
+    }
+    Ok(())
 }
 
 fn reserved_attribute(name: &str, namespace: &str) -> bool {

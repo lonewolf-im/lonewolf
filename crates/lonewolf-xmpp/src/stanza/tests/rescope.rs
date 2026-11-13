@@ -560,3 +560,248 @@ fn literal_xml_anchors() -> TestResult {
     }
     Ok(())
 }
+
+#[test]
+fn write_as_matches_rescope_for_the_corpus() -> TestResult {
+    for case in corpus()? {
+        let view = case.stanza.resolve(&case.arena)?;
+        for target in [StanzaNamespace::Client, StanzaNamespace::Server] {
+            let expected = oracle(&case, target)?;
+            let validation = view.validate_rescope(target);
+            match expected {
+                Err(error) => assert_eq!(
+                    validation,
+                    Err(error),
+                    "{} {:?} -> {target:?}",
+                    case.name,
+                    view.namespace(),
+                ),
+                Ok(expected) => {
+                    validation?;
+                    let mut xml = String::new();
+                    view.write_xml_as(target, &mut xml)?;
+                    assert_eq!(xml, expected.xml, "{} -> {target:?}", case.name);
+                    let mut writer = FragmentedWriter::default();
+                    futures_executor::block_on(view.write_xml_async_as(target, &mut writer))?;
+                    assert_eq!(
+                        writer.bytes,
+                        expected.xml.as_bytes(),
+                        "{} -> {target:?}",
+                        case.name
+                    );
+                    assert_eq!(writer.flushes, 0);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn assert_stream_header_bindings(xml: &str) -> TestResult {
+    use quick_xml::events::Event;
+    use quick_xml::name::{QName, ResolveResult};
+
+    let mut reader = quick_xml::NsReader::from_str(xml);
+    let mut roots = 0;
+    let mut payloads = 0;
+    let mut texts = 0;
+    loop {
+        match reader.read_event()? {
+            Event::Start(start) | Event::Empty(start) => {
+                let (namespace, local) = reader.resolver().resolve_element(start.name());
+                match local.as_ref() {
+                    "message" => roots += 1,
+                    "x" => {
+                        assert!(
+                            matches!(namespace, ResolveResult::Bound(namespace) if namespace.as_ref() == "urn:qname")
+                        );
+                        let kind = start.try_get_attribute("kind")?.ok_or("missing kind")?;
+                        assert_eq!(kind.value.as_ref(), "s:stream");
+                        assert!(matches!(
+                            reader.resolver().resolve_attribute(kind.key).0,
+                            ResolveResult::Unbound
+                        ));
+                        payloads += 1;
+                    }
+                    _ => return Err("unexpected element".into()),
+                }
+                for (name, expected) in [
+                    ("stream:value", STREAM_NAMESPACE),
+                    ("s:value", STREAM_NAMESPACE),
+                    ("db:value", "jabber:server:dialback"),
+                ] {
+                    assert!(
+                        matches!(
+                            reader.resolver().resolve_prefix(QName(name).prefix(), true),
+                            ResolveResult::Bound(namespace) if namespace.as_ref() == expected
+                        ),
+                        "{xml}"
+                    );
+                }
+            }
+            Event::Text(text) => {
+                assert_eq!(text.as_ref(), "db:value");
+                texts += 1;
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    assert_eq!((roots, payloads, texts), (1, 1, 1));
+    Ok(())
+}
+
+#[test]
+fn write_as_round_trips_through_the_parser() -> TestResult {
+    let mut missing_addresses = 0;
+    let mut invalid_errors = 0;
+    let mut server_serializations = 0;
+    let mut parser_rejections = 0;
+    let mut restored = 0;
+    for case in corpus()? {
+        let source = case.stanza.resolve(&case.arena)?;
+        if source.namespace() != StanzaNamespace::Client {
+            continue;
+        }
+        let expected_server = match oracle(&case, StanzaNamespace::Server)? {
+            Ok(expected) => expected,
+            Err(error) => {
+                assert_eq!(source.validate_rescope(StanzaNamespace::Server), Err(error));
+                match error {
+                    BuildError::MissingServerAddresses => missing_addresses += 1,
+                    BuildError::InvalidErrorPayload => invalid_errors += 1,
+                    _ => {
+                        return Err(format!(
+                            "{}: unexpected validation error {error:?}",
+                            case.name
+                        )
+                        .into());
+                    }
+                }
+                continue;
+            }
+        };
+        source.validate_rescope(StanzaNamespace::Server)?;
+        let mut xml = String::new();
+        source.write_xml_as(StanzaNamespace::Server, &mut xml)?;
+        assert_eq!(xml, expected_server.xml, "{}", case.name);
+        server_serializations += 1;
+        let candidate = parse_stream_stanza(StanzaNamespace::Server, &xml);
+        let reference = parse_stream_stanza(StanzaNamespace::Server, &expected_server.xml);
+        if case.name == "prefixed_content_under_foreign_default" {
+            for parsed in [candidate, reference] {
+                let error = parsed.err().ok_or("expected prefixed-root rejection")?;
+                assert!(
+                    matches!(
+                        error.downcast_ref::<crate::parser::ParseError>(),
+                        Some(crate::parser::ParseError::BadNamespacePrefix)
+                    ),
+                    "{error}"
+                );
+            }
+            parser_rejections += 1;
+            continue;
+        }
+        let (candidate, candidate_arena) =
+            candidate.map_err(|error| format!("{} candidate: {error}", case.name))?;
+        let (reference, reference_arena) =
+            reference.map_err(|error| format!("{} reference: {error}", case.name))?;
+        let original_structure = structural_walk(&source)?;
+        let mut client_outputs = Vec::new();
+        for (parsed, arena) in [(candidate, candidate_arena), (reference, reference_arena)] {
+            assert_eq!(
+                structural_walk(&parsed.resolve(&arena)?)?,
+                expected_server.structure,
+                "{}",
+                case.name
+            );
+            let mut client_arena = Arena::try_new(ArenaConfig::default())?;
+            let client = parsed
+                .resolve(&arena)?
+                .rescope_in(StanzaNamespace::Client, &mut client_arena)?;
+            assert_eq!(
+                structural_walk(&client.resolve(&client_arena)?)?,
+                original_structure,
+                "{}",
+                case.name
+            );
+            client_outputs.push(stanza_xml(client, &client_arena)?);
+        }
+        assert_eq!(client_outputs[0], client_outputs[1], "{}", case.name);
+        if case.name == "stream_header_bindings" {
+            for output in [
+                &xml,
+                &expected_server.xml,
+                &client_outputs[0],
+                &client_outputs[1],
+            ] {
+                assert_stream_header_bindings(output)?;
+            }
+        }
+        restored += 1;
+    }
+    assert_eq!(
+        (
+            missing_addresses,
+            invalid_errors,
+            server_serializations,
+            parser_rejections,
+            restored
+        ),
+        (4, 1, 17, 1, 16)
+    );
+    Ok(())
+}
+
+#[test]
+fn write_as_needs_no_arena() -> TestResult {
+    let fail = Arc::new(AtomicBool::new(false));
+    let mut arena = Arena::try_new_in(
+        ArenaConfig::default(),
+        FailingAllocator { fail: fail.clone() },
+    )?;
+    let from = Jid::parse_in("a@example.org/r", &mut arena)?;
+    let to = Jid::parse_in("b@example.net", &mut arena)?;
+    let text = "x".repeat(ArenaConfig::default().chunk_size.get() * 2);
+    let body = Element::builder_in("body", CLIENT_NAMESPACE, &mut arena)?
+        .text(&text)?
+        .build()?;
+    let stanza = Stanza::builder_in(
+        StanzaType::Message(MessageType::Chat),
+        StanzaNamespace::Client,
+        &mut arena,
+    )
+    .from(Some(from))?
+    .to(Some(to))?
+    .child(body)?
+    .build()?;
+    let mut oracle_arena = Arena::try_new_in(
+        ArenaConfig::default(),
+        FailingAllocator { fail: fail.clone() },
+    )?;
+    let view = stanza.resolve(&arena)?;
+    let copied = view.rescope_in(StanzaNamespace::Server, &mut oracle_arena)?;
+    let expected = stanza_xml(copied, &oracle_arena)?;
+    let mut refused_arena = Arena::try_new_in(
+        ArenaConfig::default(),
+        FailingAllocator { fail: fail.clone() },
+    )?;
+    assert!(text.len() > refused_arena.stats().reserved_bytes);
+    fail.store(true, Ordering::Relaxed);
+    assert_eq!(
+        view.rescope_in(StanzaNamespace::Server, &mut refused_arena)
+            .err(),
+        Some(BuildError::Allocation(ArenaError::Allocation(
+            AllocationError::Exhausted
+        ))),
+    );
+    view.validate_rescope(StanzaNamespace::Server)?;
+    let mut xml = String::new();
+    view.write_xml_as(StanzaNamespace::Server, &mut xml)?;
+    assert_eq!(xml, expected);
+    let mut writer = FragmentedWriter::default();
+    futures_executor::block_on(view.write_xml_async_as(StanzaNamespace::Server, &mut writer))?;
+    assert_eq!(writer.bytes, expected.as_bytes());
+    assert_eq!(writer.flushes, 0);
+    Ok(())
+}

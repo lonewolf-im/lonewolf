@@ -6,8 +6,6 @@ Out of the box, Lonewolf enables `roster`, `offline`, `disco`, `ping`, `vcard`, 
 
 If you maintain a software directory, [`lonewolf.doap`](../lonewolf.doap) has the same summary in the [XEP-0453](https://xmpp.org/extensions/xep-0453.html) format.
 
-Most extensions below first shipped in v0.1.0. The [v0.2.0 release](https://github.com/lonewolf-im/lonewolf/releases/tag/v0.2.0) added local support for XEP-0030, XEP-0054, XEP-0199, XEP-0280 and XEP-0297. The [v0.3.0 release](https://github.com/lonewolf-im/lonewolf/releases/tag/v0.3.0) adds federation, including XEP-0288 and XEP-0478, direct TLS (XEP-0368), Private XML Storage (XEP-0049), Software Version (XEP-0092), and opt-in SHA-512 authentication. See the [upgrade notes](https://github.com/lonewolf-im/lonewolf/releases/tag/v0.3.0#upgrade-notes) before updating an existing installation.
-
 ## XMPP extensions
 
 | Specification and reviewed version | What you get | How to enable it | Example tests |

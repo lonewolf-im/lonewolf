@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+mod rescope;
+
 use std::alloc::Layout;
 use std::fmt;
 use std::io;

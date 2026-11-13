@@ -81,26 +81,27 @@ where
 {
     match event {
         StreamEvent::Stanza(parsed) => {
-            let view = parsed
-                .value()
-                .resolve(parsed.arena())
-                .map_err(|_| StreamErrorCondition::InternalServerError)?;
-            validate(
-                view.namespace(),
-                view.from()
-                    .map_err(|_| StreamErrorCondition::InternalServerError)?,
-                view.to()
-                    .map_err(|_| StreamErrorCondition::InternalServerError)?,
-                peer,
-            )?;
-            metrics.stanza_received(view.kind());
-            if count_bidi {
-                metrics.bidi_stanza_received(view.kind());
+            {
+                let view = parsed
+                    .value()
+                    .resolve(parsed.arena())
+                    .map_err(|_| StreamErrorCondition::InternalServerError)?;
+                validate(
+                    view.namespace(),
+                    view.from()
+                        .map_err(|_| StreamErrorCondition::InternalServerError)?,
+                    view.to()
+                        .map_err(|_| StreamErrorCondition::InternalServerError)?,
+                    peer,
+                )?;
+                metrics.stanza_received(view.kind());
+                if count_bidi {
+                    metrics.bidi_stanza_received(view.kind());
+                }
             }
-            let mut arena = Arena::try_new_in(Default::default(), context.allocator.clone())
-                .map_err(|_| StreamErrorCondition::InternalServerError)?;
-            let stanza = view
-                .rescope_in(StanzaNamespace::Client, &mut arena)
+            let (stanza, mut arena) = parsed.into_parts();
+            let stanza = stanza
+                .rescope_derive_in(StanzaNamespace::Client, &mut arena)
                 .map_err(|_| StreamErrorCondition::InternalServerError)?;
             deliver(RoutedStanza::from_parts(stanza, arena)).await
         }
@@ -186,12 +187,15 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::alloc::Layout;
     use std::io::Cursor;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use compio::runtime::Runtime;
     use lonewolf_storage::RedbStorage;
-    use lonewolf_util::arena::GlobalChunkAllocator;
+    use lonewolf_util::arena::{AllocationError, Chunk, GlobalChunkAllocator};
+    use lonewolf_xmpp::stanza::CLIENT_NAMESPACE;
     use prometheus_client::registry::Registry;
 
     use super::*;
@@ -205,8 +209,24 @@ mod tests {
     const HEADER: &str = "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:server' version='1.0'>";
     const RECEIVED_MESSAGE: &str = "lonewolf_s2s_stanzas_received_total{kind=\"message\"} 1";
 
-    struct Fixture {
-        context: IngressContext<GlobalChunkAllocator>,
+    #[derive(Default)]
+    struct CountingAllocator(AtomicUsize);
+
+    // The wrapper preserves the delegated chunk ownership and layout contracts.
+    unsafe impl ChunkAllocator for CountingAllocator {
+        fn allocate(&self, layout: Layout) -> Result<Chunk, AllocationError> {
+            let chunk = GlobalChunkAllocator.allocate(layout)?;
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(chunk)
+        }
+
+        unsafe fn deallocate(&self, chunk: Chunk) {
+            unsafe { GlobalChunkAllocator.deallocate(chunk) };
+        }
+    }
+
+    struct Fixture<A: ChunkAllocator = GlobalChunkAllocator> {
+        context: IngressContext<A>,
         metrics: Arc<S2sMetrics>,
         limits: S2sReaderLimits,
         _directory: tempfile::TempDir,
@@ -214,15 +234,21 @@ mod tests {
 
     impl Fixture {
         fn new() -> TestResult<Self> {
+            Self::with_allocator(GlobalChunkAllocator)
+        }
+    }
+
+    impl<A: ChunkAllocator + Clone + 'static> Fixture<A> {
+        fn with_allocator(allocator: A) -> TestResult<Self> {
             let config = Config::default();
             let hosts = Hosts::new(&config.hosts, None)?;
-            let router = Router::new(hosts, LocalRouter::new(GlobalChunkAllocator));
+            let router = Router::new(hosts, LocalRouter::new(allocator.clone()));
             let directory = tempfile::tempdir()?;
             Ok(Self {
                 context: IngressContext {
                     router: router.handle(),
                     storage: RedbStorage::open(directory.path().join("state.redb"))?,
-                    allocator: GlobalChunkAllocator,
+                    allocator,
                     work: WorkGroup::new().handle(),
                 },
                 metrics: S2sMetrics::new(0),
@@ -235,11 +261,11 @@ mod tests {
             })
         }
 
-        async fn event(&self, xml: &str) -> TestResult<StreamEvent<GlobalChunkAllocator>> {
+        async fn event(&self, xml: &str) -> TestResult<StreamEvent<A>> {
             let mut reader = S2sReader::new(
                 Cursor::new(format!("{HEADER}{xml}").into_bytes()),
                 &self.limits,
-                GlobalChunkAllocator,
+                self.context.allocator.clone(),
                 None,
             );
             assert!(matches!(
@@ -272,6 +298,84 @@ mod tests {
             remote: "peer.test".into(),
             connection_id: 1,
         }
+    }
+
+    const CHAT: &str =
+        "<message from='u@peer.test/r' to='v@local.test' type='chat'><body>hello</body></message>";
+
+    #[test]
+    fn inbound_stanza_reaches_delivery_without_another_arena() -> TestResult {
+        Runtime::new()?.block_on(async {
+            let allocator = Arc::new(CountingAllocator::default());
+            let fixture = Fixture::with_allocator(allocator.clone())?;
+            let event = fixture.event(CHAT).await?;
+            let after_parse = allocator.0.load(Ordering::Relaxed);
+            assert!(after_parse > 0);
+            let mut at_delivery = None;
+            let result = process(
+                event,
+                &peer(),
+                &fixture.metrics,
+                &fixture.context,
+                false,
+                async |_| {
+                    at_delivery = Some(allocator.0.load(Ordering::Relaxed));
+                    Ok(())
+                },
+            )
+            .await;
+            assert_eq!(result, Ok(()));
+            assert_eq!(at_delivery, Some(after_parse));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn inbound_stanza_is_delivered_as_client_namespace() -> TestResult {
+        Runtime::new()?.block_on(async {
+            let fixture = Fixture::new()?;
+            let event = fixture.event(CHAT).await?;
+            let StreamEvent::Stanza(parsed) = &event else {
+                return Err("missing parsed stanza".into());
+            };
+            let mut reference_arena = Arena::try_new_in(Default::default(), GlobalChunkAllocator)?;
+            let reference = parsed
+                .value()
+                .resolve(parsed.arena())?
+                .rescope_in(StanzaNamespace::Client, &mut reference_arena)?;
+            let mut expected = String::new();
+            reference
+                .resolve(&reference_arena)?
+                .write_xml(&mut expected)?;
+            let mut delivered = false;
+            let result = process(
+                event,
+                &peer(),
+                &fixture.metrics,
+                &fixture.context,
+                false,
+                async |stanza| {
+                    let view = stanza
+                        .resolve()
+                        .map_err(|_| StreamErrorCondition::InternalServerError)?;
+                    assert_eq!(view.namespace(), StanzaNamespace::Client);
+                    let body = view
+                        .child("body", CLIENT_NAMESPACE)
+                        .map_err(|_| StreamErrorCondition::InternalServerError)?;
+                    assert!(body.is_some());
+                    let mut actual = String::new();
+                    view.write_xml(&mut actual)
+                        .map_err(|_| StreamErrorCondition::InternalServerError)?;
+                    assert_eq!(actual, expected);
+                    delivered = true;
+                    Ok(())
+                },
+            )
+            .await;
+            assert_eq!(result, Ok(()));
+            assert!(delivered);
+            Ok(())
+        })
     }
 
     #[test]

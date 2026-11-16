@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use futures_util::FutureExt as _;
+use futures_util::future::{Either, select};
+use lonewolf_xmpp::parser::StreamEvent;
+use std::pin::pin;
 
 #[test]
 fn accepted_socket_enables_keepalive() -> Result<(), Box<dyn std::error::Error>> {
@@ -207,7 +211,7 @@ fn cancelled_authenticated_stream(closing: bool) -> Result<(), Box<dyn std::erro
         assert!(matches!(registry.attach("muc.localhost"), Err(registry::AttachError::Conflict)));
         let outcome = if closing {
             let terminal = async {
-                writer.write_all(b"<message from='muc.localhost' to='localhost'/>").await?;
+                writer.write_all(b"<handshake/>").await?;
                 writer.flush().await?;
                 let Some(StreamEvent::Element(error)) = reader.next_event().await? else { return Err("missing stream error".into()); };
                 let error = error.value().resolve(error.arena())?;

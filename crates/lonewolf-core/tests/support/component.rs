@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fmt::Write as _;
+use std::io::Read as _;
 use std::net::{SocketAddr, TcpStream};
 
 use sha1::{Digest as _, Sha1};
@@ -95,6 +96,18 @@ impl ComponentClient {
     pub fn receive(&mut self) -> TestResult<Element> {
         self.stream.receive()
     }
+    pub fn receive_or_footer(&mut self) -> TestResult<Option<Element>> {
+        self.stream.receive_or_footer()
+    }
+    pub fn drain_to_eof(self) -> TestResult<Vec<u8>> {
+        let mut input = self.stream.into_inner();
+        let mut bytes = Vec::new();
+        match input.read_to_end(&mut bytes) {
+            Ok(_) => Ok(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => Ok(bytes),
+            Err(error) => Err(error.into()),
+        }
+    }
     pub fn expect_xml(&mut self, xml: &str) -> TestResult {
         self.receive()?.assert_xml(xml)
     }
@@ -118,6 +131,7 @@ impl ComponentClient {
     pub fn close(&mut self) -> TestResult {
         self.send("</stream:stream>")?;
         self.expect_footer()?;
+        self.shutdown_write()?;
         self.expect_eof()
     }
 }

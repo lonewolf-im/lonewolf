@@ -8,11 +8,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::io::{AsyncWrite, AsyncWriteExt as _, BufWriter};
-use lonewolf_util::arena::{ArenaConfig, ChunkAllocator, HandleError};
+use lonewolf_util::arena::{ArenaConfig, ArenaRead, ChunkAllocator, HandleError};
 use lonewolf_util::rate_limited_reader::RateLimitedReader;
 use lonewolf_xmpp::parser::{ParseError, ParserConfig, StreamEvent, XmppParser};
+use lonewolf_xmpp::stanza::{AsyncWriteError, StanzaNamespace, StanzaRef};
 use lonewolf_xmpp::stream::StreamErrorCondition;
-use tokio::io::AsyncBufRead;
+use tokio::io::{AsyncBufRead, AsyncReadExt as _};
 
 use super::metrics::{ComponentMetrics, InboundLimit};
 use crate::config::limits::ComponentLimits;
@@ -91,6 +92,17 @@ impl<A: ChunkAllocator + Clone, R: AsyncBufRead + Unpin + 'static> ComponentRead
         }
     }
 
+    /// Consume the reader only after a peer footer.
+    pub(crate) async fn transport_end(&mut self) -> Result<(), ComponentError> {
+        let (parser, _, _) = self.inner.take_parts().await?;
+        let (mut input, _) = parser.into_inner().into_parts();
+        let mut byte = [0];
+        match input.read(&mut byte).await? {
+            0 => Ok(()),
+            _ => Err(ComponentError::Io),
+        }
+    }
+
     pub(crate) async fn next_event(&mut self) -> Result<Option<StreamEvent<A>>, ComponentError> {
         let event = match self.inner.read_event().await {
             Err(ParseError::UnexpectedEof) => return Err(ComponentError::Eof),
@@ -105,14 +117,45 @@ impl<A: ChunkAllocator + Clone, R: AsyncBufRead + Unpin + 'static> ComponentRead
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct WriteProgress(Rc<Cell<Instant>>);
+impl WriteProgress {
+    pub(crate) fn new(at: Instant) -> Self {
+        Self(Rc::new(Cell::new(at)))
+    }
+    pub(crate) fn record(&self, at: Instant) {
+        self.0.set(self.0.get().max(at));
+    }
+    pub(crate) fn last(&self) -> Instant {
+        self.0.get()
+    }
+}
+
 pub(crate) struct ComponentWriter<W> {
     output: BufWriter<W>,
+    progress: WriteProgress,
 }
 impl<W: AsyncWrite + Unpin> ComponentWriter<W> {
-    pub(crate) fn new(output: W) -> Self {
+    pub(crate) fn new(output: W, progress: WriteProgress) -> Self {
         Self {
             output: BufWriter::with_capacity(4_096, output),
+            progress,
         }
+    }
+    pub(crate) fn progress(&self) -> WriteProgress {
+        self.progress.clone()
+    }
+    pub(crate) async fn write_stanza<R: ArenaRead>(
+        &mut self,
+        stanza: &StanzaRef<'_, R>,
+    ) -> Result<(), ComponentError> {
+        stanza
+            .write_xml_async_as(StanzaNamespace::ComponentAccept, &mut self.output)
+            .await
+            .map_err(|error| match error {
+                AsyncWriteError::Access(_) => ComponentError::Internal,
+                AsyncWriteError::Output(error) => error.into(),
+            })
     }
     pub(crate) async fn send(&mut self, xml: &str) -> Result<(), ComponentError> {
         self.output.write_all(xml.as_bytes()).await?;

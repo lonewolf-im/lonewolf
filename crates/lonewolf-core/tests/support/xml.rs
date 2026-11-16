@@ -277,10 +277,20 @@ impl<R: Read> XmlStream<R> {
     }
 
     pub fn receive(&mut self) -> TestResult<Element> {
-        self.receive_with_max_bytes(DEFAULT_MAX_RESPONSE_BYTES)
+        self.receive_or_footer()?
+            .ok_or_else(|| "stream ended before response".into())
     }
 
     fn receive_with_max_bytes(&mut self, max_bytes: u64) -> TestResult<Element> {
+        self.receive_or_footer_with_max_bytes(max_bytes)?
+            .ok_or_else(|| "stream ended before response".into())
+    }
+
+    pub fn receive_or_footer(&mut self) -> TestResult<Option<Element>> {
+        self.receive_or_footer_with_max_bytes(DEFAULT_MAX_RESPONSE_BYTES)
+    }
+
+    fn receive_or_footer_with_max_bytes(&mut self, max_bytes: u64) -> TestResult<Option<Element>> {
         let start_offset = self.reader.buffer_position();
         let mut stack: Vec<Element> = Vec::new();
         loop {
@@ -290,11 +300,20 @@ impl<R: Read> XmlStream<R> {
             self.buffer.clear();
             match self.reader.read_event_into(&mut self.buffer)? {
                 Event::Start(start) => stack.push(Element::from_start(&self.reader, &start)?),
-                Event::End(_) => {
-                    let element = stack.pop().ok_or("stream ended before response")?;
+                Event::End(end) => {
+                    if stack.is_empty() {
+                        let (namespace, name) = self.reader.resolver().resolve_element(end.name());
+                        if name.as_ref() == "stream"
+                            && matches!(namespace, ResolveResult::Bound(ns) if ns.as_ref() == STREAM_NAMESPACE)
+                        {
+                            return Ok(None);
+                        }
+                        return Err("unexpected closing element".into());
+                    }
+                    let element = stack.pop().ok_or("missing response element")?;
                     match stack.last_mut() {
                         Some(parent) => parent.children.push(element),
-                        None => return Ok(element),
+                        None => return Ok(Some(element)),
                     }
                 }
                 Event::Text(text) => {

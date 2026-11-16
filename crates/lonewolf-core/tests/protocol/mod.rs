@@ -5,6 +5,8 @@ mod support;
 
 mod carbons;
 
+mod component;
+
 mod observers;
 
 mod archive;

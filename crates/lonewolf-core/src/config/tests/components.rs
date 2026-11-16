@@ -4,7 +4,7 @@ use std::error::Error;
 
 use lonewolf_auth::component::ComponentSecret;
 
-use crate::config::{ComponentSecretSource, Config, ConfigError};
+use crate::config::{ComponentBalancing, ComponentSecretSource, Config, ConfigError};
 
 use super::{TestResult, config_file};
 
@@ -33,13 +33,90 @@ fn component_secret_sources_load_without_reading_secret_files() -> TestResult {
         ComponentSecretSource::File("./missing-component-secret".into())
     );
     assert!(file_domain.discoverable);
+    assert_eq!(file_domain.max_connections.get(), 1);
+    assert_eq!(file_domain.balancing, ComponentBalancing::Source);
     let inline_domain = &config.components.domains["pubsub.example.com"];
     assert_eq!(
         inline_domain.secret,
         ComponentSecretSource::Inline(ComponentSecret::new("1234567890abcdef")?)
     );
     assert!(!inline_domain.discoverable);
+    assert_eq!(inline_domain.max_connections.get(), 1);
+    assert_eq!(inline_domain.balancing, ComponentBalancing::Source);
     assert!(!format!("{config:?}").contains("1234567890abcdef"));
+    Ok(())
+}
+
+#[test]
+fn every_component_balancing_policy_accepts_multiple_connections() -> TestResult {
+    for (name, expected) in [
+        ("source", ComponentBalancing::Source),
+        ("bare_source", ComponentBalancing::BareSource),
+        ("destination", ComponentBalancing::Destination),
+        ("bare_destination", ComponentBalancing::BareDestination),
+        ("random", ComponentBalancing::Random),
+    ] {
+        let file = config_file(&format!(
+            "[components.domains.'muc.example.com']\nsecret_file = './secret'\n\
+             max_connections = 2\nbalancing = '{name}'\n"
+        ))?;
+        let config = Config::load(Some(file.path()))?;
+        let domain = &config.components.domains["muc.example.com"];
+        assert_eq!(domain.max_connections.get(), 2);
+        assert_eq!(domain.balancing, expected);
+    }
+    Ok(())
+}
+
+#[test]
+fn component_connection_allowances_are_positive_and_bounded_by_the_global_limit() -> TestResult {
+    for (global, domain, valid) in [(1, 1, true), (2, 2, true), (1, 2, false), (64, 65, false)] {
+        let file = config_file(&format!(
+            "[limits.components]\nmax_inbound_connections = {global}\n\
+             [components.domains.'muc.example.com']\nsecret_file = './secret'\n\
+             max_connections = {domain}\n"
+        ))?;
+        let result = Config::load(Some(file.path()));
+        if valid {
+            assert_eq!(
+                result?.components.domains["muc.example.com"]
+                    .max_connections
+                    .get(),
+                domain
+            );
+        } else {
+            assert!(
+                matches!(result, Err(ConfigError::Invalid { ref reason, .. })
+                    if reason == "components.domains.muc.example.com.max_connections must not exceed limits.components.max_inbound_connections"),
+                "{result:?}"
+            );
+        }
+    }
+    for settings in ["max_connections = 0", "balancing = 'round_robin'"] {
+        let file = config_file(&format!(
+            "[components.domains.'muc.example.com']\nsecret_file = './secret'\n{settings}\n"
+        ))?;
+        let result = Config::load(Some(file.path()));
+        assert!(
+            matches!(result, Err(ConfigError::Parse { .. })),
+            "{result:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn component_domain_allowances_are_validated_before_listener_requirements() -> TestResult {
+    let file = config_file(
+        "[components]\nlisteners = []\n\
+         [components.domains.'muc.example.com']\nsecret_file = './secret'\nmax_connections = 65\n",
+    )?;
+    let result = Config::load(Some(file.path()));
+    assert!(
+        matches!(result, Err(ConfigError::Invalid { ref reason, .. })
+            if reason == "components.domains.muc.example.com.max_connections must not exceed limits.components.max_inbound_connections"),
+        "{result:?}"
+    );
     Ok(())
 }
 

@@ -693,6 +693,11 @@ impl ComponentsConfig {
                     "components.domains.{domain}.secret_file must not be empty"
                 ));
             }
+            if component.max_connections > config.limits.components.max_inbound_connections {
+                return Err(format!(
+                    "components.domains.{domain}.max_connections must not exceed limits.components.max_inbound_connections"
+                ));
+            }
         }
         if self.domains.is_empty() {
             return Ok(());
@@ -767,6 +772,19 @@ impl Default for ComponentListenerConfig {
 pub struct ComponentDomainConfig {
     pub secret: ComponentSecretSource,
     pub discoverable: bool,
+    pub max_connections: NonZeroUsize,
+    pub balancing: ComponentBalancing,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ComponentBalancing {
+    #[default]
+    Source,
+    BareSource,
+    Destination,
+    BareDestination,
+    Random,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -782,6 +800,8 @@ struct RawComponentDomainConfig {
     secret: Option<String>,
     secret_file: Option<PathBuf>,
     discoverable: Option<bool>,
+    max_connections: Option<NonZeroUsize>,
+    balancing: Option<ComponentBalancing>,
 }
 
 fn deserialize_inline_component_secret<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
@@ -808,6 +828,8 @@ impl<'de> Deserialize<'de> for ComponentDomainConfig {
         Ok(Self {
             secret,
             discoverable: raw.discoverable.unwrap_or(true),
+            max_connections: raw.max_connections.unwrap_or(NonZeroUsize::MIN),
+            balancing: raw.balancing.unwrap_or_default(),
         })
     }
 }

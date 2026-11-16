@@ -295,8 +295,8 @@
 
 # [limits.components]
 
-# Increase this connection allowance when you run more component instances.
-# max_connections = 64
+# Increase this total allowance when more component connections need to negotiate or stay connected across listeners.
+# max_inbound_connections = 64
 
 # Increase the sustained rate or burst for components that reconnect frequently.
 # connection_attempts_per_ip = { per_second = 5, burst = 20 }
@@ -313,10 +313,10 @@
 # Increase the sustained byte rate or burst for components that send more XML per connection.
 # incoming_xml_per_connection = { bytes_per_second = 4_194_304, burst_bytes = 16_777_216 }
 
-# Increase the stanza allowance per component when short traffic bursts fill its queue.
+# Increase the stanza allowance per connection when short traffic bursts fill its queue.
 # max_queued_stanzas = 4_096
 
-# Increase the byte allowance per component when larger stanzas fill its queue.
+# Increase the byte allowance per connection when larger stanzas fill its queue.
 # max_queued_bytes = 16_777_216
 
 # Allow more seconds without write progress for components on slower networks.
@@ -435,6 +435,16 @@
 # secret_file = "./secrets/muc.example.com"
 # Choose whether the closest parent host lists this component in service discovery.
 # discoverable = true
+# Increase this domain's connection allowance only when its instances share state, because each instance receives only part of its traffic.
+# Keep this no greater than limits.components.max_inbound_connections.
+# max_connections = 1
+# Choose "source" for affinity by full sender JID or "bare_source" for all resources of one account.
+# Choose "destination" or "bare_destination" for affinity by the full or bare addressed JID.
+# These policies keep each key on one connection while the set of connections stays the same.
+# Choose "random" to spread traffic without preserving stanza order.
+# Answers to an instance's own requests can reach another instance.
+# When instances connect or disconnect, some senders move between instances.
+# balancing = "source"
 
 # Use an inline secret instead of secret_file only when file storage is unsuitable.
 # The domain and secret below are examples.

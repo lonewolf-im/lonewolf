@@ -135,7 +135,7 @@ fn limits_defaults_match_the_policy() -> TestResult {
         ("failure_backoff_max_secs", 900),
     ];
     let component_expected = [
-        ("max_connections", 64),
+        ("max_inbound_connections", 64),
         ("connection_attempts_per_ip.per_second", 5),
         ("connection_attempts_per_ip.burst", 20),
         ("negotiation_timeout_secs", 10),
@@ -617,5 +617,17 @@ fn component_timeouts_must_fit_the_platform_clock() -> TestResult {
             "{result:?}"
         );
     }
+    Ok(())
+}
+
+#[test]
+fn component_global_connection_limit_rejects_the_renamed_key() -> TestResult {
+    let file = setting("components.max_connections", 64)?;
+    let result = Config::load(Some(file.path()));
+    assert!(
+        matches!(result, Err(ConfigError::Parse { ref source, .. })
+            if source.message().contains("unknown field `max_connections`")),
+        "{result:?}"
+    );
     Ok(())
 }

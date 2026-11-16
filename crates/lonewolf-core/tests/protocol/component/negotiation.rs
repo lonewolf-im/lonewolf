@@ -221,10 +221,10 @@ fn attempt_and_global_connection_limits_refuse_without_xml() -> TestResult {
 }
 
 #[test]
-fn interim_stanza_closes_stream_as_unsupported_type() -> TestResult {
+fn repeated_handshake_closes_stream_as_unsupported_type() -> TestResult {
     let mut suite = C2sSuite::with_components(CONFIG)?;
     let mut client = ComponentClient::authenticated(&suite, DOMAIN, SECRET)?;
-    client.send("<message from='muc.localhost' to='localhost'/>")?;
+    client.send("<handshake/>")?;
     rejected(&mut client, "unsupported-stanza-type")?;
     closed(&suite, "unsupported_stanza_type", 1)?;
     suite.wait_for_metric("lonewolf_component_streams 0")?;

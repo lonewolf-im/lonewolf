@@ -19,7 +19,7 @@ use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt as _};
 
 use super::metrics::{AuthOutcome, ComponentMetrics, GaugeGuard};
 use super::registry::{AttachError, ComponentLink};
-use super::stream::{self, ComponentError, ComponentReader, ComponentWriter};
+use super::stream::{self, ComponentError, ComponentReader, ComponentWriter, WriteProgress};
 use super::{Settings, StreamAccounting};
 use crate::connection::ShutdownSignal;
 use crate::xml_stream::traffic::{ObservedIo, TrafficObserver};
@@ -40,13 +40,21 @@ pub(crate) struct Authenticated<A: ChunkAllocator, R, W> {
 }
 
 #[derive(Clone)]
-pub(super) struct ComponentByteObserver(Arc<ComponentMetrics>);
+pub(super) struct ComponentByteObserver(Arc<ComponentMetrics>, WriteProgress);
+impl ComponentByteObserver {
+    pub(super) fn new(metrics: Arc<ComponentMetrics>, progress: WriteProgress) -> Self {
+        Self(metrics, progress)
+    }
+}
 impl TrafficObserver for ComponentByteObserver {
     fn received(&self, bytes: usize) {
         self.0.bytes(bytes as u64, 0);
     }
     fn sent(&self, bytes: usize) {
         self.0.bytes(0, bytes as u64);
+        if bytes > 0 {
+            self.1.record(Instant::now());
+        }
     }
 }
 
@@ -114,9 +122,10 @@ pub(super) async fn negotiate<A: ChunkAllocator + Clone>(
     connection_id: u64,
     mut accounting: Accounting,
 ) -> Result<Authenticated<A, Input, Output>, ComponentError> {
+    let progress = WriteProgress::new(Instant::now());
     let input = Box::pin(AsyncReadStream::new(ObservedIo::new(
         tcp.clone(),
-        ComponentByteObserver(Arc::clone(&settings.metrics)),
+        ComponentByteObserver::new(Arc::clone(&settings.metrics), progress.clone()),
     )))
     .compat();
     let mut reader = ComponentReader::new(
@@ -125,10 +134,13 @@ pub(super) async fn negotiate<A: ChunkAllocator + Clone>(
         settings.services.allocator.clone(),
         Arc::clone(&settings.metrics),
     );
-    let mut writer = ComponentWriter::new(Box::pin(AsyncStream::new(ObservedIo::new(
-        tcp.clone(),
-        ComponentByteObserver(Arc::clone(&settings.metrics)),
-    ))));
+    let mut writer = ComponentWriter::new(
+        Box::pin(AsyncStream::new(ObservedIo::new(
+            tcp.clone(),
+            ComponentByteObserver::new(Arc::clone(&settings.metrics), progress.clone()),
+        ))),
+        progress,
+    );
     let mut progress = Progress {
         domain: None,
         header_sent: false,

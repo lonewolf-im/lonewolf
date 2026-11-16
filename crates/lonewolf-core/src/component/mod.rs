@@ -7,23 +7,17 @@ pub(crate) mod service;
 
 use std::future::Future;
 use std::net::IpAddr;
-use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use compio::net::TcpStream;
-use futures_util::FutureExt as _;
-use futures_util::future::{Either, select};
 use lonewolf_storage::RedbStorage;
 use lonewolf_util::arena::ChunkAllocator;
 use lonewolf_util::core_dispatcher::DispatchHandle;
-use lonewolf_xmpp::parser::StreamEvent;
-use lonewolf_xmpp::stream::StreamErrorCondition;
 
 use self::metrics::{ComponentMetrics, ConnectionRejection, StreamClose, Transport};
 use self::registry::ComponentRegistry;
-use self::stream::ComponentError;
 use crate::admission::attempt_limit::{Admission, AttemptLimiter};
 use crate::admission::global_limit::{GlobalLimit, GlobalPermit};
 use crate::config::ComponentsConfig;
@@ -34,7 +28,10 @@ use crate::connection::{
 };
 use crate::router::RouterHandle;
 
+mod ingress;
 mod negotiate;
+mod receive;
+mod session;
 pub(crate) mod stream;
 
 static NEXT_COMPONENT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
@@ -66,9 +63,7 @@ impl Drop for StreamAccounting {
 
 #[derive(Clone)]
 pub(crate) struct ComponentServices<A: ChunkAllocator> {
-    #[allow(dead_code)]
     pub(crate) router: RouterHandle<A>,
-    #[allow(dead_code)]
     pub(crate) storage: RedbStorage,
     pub(crate) allocator: A,
 }
@@ -191,74 +186,16 @@ impl<A: ChunkAllocator + Clone> AcceptHandler for ComponentAcceptor<A> {
             let connection_id = NEXT_COMPONENT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
             set_keepalive(&tcp, connection_id);
             let started = Instant::now();
-            if let Ok(mut authenticated) =
+            if let Ok(authenticated) =
                 negotiate::negotiate(&tcp, &settings, shutdown.clone(), connection_id, accounting)
                     .await
             {
-                let domain = &authenticated.domain;
-                let connection_id = authenticated.connection_id;
+                let domain = Arc::clone(&authenticated.domain);
                 tracing::info!(component_domain = %domain, connection_id, "component connected");
-                let (outcome, condition, peer_footer, deadline) = match select(
-                    pin!(shutdown.clone()),
-                    pin!(authenticated.reader.next_event()),
-                )
-                .await
-                {
-                    Either::Left((deadline, _)) => (
-                        StreamClose::Shutdown,
-                        Some(StreamErrorCondition::SystemShutdown),
-                        false,
-                        Some(deadline),
-                    ),
-                    Either::Right((Ok(Some(StreamEvent::StreamEnd)), _)) => {
-                        (StreamClose::StreamEnd, None, true, None)
-                    }
-                    Either::Right((Err(ComponentError::PeerError(_)), _)) => {
-                        (StreamClose::PeerError, None, false, None)
-                    }
-                    Either::Right((
-                        Err(ComponentError::Io | ComponentError::Timeout | ComponentError::Eof)
-                        | Ok(None),
-                        _,
-                    )) => (StreamClose::TransportError, None, false, None),
-                    Either::Right((Err(ComponentError::Stream(condition)), _)) => {
-                        (StreamClose::ProtocolError, Some(condition), false, None)
-                    }
-                    Either::Right((Err(ComponentError::Internal), _)) => (
-                        StreamClose::InternalError,
-                        Some(StreamErrorCondition::InternalServerError),
-                        false,
-                        None,
-                    ),
-                    Either::Right((Ok(Some(_)), _)) => (
-                        StreamClose::UnsupportedStanzaType,
-                        Some(StreamErrorCondition::UnsupportedStanzaType),
-                        false,
-                        None,
-                    ),
-                };
-                authenticated.stream_accounting.set_outcome(outcome);
-                if !matches!(
-                    outcome,
-                    StreamClose::PeerError | StreamClose::TransportError
-                ) {
-                    if !matches!(outcome, StreamClose::Shutdown | StreamClose::StreamEnd) {
-                        tracing::warn!(component_domain = %domain, connection_id, outcome = outcome.as_str(), "component stream rejected");
-                    }
-                    stream::close(
-                        &mut authenticated.reader,
-                        &mut authenticated.writer,
-                        condition,
-                        peer_footer,
-                        deadline.or_else(|| shutdown.now_or_never()),
-                    )
-                    .await;
-                }
-                let _ = socket2::SockRef::from(&tcp).shutdown(std::net::Shutdown::Both);
+                let outcome =
+                    session::serve(authenticated, &tcp, &settings, &settings.services, shutdown)
+                        .await;
                 tracing::info!(component_domain = %domain, connection_id, outcome = outcome.as_str(), duration_ms = started.elapsed().as_millis() as u64, "component disconnected");
-                drop(authenticated.link);
-                drop(authenticated.stream_accounting);
-                drop(authenticated.stream_gauge);
             }
         }
     }

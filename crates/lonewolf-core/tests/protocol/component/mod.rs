@@ -4,6 +4,8 @@ use crate::support::{C2sSuite, TestResult};
 
 mod negotiation;
 mod registry;
+mod stream;
+mod stream_conformance;
 
 #[test]
 fn configured_component_domains_register_the_component_catalog() -> TestResult {

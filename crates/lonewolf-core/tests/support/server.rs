@@ -325,7 +325,20 @@ impl C2sSuite {
         hosts: &str,
         setup: impl FnOnce(&Path) -> TestResult,
     ) -> TestResult<Self> {
-        Self::settings_with_setup("", "", 10, hosts, |directory| {
+        Self::component_settings(domains, hosts, "", setup)
+    }
+
+    pub fn with_components_limits(domains: &str, limits: &str) -> TestResult<Self> {
+        Self::component_settings(domains, "", limits, |_| Ok(()))
+    }
+
+    fn component_settings(
+        domains: &str,
+        hosts: &str,
+        limits: &str,
+        setup: impl FnOnce(&Path) -> TestResult,
+    ) -> TestResult<Self> {
+        Self::settings_with_setup("", limits, 10, hosts, |directory| {
             let mut file = fs::OpenOptions::new()
                 .append(true)
                 .open(directory.join("lonewolf.toml"))?;

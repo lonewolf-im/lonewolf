@@ -283,6 +283,11 @@ impl<A: ChunkAllocator, S: Storage> ExtensionRegistry<A, S> {
         &self.discovery
     }
 
+    /// Lists a service domain in this host's discovery items.
+    pub fn add_service_item(&mut self, domain: &str) {
+        Arc::make_mut(&mut self.discovery).add_service(domain);
+    }
+
     #[expect(clippy::type_complexity)]
     pub fn account_handlers(&self) -> &[(&'static str, Arc<dyn AccountHandler<A, S>>)] {
         &self.accounts

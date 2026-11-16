@@ -24,6 +24,10 @@ pub enum RunError {
     ServiceDomain {
         domain: String,
     },
+    ComponentSecret {
+        domain: String,
+        source: io::Error,
+    },
     StanzaPool(PoolError),
     Runtime(io::Error),
     WorkerCount(io::Error),
@@ -67,6 +71,10 @@ impl fmt::Display for RunError {
             Self::ServiceDomain { domain } => write!(
                 formatter,
                 "service domain {domain:?} conflicts with a served host or another service"
+            ),
+            Self::ComponentSecret { domain, source } => write!(
+                formatter,
+                "cannot load the secret for component domain {domain:?}: {source}"
             ),
             Self::StanzaPool(source) => {
                 write!(formatter, "cannot initialize stanza arena pool: {source}")
@@ -119,6 +127,7 @@ impl Error for RunError {
             | Self::Admin(source)
             | Self::C2s(source)
             | Self::S2s(source) => Some(source),
+            Self::ComponentSecret { source, .. } => Some(source),
             Self::StorageDirectory { source, .. } => Some(source),
             Self::Storage { source, .. } => Some(source),
             Self::UnknownStore(_) | Self::ServiceDomain { .. } => None,

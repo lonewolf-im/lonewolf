@@ -35,6 +35,7 @@ use crate::config::limits::S2sLimits;
 use crate::delivery::{WorkGroup, WorkGuard, WorkHandle};
 use crate::hosts::{Hosts, peer_identity::PeerTrust};
 use crate::router::RouterHandle;
+use crate::xml_stream::serialized_len;
 use crate::xml_stream::traffic::ObservedIo;
 
 mod bidi;
@@ -402,7 +403,7 @@ impl<A: ChunkAllocator + Clone> RemoteRouter<A> {
         remote: &str,
         stanza: RoutedStanza<A>,
     ) -> Result<Option<Launch<A>>, RemoteError> {
-        let bytes = stanza_bytes(&stanza);
+        let bytes = serialized_len(&stanza);
         let mut state = self.inner.state.lock();
         if state.stopped {
             self.inner
@@ -546,19 +547,6 @@ impl<A: ChunkAllocator> LinkStats for Inner<A> {
         }
         snapshot
     }
-}
-
-fn stanza_bytes<A: ChunkAllocator>(stanza: &RoutedStanza<A>) -> Option<usize> {
-    struct Counter(usize);
-    impl std::fmt::Write for Counter {
-        fn write_str(&mut self, value: &str) -> std::fmt::Result {
-            self.0 = self.0.checked_add(value.len()).ok_or(std::fmt::Error)?;
-            Ok(())
-        }
-    }
-    let mut counter = Counter(0);
-    stanza.resolve().ok()?.write_xml(&mut counter).ok()?;
-    Some(counter.0)
 }
 
 fn backoff_delay(limits: &S2sLimits, failures: u32, jitter: u16) -> Duration {

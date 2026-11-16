@@ -20,6 +20,65 @@ use super::{Client, PlainClient, Signal, TIMEOUT, TestResult, tls};
 static ACTIVE_SERVERS: PlMutex<usize> = PlMutex::new(0);
 static SERVER_SLOT: PlCondvar = PlCondvar::new();
 
+const STARTUP_FAILURE: &str = "startup-failure.json";
+
+#[derive(serde::Deserialize, serde::Serialize)]
+enum StartupFailure {
+    ComponentSecret {
+        domain: String,
+        message: String,
+        invalid_data: bool,
+        raw_os_error: Option<i32>,
+    },
+    ServiceDomain {
+        domain: String,
+    },
+}
+
+impl StartupFailure {
+    fn from_error(error: &lonewolf_core::RunError) -> Option<Self> {
+        match error {
+            lonewolf_core::RunError::ComponentSecret { domain, source } => {
+                Some(Self::ComponentSecret {
+                    domain: domain.clone(),
+                    message: source.to_string(),
+                    invalid_data: source.kind() == io::ErrorKind::InvalidData,
+                    raw_os_error: source.raw_os_error(),
+                })
+            }
+            lonewolf_core::RunError::ServiceDomain { domain } => Some(Self::ServiceDomain {
+                domain: domain.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    fn into_error(self) -> lonewolf_core::RunError {
+        match self {
+            Self::ServiceDomain { domain } => lonewolf_core::RunError::ServiceDomain { domain },
+            Self::ComponentSecret {
+                domain,
+                message,
+                invalid_data,
+                raw_os_error,
+            } => {
+                let source = match raw_os_error {
+                    Some(code) => io::Error::from_raw_os_error(code),
+                    None => io::Error::new(
+                        if invalid_data {
+                            io::ErrorKind::InvalidData
+                        } else {
+                            io::ErrorKind::Other
+                        },
+                        message,
+                    ),
+                };
+                lonewolf_core::RunError::ComponentSecret { domain, source }
+            }
+        }
+    }
+}
+
 pub(super) struct C2sSuitePermit;
 
 impl C2sSuitePermit {
@@ -40,6 +99,11 @@ impl C2sSuitePermit {
 
 fn spawn_process(directory: &Path, readiness: &ReadinessSocket) -> TestResult<Child> {
     super::federation::remove_shutdown_receipt(directory)?;
+    match fs::remove_file(directory.join(STARTUP_FAILURE)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     let mut command = Command::new(std::env::current_exe()?);
     readiness
         .configure(&mut command)
@@ -241,7 +305,15 @@ impl C2sSuite {
     }
 
     pub fn with_components(domains: &str) -> TestResult<Self> {
-        Self::settings_with_setup("", "", 10, "", |directory| {
+        Self::with_components_and_setup(domains, "", |_| Ok(()))
+    }
+
+    pub fn with_components_and_setup(
+        domains: &str,
+        hosts: &str,
+        setup: impl FnOnce(&Path) -> TestResult,
+    ) -> TestResult<Self> {
+        Self::settings_with_setup("", "", 10, hosts, |directory| {
             let mut file = fs::OpenOptions::new()
                 .append(true)
                 .open(directory.join("lonewolf.toml"))?;
@@ -249,7 +321,7 @@ impl C2sSuite {
                 file,
                 "\n[[components.listeners]]\naddress = \"127.0.0.1:0\"\n{domains}"
             )?;
-            Ok(())
+            setup(directory)
         })
     }
 
@@ -562,6 +634,15 @@ timeout_secs = 1
         loop {
             if let Some(status) = self.child.try_wait()? {
                 self.record_reaped(status);
+                match fs::read(self.directory.path().join(STARTUP_FAILURE)) {
+                    Ok(bytes) => {
+                        assert!(!status.success(), "{status}");
+                        let failure: StartupFailure = serde_json::from_slice(&bytes)?;
+                        return Err(failure.into_error().into());
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
                 let logs = fs::read_to_string(self.directory.path().join("server.log"))?;
                 return Err(format!("server exited before readiness: {logs}").into());
             }
@@ -774,7 +855,7 @@ fn server_process() -> TestResult {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    let state = lonewolf_core::test_support::run_with_extensions_and_s2s_shutdown_state(
+    let state = match lonewolf_core::test_support::run_with_extensions_and_s2s_shutdown_state(
         None,
         lonewolf_core::BuildInfo {
             version: "integration-test",
@@ -782,7 +863,14 @@ fn server_process() -> TestResult {
             commit: "test",
         },
         super::extensions::catalog()?,
-    )
-    .map_err(|error| error.to_string())?;
+    ) {
+        Ok(state) => state,
+        Err(error) => {
+            if let Some(failure) = StartupFailure::from_error(&error) {
+                fs::write(STARTUP_FAILURE, serde_json::to_vec(&failure)?)?;
+            }
+            return Err(error.to_string().into());
+        }
+    };
     super::federation::write_shutdown_receipt(&std::env::current_dir()?, state)
 }

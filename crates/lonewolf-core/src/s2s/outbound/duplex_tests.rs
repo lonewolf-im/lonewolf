@@ -268,7 +268,7 @@ impl<A: ChunkAllocator + Clone + 'static> Fixture<A> {
                     Err(lonewolf_xmpp::stanza::BuildError::MissingServerAddresses)
                 ));
             }
-            let bytes = stanza_bytes(&source).ok_or("stanza size")?;
+            let bytes = serialized_len(&source).ok_or("stanza size")?;
             handle
                 .enqueue(source, bytes, &self.remote.inner.limits)
                 .map_err(|error| format!("{error:?}"))?;

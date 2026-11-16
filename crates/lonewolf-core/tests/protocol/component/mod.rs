@@ -2,6 +2,8 @@
 
 use crate::support::{C2sSuite, TestResult};
 
+mod registry;
+
 #[test]
 fn configured_component_domains_register_the_component_catalog() -> TestResult {
     let mut suite = C2sSuite::with_components(

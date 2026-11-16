@@ -116,7 +116,7 @@ fn count_and_byte_refusals_release_only_their_own_reservations() -> TestResult {
         };
         let manager = manager(limits.clone())?;
         let message = message().await?;
-        let bytes = stanza_bytes(&message).ok_or("size")?;
+        let bytes = serialized_len(&message).ok_or("size")?;
         let task = manager
             .admit("localhost", "remote.test", message.clone())
             .map_err(|error| format!("{error:?}"))?

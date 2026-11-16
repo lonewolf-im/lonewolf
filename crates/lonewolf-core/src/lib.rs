@@ -214,7 +214,7 @@ fn run_internal(
                         options: &host.options,
                     })
                     .collect();
-                let enabled_extensions =
+                let mut enabled_extensions =
                     extensions
                         .enable(&selections)
                         .map_err(|error| RunError::Extensions {
@@ -273,7 +273,7 @@ fn run_internal(
                     );
                     None
                 };
-                let _component_metrics = if !config.components.domains.is_empty() {
+                let component_metrics = if !config.components.domains.is_empty() {
                     let metrics = component::metrics::ComponentMetrics::new(
                         config.components.listeners.len(),
                         config.components.domains.len(),
@@ -283,6 +283,35 @@ fn run_internal(
                 } else {
                     None
                 };
+                if let Some(metrics) = &component_metrics {
+                    let secrets = component::credentials::load(&config.components)?;
+                    let registry = component::registry::ComponentRegistry::new(
+                        &config.components,
+                        secrets,
+                        &config.limits.components,
+                        Arc::clone(metrics),
+                    );
+                    for (domain, configured) in &config.components.domains {
+                        if hosts.is_local_host(domain) || services.contains_key(domain) {
+                            return Err(RunError::ServiceDomain { domain: domain.clone() });
+                        }
+                        let service_domain: Arc<str> = Arc::from(domain.as_str());
+                        services.insert(domain.clone(), ServiceRoute {
+                            domain: Arc::clone(&service_domain),
+                            handler: Arc::new(component::service::ComponentService::new(service_domain, registry.clone())),
+                        });
+                        if configured.discoverable {
+                            let parent = component::service::discovery_parent(domain, config.hosts.keys().map(String::as_str));
+                            if let Some(parent) = parent
+                                && let Some(extensions) = enabled_extensions.get_mut(parent)
+                            {
+                                extensions.add_service_item(domain);
+                            }
+                        }
+                        tracing::info!(component_domain = %domain, "component domain registered");
+                    }
+                    serving.components = Some(registry);
+                }
                 #[cfg(feature = "test-support")]
                 if s2s_shutdown_state.is_some() {
                     observed_s2s_metrics = s2s_metrics.as_ref().map(Arc::clone);

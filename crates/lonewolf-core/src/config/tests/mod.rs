@@ -10,9 +10,9 @@ use std::process::Command;
 
 use crate::config::limits::C2sLimitProfile;
 use crate::config::{
-    AccountConfig, ClientCertificateConfig, ComponentDomainConfig, ComponentSecretSource, Config,
-    ConfigError, HostConfig, HostTlsConfig, HostTlsSource, MetricsConfig, S2sRouteEndpoint,
-    StoreConfig, TcpListenerConfig, TlsMode, XmppConfig,
+    AccountConfig, ClientCertificateConfig, ComponentBalancing, ComponentDomainConfig,
+    ComponentSecretSource, Config, ConfigError, HostConfig, HostTlsConfig, HostTlsSource,
+    MetricsConfig, S2sRouteEndpoint, StoreConfig, TcpListenerConfig, TlsMode, XmppConfig,
 };
 use lonewolf_auth::server::Mechanism;
 use lonewolf_extension::{Extensions, HostSelection};
@@ -956,6 +956,8 @@ fn reference_configuration_settings_match_documented_defaults() -> TestResult {
         ComponentDomainConfig {
             secret: ComponentSecretSource::File("./secrets/muc.example.com".into()),
             discoverable: true,
+            max_connections: NonZeroUsize::MIN,
+            balancing: ComponentBalancing::Source,
         },
     );
     expected.s2s.tls.crls_path = Some("./certs/federation-crls.pem".into());

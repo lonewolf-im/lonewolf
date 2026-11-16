@@ -203,7 +203,7 @@ impl S2sLimits {
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(from = "ComponentLimitsInput")]
 pub struct ComponentLimits {
-    pub max_connections: NonZeroUsize,
+    pub max_inbound_connections: NonZeroUsize,
     pub connection_attempts_per_ip: EventRate,
     pub negotiation_timeout_secs: NonZeroU64,
     pub max_stanza_bytes: NonZeroUsize,
@@ -218,7 +218,7 @@ impl Default for ComponentLimits {
     fn default() -> Self {
         const {
             Self {
-                max_connections: nonzero(64),
+                max_inbound_connections: nonzero(64),
                 connection_attempts_per_ip: EventRate {
                     per_second: nonzero(5),
                     burst: nonzero(20),
@@ -244,7 +244,7 @@ impl Default for ComponentLimits {
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct ComponentLimitsInput {
-    max_connections: Option<NonZeroUsize>,
+    max_inbound_connections: Option<NonZeroUsize>,
     connection_attempts_per_ip: Option<EventRateInput>,
     negotiation_timeout_secs: Option<NonZeroU64>,
     max_stanza_bytes: Option<NonZeroUsize>,
@@ -259,7 +259,9 @@ impl From<ComponentLimitsInput> for ComponentLimits {
     fn from(input: ComponentLimitsInput) -> Self {
         let defaults = Self::default();
         Self {
-            max_connections: input.max_connections.unwrap_or(defaults.max_connections),
+            max_inbound_connections: input
+                .max_inbound_connections
+                .unwrap_or(defaults.max_inbound_connections),
             connection_attempts_per_ip: input
                 .connection_attempts_per_ip
                 .unwrap_or_default()

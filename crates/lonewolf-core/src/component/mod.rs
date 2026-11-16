@@ -39,6 +39,31 @@ pub(crate) mod stream;
 
 static NEXT_COMPONENT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
+pub(crate) struct StreamAccounting {
+    metrics: Arc<ComponentMetrics>,
+    outcome: StreamClose,
+}
+
+impl StreamAccounting {
+    fn new(metrics: Arc<ComponentMetrics>) -> Self {
+        Self {
+            metrics,
+            outcome: StreamClose::Shutdown,
+        }
+    }
+
+    /// Set the terminal outcome before awaiting stream closure.
+    fn set_outcome(&mut self, outcome: StreamClose) {
+        self.outcome = outcome;
+    }
+}
+
+impl Drop for StreamAccounting {
+    fn drop(&mut self) {
+        self.metrics.stream_closed(self.outcome);
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ComponentServices<A: ChunkAllocator> {
     #[allow(dead_code)]
@@ -212,6 +237,7 @@ impl<A: ChunkAllocator + Clone> AcceptHandler for ComponentAcceptor<A> {
                         None,
                     ),
                 };
+                authenticated.stream_accounting.set_outcome(outcome);
                 if !matches!(
                     outcome,
                     StreamClose::PeerError | StreamClose::TransportError
@@ -229,9 +255,9 @@ impl<A: ChunkAllocator + Clone> AcceptHandler for ComponentAcceptor<A> {
                     .await;
                 }
                 let _ = socket2::SockRef::from(&tcp).shutdown(std::net::Shutdown::Both);
-                settings.metrics.stream_closed(outcome);
                 tracing::info!(component_domain = %domain, connection_id, outcome = outcome.as_str(), duration_ms = started.elapsed().as_millis() as u64, "component disconnected");
                 drop(authenticated.link);
+                drop(authenticated.stream_accounting);
                 drop(authenticated.stream_gauge);
             }
         }

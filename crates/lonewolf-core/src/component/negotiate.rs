@@ -17,10 +17,10 @@ use lonewolf_xmpp::stream::StreamErrorCondition;
 use tokio::io::BufReader;
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt as _};
 
-use super::Settings;
 use super::metrics::{AuthOutcome, ComponentMetrics, GaugeGuard};
 use super::registry::{AttachError, ComponentLink};
 use super::stream::{self, ComponentError, ComponentReader, ComponentWriter};
+use super::{Settings, StreamAccounting};
 use crate::connection::ShutdownSignal;
 use crate::xml_stream::traffic::{ObservedIo, TrafficObserver};
 
@@ -35,6 +35,7 @@ pub(crate) struct Authenticated<A: ChunkAllocator, R, W> {
     pub(crate) reader: ComponentReader<A, R>,
     pub(crate) writer: ComponentWriter<W>,
     pub(crate) link: ComponentLink<A>,
+    pub(crate) stream_accounting: StreamAccounting,
     pub(crate) stream_gauge: GaugeGuard,
 }
 
@@ -170,6 +171,7 @@ pub(super) async fn negotiate<A: ChunkAllocator + Clone>(
                 reader,
                 writer,
                 link,
+                stream_accounting: StreamAccounting::new(Arc::clone(&settings.metrics)),
                 stream_gauge: settings.metrics.stream_opened(),
             })
         }

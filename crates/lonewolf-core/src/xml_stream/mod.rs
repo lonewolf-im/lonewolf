@@ -2,7 +2,7 @@
 
 use lonewolf_util::arena::{ChunkAllocator, HandleError};
 use lonewolf_xmpp::parser::StreamEvent;
-use lonewolf_xmpp::stanza::{NodeRef, STREAM_NAMESPACE};
+use lonewolf_xmpp::stanza::{NodeRef, RoutedStanza, STREAM_NAMESPACE};
 use lonewolf_xmpp::stream::{STREAM_ERROR_NAMESPACE, StreamError, StreamErrorCondition};
 
 pub(crate) mod limiter;
@@ -11,6 +11,19 @@ pub(crate) mod reader;
 pub(crate) mod traffic;
 
 pub(crate) const STREAM_FOOTER: &str = "</stream:stream>";
+
+pub(crate) fn serialized_len<A: ChunkAllocator>(stanza: &RoutedStanza<A>) -> Option<usize> {
+    struct Counter(usize);
+    impl std::fmt::Write for Counter {
+        fn write_str(&mut self, value: &str) -> std::fmt::Result {
+            self.0 = self.0.checked_add(value.len()).ok_or(std::fmt::Error)?;
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    stanza.resolve().ok()?.write_xml(&mut counter).ok()?;
+    Some(counter.0)
+}
 
 pub(crate) fn version_components(version: &str) -> Option<(&str, &str)> {
     let (major, minor) = version.split_once('.')?;

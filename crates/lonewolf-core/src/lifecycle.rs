@@ -6,6 +6,7 @@ use std::time::Instant;
 use futures_util::FutureExt as _;
 use lonewolf_util::arena::ChunkAllocator;
 
+use crate::component::registry::ComponentRegistry;
 use crate::connection::ListenerSet;
 use crate::router::{Router, RouterFailure, RouterState};
 use crate::s2s::outbound::RemoteRouter;
@@ -14,6 +15,7 @@ use crate::{RunError, shutdown_timeout};
 pub(crate) struct Serving<A: ChunkAllocator> {
     pub(crate) router: Option<Router<A>>,
     pub(crate) remote: Option<RemoteRouter<A>>,
+    pub(crate) components: Option<ComponentRegistry<A>>,
     pub(crate) c2s: Option<ListenerSet>,
     pub(crate) s2s: Option<ListenerSet>,
     deadline: Option<Instant>,
@@ -24,6 +26,7 @@ impl<A: ChunkAllocator + Clone> Serving<A> {
         Self {
             router: None,
             remote: None,
+            components: None,
             c2s: None,
             s2s: None,
             deadline: None,
@@ -35,6 +38,9 @@ impl<A: ChunkAllocator + Clone> Serving<A> {
             return;
         }
         self.deadline = Some(deadline);
+        if let Some(components) = &self.components {
+            components.stop();
+        }
         if let Some(router) = &self.router {
             router.stop();
         }

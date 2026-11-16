@@ -81,6 +81,7 @@
         <xmpp:status>complete</xmpp:status>
         <xmpp:version>2.5.0</xmpp:version>
         <xmpp:since>0.2.0</xmpp:since>
+        <xmpp:note>Configured component domains can appear in their closest parent host's discovery items. Component-domain discovery is not in a release yet.</xmpp:note>
       </xmpp:SupportedXep>
     </implements>
     <implements>

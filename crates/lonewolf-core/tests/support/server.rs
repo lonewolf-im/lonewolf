@@ -240,6 +240,19 @@ impl C2sSuite {
         Self::settings("", "", 10, hosts)
     }
 
+    pub fn with_components(domains: &str) -> TestResult<Self> {
+        Self::settings_with_setup("", "", 10, "", |directory| {
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(directory.join("lonewolf.toml"))?;
+            writeln!(
+                file,
+                "\n[[components.listeners]]\naddress = \"127.0.0.1:0\"\n{domains}"
+            )?;
+            Ok(())
+        })
+    }
+
     pub fn with_hosts_and_setup(
         hosts: &str,
         setup: impl FnOnce(&Path) -> TestResult,

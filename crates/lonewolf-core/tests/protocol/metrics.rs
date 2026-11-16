@@ -31,6 +31,7 @@ fn metrics_endpoint_reports_build_information() -> TestResult {
         "{body}"
     );
     assert!(body.ends_with("# EOF\n"), "{body}");
+    assert!(!body.contains("lonewolf_component_"), "{body}");
     suite.stop()
 }
 

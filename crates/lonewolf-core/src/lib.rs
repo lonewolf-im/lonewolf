@@ -28,6 +28,7 @@ mod account_deletion;
 mod acme;
 mod admission;
 mod c2s;
+mod component;
 pub mod config;
 mod connection;
 mod delivery;
@@ -270,6 +271,16 @@ fn run_internal(
                         },
                         "s2s federation inactive"
                     );
+                    None
+                };
+                let _component_metrics = if !config.components.domains.is_empty() {
+                    let metrics = component::metrics::ComponentMetrics::new(
+                        config.components.listeners.len(),
+                        config.components.domains.len(),
+                    );
+                    metrics.register(server_metrics.registry());
+                    Some(metrics)
+                } else {
                     None
                 };
                 #[cfg(feature = "test-support")]

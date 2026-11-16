@@ -32,6 +32,7 @@ use storage::{SliceBuilder, StoredSlice};
 
 pub const CLIENT_NAMESPACE: &str = "jabber:client";
 pub const SERVER_NAMESPACE: &str = "jabber:server";
+pub const COMPONENT_ACCEPT_NAMESPACE: &str = "jabber:component:accept";
 pub const STREAM_NAMESPACE: &str = "http://etherx.jabber.org/streams";
 pub const STANZA_ERROR_NAMESPACE: &str = "urn:ietf:params:xml:ns:xmpp-stanzas";
 pub const XML_NAMESPACE: &str = xml::XML_NAMESPACE;
@@ -45,6 +46,7 @@ pub const MAX_ELEMENT_NODES: usize = 65_536;
 pub enum StanzaNamespace {
     Client,
     Server,
+    ComponentAccept,
 }
 
 impl StanzaNamespace {
@@ -52,6 +54,7 @@ impl StanzaNamespace {
         match self {
             Self::Client => CLIENT_NAMESPACE,
             Self::Server => SERVER_NAMESPACE,
+            Self::ComponentAccept => COMPONENT_ACCEPT_NAMESPACE,
         }
     }
 }
@@ -1049,8 +1052,8 @@ impl<A: ChunkAllocator> StanzaBuilder<'_, A> {
     ///
     /// # Errors
     ///
-    /// Returns [`BuildError::MissingServerAddresses`] without both server
-    /// addresses, [`BuildError::MissingIqId`] without an IQ ID, or
+    /// Returns [`BuildError::MissingServerAddresses`] without both addresses in the server or
+    /// component namespace, [`BuildError::MissingIqId`] without an IQ ID, or
     /// [`BuildError::InvalidIqPayload`] for an invalid IQ child count.
     /// [`BuildError::InvalidErrorPayload`] rejects a missing, unexpected,
     /// repeated, or non-final error child. Tree limits, unresolved handles, and
@@ -1098,7 +1101,10 @@ fn validate_stanza<R: ArenaRead>(
     rescope: Option<Rescope<'_>>,
     mut validate_child: impl FnMut(&ElementRef<'_, R>) -> Result<(), BuildError>,
 ) -> Result<(), BuildError> {
-    if header.namespace == StanzaNamespace::Server && (header.from.is_none() || header.to.is_none())
+    if matches!(
+        header.namespace,
+        StanzaNamespace::Server | StanzaNamespace::ComponentAccept
+    ) && (header.from.is_none() || header.to.is_none())
     {
         return Err(BuildError::MissingServerAddresses);
     }
@@ -1222,7 +1228,7 @@ impl fmt::Display for BuildError {
             Self::InvalidErrorPayload => formatter
                 .write_str("error stanza requires one final error child; other types forbid it"),
             Self::MissingServerAddresses => {
-                formatter.write_str("server stanza requires both addresses")
+                formatter.write_str("server or component stanza requires both addresses")
             }
             Self::NotIqRequest => {
                 formatter.write_str("only IQ requests can produce result replies")

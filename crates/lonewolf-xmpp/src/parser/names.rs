@@ -9,8 +9,8 @@ use super::{MAX_ATTRIBUTES_PER_ELEMENT, ParseError};
 use crate::stanza::incoming::Frame;
 use crate::stanza::namespace::NamespaceContext;
 use crate::stanza::{
-    BuildError, CLIENT_NAMESPACE, SERVER_NAMESPACE, STREAM_NAMESPACE, StanzaKind, StanzaNamespace,
-    XML_NAMESPACE, xml,
+    BuildError, CLIENT_NAMESPACE, COMPONENT_ACCEPT_NAMESPACE, SERVER_NAMESPACE, STREAM_NAMESPACE,
+    StanzaKind, StanzaNamespace, XML_NAMESPACE, xml,
 };
 
 const XMLNS_NAMESPACE: &str = "http://www.w3.org/2000/xmlns/";
@@ -143,6 +143,7 @@ pub(super) fn frame<A: ChunkAllocator>(
     let stanza_namespace = match namespace {
         CLIENT_NAMESPACE => Some(StanzaNamespace::Client),
         SERVER_NAMESPACE => Some(StanzaNamespace::Server),
+        COMPONENT_ACCEPT_NAMESPACE => Some(StanzaNamespace::ComponentAccept),
         _ => None,
     };
     let mut frame = if root

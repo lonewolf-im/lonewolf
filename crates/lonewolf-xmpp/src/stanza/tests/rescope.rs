@@ -180,6 +180,27 @@ pub(super) fn corpus() -> Result<Vec<Case>, Box<dyn std::error::Error>> {
             arena,
         });
     }
+    for (name, xml) in [
+        (
+            "component_message_content",
+            "<message from='a@example.org/r' to='b@example.net' type='error'><body>hi</body><subject>s</subject><thread>t</thread><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>",
+        ),
+        (
+            "component_presence_foreign_subtree",
+            "<presence from='a@example.org/r' to='b@example.net'><x xmlns='http://jabber.org/protocol/muc#user'><item role='participant'/></x></presence>",
+        ),
+        (
+            "component_forwarded_client_message",
+            "<message from='a@example.org/r' to='b@example.net' type='chat'><forwarded xmlns='urn:xmpp:forward:0'><message xmlns='jabber:client' from='c@example.org' to='d@example.org'><body>forwarded</body></message></forwarded></message>",
+        ),
+    ] {
+        let (stanza, arena) = parse_stream_stanza(StanzaNamespace::ComponentAccept, xml)?;
+        cases.push(Case {
+            name,
+            stanza,
+            arena,
+        });
+    }
     Ok(cases)
 }
 
@@ -449,7 +470,7 @@ fn foreign_error_namespace() -> TestResult {
 #[test]
 fn corpus_matches_structure_and_copy_paths() -> TestResult {
     let cases = corpus()?;
-    assert_eq!(cases.len(), 40);
+    assert_eq!(cases.len(), 43);
     for case in &cases {
         let source = case.stanza.resolve(&case.arena)?;
         for target in [StanzaNamespace::Client, StanzaNamespace::Server] {
@@ -500,6 +521,88 @@ fn corpus_matches_structure_and_copy_paths() -> TestResult {
 }
 
 #[test]
+fn component_namespace_rescope_and_write_round_trip() -> TestResult {
+    for case in corpus()?
+        .into_iter()
+        .filter(|case| case.name.starts_with("component_"))
+    {
+        let source = case.stanza.resolve(&case.arena)?;
+        let mut source_client_arena = Arena::try_new(ArenaConfig::default())?;
+        let source_client = source.rescope_in(StanzaNamespace::Client, &mut source_client_arena)?;
+        let source_client_view = source_client.resolve(&source_client_arena)?;
+        let original = structural_walk(&source_client_view)?;
+        let mut component_arena = Arena::try_new(ArenaConfig::default())?;
+        let component = source_client_view
+            .rescope_in(StanzaNamespace::ComponentAccept, &mut component_arena)?;
+        let component_view = component.resolve(&component_arena)?;
+        let mut written = String::new();
+        component_view.write_xml(&mut written)?;
+        let mut written_as = String::new();
+        source_client_view.write_xml_as(StanzaNamespace::ComponentAccept, &mut written_as)?;
+        assert_eq!(written_as, written, "{}", case.name);
+        assert_eq!(
+            structural_walk(&component_view)?,
+            walk_as(&source_client_view, StanzaNamespace::ComponentAccept)?,
+            "{}",
+            case.name
+        );
+
+        let (parsed, parsed_arena) =
+            parse_stream_stanza(StanzaNamespace::ComponentAccept, &written)?;
+        let parsed_view = parsed.resolve(&parsed_arena)?;
+        assert_eq!(
+            structural_walk(&parsed_view)?,
+            structural_walk(&component_view)?,
+            "{}",
+            case.name
+        );
+        let mut client_arena = Arena::try_new(ArenaConfig::default())?;
+        let restored = parsed_view.rescope_in(StanzaNamespace::Client, &mut client_arena)?;
+        assert_eq!(
+            structural_walk(&restored.resolve(&client_arena)?)?,
+            original,
+            "{}",
+            case.name
+        );
+    }
+
+    let mut arena = Arena::try_new(ArenaConfig::default())?;
+    let stanza = Stanza::builder_in(
+        StanzaType::Message(MessageType::Chat),
+        StanzaNamespace::Client,
+        &mut arena,
+    )
+    .build()?;
+    assert_eq!(
+        stanza
+            .resolve(&arena)?
+            .validate_rescope(StanzaNamespace::ComponentAccept),
+        Err(BuildError::MissingServerAddresses)
+    );
+    assert_eq!(
+        BuildError::MissingServerAddresses.to_string(),
+        "server or component stanza requires both addresses"
+    );
+    let from = Jid::parse_in("a@example.org/r", &mut arena)?;
+    let to = Jid::parse_in("b@example.net", &mut arena)?;
+    let stanza = Stanza::builder_in(
+        StanzaType::Message(MessageType::Chat),
+        StanzaNamespace::Client,
+        &mut arena,
+    )
+    .from(Some(from))?
+    .to(Some(to))?
+    .build()?;
+    assert_eq!(
+        stanza
+            .resolve(&arena)?
+            .validate_rescope(StanzaNamespace::ComponentAccept),
+        Ok(())
+    );
+    Ok(())
+}
+
+#[test]
 fn literal_xml_anchors() -> TestResult {
     for case in corpus()? {
         let source = case.stanza.resolve(&case.arena)?.namespace();
@@ -542,6 +645,9 @@ fn literal_xml_anchors() -> TestResult {
                 }
                 StanzaNamespace::Server => {
                     "<message xmlns:stream=\"http://etherx.jabber.org/streams\" xmlns=\"jabber:server\" from=\"a@example.org/r\" to=\"b@example.net\""
+                }
+                StanzaNamespace::ComponentAccept => {
+                    "<message xmlns:stream=\"http://etherx.jabber.org/streams\" xmlns=\"jabber:component:accept\" from=\"a@example.org/r\" to=\"b@example.net\""
                 }
             };
             assert_eq!(
@@ -810,7 +916,7 @@ fn write_as_needs_no_arena() -> TestResult {
 fn derive_in_place_matches_rescope_for_the_corpus() -> TestResult {
     for target in [StanzaNamespace::Client, StanzaNamespace::Server] {
         let cases = corpus()?;
-        assert_eq!(cases.len(), 40);
+        assert_eq!(cases.len(), 43);
         for mut case in cases {
             let expected = oracle(&case, target)?;
             let source_namespace = case.stanza.resolve(&case.arena)?.namespace();

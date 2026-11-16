@@ -14,9 +14,9 @@ use crate::parser::{
     StreamEvent, XmppParser, compio_reader, parse_element,
 };
 use crate::stanza::{
-    BuildError, CLIENT_NAMESPACE, Element, ElementRef, MAX_ELEMENT_DEPTH, MAX_ELEMENT_NODES,
-    MessageType, NodeRef, Stanza, StanzaErrorCondition, StanzaNamespace, StanzaRejection,
-    StanzaType, XML_NAMESPACE,
+    BuildError, CLIENT_NAMESPACE, COMPONENT_ACCEPT_NAMESPACE, Element, ElementRef,
+    MAX_ELEMENT_DEPTH, MAX_ELEMENT_NODES, MessageType, NodeRef, Stanza, StanzaErrorCondition,
+    StanzaNamespace, StanzaRejection, StanzaType, XML_NAMESPACE,
 };
 use compio_io::compat::AsyncReadStream;
 use futures_executor::block_on;
@@ -443,6 +443,88 @@ fn opening_stream_exposes_content_namespace() -> TestResult {
             };
             assert_eq!(content_namespace, expected);
         }
+        Ok(())
+    })
+}
+
+#[test]
+fn component_accept_stanzas_and_elements_parse_under_the_component_namespace() -> TestResult {
+    block_on(async {
+        let input = "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:component:accept'><message from='room@muc.example' to='alice@example.org/desk' type='chat'><body>hi</body></message><handshake>aaee83c26aeeafcbabeabfcbcd50df997e0a2a1e</handshake>";
+        let mut parser = XmppParser::new(input.as_bytes(), config(4096)?, GlobalChunkAllocator);
+        open(&mut parser).await?;
+        let Some(StreamEvent::Stanza(parsed)) = parser.next_event().await? else {
+            return Err("expected component stanza".into());
+        };
+        let stanza = parsed.value().resolve(parsed.arena())?;
+        assert_eq!(stanza.namespace(), StanzaNamespace::ComponentAccept);
+        assert_eq!(
+            stanza.from()?.map(|jid| jid.as_str()),
+            Some("room@muc.example")
+        );
+        assert_eq!(
+            stanza.to()?.map(|jid| jid.as_str()),
+            Some("alice@example.org/desk")
+        );
+        assert_eq!(
+            stanza
+                .child("body", COMPONENT_ACCEPT_NAMESPACE)?
+                .ok_or("body")?
+                .namespace(),
+            COMPONENT_ACCEPT_NAMESPACE
+        );
+        let Some(StreamEvent::Element(parsed)) = parser.next_event().await? else {
+            return Err("expected handshake element".into());
+        };
+        let handshake = parsed.value().resolve(parsed.arena())?;
+        assert_eq!(handshake.name(), "handshake");
+        assert_eq!(handshake.namespace(), COMPONENT_ACCEPT_NAMESPACE);
+        assert_eq!(
+            handshake.text()?,
+            Some("aaee83c26aeeafcbabeabfcbcd50df997e0a2a1e")
+        );
+        Ok(())
+    })
+}
+
+#[test]
+fn component_accept_stanza_address_rejections_keep_the_namespace() -> TestResult {
+    block_on(async {
+        for xml in [
+            "<message to='alice@example.org'><body>hi</body></message>",
+            "<message from='room@muc.example'><body>hi</body></message>",
+        ] {
+            let input = format!(
+                "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:component:accept'>{xml}"
+            );
+            let mut parser = XmppParser::new(input.as_bytes(), config(4096)?, GlobalChunkAllocator);
+            open(&mut parser).await?;
+            let Some(StreamEvent::RejectedStanza(parsed)) = parser.next_event().await? else {
+                return Err("expected component stanza rejection".into());
+            };
+            let rejected = parsed.value();
+            assert_eq!(rejected.reason(), StanzaRejection::BadRequest);
+            assert_eq!(rejected.namespace(), StanzaNamespace::ComponentAccept);
+            assert!(rejected.can_reply());
+            assert!(!rejected.invalid_from());
+            assert!(!rejected.invalid_to());
+        }
+
+        let input = "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:component:accept'><iq type='result' id='x' to='a@example.org'/>";
+        let mut parser = XmppParser::new(input.as_bytes(), config(4096)?, GlobalChunkAllocator);
+        open(&mut parser).await?;
+        let Some(StreamEvent::RejectedStanza(parsed)) = parser.next_event().await? else {
+            return Err("expected IQ stanza rejection".into());
+        };
+        assert!(!parsed.value().can_reply());
+
+        let prefixed = "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns:c='jabber:component:accept'><c:message from='a@example.org' to='b@example.org'/>";
+        let mut parser = XmppParser::new(prefixed.as_bytes(), config(4096)?, GlobalChunkAllocator);
+        open(&mut parser).await?;
+        assert!(matches!(
+            parser.next_event().await,
+            Err(ParseError::BadNamespacePrefix)
+        ));
         Ok(())
     })
 }

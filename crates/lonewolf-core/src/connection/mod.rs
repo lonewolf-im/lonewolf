@@ -33,6 +33,7 @@ pub(crate) struct ListenerControl {
 pub(crate) enum ListenerKind {
     C2s,
     S2s,
+    Component,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -104,6 +105,7 @@ impl fmt::Display for DrainDeadline {
         formatter.write_str(match self.0 {
             ListenerKind::C2s => "c2s connections exceeded shutdown deadline",
             ListenerKind::S2s => "s2s listener shutdown timed out",
+            ListenerKind::Component => "component connections exceeded shutdown deadline",
         })
     }
 }
@@ -213,6 +215,9 @@ impl ListenerSet {
                                 ListenerKind::S2s => {
                                     "s2s listener stopped before reporting readiness"
                                 }
+                                ListenerKind::Component => {
+                                    "component listener stopped before reporting readiness"
+                                }
                             }));
                         }
                     }
@@ -230,6 +235,12 @@ impl ListenerSet {
                         worker_count = dispatcher.worker_count(),
                         port = address.port(),
                         "s2s TCP listener started"
+                    ),
+                    ListenerKind::Component => tracing::info!(
+                        listener_id,
+                        worker_count = dispatcher.worker_count(),
+                        port = address.port(),
+                        "component TCP listener started"
                     ),
                 }
                 listeners.addresses.push(address);
@@ -270,6 +281,7 @@ impl ListenerSet {
                     Ok(()) => io::Error::other(match self.kind {
                         ListenerKind::C2s => "c2s listener stopped unexpectedly",
                         ListenerKind::S2s => "s2s listener stopped unexpectedly",
+                        ListenerKind::Component => "component listener stopped unexpectedly",
                     }),
                 }
             }
@@ -301,6 +313,11 @@ impl ListenerSet {
                     listener_id,
                     worker_count = self.worker_count,
                     "s2s TCP listener stopped"
+                ),
+                ListenerKind::Component => tracing::info!(
+                    listener_id,
+                    worker_count = self.worker_count,
+                    "component TCP listener stopped"
                 ),
             }
         }
@@ -373,6 +390,13 @@ pub(crate) async fn run_listener<H: AcceptHandler>(
         ListenerKind::S2s => {
             tracing::debug!(listener_id, worker_id, "s2s TCP worker listener stopped")
         }
+        ListenerKind::Component => {
+            tracing::debug!(
+                listener_id,
+                worker_id,
+                "component TCP worker listener stopped"
+            )
+        }
     }
     ListenerOutcome {
         result: result.result.and(closed),
@@ -420,6 +444,15 @@ where
                 Err(error) => return ListenerOutcome::from(Err(error)),
             },
             "s2s TCP worker listener started"
+        ),
+        ListenerKind::Component => tracing::debug!(
+            listener_id,
+            worker_id,
+            port = match listener.local_addr() {
+                Ok(address) => address.port(),
+                Err(error) => return ListenerOutcome::from(Err(error)),
+            },
+            "component TCP worker listener started"
         ),
     }
     let shutdown = async move {
@@ -487,6 +520,9 @@ where
                         }
                         ListenerKind::S2s => {
                             tracing::warn!(listener_id, worker_id, error_kind = ?error.kind(), "s2s accept delayed by resource exhaustion")
+                        }
+                        ListenerKind::Component => {
+                            tracing::warn!(listener_id, worker_id, error_kind = ?error.kind(), "component accept delayed by resource exhaustion")
                         }
                     }
                     if let Either::Left(_) = select(

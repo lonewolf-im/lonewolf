@@ -464,6 +464,8 @@ struct ShutdownReceipt {
     // A missing field must not be accepted as an inactive result.
     #[serde(deserialize_with = "serde::Deserialize::deserialize")]
     state: Option<lonewolf_core::test_support::S2sShutdownState>,
+    #[serde(deserialize_with = "serde::Deserialize::deserialize")]
+    component: Option<lonewolf_core::test_support::ComponentShutdownState>,
 }
 
 pub fn remove_shutdown_receipt(directory: &std::path::Path) -> std::io::Result<()> {
@@ -476,11 +478,12 @@ pub fn remove_shutdown_receipt(directory: &std::path::Path) -> std::io::Result<(
 
 pub fn write_shutdown_receipt(
     directory: &std::path::Path,
-    state: Option<lonewolf_core::test_support::S2sShutdownState>,
+    state: lonewolf_core::test_support::RuntimeShutdownState,
 ) -> TestResult {
     let receipt = ShutdownReceipt {
         pid: std::process::id(),
-        state,
+        state: state.s2s,
+        component: state.component,
     };
     std::fs::write(
         directory.join("s2s-shutdown.json"),
@@ -493,10 +496,24 @@ pub fn read_shutdown_receipt(
     directory: &std::path::Path,
     pid: u32,
 ) -> TestResult<Option<lonewolf_core::test_support::S2sShutdownState>> {
+    Ok(read_runtime_shutdown_receipt(directory, pid)?.state)
+}
+
+pub fn read_component_shutdown_receipt(
+    directory: &std::path::Path,
+    pid: u32,
+) -> TestResult<Option<lonewolf_core::test_support::ComponentShutdownState>> {
+    Ok(read_runtime_shutdown_receipt(directory, pid)?.component)
+}
+
+fn read_runtime_shutdown_receipt(
+    directory: &std::path::Path,
+    pid: u32,
+) -> TestResult<ShutdownReceipt> {
     let receipt: ShutdownReceipt =
         serde_json::from_slice(&std::fs::read(directory.join("s2s-shutdown.json"))?)?;
     if receipt.pid != pid {
         return Err("S2S shutdown receipt belongs to another process".into());
     }
-    Ok(receipt.state)
+    Ok(receipt)
 }

@@ -44,6 +44,7 @@ pub enum RunError {
     Metrics(io::Error),
     C2s(io::Error),
     S2s(io::Error),
+    Component(io::Error),
     UnknownStore(String),
     StorageDirectory {
         store: String,
@@ -93,6 +94,7 @@ impl fmt::Display for RunError {
             Self::Acme { phase, source } => write!(formatter, "ACME {phase} failed: {source}"),
             Self::Admin(source) => write!(formatter, "admin service failed: {source}"),
             Self::C2s(source) => write!(formatter, "c2s listener service failed: {source}"),
+            Self::Component(source) => write!(formatter, "component listener failed: {source}"),
             Self::S2s(source) => write!(formatter, "s2s listener service failed: {source}"),
             Self::Signal(source) => write!(formatter, "cannot wait for shutdown signal: {source}"),
             Self::UnknownStore(store) => write!(formatter, "unknown storage store {store:?}"),
@@ -126,6 +128,7 @@ impl Error for RunError {
             | Self::Metrics(source)
             | Self::Admin(source)
             | Self::C2s(source)
+            | Self::Component(source)
             | Self::S2s(source) => Some(source),
             Self::ComponentSecret { source, .. } => Some(source),
             Self::StorageDirectory { source, .. } => Some(source),

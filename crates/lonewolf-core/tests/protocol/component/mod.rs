@@ -2,6 +2,7 @@
 
 use crate::support::{C2sSuite, TestResult};
 
+mod negotiation;
 mod registry;
 
 #[test]

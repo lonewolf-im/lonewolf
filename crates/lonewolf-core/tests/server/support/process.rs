@@ -72,6 +72,7 @@ impl Server {
                 return Err(format!("server exited before readiness: {}", self.logs()?).into());
             }
             if let Some(readiness) = self.readiness.receive(Duration::from_millis(10))? {
+                assert!(readiness.component.is_none());
                 self.metrics = readiness.metrics;
                 return Ok(take(readiness));
             }

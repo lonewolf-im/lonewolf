@@ -258,6 +258,30 @@ pub(crate) struct ComponentMetrics {
 }
 
 impl ComponentMetrics {
+    #[cfg(feature = "test-support")]
+    pub(crate) fn shutdown_state(&self) -> crate::test_support::ComponentShutdownState {
+        crate::test_support::ComponentShutdownState {
+            connections: self.connections.load(Ordering::Acquire),
+            streams: self.streams.load(Ordering::Acquire),
+            authentication_success: self.authentications[AuthOutcome::Success as usize]
+                .load(Ordering::Relaxed),
+            authentication_shutdown: self.authentications[AuthOutcome::Shutdown as usize]
+                .load(Ordering::Relaxed),
+            authentication_total: self
+                .authentications
+                .iter()
+                .map(|counter| counter.load(Ordering::Relaxed))
+                .sum(),
+            streams_closed_shutdown: self.streams_closed[StreamClose::Shutdown as usize]
+                .load(Ordering::Relaxed),
+            streams_closed_total: self
+                .streams_closed
+                .iter()
+                .map(|counter| counter.load(Ordering::Relaxed))
+                .sum(),
+        }
+    }
+
     pub(crate) fn new(listener_count: usize, domain_count: usize) -> Arc<Self> {
         Arc::new(Self {
             domains: domain_count as u64,

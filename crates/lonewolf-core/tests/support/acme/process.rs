@@ -251,6 +251,7 @@ ca_certificates_path = {:?}
                 .readiness
                 .receive(remaining.min(Duration::from_millis(100)))?
             {
+                assert!(readiness.component.is_none());
                 self.address = *readiness.c2s.first().ok_or("no C2S listener is ready")?;
                 self.s2s = readiness.s2s;
                 self.metrics = readiness.metrics;
@@ -360,6 +361,7 @@ ca_certificates_path = {:?}
             }
             if let Some(readiness) = self.readiness.receive(Duration::from_millis(5))? {
                 assert!(readiness.s2s.is_none());
+                assert!(readiness.component.is_none());
                 self.address = *readiness.c2s.first().ok_or("no C2S listener is ready")?;
                 self.metrics = readiness.metrics;
                 return Ok(None);

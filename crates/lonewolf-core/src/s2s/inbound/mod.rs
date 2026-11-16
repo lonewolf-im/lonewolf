@@ -3,13 +3,12 @@
 use std::future::Future;
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use compio::net::TcpStream;
 use lonewolf_util::arena::ChunkAllocator;
 use lonewolf_util::core_dispatcher::DispatchHandle;
-use parking_lot::Mutex as PlMutex;
 
 use super::NEXT_S2S_CONNECTION_ID;
 use super::ingress::IngressServices;
@@ -20,7 +19,7 @@ use crate::admission::attempt_limit::{Admission, AttemptLimiter};
 use crate::admission::connection_limit::{
     ConnectionAdmission, ConnectionLimiter, ConnectionPermit,
 };
-use crate::admission::rejection_report::RejectionReport;
+use crate::admission::global_limit::{GlobalLimit, GlobalPermit};
 use crate::config::S2sConfig;
 use crate::config::limits::S2sLimits;
 use crate::connection::{
@@ -46,20 +45,6 @@ struct Settings<A: ChunkAllocator> {
     max_streams: usize,
     idle_timeout: Duration,
     metrics: Arc<S2sMetrics>,
-}
-
-struct GlobalLimit {
-    active: AtomicUsize,
-    max: usize,
-    report: PlMutex<RejectionReport>,
-}
-
-struct GlobalPermit(Arc<GlobalLimit>);
-
-impl Drop for GlobalPermit {
-    fn drop(&mut self) {
-        self.0.active.fetch_sub(1, Ordering::AcqRel);
-    }
 }
 
 struct AdmissionLimits {
@@ -90,25 +75,10 @@ impl AdmissionLimits {
                 report_count,
             });
         }
-        let mut active = self.global.active.load(Ordering::Acquire);
-        loop {
-            if active >= self.global.max {
-                return Err(Rejection {
-                    reason: ConnectionRejection::MaxInboundConnections,
-                    report_count: self.global.report.lock().record(now),
-                });
-            }
-            match self.global.active.compare_exchange_weak(
-                active,
-                active + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(current) => active = current,
-            }
-        }
-        let global = GlobalPermit(Arc::clone(&self.global));
+        let global = self.global.reserve(now).map_err(|report_count| Rejection {
+            reason: ConnectionRejection::MaxInboundConnections,
+            report_count,
+        })?;
         match self.connections.reserve(ip, now).await {
             ConnectionAdmission::Allowed(permit) => Ok((global, permit)),
             ConnectionAdmission::Denied {
@@ -140,11 +110,7 @@ impl S2sListeners {
         let admission = Arc::new(AdmissionLimits {
             attempts: AttemptLimiter::new(&limits.connection_attempts_per_ip),
             connections: ConnectionLimiter::new(limits.max_connections_per_ip.get()),
-            global: Arc::new(GlobalLimit {
-                active: AtomicUsize::new(0),
-                max: limits.max_inbound_connections.get(),
-                report: PlMutex::new(RejectionReport::default()),
-            }),
+            global: GlobalLimit::new(limits.max_inbound_connections.get()),
         });
         let settings = Settings {
             tls_mode: crate::config::TlsMode::StartTls,

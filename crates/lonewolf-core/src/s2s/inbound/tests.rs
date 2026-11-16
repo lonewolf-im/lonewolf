@@ -1404,9 +1404,7 @@ fn admitted_unpolled_connection_counts_cancelled_once_and_releases_mode_gauges_a
         AcceptHandler, ListenerSlot,
         socket::{ConnectionSocket, ConnectionTask},
     };
-    use parking_lot::Mutex as PlMutex;
     use std::io::Read as _;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     Runtime::new()?.block_on(async {
         for mode in TlsMode::ALL {
             let mut fixture = Fixture::new()?;
@@ -1416,7 +1414,7 @@ fn admitted_unpolled_connection_counts_cancelled_once_and_releases_mode_gauges_a
             let admission = Arc::new(AdmissionLimits {
                 attempts: crate::admission::attempt_limit::AttemptLimiter::new(&limits.connection_attempts_per_ip),
                 connections: crate::admission::connection_limit::ConnectionLimiter::new(limits.max_connections_per_ip.get()),
-                global: Arc::new(GlobalLimit { active: AtomicUsize::new(0), max: limits.max_inbound_connections.get(), report: PlMutex::new(crate::admission::rejection_report::RejectionReport::default()) }),
+                global: GlobalLimit::new(limits.max_inbound_connections.get()),
             });
             let handler = S2sAcceptor { admission: Arc::clone(&admission), settings: fixture.settings.clone() };
             let listener = crate::connection::bind(([127, 0, 0, 1], 0).into()).await?;
@@ -1425,13 +1423,13 @@ fn admitted_unpolled_connection_counts_cancelled_once_and_releases_mode_gauges_a
             let (socket, peer_address) = listener.accept().await?;
             let permit = handler.admit(peer_address.ip()).await.map_err(|_| "admission rejected")?;
             let task = ConnectionTask { _socket: ConnectionSocket(socket.clone()), future: Box::pin(handler.serve(ListenerSlot { listener_id: 0, worker_id: 0 }, socket, permit, std::future::pending().boxed_local().shared())) };
-            assert_eq!(admission.global.active.load(Ordering::Acquire), 1);
+            assert_eq!(admission.global.active(), 1);
             let output = render(&fixture.settings.metrics)?;
             assert!(!output.contains("s2s_transport_attempts_total"));
             assert!(output.contains("s2s_connections{direction=\"inbound\"} 1"));
             drop(task);
             assert_eq!(peer.read(&mut [0; 1])?, 0);
-            assert_eq!(admission.global.active.load(Ordering::Acquire), 0);
+            assert_eq!(admission.global.active(), 0);
             let output = render(&fixture.settings.metrics)?;
             assert_eq!(output.lines().filter(|line| line.starts_with("s2s_transport_attempts_total{")).count(), 1);
             assert!(output.contains(&format!("s2s_transport_attempts_total{{direction=\"inbound\",tls_mode=\"{}\",outcome=\"cancelled\"}} 1", mode.as_str())));

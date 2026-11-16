@@ -293,6 +293,35 @@
 # Keep this at least as large as the initial delay.
 # failure_backoff_max_secs = 900
 
+# [limits.components]
+
+# Increase this connection allowance when you run more component instances.
+# max_connections = 64
+
+# Increase the sustained rate or burst for components that reconnect frequently.
+# connection_attempts_per_ip = { per_second = 5, burst = 20 }
+
+# Allow more negotiation time in seconds for components on slower networks.
+# negotiation_timeout_secs = 10
+
+# Increase the stanza byte limit for larger payloads, within 10,000 through 4,294,967,295 bytes and the platform allocation range.
+# max_stanza_bytes = 524_288
+
+# Increase the sustained rate or burst for components that send more stanzas per connection.
+# incoming_stanzas_per_connection = { per_second = 1_000, burst = 10_000 }
+
+# Increase the sustained byte rate or burst for components that send more XML per connection.
+# incoming_xml_per_connection = { bytes_per_second = 4_194_304, burst_bytes = 16_777_216 }
+
+# Increase the stanza allowance per component when short traffic bursts fill its queue.
+# max_queued_stanzas = 4_096
+
+# Increase the byte allowance per component when larger stanzas fill its queue.
+# max_queued_bytes = 16_777_216
+
+# Allow more seconds without write progress for components on slower networks.
+# stalled_write_timeout_secs = 60
+
 # Add one section per TCP endpoint. These sections replace the default endpoint.
 # Lonewolf requires at least one client endpoint.
 # [[c2s.listeners]]
@@ -389,6 +418,30 @@
 # Strings use STARTTLS; tables select starttls or direct, with starttls when omitted.
 # Direct TLS requires a DNS domain name. These values are examples.
 # "remote.example" = ["127.0.0.1:5269", { address = "127.0.0.1:5270", tls_mode = "direct" }]
+
+# [components]
+
+# Connect only component software you trust to send from any address at its domain.
+# No listener opens while no component domain is configured.
+# Without TLS, the handshake and all traffic are unencrypted, so keep the loopback address unless the component runs on another machine.
+# Endpoints must not overlap client, server, metrics, or HTTP challenge endpoints.
+# [[components.listeners]]
+# address = "127.0.0.1:5347"
+
+# The domain and path below are examples; the domain must not be a configured host.
+# [components.domains."muc.example.com"]
+# Prefer a secret file; Lonewolf reads it at startup and removes one trailing line break.
+# Use a long random secret of 16 to 1024 bytes.
+# secret_file = "./secrets/muc.example.com"
+# Choose whether the closest parent host lists this component in service discovery.
+# discoverable = true
+
+# Use an inline secret instead of secret_file only when file storage is unsuitable.
+# The domain and secret below are examples.
+# ```toml
+# [components.domains."muc.example.com"]
+# secret = "replace-with-a-long-random-value"
+# ```
 
 # [storage]
 

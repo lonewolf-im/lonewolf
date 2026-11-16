@@ -13,6 +13,10 @@ const TABLES: &[&str] = &[
     "limits.s2s.connection_attempts_per_ip",
     "limits.s2s.incoming_stanzas_per_connection",
     "limits.s2s.incoming_xml_per_connection",
+    "limits.components",
+    "limits.components.connection_attempts_per_ip",
+    "limits.components.incoming_stanzas_per_connection",
+    "limits.components.incoming_xml_per_connection",
     "limits.c2s.profiles.default",
     "limits.c2s.profiles.default.connection_attempts_per_ip",
     "limits.c2s.profiles.default.incoming_stanzas_per_connection",
@@ -130,7 +134,30 @@ fn limits_defaults_match_the_policy() -> TestResult {
         ("failure_backoff_initial_secs", 30),
         ("failure_backoff_max_secs", 900),
     ];
-    assert_eq!(actual.len(), expected.len() + s2s_expected.len() + 3);
+    let component_expected = [
+        ("max_connections", 64),
+        ("connection_attempts_per_ip.per_second", 5),
+        ("connection_attempts_per_ip.burst", 20),
+        ("negotiation_timeout_secs", 10),
+        ("max_stanza_bytes", 524_288),
+        ("incoming_stanzas_per_connection.per_second", 1_000),
+        ("incoming_stanzas_per_connection.burst", 10_000),
+        ("incoming_xml_per_connection.bytes_per_second", 4_194_304),
+        ("incoming_xml_per_connection.burst_bytes", 16_777_216),
+        ("max_queued_stanzas", 4_096),
+        ("max_queued_bytes", 16_777_216),
+        ("stalled_write_timeout_secs", 60),
+    ];
+    assert_eq!(
+        actual.len(),
+        expected.len() + s2s_expected.len() + component_expected.len() + 3
+    );
+    for (path, value) in component_expected {
+        assert!(
+            actual.contains(&(format!("components.{path}"), value)),
+            "unexpected component default for {path}"
+        );
+    }
     for (path, value) in s2s_expected {
         assert!(
             actual.contains(&(format!("s2s.{path}"), value)),
@@ -552,6 +579,43 @@ fn s2s_wire_ranges_are_validated_even_when_federation_and_bidi_are_disabled() ->
                 );
             }
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn component_stanza_sizes_must_fit_the_wire_and_platform_ranges() -> TestResult {
+    let maximum = (u32::MAX as usize).min(isize::MAX as usize);
+    for (value, valid) in [
+        (9_999, false),
+        (10_000, true),
+        (maximum, true),
+        (maximum + 1, false),
+    ] {
+        let result = Config::load(Some(setting("components.max_stanza_bytes", value)?.path()));
+        if valid {
+            assert!(result.is_ok(), "{result:?}");
+        } else {
+            assert!(
+                matches!(result, Err(ConfigError::Invalid { ref reason, .. })
+                    if reason == &format!("limits.components.max_stanza_bytes must be between 10000 and {maximum}")),
+                "{result:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn component_timeouts_must_fit_the_platform_clock() -> TestResult {
+    for field in ["negotiation_timeout_secs", "stalled_write_timeout_secs"] {
+        let file = setting(&format!("components.{field}"), u64::MAX)?;
+        let result = Config::load(Some(file.path()));
+        assert!(
+            matches!(result, Err(ConfigError::Invalid { ref reason, .. })
+                if reason == &format!("limits.components.{field} exceeds the platform clock range")),
+            "{result:?}"
+        );
     }
     Ok(())
 }

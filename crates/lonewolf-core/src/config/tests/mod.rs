@@ -10,15 +10,16 @@ use std::process::Command;
 
 use crate::config::limits::C2sLimitProfile;
 use crate::config::{
-    AccountConfig, ClientCertificateConfig, Config, ConfigError, HostConfig, HostTlsConfig,
-    HostTlsSource, MetricsConfig, S2sRouteEndpoint, StoreConfig, TcpListenerConfig, TlsMode,
-    XmppConfig,
+    AccountConfig, ClientCertificateConfig, ComponentDomainConfig, ComponentSecretSource, Config,
+    ConfigError, HostConfig, HostTlsConfig, HostTlsSource, MetricsConfig, S2sRouteEndpoint,
+    StoreConfig, TcpListenerConfig, TlsMode, XmppConfig,
 };
 use lonewolf_auth::server::Mechanism;
 use lonewolf_extension::{Extensions, HostSelection};
 use lonewolf_storage::RedbStorage;
 use lonewolf_util::arena::GlobalChunkAllocator;
 
+mod components;
 mod hosts;
 mod limits;
 
@@ -848,7 +849,7 @@ fn documented_settings_and_examples() -> Result<(String, Vec<String>), Box<dyn E
 #[test]
 fn reference_configuration_fenced_examples_load() -> TestResult {
     let (_, examples) = documented_settings_and_examples()?;
-    assert_eq!(examples.len(), 6);
+    assert_eq!(examples.len(), 7);
     for example in examples {
         let contents = if example.starts_with("[letsencrypt]") {
             format!("[hosts.'example.com'.tls]\nprovider = 'letsencrypt'\n{example}")
@@ -950,6 +951,13 @@ fn reference_configuration_settings_match_documented_defaults() -> TestResult {
         },
     );
     expected.s2s.tls.trust_anchors_path = Some("./certs/federation-roots.pem".into());
+    expected.components.domains.insert(
+        "muc.example.com".into(),
+        ComponentDomainConfig {
+            secret: ComponentSecretSource::File("./secrets/muc.example.com".into()),
+            discoverable: true,
+        },
+    );
     expected.s2s.tls.crls_path = Some("./certs/federation-crls.pem".into());
     expected.s2s.routes.insert(
         "remote.example".into(),

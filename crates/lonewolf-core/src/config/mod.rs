@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use http::Uri;
+use lonewolf_auth::component::ComponentSecret;
 use lonewolf_auth::server::Mechanism;
 use lonewolf_util::arena::{Arena, ArenaConfig};
 use lonewolf_util::pool::{DEFAULT_POOL_SIZE, MIN_POOL_SIZE, PoolConfig, PoolError};
@@ -23,7 +24,7 @@ use serde::{Deserialize, Deserializer};
 pub mod limits;
 
 use limits::LimitsConfig;
-pub use limits::S2sLimits;
+pub use limits::{ComponentLimits, S2sLimits};
 
 pub const DEFAULT_CONFIG_PATH: &str = "lonewolf.toml";
 const MEBIBYTE: usize = 1024 * 1024;
@@ -38,6 +39,7 @@ pub struct Config {
     pub hosts: BTreeMap<String, HostConfig>,
     pub c2s: C2sConfig,
     pub s2s: S2sConfig,
+    pub components: ComponentsConfig,
     pub limits: LimitsConfig,
     pub storage: StorageConfig,
     pub account: AccountConfig,
@@ -54,6 +56,7 @@ impl Default for Config {
             hosts: default_hosts(),
             c2s: C2sConfig::default(),
             s2s: S2sConfig::default(),
+            components: ComponentsConfig::default(),
             limits: LimitsConfig::default(),
             storage: StorageConfig::default(),
             account: AccountConfig::default(),
@@ -88,9 +91,12 @@ impl Config {
             }
         };
 
-        let config: Self = toml::from_str(&contents).map_err(|source| ConfigError::Parse {
-            path: selected_path.to_path_buf(),
-            source,
+        let config: Self = toml::from_str(&contents).map_err(|mut source| {
+            source.set_input(None);
+            ConfigError::Parse {
+                path: selected_path.to_path_buf(),
+                source,
+            }
         })?;
         config.validate().map_err(|reason| ConfigError::Invalid {
             path: selected_path.to_path_buf(),
@@ -107,6 +113,7 @@ impl Config {
         self.letsencrypt
             .validate(&self.hosts, &self.c2s, &self.metrics)?;
         self.s2s.validate(self)?;
+        self.components.validate(self)?;
         self.limits.validate()?;
         for (index, listener) in self.c2s.listeners.iter().enumerate() {
             if !listener.auth_mechanisms.has_scram() {
@@ -646,6 +653,162 @@ impl S2sConfig {
             }
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ComponentsConfig {
+    pub listeners: Vec<ComponentListenerConfig>,
+    pub domains: BTreeMap<String, ComponentDomainConfig>,
+}
+
+impl Default for ComponentsConfig {
+    fn default() -> Self {
+        Self {
+            listeners: vec![ComponentListenerConfig::default()],
+            domains: BTreeMap::new(),
+        }
+    }
+}
+
+impl ComponentsConfig {
+    fn validate(&self, config: &Config) -> Result<(), String> {
+        for (domain, component) in &self.domains {
+            validate_domain(domain, "components.domains")?;
+            if config.hosts.contains_key(domain) {
+                return Err(format!(
+                    "components.domains.{domain} must not be a configured host"
+                ));
+            }
+            if config.s2s.routes.contains_key(domain) {
+                return Err(format!(
+                    "components.domains.{domain} must not have an s2s.routes entry"
+                ));
+            }
+            if let ComponentSecretSource::File(path) = &component.secret
+                && path.as_os_str().is_empty()
+            {
+                return Err(format!(
+                    "components.domains.{domain}.secret_file must not be empty"
+                ));
+            }
+        }
+        if self.domains.is_empty() {
+            return Ok(());
+        }
+        if self.listeners.is_empty() {
+            return Err("components.listeners must define at least one listener when component domains are configured".into());
+        }
+        let managed = config.hosts.values().any(|host| {
+            host.tls
+                .as_ref()
+                .is_some_and(|tls| matches!(tls.source, HostTlsSource::LetsEncrypt))
+        });
+        for (index, listener) in self.listeners.iter().enumerate() {
+            for (previous, other) in self.listeners[..index].iter().enumerate() {
+                if endpoints_overlap(listener.address, other.address) {
+                    return Err(format!(
+                        "components.listeners[{index}] overlaps components.listeners[{previous}]"
+                    ));
+                }
+            }
+            for (other, client) in config.c2s.listeners.iter().enumerate() {
+                if endpoints_overlap(listener.address, client.address) {
+                    return Err(format!(
+                        "components.listeners[{index}] overlaps c2s.listeners[{other}]"
+                    ));
+                }
+            }
+            if config.s2s.enabled {
+                for (other, server) in config.s2s.listeners.iter().enumerate() {
+                    if endpoints_overlap(listener.address, server.address) {
+                        return Err(format!(
+                            "components.listeners[{index}] overlaps s2s.listeners[{other}]"
+                        ));
+                    }
+                }
+            }
+            if config.metrics.enabled && endpoints_overlap(listener.address, config.metrics.address)
+            {
+                return Err(format!(
+                    "components.listeners[{index}] overlaps metrics.address"
+                ));
+            }
+            if managed {
+                for (other, &address) in config.letsencrypt.listen.iter().enumerate() {
+                    if endpoints_overlap(listener.address, address) {
+                        return Err(format!(
+                            "components.listeners[{index}] overlaps letsencrypt.listen[{other}]"
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ComponentListenerConfig {
+    pub address: SocketAddr,
+}
+
+impl Default for ComponentListenerConfig {
+    fn default() -> Self {
+        Self {
+            address: SocketAddr::from((Ipv4Addr::LOCALHOST, 5347)),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComponentDomainConfig {
+    pub secret: ComponentSecretSource,
+    pub discoverable: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ComponentSecretSource {
+    Inline(ComponentSecret),
+    File(PathBuf),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawComponentDomainConfig {
+    #[serde(default, deserialize_with = "deserialize_inline_component_secret")]
+    secret: Option<String>,
+    secret_file: Option<PathBuf>,
+    discoverable: Option<bool>,
+}
+
+fn deserialize_inline_component_secret<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)
+        .map_err(|_| D::Error::custom("component secret must be a string"))
+}
+
+impl<'de> Deserialize<'de> for ComponentDomainConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawComponentDomainConfig::deserialize(deserializer)?;
+        let secret = match (raw.secret, raw.secret_file) {
+            (Some(value), None) => ComponentSecretSource::Inline(
+                ComponentSecret::new(&value).map_err(D::Error::custom)?,
+            ),
+            (None, Some(path)) => ComponentSecretSource::File(path),
+            _ => return Err(D::Error::custom("set exactly one of secret or secret_file")),
+        };
+        Ok(Self {
+            secret,
+            discoverable: raw.discoverable.unwrap_or(true),
+        })
     }
 }
 

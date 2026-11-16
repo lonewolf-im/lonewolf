@@ -11,12 +11,14 @@ use serde::{Deserialize, Serialize};
 pub struct LimitsConfig {
     pub c2s: C2sLimits,
     pub s2s: S2sLimits,
+    pub components: ComponentLimits,
 }
 
 impl LimitsConfig {
     pub(super) fn validate(&self) -> Result<(), String> {
         self.c2s.validate()?;
-        self.s2s.validate()
+        self.s2s.validate()?;
+        self.components.validate()
     }
 }
 
@@ -193,6 +195,121 @@ impl S2sLimits {
         }
         if self.failure_backoff_initial_secs > self.failure_backoff_max_secs {
             return Err("limits.s2s.failure_backoff_initial_secs must not exceed limits.s2s.failure_backoff_max_secs".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(from = "ComponentLimitsInput")]
+pub struct ComponentLimits {
+    pub max_connections: NonZeroUsize,
+    pub connection_attempts_per_ip: EventRate,
+    pub negotiation_timeout_secs: NonZeroU64,
+    pub max_stanza_bytes: NonZeroUsize,
+    pub incoming_stanzas_per_connection: EventRate,
+    pub incoming_xml_per_connection: ByteRate,
+    pub max_queued_stanzas: NonZeroUsize,
+    pub max_queued_bytes: NonZeroUsize,
+    pub stalled_write_timeout_secs: NonZeroU64,
+}
+
+impl Default for ComponentLimits {
+    fn default() -> Self {
+        const {
+            Self {
+                max_connections: nonzero(64),
+                connection_attempts_per_ip: EventRate {
+                    per_second: nonzero(5),
+                    burst: nonzero(20),
+                },
+                negotiation_timeout_secs: nonzero_secs(10),
+                max_stanza_bytes: nonzero(524_288),
+                incoming_stanzas_per_connection: EventRate {
+                    per_second: nonzero(1_000),
+                    burst: nonzero(10_000),
+                },
+                incoming_xml_per_connection: ByteRate {
+                    bytes_per_second: nonzero(4_194_304),
+                    burst_bytes: nonzero(16_777_216),
+                },
+                max_queued_stanzas: nonzero(4_096),
+                max_queued_bytes: nonzero(16_777_216),
+                stalled_write_timeout_secs: nonzero_secs(60),
+            }
+        }
+    }
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ComponentLimitsInput {
+    max_connections: Option<NonZeroUsize>,
+    connection_attempts_per_ip: Option<EventRateInput>,
+    negotiation_timeout_secs: Option<NonZeroU64>,
+    max_stanza_bytes: Option<NonZeroUsize>,
+    incoming_stanzas_per_connection: Option<EventRateInput>,
+    incoming_xml_per_connection: Option<ByteRateInput>,
+    max_queued_stanzas: Option<NonZeroUsize>,
+    max_queued_bytes: Option<NonZeroUsize>,
+    stalled_write_timeout_secs: Option<NonZeroU64>,
+}
+
+impl From<ComponentLimitsInput> for ComponentLimits {
+    fn from(input: ComponentLimitsInput) -> Self {
+        let defaults = Self::default();
+        Self {
+            max_connections: input.max_connections.unwrap_or(defaults.max_connections),
+            connection_attempts_per_ip: input
+                .connection_attempts_per_ip
+                .unwrap_or_default()
+                .with_defaults(defaults.connection_attempts_per_ip),
+            negotiation_timeout_secs: input
+                .negotiation_timeout_secs
+                .unwrap_or(defaults.negotiation_timeout_secs),
+            max_stanza_bytes: input.max_stanza_bytes.unwrap_or(defaults.max_stanza_bytes),
+            incoming_stanzas_per_connection: input
+                .incoming_stanzas_per_connection
+                .unwrap_or_default()
+                .with_defaults(defaults.incoming_stanzas_per_connection),
+            incoming_xml_per_connection: input
+                .incoming_xml_per_connection
+                .unwrap_or_default()
+                .with_defaults(defaults.incoming_xml_per_connection),
+            max_queued_stanzas: input
+                .max_queued_stanzas
+                .unwrap_or(defaults.max_queued_stanzas),
+            max_queued_bytes: input.max_queued_bytes.unwrap_or(defaults.max_queued_bytes),
+            stalled_write_timeout_secs: input
+                .stalled_write_timeout_secs
+                .unwrap_or(defaults.stalled_write_timeout_secs),
+        }
+    }
+}
+
+impl ComponentLimits {
+    fn validate(&self) -> Result<(), String> {
+        let max = (u32::MAX as usize).min(isize::MAX as usize);
+        if !(10_000..=max).contains(&self.max_stanza_bytes.get()) {
+            return Err(format!(
+                "limits.components.max_stanza_bytes must be between 10000 and {max}"
+            ));
+        }
+        for (field, value) in [
+            ("negotiation_timeout_secs", self.negotiation_timeout_secs),
+            (
+                "stalled_write_timeout_secs",
+                self.stalled_write_timeout_secs,
+            ),
+        ] {
+            if Instant::now()
+                .checked_add(Duration::from_secs(value.get()))
+                .is_none()
+            {
+                return Err(format!(
+                    "limits.components.{field} exceeds the platform clock range"
+                ));
+            }
         }
         Ok(())
     }

@@ -18,6 +18,7 @@ pub(crate) struct Serving<A: ChunkAllocator> {
     pub(crate) components: Option<ComponentRegistry<A>>,
     pub(crate) c2s: Option<ListenerSet>,
     pub(crate) s2s: Option<ListenerSet>,
+    pub(crate) component: Option<ListenerSet>,
     deadline: Option<Instant>,
 }
 
@@ -29,6 +30,7 @@ impl<A: ChunkAllocator + Clone> Serving<A> {
             components: None,
             c2s: None,
             s2s: None,
+            component: None,
             deadline: None,
         }
     }
@@ -40,6 +42,9 @@ impl<A: ChunkAllocator + Clone> Serving<A> {
         self.deadline = Some(deadline);
         if let Some(components) = &self.components {
             components.stop();
+        }
+        if let Some(listeners) = &mut self.component {
+            listeners.stop(deadline);
         }
         if let Some(router) = &self.router {
             router.stop();
@@ -73,9 +78,11 @@ impl<A: ChunkAllocator + Clone> Serving<A> {
             remote,
             c2s,
             s2s,
+            component,
             ..
         } = self;
         collect_join(
+            join_listeners(component.as_mut(), deadline, RunError::Component),
             join_listeners(s2s.as_mut(), deadline, RunError::S2s),
             acme_drain,
             join_listeners(c2s.as_mut(), deadline, RunError::C2s),
@@ -131,18 +138,21 @@ async fn join_listeners(
 }
 
 async fn collect_join(
+    component: impl Future<Output = ListenerJoin>,
     s2s: impl Future<Output = ListenerJoin>,
     acme_drain: impl Future<Output = Result<(), RunError>>,
     c2s: impl Future<Output = ListenerJoin>,
     remote: impl Future<Output = Result<(), RunError>>,
     router: impl Future<Output = Result<(), RunError>>,
 ) -> ServingJoin {
+    let component = component.await;
     let s2s = s2s.await;
     let acme_drain = acme_drain.await;
     let c2s = c2s.await;
     let remote = remote.await;
     let router = router.await;
     ServingJoin {
+        component,
         s2s,
         acme_drain,
         c2s,
@@ -161,6 +171,7 @@ pub(crate) struct ServiceJoin {
 }
 
 pub(crate) struct ServingJoin {
+    component: ListenerJoin,
     s2s: ListenerJoin,
     acme_drain: Result<(), RunError>,
     c2s: ListenerJoin,
@@ -180,6 +191,7 @@ impl ServingJoin {
             || services.metrics.is_err()
             || self.c2s.drain_deadline_exceeded
             || self.s2s.drain_deadline_exceeded
+            || self.component.drain_deadline_exceeded
         {
             return None;
         }
@@ -194,7 +206,10 @@ impl ServingJoin {
         services: ServiceJoin,
         dispatcher: Result<(), RunError>,
     ) -> Result<(), RunError> {
-        let drain = if self.s2s.drain_deadline_exceeded || self.c2s.drain_deadline_exceeded {
+        let drain = if self.s2s.drain_deadline_exceeded
+            || self.c2s.drain_deadline_exceeded
+            || self.component.drain_deadline_exceeded
+        {
             Err(match services.router_failure {
                 Some(failure) => RunError::RouterFailed(failure),
                 None => RunError::DispatcherShutdown(shutdown_timeout()),
@@ -211,6 +226,7 @@ impl ServingJoin {
             .and(services.acme)
             .and(self.c2s.result)
             .and(self.s2s.result)
+            .and(self.component.result)
             .and(dispatcher)
             .and(self.router)
             .and(self.acme_drain)
@@ -225,6 +241,7 @@ impl ServingJoin {
             .and(dispatcher)
             .and(self.c2s.result)
             .and(self.s2s.result)
+            .and(self.component.result)
             .and(self.remote)
             .and(self.router)
             .and(self.acme_drain)

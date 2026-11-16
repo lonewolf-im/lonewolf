@@ -36,6 +36,7 @@ fn listener(result: Result<(), RunError>, deadline: bool) -> ListenerJoin {
 }
 fn joined() -> ServingJoin {
     ServingJoin {
+        component: listener(Ok(()), false),
         s2s: listener(Ok(()), false),
         c2s: listener(Ok(()), false),
         remote: Ok(()),
@@ -47,7 +48,7 @@ fn joined() -> ServingJoin {
 #[test]
 fn partial_startup_owned_components_stop_once_and_join_before_returning_primary() -> TestResult {
     Runtime::new()?.block_on(async {
-        for count in 0_usize..4 {
+        for count in 0_usize..5 {
             let config = crate::Config::default();
             let hosts = crate::Hosts::new(&config.hosts, config.xmpp.default_host.as_deref())?;
             let mut serving = Serving::<GlobalChunkAllocator>::new();
@@ -55,8 +56,8 @@ fn partial_startup_owned_components_stop_once_and_join_before_returning_primary(
             let mut stopped = Vec::new();
             for slot in 0..count.saturating_sub(1) {
                 let (stop, until) = oneshot::channel();
-                let listeners = ListenerSet::with_test_channels(if slot==0 { ListenerKind::C2s } else { ListenerKind::S2s }, stop, async_channel::bounded(1).1, 1);
-                if slot==0 { serving.c2s = Some(listeners); } else { serving.s2s = Some(listeners); }
+                let listeners = ListenerSet::with_test_channels(match slot { 0 => ListenerKind::C2s, 1 => ListenerKind::S2s, _ => ListenerKind::Component }, stop, async_channel::bounded(1).1, 1);
+                match slot { 0 => serving.c2s = Some(listeners), 1 => serving.s2s = Some(listeners), _ => serving.component = Some(listeners) }
                 stopped.push(until);
             }
             let deadline = Instant::now() + TIMEOUT;
@@ -83,6 +84,7 @@ fn join_retains_acme_interleave_and_runs_every_cleanup_after_errors() -> TestRes
         let (release_acme, acme_ready) = oneshot::channel();
         let c2s_started = Cell::new(false);
         let mut join = pin!(collect_join(
+            async { listener(Ok(()), false) },
             async {
                 events.borrow_mut().push("s2s");
                 let _ = s2s_ready.await;
@@ -175,6 +177,7 @@ fn normal_results_follow_component_priority_without_execution_order_bias() {
             router_failure: None,
         };
         let result = ServingJoin {
+            component: listener(Ok(()), false),
             remote: stage(2, first),
             c2s: listener(stage(5, first), false),
             s2s: listener(stage(6, first), false),
@@ -205,6 +208,7 @@ fn startup_results_keep_the_existing_fallback_priority() {
             }
         };
         let result = ServingJoin {
+            component: listener(Ok(()), false),
             remote: fail(2),
             c2s: listener(fail(5), true),
             s2s: listener(fail(6), true),
@@ -267,10 +271,11 @@ fn listener_only_outer_deadline_maps_global_drain_after_backgrounds_finish() -> 
     Runtime::new()?.block_on(compio::time::timeout(TIMEOUT, async {
         let dispatcher =
             CoreDispatcher::new(std::num::NonZeroUsize::MIN, std::num::NonZeroUsize::MIN)?;
-        for kind in [ListenerKind::C2s, ListenerKind::S2s] {
+        for kind in [ListenerKind::C2s, ListenerKind::S2s, ListenerKind::Component] {
             let error: fn(io::Error) -> RunError = match kind {
                 ListenerKind::C2s => RunError::C2s,
                 ListenerKind::S2s => RunError::S2s,
+                ListenerKind::Component => RunError::Component,
             };
             for failure in [None, Some(RouterFailure { shard_id: 4 })] {
                 let (stop, _stopped) = oneshot::channel();
@@ -285,11 +290,12 @@ fn listener_only_outer_deadline_maps_global_drain_after_backgrounds_finish() -> 
                 );
                 let late = join_listeners(Some(&mut listeners), Instant::now(), error).await;
                 assert!(late.drain_deadline_exceeded);
-                assert!(matches!(&late.result, Err(RunError::C2s(error) | RunError::S2s(error)) if error.kind() == io::ErrorKind::TimedOut));
+                assert!(matches!(&late.result, Err(RunError::C2s(error) | RunError::S2s(error) | RunError::Component(error)) if error.kind() == io::ErrorKind::TimedOut));
                 let mut cleanup = joined();
                 match kind {
                     ListenerKind::C2s => cleanup.c2s = late,
                     ListenerKind::S2s => cleanup.s2s = late,
+                    ListenerKind::Component => cleanup.component = late,
                 }
                 let mut services = service_join();
                 services.router_failure = failure;
@@ -313,10 +319,15 @@ fn ready_listener_join_does_not_infer_exhaustion_from_the_clock() -> TestResult 
     Runtime::new()?.block_on(compio::time::timeout(TIMEOUT, async {
         let dispatcher =
             CoreDispatcher::new(std::num::NonZeroUsize::MIN, std::num::NonZeroUsize::MIN)?;
-        for kind in [ListenerKind::C2s, ListenerKind::S2s] {
+        for kind in [
+            ListenerKind::C2s,
+            ListenerKind::S2s,
+            ListenerKind::Component,
+        ] {
             let error: fn(io::Error) -> RunError = match kind {
                 ListenerKind::C2s => RunError::C2s,
                 ListenerKind::S2s => RunError::S2s,
+                ListenerKind::Component => RunError::Component,
             };
             for outcome in [
                 None,
@@ -360,7 +371,11 @@ fn ready_listener_join_does_not_infer_exhaustion_from_the_clock() -> TestResult 
                 match expected_error {
                     None => assert!(result.result.is_ok()),
                     Some(expected) => match result.result {
-                        Err(RunError::C2s(error) | RunError::S2s(error)) => {
+                        Err(
+                            RunError::C2s(error)
+                            | RunError::S2s(error)
+                            | RunError::Component(error),
+                        ) => {
                             assert_eq!(error.kind(), io::ErrorKind::TimedOut);
                             assert_eq!(error.to_string(), expected);
                         }

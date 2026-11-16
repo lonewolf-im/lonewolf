@@ -139,6 +139,7 @@ pub struct C2sSuite {
     readiness: ReadinessSocket,
     pub address: SocketAddr,
     pub s2s: Option<Vec<SocketAddr>>,
+    pub component: Option<Vec<SocketAddr>>,
     federation_enabled: bool,
     listeners: Vec<SocketAddr>,
     metrics: SocketAddr,
@@ -267,6 +268,17 @@ impl C2sSuite {
             return Err("server did not complete successfully".into());
         }
         super::federation::read_shutdown_receipt(self.directory.path(), self.child.id())
+    }
+
+    pub fn stop_with_component_state(
+        &mut self,
+    ) -> TestResult<Option<lonewolf_core::test_support::ComponentShutdownState>> {
+        self.stop()?;
+        let status = self.child.try_wait()?.ok_or("server has not been reaped")?;
+        if !self.reaped || !status.success() {
+            return Err("server did not complete successfully".into());
+        }
+        super::federation::read_component_shutdown_receipt(self.directory.path(), self.child.id())
     }
 
     pub fn with_extensions(extensions: &str) -> TestResult<Self> {
@@ -462,6 +474,7 @@ max_resources_per_account = {resources}
             address: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
             listeners: Vec::new(),
             s2s: None,
+            component: None,
             federation_enabled,
             metrics: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
             tls: Arc::new(tls),
@@ -584,6 +597,7 @@ timeout_secs = 1
             readiness,
             address: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
             s2s: None,
+            component: None,
             federation_enabled,
             listeners: Vec::new(),
             metrics: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
@@ -592,6 +606,14 @@ timeout_secs = 1
         };
         server.wait_until_ready()?;
         Ok(server)
+    }
+
+    pub fn component_address(&self, listener_id: usize) -> TestResult<SocketAddr> {
+        self.component
+            .as_ref()
+            .and_then(|addresses| addresses.get(listener_id))
+            .copied()
+            .ok_or_else(|| "missing component listener".into())
     }
 
     pub fn s2s_addresses(&self) -> TestResult<&[SocketAddr]> {
@@ -649,6 +671,7 @@ timeout_secs = 1
             if let Some(readiness) = self.readiness.receive(Duration::from_millis(10))? {
                 assert_eq!(readiness.s2s.is_some(), self.federation_enabled);
                 self.s2s = readiness.s2s;
+                self.component = readiness.component;
                 self.address = *readiness.c2s.first().ok_or("no C2S listener is ready")?;
                 self.metrics = readiness.metrics.ok_or("metrics service is not ready")?;
                 self.listeners = readiness.c2s;
@@ -855,7 +878,7 @@ fn server_process() -> TestResult {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    let state = match lonewolf_core::test_support::run_with_extensions_and_s2s_shutdown_state(
+    let state = match lonewolf_core::test_support::run_with_extensions_and_shutdown_state(
         None,
         lonewolf_core::BuildInfo {
             version: "integration-test",

@@ -65,6 +65,23 @@ pub struct S2sShutdownState {
     pub router_sessions: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ComponentShutdownState {
+    pub connections: u64,
+    pub streams: u64,
+    pub authentication_success: u64,
+    pub authentication_shutdown: u64,
+    pub authentication_total: u64,
+    pub streams_closed_shutdown: u64,
+    pub streams_closed_total: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RuntimeShutdownState {
+    pub s2s: Option<S2sShutdownState>,
+    pub component: Option<ComponentShutdownState>,
+}
+
 pub fn run_with_extensions_and_s2s_shutdown_state(
     config_path: Option<&std::path::Path>,
     build: crate::BuildInfo,
@@ -73,7 +90,18 @@ pub fn run_with_extensions_and_s2s_shutdown_state(
         lonewolf_storage::RedbStorage,
     >,
 ) -> Result<Option<S2sShutdownState>, crate::RunError> {
-    let mut state = None;
+    Ok(run_with_extensions_and_shutdown_state(config_path, build, extensions)?.s2s)
+}
+
+pub fn run_with_extensions_and_shutdown_state(
+    config_path: Option<&std::path::Path>,
+    build: crate::BuildInfo,
+    extensions: lonewolf_extension::Extensions<
+        Arc<lonewolf_util::pool::PooledChunkAllocator>,
+        lonewolf_storage::RedbStorage,
+    >,
+) -> Result<RuntimeShutdownState, crate::RunError> {
+    let mut state = RuntimeShutdownState::default();
     crate::run_internal(
         config_path,
         build,

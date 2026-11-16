@@ -128,8 +128,8 @@ fn run_internal(
     build: BuildInfo,
     mut extensions: Extensions<Arc<PooledChunkAllocator>, RedbStorage>,
     acme_options: acme::LoadOptions,
-    #[cfg(feature = "test-support")] s2s_shutdown_state: Option<
-        &mut Option<test_support::S2sShutdownState>,
+    #[cfg(feature = "test-support")] runtime_shutdown_state: Option<
+        &mut test_support::RuntimeShutdownState,
     >,
 ) -> Result<(), RunError> {
     panic::init(&build);
@@ -185,6 +185,8 @@ fn run_internal(
             let mut serving = Serving::new();
             #[cfg(feature = "test-support")]
             let mut observed_s2s_metrics = None;
+            #[cfg(feature = "test-support")]
+            let mut observed_component_metrics = None;
             #[cfg(feature = "test-support")]
             let mut observed_registry = None;
             let mut shutdown_deadline = None;
@@ -313,8 +315,9 @@ fn run_internal(
                     serving.components = Some(registry);
                 }
                 #[cfg(feature = "test-support")]
-                if s2s_shutdown_state.is_some() {
+                if runtime_shutdown_state.is_some() {
                     observed_s2s_metrics = s2s_metrics.as_ref().map(Arc::clone);
+                    observed_component_metrics = component_metrics.as_ref().map(Arc::clone);
                 }
                 let metrics_server = if config.metrics.enabled {
                     Some(
@@ -421,8 +424,8 @@ fn run_internal(
                             peers,
                             &dispatcher.handle(),
                             s2s::ingress::IngressServices {
-                                router: router_handle,
-                                storage,
+                                router: router_handle.clone(),
+                                storage: storage.clone(),
                                 allocator: Arc::clone(&stanza_pool),
                             },
                             metrics,
@@ -434,9 +437,18 @@ fn run_internal(
                         })?.into_inner(),
                     );
                 }
+                if let (Some(metrics), Some(registry)) = (component_metrics, serving.components.as_ref()) {
+                    serving.component = Some(component::ComponentListeners::start(
+                        &config.components, &config.limits.components, registry.clone(), &dispatcher.handle(),
+                        component::ComponentServices { router: router_handle, storage, allocator: Arc::clone(&stanza_pool) }, metrics,
+                    ).await.map_err(|failure| {
+                        shutdown_deadline = Some(failure.deadline);
+                        RunError::Component(failure.error)
+                    })?);
+                }
                 let registry = server_metrics.into_registry();
                 #[cfg(feature = "test-support")]
-                if s2s_shutdown_state.is_some() {
+                if runtime_shutdown_state.is_some() {
                     observed_registry = Some(Arc::clone(&registry));
                 }
                 Ok(Some(run_services(
@@ -492,17 +504,18 @@ fn run_internal(
                 other => joined.startup(other.map(|_| ()), stopped),
             }?;
             #[cfg(feature = "test-support")]
-            if let Some(destination) = s2s_shutdown_state
-                && let Some(metrics) = observed_s2s_metrics
-            {
-                let mut state = metrics.shutdown_state();
-                if let Some(registry) = observed_registry {
-                    let [connections, unauthenticated, sessions] = test_support::shutdown_gauges(&registry).map_err(RunError::Metrics)?;
-                    state.c2s_connections=connections;
-                    state.c2s_unauthenticated=unauthenticated;
-                    state.router_sessions=sessions;
+            if let Some(destination) = runtime_shutdown_state {
+                if let Some(metrics) = observed_s2s_metrics {
+                    let mut state = metrics.shutdown_state();
+                    if let Some(registry) = observed_registry {
+                        let [connections, unauthenticated, sessions] = test_support::shutdown_gauges(&registry).map_err(RunError::Metrics)?;
+                        state.c2s_connections = connections;
+                        state.c2s_unauthenticated = unauthenticated;
+                        state.router_sessions = sessions;
+                    }
+                    destination.s2s = Some(state);
                 }
-                *destination = Some(state);
+                destination.component = observed_component_metrics.map(|metrics| metrics.shutdown_state());
             }
             Ok(())
         })?;
@@ -551,6 +564,10 @@ async fn run_services<A: ChunkAllocator + Clone>(
             .as_ref()
             .map_or(&[], |listeners| listeners.addresses()),
         serving.s2s.as_ref().map(|listeners| listeners.addresses()),
+        serving
+            .component
+            .as_ref()
+            .map(|listeners| listeners.addresses()),
         metrics.as_ref().map(|(server, _)| server.local_addr()),
     );
     let (stop_metrics, metrics_stopped) = oneshot::channel::<()>();
@@ -597,6 +614,7 @@ async fn run_services<A: ChunkAllocator + Clone>(
         let router = &mut serving.router;
         let listeners = &mut serving.c2s;
         let s2s_listeners = &mut serving.s2s;
+        let component_listeners = &mut serving.component;
         let external_shutdown = async {
             readiness::notify(&readiness);
             tracing::info!("waiting for stop signal... (press Ctrl+C to stop the server)");
@@ -614,9 +632,21 @@ async fn run_services<A: ChunkAllocator + Clone>(
                             None => pending().await,
                         }
                     };
-                    match select(pin!(c2s_failure), pin!(s2s_failure)).await {
-                        Either::Left((error, _)) => RunError::C2s(error),
-                        Either::Right((error, _)) => RunError::S2s(error),
+                    let component_failure = async {
+                        match component_listeners.as_mut() {
+                            Some(listeners) => listeners.failure().await,
+                            None => pending().await,
+                        }
+                    };
+                    match select(
+                        pin!(component_failure),
+                        pin!(select(pin!(c2s_failure), pin!(s2s_failure))),
+                    )
+                    .await
+                    {
+                        Either::Left((error, _)) => RunError::Component(error),
+                        Either::Right((Either::Left((error, _)), _)) => RunError::C2s(error),
+                        Either::Right((Either::Right((error, _)), _)) => RunError::S2s(error),
                     }
                 };
                 match select(pin!(stop_signal), pin!(listener_failure)).await {

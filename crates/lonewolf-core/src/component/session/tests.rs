@@ -373,7 +373,7 @@ impl Fixture {
         })
     }
 }
-fn assert_closed(metrics: &ComponentMetrics, expected: StreamClose) -> TestResult {
+fn assert_closed(metrics: &std::sync::Arc<ComponentMetrics>, expected: StreamClose) -> TestResult {
     let snapshot = metrics.shutdown_state();
     assert_eq!(snapshot.streams, 0);
     assert_eq!(snapshot.streams_closed_total, 1);
@@ -381,6 +381,15 @@ fn assert_closed(metrics: &ComponentMetrics, expected: StreamClose) -> TestResul
         snapshot.streams_closed_shutdown,
         u64::from(matches!(expected, StreamClose::Shutdown))
     );
+    let mut root = prometheus_client::registry::Registry::default();
+    metrics.register(root.sub_registry_with_prefix("lonewolf"));
+    let mut encoded = String::new();
+    prometheus_client::encoding::text::encode(&mut encoded, &root)?;
+    let expected_sample = format!(
+        "lonewolf_component_streams_closed_total{{outcome=\"{}\"}} 1",
+        expected.as_str()
+    );
+    assert!(encoded.lines().any(|line| line == expected_sample));
     Ok(())
 }
 
@@ -390,6 +399,7 @@ enum CloseCase {
     Expire,
     ExpireReady,
     Shorten,
+    Cancel,
 }
 async fn close_partial_write(case: CloseCase) -> TestResult {
     use tokio::io::AsyncWriteExt as _;
@@ -453,6 +463,22 @@ async fn close_partial_write(case: CloseCase) -> TestResult {
             assert!(!aborted.get());
             clock.advance(Duration::from_secs(2));
         }
+        CloseCase::Cancel => {
+            drop(serving);
+            assert_eq!(fixture.output.bytes.borrow().len(), 64);
+            assert_closed(
+                &fixture.settings.metrics,
+                StreamClose::UnsupportedStanzaType,
+            )?;
+            drop(
+                fixture
+                    .settings
+                    .registry
+                    .attach("muc.localhost")
+                    .map_err(|_| "attachment was not released")?,
+            );
+            return Ok(());
+        }
     }
     let outcome = serving.await;
     assert!(matches!(outcome, StreamClose::UnsupportedStanzaType));
@@ -464,7 +490,7 @@ async fn close_partial_write(case: CloseCase) -> TestResult {
             ));
             assert_eq!(&*fixture.output.bytes.borrow(), expected.as_bytes());
         }
-        CloseCase::Expire | CloseCase::ExpireReady | CloseCase::Shorten => {
+        CloseCase::Expire | CloseCase::ExpireReady | CloseCase::Shorten | CloseCase::Cancel => {
             assert_eq!(fixture.output.bytes.borrow().len(), 64)
         }
     }
@@ -498,6 +524,109 @@ fn output_readiness_at_the_close_deadline_does_not_write_more_stanza_bytes() -> 
 #[test]
 fn later_shutdown_shortens_the_existing_close_deadline_without_restarting_it() -> TestResult {
     run(close_partial_write(CloseCase::Shorten))
+}
+
+#[test]
+fn cancellation_during_terminal_output_preserves_the_selected_close_outcome_once() -> TestResult {
+    run(close_partial_write(CloseCase::Cancel))
+}
+
+#[test]
+fn dispatch_failure_sends_internal_server_error_and_records_one_close() -> TestResult {
+    run(async {
+        use tokio::io::AsyncWriteExt as _;
+        let clock = TestClock::new();
+        let mut fixture = Fixture::new(&clock).await?;
+        fixture
+            .peer
+            .write_all(b"<message from='muc.localhost' to='alice@localhost'/></stream:stream>")
+            .await?;
+        fixture.peer.shutdown().await?;
+        fixture.output.release(usize::MAX);
+        let shutdown = std::future::pending::<Instant>().boxed_local().shared();
+        let aborted = Cell::new(false);
+        let abort = || aborted.set(true);
+        let outcome = serve_with(
+            fixture.authenticated,
+            &fixture.settings,
+            &fixture.settings.services,
+            shutdown,
+            async |_: &Context<GlobalChunkAllocator>,
+                   _: &str,
+                   _: RoutedStanza<GlobalChunkAllocator>| Err(IngressFailure),
+            &clock,
+            &abort,
+        )
+        .await;
+        assert!(matches!(outcome, StreamClose::InternalError));
+        let expected =
+            crate::xml_stream::stream_error_xml(StreamErrorCondition::InternalServerError);
+        assert_eq!(&*fixture.output.bytes.borrow(), expected.as_bytes());
+        assert!(aborted.get());
+        assert_closed(&fixture.settings.metrics, StreamClose::InternalError)?;
+        Ok(())
+    })
+}
+
+#[test]
+fn pending_dispatch_prevents_processing_the_next_stanza() -> TestResult {
+    run(async {
+        use tokio::io::AsyncWriteExt as _;
+        let clock = TestClock::new();
+        let mut fixture = Fixture::new(&clock).await?;
+        fixture.peer.write_all(b"<message id='first' from='muc.localhost' to='alice@localhost'/><message id='second' from='muc.localhost' to='alice@localhost'/></stream:stream>").await?;
+        fixture.peer.shutdown().await?;
+        fixture.output.release(usize::MAX);
+        let (release, released) = futures_channel::oneshot::channel();
+        let released = RefCell::new(Some(released));
+        let dispatched = RefCell::new(Vec::new());
+        let dispatch = async |_: &Context<GlobalChunkAllocator>,
+                              _: &str,
+                              stanza: RoutedStanza<GlobalChunkAllocator>| {
+            let id = stanza
+                .resolve()
+                .map_err(|_| IngressFailure)?
+                .id()
+                .map_err(|_| IngressFailure)?
+                .ok_or(IngressFailure)?
+                .to_owned();
+            dispatched.borrow_mut().push(id);
+            let wait = released.borrow_mut().take();
+            if let Some(wait) = wait {
+                wait.await.map_err(|_| IngressFailure)?;
+            }
+            Ok(())
+        };
+        let shutdown = std::future::pending::<Instant>().boxed_local().shared();
+        let aborted = Cell::new(false);
+        let abort = || aborted.set(true);
+        let mut serving = Box::pin(serve_with(
+            fixture.authenticated,
+            &fixture.settings,
+            &fixture.settings.services,
+            shutdown,
+            dispatch,
+            &clock,
+            &abort,
+        ));
+        assert!(poll!(serving.as_mut()).is_pending());
+        assert_eq!(&*dispatched.borrow(), &["first"]);
+        let mut root = prometheus_client::registry::Registry::default();
+        fixture
+            .settings
+            .metrics
+            .register(root.sub_registry_with_prefix("lonewolf"));
+        let mut encoded = String::new();
+        prometheus_client::encoding::text::encode(&mut encoded, &root)?;
+        assert!(encoded.lines().any(|line| line == "lonewolf_component_stanzas_received_total{kind=\"message\"} 1"));
+        release.send(()).map_err(|_| "dispatch receiver dropped")?;
+        assert!(matches!(serving.await, StreamClose::StreamEnd));
+        assert_eq!(&*dispatched.borrow(), &["first", "second"]);
+        assert_eq!(&*fixture.output.bytes.borrow(), b"</stream:stream>");
+        assert!(aborted.get());
+        assert_closed(&fixture.settings.metrics, StreamClose::StreamEnd)?;
+        Ok(())
+    })
 }
 
 struct Foreground(Rc<Cell<bool>>);

@@ -11,7 +11,7 @@ use sha1::{Digest as _, Sha1};
 
 use super::wire::{WireCounters, WireIo};
 use super::xml::{Element, XmlStream};
-use super::{C2sSuite, TIMEOUT, TestResult};
+use super::{C2sSuite, Client, TIMEOUT, TestResult};
 
 pub fn tcp(address: SocketAddr) -> TestResult<TcpStream> {
     let socket = TcpStream::connect_timeout(&address, TIMEOUT)?;
@@ -55,6 +55,52 @@ pub struct ComponentClient<T = WireIo<TcpStream>> {
     socket: TcpStream,
 }
 
+pub struct ComponentWriteControl {
+    peer: SocketAddr,
+    server: String,
+}
+
+impl ComponentWriteControl {
+    fn command(&self, client: &mut Client, name: &str, attributes: &str) -> TestResult<Element> {
+        let namespace = super::extensions::COMPONENT_WRITE_PROBE_NAMESPACE;
+        client.send(&format!("<iq type='get' to='{}' id='component-write-control'><{name} xmlns='{namespace}' peer='{}' {attributes}/></iq>", self.server, self.peer))?;
+        let reply = client.receive()?;
+        reply.assert_name("jabber:client", "iq");
+        assert_eq!(reply.attribute("id"), Some("component-write-control"));
+        assert_eq!(reply.attribute("type"), Some("result"), "{name}: {reply:?}");
+        assert_eq!(reply.attribute("from"), Some(self.server.as_str()));
+        Ok(reply)
+    }
+
+    pub fn hold_after_bytes(&self, client: &mut Client, bytes: usize) -> TestResult {
+        assert!(
+            self.command(client, "arm", &format!("bytes='{bytes}'"))?
+                .children
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    pub fn wait_held(&self, client: &mut Client) -> TestResult {
+        let reply = self.command(client, "event", "")?;
+        assert_eq!(reply.children.len(), 1);
+        reply.children[0].assert_xml(&format!(
+            "<event xmlns='{}' name='held'/>",
+            super::extensions::COMPONENT_WRITE_PROBE_NAMESPACE
+        ))
+    }
+
+    pub fn release_write(&self, client: &mut Client) -> TestResult {
+        assert!(self.command(client, "release", "")?.children.is_empty());
+        Ok(())
+    }
+
+    pub fn remove(self, client: &mut Client) -> TestResult {
+        assert!(self.command(client, "remove", "")?.children.is_empty());
+        Ok(())
+    }
+}
+
 impl ComponentClient {
     pub fn connect(address: SocketAddr) -> TestResult<Self> {
         let socket = tcp(address)?;
@@ -78,6 +124,24 @@ impl ComponentClient {
         client.send_handshake_for(secret, &header.id)?;
         client.expect_handshake()?;
         Ok(client)
+    }
+
+    pub fn authenticated_with_write_probe(
+        suite: &C2sSuite,
+        domain: &str,
+        secret: &str,
+        control: &mut Client,
+    ) -> TestResult<(Self, ComponentWriteControl)> {
+        let mut client = Self::connect(suite.component_address(0)?)?;
+        let probe = ComponentWriteControl {
+            peer: client.local_address()?,
+            server: suite.domain.clone(),
+        };
+        assert!(probe.command(control, "install", "")?.children.is_empty());
+        let header = client.open(domain, None)?;
+        client.send_handshake_for(secret, &header.id)?;
+        client.expect_handshake()?;
+        Ok((client, probe))
     }
 }
 
@@ -116,6 +180,10 @@ impl TlsComponentClient {
 }
 
 impl<T: Read + Write> ComponentClient<T> {
+    pub fn local_address(&self) -> TestResult<SocketAddr> {
+        self.socket.local_addr().map_err(Into::into)
+    }
+
     pub fn open(&mut self, domain: &str, version: Option<&str>) -> TestResult<ResponseHeader> {
         let mut opening = format!(
             "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='{NAMESPACE}' to='{domain}'"

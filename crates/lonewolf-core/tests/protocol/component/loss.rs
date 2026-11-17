@@ -4,7 +4,9 @@ use std::io::{Read as _, Write as _};
 use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
-use crate::support::component::{ComponentClient, NAMESPACE, completed_stanzas};
+use crate::support::component::{
+    ComponentClient, ComponentWriteControl, NAMESPACE, completed_stanzas,
+};
 use crate::support::xml::Element;
 use crate::support::{C2sSuite, Client, PASSWORD, STREAM_ERRORS, TestResult, barrier};
 
@@ -77,7 +79,12 @@ fn assert_recovery(suite: &C2sSuite, moved: usize, bounced: usize, dropped: usiz
     Ok(())
 }
 fn suite() -> TestResult<C2sSuite> {
-    C2sSuite::with_components_limits(CONFIG, C2S_LIMITS)
+    let mut extensions = lonewolf_core::config::HostConfig::default().extensions;
+    extensions.push("test-component-write-probe".into());
+    C2sSuite::with_components_limits(
+        &format!("{CONFIG}\n[hosts.localhost]\nextensions={extensions:?}"),
+        C2S_LIMITS,
+    )
 }
 
 enum Sender<'a> {
@@ -125,11 +132,13 @@ fn pressure(
     sender: &mut Sender<'_>,
     mixed: bool,
     prefix: &str,
+    mut held: Option<(&ComponentWriteControl, &mut Client)>,
 ) -> TestResult<Vec<Input>> {
     let baseline = sample(suite, QUEUE_FULL)?;
     let body = "x".repeat(131_072);
     let mut accepted = Vec::new();
-    for n in 0..256 {
+    let bound = if held.is_some() { 6 } else { 256 };
+    for n in 0..bound {
         let (name, kind, payload) = match (mixed, n % 4) {
             (true, 0) => (
                 "message",
@@ -172,9 +181,18 @@ fn pressure(
         assert_eq!(rejected_reply, rejected && input.bounceable());
         if rejected {
             assert!(accepted.len() >= 4);
+            if held.is_some() {
+                assert_eq!(n, 5);
+                assert_eq!(accepted.len(), 5);
+            }
             return Ok(accepted);
         }
         accepted.push(input);
+        if n == 0
+            && let Some((probe, control)) = held.as_mut()
+        {
+            probe.wait_held(control)?;
+        }
     }
     Err("socket pressure did not reach the bounded queue".into())
 }
@@ -207,7 +225,7 @@ fn graceful(check_detached: bool) -> TestResult {
     suite.create_account("alice", PASSWORD)?;
     let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     let mut component = ComponentClient::authenticated(&suite, DOMAIN, SECRET)?;
-    let accepted = pressure(&suite, &mut Sender::Client(&mut alice), true, "mixed")?;
+    let accepted = pressure(&suite, &mut Sender::Client(&mut alice), true, "mixed", None)?;
     let written = written_prefix(&mut component, &accepted)?;
     suite.wait_for_metric("lonewolf_component_connections 0")?;
     let tail = &accepted[written..];
@@ -255,8 +273,17 @@ fn reset_recovers_a_nonempty_eligible_tail_without_bouncing_written_stanzas() ->
     let mut suite = suite()?;
     suite.create_account("alice", PASSWORD)?;
     let mut alice = suite.connect("alice", PASSWORD, "desk")?;
-    let component = ComponentClient::authenticated(&suite, DOMAIN, SECRET)?;
-    let accepted = pressure(&suite, &mut Sender::Client(&mut alice), true, "reset")?;
+    let mut control = suite.connect("alice", PASSWORD, "control")?;
+    let (component, probe) =
+        ComponentClient::authenticated_with_write_probe(&suite, DOMAIN, SECRET, &mut control)?;
+    probe.hold_after_bytes(&mut control, 64)?;
+    let accepted = pressure(
+        &suite,
+        &mut Sender::Client(&mut alice),
+        true,
+        "reset",
+        Some((&probe, &mut control)),
+    )?;
     component.reset()?;
     suite.wait_for_metric("lonewolf_component_connections 0")?;
     let metrics = suite.scrape_metrics()?;
@@ -267,6 +294,8 @@ fn reset_recovers_a_nonempty_eligible_tail_without_bouncing_written_stanzas() ->
         "lonewolf_component_dropped_stanzas_total{reason=\"not_bounceable\"}",
     ) as usize;
     assert!(bounced > 0, "reset must exercise recovery");
+    assert_eq!(bounced, 2);
+    assert_eq!(dropped, 2);
     let tail_len = bounced + dropped;
     assert!(written + tail_len <= accepted.len());
     assert!(
@@ -280,6 +309,8 @@ fn reset_recovers_a_nonempty_eligible_tail_without_bouncing_written_stanzas() ->
         dropped
     );
     assert_recovery(&suite, 0, bounced, dropped)?;
+    probe.remove(&mut control)?;
+    control.close()?;
     alice.close()?;
     suite.stop()
 }
@@ -289,7 +320,13 @@ fn stranded_service_sender_replies_return_to_its_component_with_original_address
     let mut suite = suite()?;
     let mut component = ComponentClient::authenticated(&suite, DOMAIN, SECRET)?;
     let mut pubsub = ComponentClient::authenticated(&suite, "pubsub.localhost", SECRET)?;
-    let accepted = pressure(&suite, &mut Sender::Service(&mut pubsub), false, "service")?;
+    let accepted = pressure(
+        &suite,
+        &mut Sender::Service(&mut pubsub),
+        false,
+        "service",
+        None,
+    )?;
     let written = written_prefix(&mut component, &accepted)?;
     suite.wait_for_metric("lonewolf_component_streams 1")?;
     let tail = &accepted[written..];
@@ -325,16 +362,25 @@ fn instances(
     suite: &C2sSuite,
     alice: &mut Client,
 ) -> TestResult<(ComponentClient, ComponentClient)> {
-    let mut first = ComponentClient::authenticated(suite, DOMAIN, SECRET)?;
-    let mut second = ComponentClient::authenticated(suite, DOMAIN, SECRET)?;
+    let first = ComponentClient::authenticated(suite, DOMAIN, SECRET)?;
+    let second = ComponentClient::authenticated(suite, DOMAIN, SECRET)?;
+    let ((selected, ()), (survivor, ())) = identify_instances(alice, (first, ()), (second, ()))?;
+    Ok((selected, survivor))
+}
+
+fn identify_instances<P>(
+    alice: &mut Client,
+    mut first: (ComponentClient, P),
+    mut second: (ComponentClient, P),
+) -> TestResult<((ComponentClient, P), (ComponentClient, P))> {
     alice.send(&format!(
         "<message type='chat' to='{TARGET}' id='owner'><body>owner</body></message>"
     ))?;
     barrier(alice)?;
-    ping(&mut first, "first")?;
-    ping(&mut second, "second")?;
-    let a = through_ping(&mut first, "first")?;
-    let b = through_ping(&mut second, "second")?;
+    ping(&mut first.0, "first")?;
+    ping(&mut second.0, "second")?;
+    let a = through_ping(&mut first.0, "first")?;
+    let b = through_ping(&mut second.0, "second")?;
     assert_eq!(a.len() + b.len(), 1);
     let marker = a.first().or_else(|| b.first()).ok_or("marker missing")?;
     assert_eq!(marker.attribute("id"), Some("owner"));
@@ -351,7 +397,13 @@ fn graceful_failover_preserves_the_unwritten_tail_and_routes_new_traffic_to_the_
     suite.create_account("alice", PASSWORD)?;
     let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     let (mut selected, mut survivor) = instances(&suite, &mut alice)?;
-    let accepted = pressure(&suite, &mut Sender::Client(&mut alice), false, "failover")?;
+    let accepted = pressure(
+        &suite,
+        &mut Sender::Client(&mut alice),
+        false,
+        "failover",
+        None,
+    )?;
     let written = written_prefix(&mut selected, &accepted)?;
     suite.wait_for_metric("lonewolf_component_streams 1")?;
     let tail = &accepted[written..];
@@ -380,15 +432,21 @@ fn fill_reply_queue(
     suite: &C2sSuite,
     component: &mut ComponentClient,
     alice: &mut Client,
+    probe: &ComponentWriteControl,
+    control: &mut Client,
 ) -> TestResult<usize> {
     let rejected = sample(suite, QUEUE_FULL)?;
     let payload = "x".repeat(131_072);
-    for n in 0..256 {
+    for n in 0..6 {
         component.send(&format!("<iq type='get' from='muc.localhost' to='localhost' id='target{n}'><query xmlns='urn:test:loss'>{payload}</query></iq>"))?;
         component.send("<message type='chat' from='muc.localhost' to='alice@localhost/desk' id='fill-ack'><body>processed</body></message>")?;
         alice.expect_xml("<message xmlns='jabber:client' type='chat' from='muc.localhost' to='alice@localhost/desk' id='fill-ack'><body>processed</body></message>")?;
         if sample(suite, QUEUE_FULL)? > rejected {
+            assert_eq!(n, 5);
             return Ok(n as usize);
+        }
+        if n == 0 {
+            probe.wait_held(control)?;
         }
     }
     Err("target reply queue did not fill".into())
@@ -398,19 +456,43 @@ fn reset_with_a_pressured_survivor_bounces_tail_that_cannot_move() -> TestResult
     let mut suite = suite()?;
     suite.create_account("alice", PASSWORD)?;
     let mut alice = suite.connect("alice", PASSWORD, "desk")?;
-    let (selected, mut survivor) = instances(&suite, &mut alice)?;
-    let target_admitted = fill_reply_queue(&suite, &mut survivor, &mut alice)?;
-    let accepted = pressure(&suite, &mut Sender::Client(&mut alice), false, "full")?;
+    let mut control = suite.connect("alice", PASSWORD, "control")?;
+    let first =
+        ComponentClient::authenticated_with_write_probe(&suite, DOMAIN, SECRET, &mut control)?;
+    let second =
+        ComponentClient::authenticated_with_write_probe(&suite, DOMAIN, SECRET, &mut control)?;
+    let ((selected, selected_probe), (mut survivor, survivor_probe)) =
+        identify_instances(&mut alice, first, second)?;
+    survivor_probe.hold_after_bytes(&mut control, 64)?;
+    let target_admitted = fill_reply_queue(
+        &suite,
+        &mut survivor,
+        &mut alice,
+        &survivor_probe,
+        &mut control,
+    )?;
+    selected_probe.hold_after_bytes(&mut control, 64)?;
+    let accepted = pressure(
+        &suite,
+        &mut Sender::Client(&mut alice),
+        false,
+        "full",
+        Some((&selected_probe, &mut control)),
+    )?;
     selected.reset()?;
     suite.wait_for_metric("lonewolf_component_streams 1")?;
+    suite.wait_for_metric("lonewolf_component_connections 1")?;
     let metrics = suite.scrape_metrics()?;
     let bounced = counter(&metrics, "lonewolf_component_bounces_total") as usize;
     let moved = counter(&metrics, "lonewolf_component_moved_stanzas_total") as usize;
     assert!(bounced > 0, "the full target must strand eligible input");
+    assert_eq!(bounced, 4);
+    assert_eq!(moved, 0);
     let tail = &accepted[accepted
         .len()
         .checked_sub(bounced + moved)
         .ok_or("invalid recovery count")?..];
+    survivor_probe.release_write(&mut control)?;
     for n in 0..target_admitted {
         let reply = survivor.receive()?;
         assert_eq!(reply.attribute("id"), Some(format!("target{n}").as_str()));
@@ -439,6 +521,9 @@ fn reset_with_a_pressured_survivor_bounces_tail_that_cannot_move() -> TestResult
         .checked_sub(written + moved + bounced)
         .ok_or("replayed input")?;
     assert!(unresolved <= 1, "only A's active write may be lost");
+    selected_probe.remove(&mut control)?;
+    survivor_probe.remove(&mut control)?;
+    control.close()?;
     alice.close()?;
     suite.stop()
 }
@@ -495,7 +580,13 @@ fn server_shutdown_sends_no_bounces_before_client_shutdown_and_discards_queued_i
     suite.create_account("alice", PASSWORD)?;
     let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     let mut component = ComponentClient::authenticated(&suite, DOMAIN, SECRET)?;
-    let accepted = pressure(&suite, &mut Sender::Client(&mut alice), true, "shutdown")?;
+    let accepted = pressure(
+        &suite,
+        &mut Sender::Client(&mut alice),
+        true,
+        "shutdown",
+        None,
+    )?;
     let metrics_address = suite.metrics_address();
     std::thread::scope(|scope| -> TestResult {
         let component_peer = scope.spawn(move || -> Result<Option<u64>, String> {

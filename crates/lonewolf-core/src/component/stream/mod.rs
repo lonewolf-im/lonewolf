@@ -132,15 +132,24 @@ impl WriteProgress {
 }
 
 pub(crate) struct ComponentWriter<W> {
+    #[cfg(not(feature = "test-support"))]
     output: BufWriter<W>,
+    #[cfg(feature = "test-support")]
+    output: BufWriter<crate::test_support::component_write::ComponentOutput<W>>,
     progress: WriteProgress,
 }
 impl<W: AsyncWrite + Unpin> ComponentWriter<W> {
     pub(crate) fn new(output: W, progress: WriteProgress) -> Self {
+        #[cfg(feature = "test-support")]
+        let output = crate::test_support::component_write::ComponentOutput::new(output);
         Self {
             output: BufWriter::with_capacity(4_096, output),
             progress,
         }
+    }
+    #[cfg(feature = "test-support")]
+    pub(crate) fn bind_write_probe(&mut self, peer: std::net::SocketAddr) {
+        self.output.get_mut().bind(peer);
     }
     pub(crate) fn progress(&self) -> WriteProgress {
         self.progress.clone()

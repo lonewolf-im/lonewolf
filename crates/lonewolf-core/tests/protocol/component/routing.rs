@@ -706,3 +706,41 @@ fn inbound_policy_drops_component_messages_and_presence_before_permitted_deliver
     alice.close()?;
     suite.stop()
 }
+
+#[test]
+fn extension_iq_results_return_only_to_the_requesting_component_attachment() -> TestResult {
+    const SENDER: &str = "room@muc.localhost/occupant";
+    let mut suite = C2sSuite::with_components(
+        "[components.domains.'muc.localhost']\nsecret='component-test-secret-0001'\nmax_connections=2\nbalancing='source'\n[hosts.localhost]\nextensions=['test-service','ping']",
+    )?;
+    let mut sockets = [
+        ComponentClient::authenticated(&suite, DOMAIN, SECRET)?,
+        ComponentClient::authenticated(&suite, DOMAIN, SECRET)?,
+    ];
+    suite.wait_for_metric("lonewolf_component_streams 2")?;
+    let mut outputs = [Vec::new(), Vec::new()];
+    for (i, socket) in sockets.iter_mut().enumerate() {
+        socket.send(&format!("<iq type='get' from='{SENDER}' to='echo.localhost' id='count-{i}'><query xmlns='urn:lonewolf:test:service'/></iq>"))?;
+        ping(socket, &format!("processed-{i}"))?;
+    }
+    for (i, socket) in sockets.iter_mut().enumerate() {
+        outputs[i] = through_ping(socket, &format!("processed-{i}"))?;
+    }
+    for (i, socket) in sockets.iter_mut().enumerate() {
+        let id = format!("after-both-requests-{i}");
+        ping(socket, &id)?;
+        outputs[i].extend(through_ping(socket, &id)?);
+        assert_eq!(
+            outputs[i].len(),
+            1,
+            "attachment {i} received {:?}",
+            outputs[i]
+        );
+        outputs[i][0].assert_xml(&format!("<iq xmlns='{NAMESPACE}' type='result' from='echo.localhost' to='{SENDER}' id='count-{i}'><query xmlns='urn:lonewolf:test:service'><count>0</count></query></iq>"))?;
+    }
+    traffic(&suite, "iq", 6, 6)?;
+    for socket in &mut sockets {
+        socket.close()?;
+    }
+    suite.stop()
+}

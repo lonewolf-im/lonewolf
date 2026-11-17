@@ -9,7 +9,7 @@ const SECRET: &str = "component-test-secret-0001";
 const CONFIG: &str = "[components.domains.'muc.localhost']\nsecret='component-test-secret-0001'\n[components.domains.'pubsub.localhost']\nsecret='component-test-secret-0001'";
 const ERRORS: &str = "urn:ietf:params:xml:ns:xmpp-stanzas";
 
-fn ping(component: &mut ComponentClient, id: &str) -> TestResult {
+pub(super) fn ping(component: &mut ComponentClient, id: &str) -> TestResult {
     component.send(&format!("<iq type='get' from='muc.localhost' to='localhost' id='{id}'><ping xmlns='urn:xmpp:ping'/></iq>"))
 }
 
@@ -19,7 +19,7 @@ fn ping_result(component: &mut ComponentClient, id: &str) -> TestResult {
     ))
 }
 
-fn traffic(suite: &C2sSuite, kind: &str, received: u64, sent: u64) -> TestResult {
+pub(super) fn traffic(suite: &C2sSuite, kind: &str, received: u64, sent: u64) -> TestResult {
     for (direction, count) in [("received", received), ("sent", sent)] {
         let sample = format!("lonewolf_component_stanzas_{direction}_total{{kind=\"{kind}\"}}");
         if count > 0 {
@@ -397,6 +397,15 @@ fn component_stanzas_route_to_other_and_own_service_domains_without_recursive_di
             ("message", "type='chat'", "<body>service message</body>"),
             ("iq", "type='get'", "<query xmlns='urn:test'/>"),
             ("presence", "type='subscribe'", ""),
+            ("presence", "type='subscribed'", ""),
+            ("presence", "type='unsubscribe'", ""),
+            ("presence", "type='unsubscribed'", ""),
+            ("presence", "type='unavailable'", ""),
+            (
+                "presence",
+                "type='error'",
+                "<error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>",
+            ),
             ("presence", "type='probe'", ""),
             ("presence", "", "<status>service state</status>"),
         ] {
@@ -411,7 +420,7 @@ fn component_stanzas_route_to_other_and_own_service_domains_without_recursive_di
     }
     traffic(&suite, "message", 2, 2)?;
     traffic(&suite, "iq", 2, 2)?;
-    traffic(&suite, "presence", 6, 6)?;
+    traffic(&suite, "presence", 16, 16)?;
     pubsub.close()?;
     suite.wait_for_metric("lonewolf_component_streams 1")?;
     for (kind, attributes, payload) in [
@@ -501,7 +510,7 @@ fn component_error_stanzas_and_server_iq_results_never_generate_replies() -> Tes
     suite.stop()
 }
 
-fn through_ping(component: &mut ComponentClient, id: &str) -> TestResult<Vec<Element>> {
+pub(super) fn through_ping(component: &mut ComponentClient, id: &str) -> TestResult<Vec<Element>> {
     let mut stanzas = Vec::new();
     loop {
         let stanza = component.receive()?;
@@ -598,6 +607,30 @@ fn generated_replies_keep_connection_affinity_while_authorized_client_results_fo
             room_owner = Some(owner);
         }
     }
+    for index in 0..20 {
+        let nick = if index % 2 == 0 { "north" } else { "south" };
+        alice.send(&format!("<message type='chat' to='room@muc.localhost/{nick}' id='occupant-{index}'><body>{index}</body></message>"))?;
+    }
+    barrier(&mut alice)?;
+    ping(&mut first, "first-occupants")?;
+    ping(&mut second, "second-occupants")?;
+    for (i, stanzas) in [
+        through_ping(&mut first, "first-occupants")?,
+        through_ping(&mut second, "second-occupants")?,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if Some(i) == room_owner {
+            assert_eq!(stanzas.len(), 20);
+            for (index, stanza) in stanzas.iter().enumerate() {
+                let nick = if index % 2 == 0 { "north" } else { "south" };
+                stanza.assert_xml(&format!("<message xmlns='{NAMESPACE}' from='alice@localhost/desk' type='chat' to='room@muc.localhost/{nick}' id='occupant-{index}'><body>{index}</body></message>"))?;
+            }
+        } else {
+            assert!(stanzas.is_empty());
+        }
+    }
     let owner = room_owner.ok_or("missing room owner")?;
     let presence: Vec<_> = distribution
         .iter()
@@ -628,11 +661,48 @@ fn generated_replies_keep_connection_affinity_while_authorized_client_results_fo
     assert_eq!(results.len(), 1);
     results[0].assert_xml("<iq xmlns='jabber:component:accept' type='result' from='alice@localhost/desk' to='room@muc.localhost' id='allowed'><answer xmlns='urn:test:resource'>yes</answer></iq>")?;
     assert!(through_ping(requesting, "requester-boundary")?.is_empty());
-    traffic(&suite, "message", 2, 42)?;
-    traffic(&suite, "iq", 9, 9)?;
+    traffic(&suite, "message", 2, 62)?;
+    traffic(&suite, "iq", 11, 11)?;
     traffic(&suite, "presence", 0, 1)?;
     first.close()?;
     second.close()?;
+    alice.close()?;
+    suite.stop()
+}
+
+#[test]
+fn component_dispatch_to_an_extension_service_returns_its_result() -> TestResult {
+    let mut suite = C2sSuite::with_components(&format!(
+        "{CONFIG}\n[hosts.localhost]\nextensions=['test-service']"
+    ))?;
+    let mut component = ComponentClient::authenticated(&suite, DOMAIN, SECRET)?;
+    component.send("<iq type='get' from='room@muc.localhost' to='echo.localhost' id='extension'><query xmlns='urn:lonewolf:test:service'/></iq>")?;
+    component.expect_xml("<iq xmlns='jabber:component:accept' type='result' from='echo.localhost' to='room@muc.localhost' id='extension'><query xmlns='urn:lonewolf:test:service'><count>0</count></query></iq>")?;
+    traffic(&suite, "iq", 1, 1)?;
+    component.close()?;
+    suite.stop()
+}
+#[test]
+fn inbound_policy_drops_component_messages_and_presence_before_permitted_delivery() -> TestResult {
+    let mut suite = C2sSuite::with_components(&format!(
+        "{CONFIG}\n[hosts.localhost]\nextensions=['test-policy','ping']"
+    ))?;
+    suite.create_account("alice", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let mut component = ComponentClient::authenticated(&suite, DOMAIN, SECRET)?;
+    for (kind, ty) in [("message", " type='chat'"), ("presence", "")] {
+        for user in ["spammer", "friend"] {
+            component.send(&format!(
+                "<{kind}{ty} from='{user}@muc.localhost' to='alice@localhost/desk' id='{user}'/>"
+            ))?;
+        }
+        alice.expect_xml(&format!("<{kind} xmlns='jabber:client'{ty} from='friend@muc.localhost' to='alice@localhost/desk' id='friend'/>"))?;
+        traffic(&suite, kind, 2, 0)?;
+    }
+    ping(&mut component, "end-policy")?;
+    ping_result(&mut component, "end-policy")?;
+    traffic(&suite, "iq", 1, 1)?;
+    component.close()?;
     alice.close()?;
     suite.stop()
 }

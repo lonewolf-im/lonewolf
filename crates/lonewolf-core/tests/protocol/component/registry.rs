@@ -49,6 +49,9 @@ fn nonbounceable_stanzas_to_a_disconnected_component_are_silent() -> TestResult 
     let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     alice.send("<presence to='room@muc.localhost/a'/><iq type='result' to='muc.localhost' id='ignored'/><message type='error' to='muc.localhost'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message><iq type='get' to='localhost' id='barrier'><ping xmlns='urn:xmpp:ping'/></iq>")?;
     alice.expect_xml("<iq xmlns='jabber:client' type='result' from='localhost' to='alice@localhost/desk' id='barrier'/>")?;
+    suite.wait_for_metric(
+        "lonewolf_component_admission_rejections_total{reason=\"not_connected\"} 3",
+    )?;
     alice.close()?;
     suite.stop()
 }
@@ -118,5 +121,25 @@ fn component_domains_cannot_replace_an_extension_service() -> TestResult {
         "service domain \"echo.localhost\" conflicts with a served host or another service"
     );
     assert!(matches!(*error, RunError::ServiceDomain { ref domain } if domain == "echo.localhost"));
+    Ok(())
+}
+
+#[test]
+fn missing_component_secret_file_fails_startup_with_the_domain_and_not_found() -> TestResult {
+    let error = C2sSuite::with_components(
+        "[components.domains.'muc.localhost']\nsecret_file='absent-secret-file'",
+    )
+    .err()
+    .ok_or("started with a missing component secret")?
+    .downcast::<RunError>()
+    .map_err(|_| "missing typed startup failure")?;
+    assert!(error.to_string().contains("muc.localhost"));
+    match *error {
+        RunError::ComponentSecret { domain, source } => {
+            assert_eq!(domain, "muc.localhost");
+            assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+        }
+        _ => return Err("unexpected startup error".into()),
+    }
     Ok(())
 }

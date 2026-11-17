@@ -644,3 +644,91 @@ fn server_shutdown_sends_no_bounces_before_client_shutdown_and_discards_queued_i
         Ok(())
     })
 }
+
+fn mixed_survivor(full: bool) -> TestResult {
+    let mut suite = suite()?;
+    suite.create_account("alice", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let mut control = suite.connect("alice", PASSWORD, "control")?;
+    let first =
+        ComponentClient::authenticated_with_write_probe(&suite, DOMAIN, SECRET, &mut control)?;
+    let second =
+        ComponentClient::authenticated_with_write_probe(&suite, DOMAIN, SECRET, &mut control)?;
+    let ((selected, selected_probe), (mut survivor, survivor_probe)) =
+        identify_instances(&mut alice, first, second)?;
+    let prefill = if full {
+        survivor_probe.hold_after_bytes(&mut control, 64)?;
+        fill_reply_queue(
+            &suite,
+            &mut survivor,
+            &mut alice,
+            &survivor_probe,
+            &mut control,
+        )?
+    } else {
+        0
+    };
+    selected_probe.hold_after_bytes(&mut control, 64)?;
+    let baseline = sample(&suite, QUEUE_FULL)?;
+    let admitted = pressure(
+        &suite,
+        &mut Sender::Client(&mut alice),
+        true,
+        "mixed-survivor",
+        Some((&selected_probe, &mut control)),
+    )?;
+    assert_eq!(admitted.len(), 5);
+    let tail = &admitted[1..];
+    assert_eq!(
+        tail.iter()
+            .map(|item| (item.name, item.kind))
+            .collect::<Vec<_>>(),
+        [
+            ("iq", "get"),
+            ("message", "chat"),
+            ("presence", ""),
+            ("message", "error")
+        ]
+    );
+    alice.send(&format!("<message type='error' id='already-full' to='{TARGET}'><error type='cancel'><service-unavailable xmlns='{ERRORS}'/></error></message>"))?;
+    barrier(&mut alice)?;
+    assert_eq!(sample(&suite, QUEUE_FULL)?, baseline + 2);
+    selected.reset()?;
+    suite.wait_for_metric("lonewolf_component_streams 1")?;
+    suite.wait_for_metric("lonewolf_component_connections 1")?;
+    if full {
+        assert_eq!(recover(&mut Sender::Client(&mut alice), tail)?, 2);
+        assert_recovery(&suite, 0, 2, 2)?;
+        survivor_probe.release_write(&mut control)?;
+        for n in 0..prefill {
+            let stanza = survivor.receive()?;
+            assert_eq!(stanza.attribute("id"), Some(format!("target{n}").as_str()));
+            assert_eq!(stanza.attribute("type"), Some("error"));
+        }
+    } else {
+        for item in tail {
+            survivor.expect_xml(&item.xml(NAMESPACE))?;
+        }
+        barrier(&mut alice)?;
+        assert_recovery(&suite, 4, 0, 0)?;
+    }
+    ping(&mut survivor, "end-mixed")?;
+    assert!(through_ping(&mut survivor, "end-mixed")?.is_empty());
+    selected_probe.remove(&mut control)?;
+    survivor_probe.remove(&mut control)?;
+    survivor.close()?;
+    alice.close()?;
+    control.close()?;
+    suite.stop()
+}
+
+#[test]
+fn mixed_queued_presence_error_chat_and_iq_move_in_fifo_order_to_the_survivor() -> TestResult {
+    mixed_survivor(false)
+}
+
+#[test]
+fn a_full_survivor_bounces_only_the_two_requests_and_counts_two_nonbounceable_drops() -> TestResult
+{
+    mixed_survivor(true)
+}

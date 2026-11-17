@@ -529,3 +529,87 @@ fn reset_returns_exactly_four_queued_remote_messages_without_replaying_the_prefi
     bob.close()?;
     pair.stop()
 }
+
+#[test]
+fn covered_components_exchange_all_presence_types_and_a_remote_iq_request_and_result() -> TestResult
+{
+    const OTHER: &str = "pubsub.b.test";
+    let mut options = options(true);
+    options.b_certificate_names.push(OTHER.into());
+    options.b_extra_toml = format!(
+        "[[components.listeners]]\naddress='127.0.0.1:0'\n[components.domains.'{OTHER}']\nsecret='{SECRET}'"
+    );
+    let mut pair = start(options)?;
+    let addr = pair
+        .b
+        .s2s_addresses()?
+        .first()
+        .ok_or("B has no S2S listener")?;
+    pair.dns
+        .srv(OTHER, &[(0, 0, addr.port(), "component.b.test")]);
+    pair.dns.a("component.b.test", Ipv4Addr::LOCALHOST);
+    let mut a = ComponentClient::authenticated(&pair.a, DOMAIN, SECRET)?;
+    let mut b = ComponentClient::authenticated(&pair.b, OTHER, SECRET)?;
+    let before_a = pair.a.scrape_metrics()?;
+    let before_b = pair.b.scrape_metrics()?;
+    for (i, kind) in [
+        "",
+        "unavailable",
+        "probe",
+        "subscribe",
+        "subscribed",
+        "unsubscribe",
+        "unsubscribed",
+        "error",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let ty = if kind.is_empty() {
+            String::new()
+        } else {
+            format!(" type='{kind}'")
+        };
+        let payload = if kind == "error" {
+            "<error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>"
+        } else {
+            "<status>component presence</status>"
+        };
+        let xml = format!(
+            "<presence xmlns='{NAMESPACE}' xml:lang='en'{ty} from='{ROOM}/nick' to='node@{OTHER}/dest' id='presence-{i}'>{payload}</presence>"
+        );
+        a.send(&xml)?;
+        b.expect_xml(&xml)?;
+    }
+    let request = format!(
+        "<iq xmlns='{NAMESPACE}' xml:lang='en' type='get' from='{ROOM}/nick' to='node@{OTHER}/dest' id='federated'><query xmlns='urn:test:component'/></iq>"
+    );
+    a.send(&request)?;
+    b.expect_xml(&request)?;
+    let result = format!(
+        "<iq xmlns='{NAMESPACE}' xml:lang='en' type='result' from='node@{OTHER}/dest' to='{ROOM}/nick' id='federated'><answer xmlns='urn:test:component'>verified</answer></iq>"
+    );
+    b.send(&result)?;
+    a.expect_xml(&result)?;
+    for (suite, before, component_direction, s2s_direction) in [
+        (&pair.a, &before_a, "received", "sent"),
+        (&pair.b, &before_b, "sent", "received"),
+    ] {
+        traffic(
+            suite,
+            before,
+            "component",
+            component_direction,
+            "presence",
+            8,
+        )?;
+        traffic(suite, before, "s2s", s2s_direction, "presence", 8)?;
+        for direction in ["received", "sent"] {
+            traffic(suite, before, "component", direction, "iq", 1)?;
+            traffic(suite, before, "s2s", direction, "iq", 1)?;
+        }
+    }
+    a.close()?;
+    b.close()?;
+    pair.stop()
+}

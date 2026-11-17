@@ -1,14 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fmt::Write as _;
-use std::io::Read as _;
+use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::sync::Arc;
 
+use rustls::pki_types::ServerName;
+use rustls::{ClientConfig, ClientConnection, StreamOwned};
 use sha1::{Digest as _, Sha1};
 
 use super::wire::{WireCounters, WireIo};
 use super::xml::{Element, XmlStream};
 use super::{C2sSuite, TIMEOUT, TestResult};
+
+pub fn tcp(address: SocketAddr) -> TestResult<TcpStream> {
+    let socket = TcpStream::connect_timeout(&address, TIMEOUT)?;
+    socket.set_read_timeout(Some(TIMEOUT))?;
+    socket.set_write_timeout(Some(TIMEOUT))?;
+    Ok(socket)
+}
 
 pub const NAMESPACE: &str = "jabber:component:accept";
 
@@ -19,17 +29,15 @@ pub struct ResponseHeader {
     pub version: Option<String>,
 }
 
-pub struct ComponentClient {
-    stream: XmlStream<WireIo<TcpStream>>,
+pub struct ComponentClient<T = WireIo<TcpStream>> {
+    stream: XmlStream<T>,
     pub counters: WireCounters,
     socket: TcpStream,
 }
 
 impl ComponentClient {
     pub fn connect(address: SocketAddr) -> TestResult<Self> {
-        let socket = TcpStream::connect_timeout(&address, TIMEOUT)?;
-        socket.set_read_timeout(Some(TIMEOUT))?;
-        socket.set_write_timeout(Some(TIMEOUT))?;
+        let socket = tcp(address)?;
         let transport = WireIo::new(socket.try_clone()?);
         let counters = transport.counters();
         Ok(Self {
@@ -39,6 +47,50 @@ impl ComponentClient {
         })
     }
 
+    pub fn authenticated(suite: &C2sSuite, domain: &str, secret: &str) -> TestResult<Self> {
+        let mut client = Self::connect(suite.component_address(0)?)?;
+        let header = client.open(domain, None)?;
+        client.send_handshake_for(secret, &header.id)?;
+        client.expect_handshake()?;
+        Ok(client)
+    }
+}
+
+pub type TlsComponentClient = ComponentClient<StreamOwned<ClientConnection, WireIo<TcpStream>>>;
+
+impl TlsComponentClient {
+    pub fn connect_tls(
+        address: SocketAddr,
+        config: Arc<ClientConfig>,
+        identity: ServerName<'static>,
+    ) -> TestResult<Self> {
+        let socket = tcp(address)?;
+        let transport = WireIo::new(socket.try_clone()?);
+        let counters = transport.counters();
+        let mut transport = StreamOwned::new(ClientConnection::new(config, identity)?, transport);
+        while transport.conn.is_handshaking() {
+            transport.conn.complete_io(&mut transport.sock)?;
+        }
+        Ok(Self {
+            stream: XmlStream::new(transport),
+            counters,
+            socket,
+        })
+    }
+
+    pub fn tls_connection(&mut self) -> &ClientConnection {
+        &self.stream.transport().conn
+    }
+
+    pub fn expect_tls_close(&mut self) -> TestResult {
+        assert!(!self.stream.has_buffered_input());
+        assert_eq!(self.stream.transport().read(&mut [0; 1])?, 0);
+        assert_eq!(self.socket.read(&mut [0; 1])?, 0);
+        Ok(())
+    }
+}
+
+impl<T: Read + Write> ComponentClient<T> {
     pub fn open(&mut self, domain: &str, version: Option<&str>) -> TestResult<ResponseHeader> {
         let mut opening = format!(
             "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='{NAMESPACE}' to='{domain}'"
@@ -77,14 +129,6 @@ impl ComponentClient {
         }
         xml.push_str("</handshake>");
         self.send(&xml)
-    }
-
-    pub fn authenticated(suite: &C2sSuite, domain: &str, secret: &str) -> TestResult<Self> {
-        let mut client = Self::connect(suite.component_address(0)?)?;
-        let header = client.open(domain, None)?;
-        client.send_handshake_for(secret, &header.id)?;
-        client.expect_handshake()?;
-        Ok(client)
     }
 
     pub fn send_raw(&mut self, xml: &str) -> TestResult {

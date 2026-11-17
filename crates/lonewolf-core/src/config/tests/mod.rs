@@ -1712,3 +1712,23 @@ fn s2s_tls_modes_preserve_default_address_replacement_and_overlap_validation() -
     assert!(Config::load(Some(file.path())).is_err());
     Ok(())
 }
+
+#[test]
+fn component_tls_modes_preserve_plain_default_and_reject_starttls() -> TestResult {
+    use crate::config::{ComponentListenerConfig, ComponentTlsMode};
+    assert_eq!(
+        ComponentListenerConfig::default().tls_mode,
+        ComponentTlsMode::None
+    );
+    for (name, mode) in [
+        ("none", ComponentTlsMode::None),
+        ("direct", ComponentTlsMode::Direct),
+    ] {
+        let config: Config =
+            toml::from_str(&format!("[[components.listeners]]\ntls_mode='{name}'"))?;
+        assert_eq!(config.components.listeners[0].tls_mode, mode);
+        assert_eq!(mode.as_str(), name);
+    }
+    assert!(toml::from_str::<Config>("[[components.listeners]]\ntls_mode='starttls'").is_err());
+    Ok(())
+}

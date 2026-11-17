@@ -2,6 +2,7 @@
 
 use crate::support::{C2sSuite, TestResult};
 
+mod direct_tls;
 mod negotiation;
 mod registry;
 mod routing;

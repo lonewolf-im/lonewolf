@@ -758,12 +758,32 @@ impl ComponentsConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct ComponentListenerConfig {
     pub address: SocketAddr,
+    pub tls_mode: ComponentTlsMode,
 }
 
 impl Default for ComponentListenerConfig {
     fn default() -> Self {
         Self {
             address: SocketAddr::from((Ipv4Addr::LOCALHOST, 5347)),
+            tls_mode: ComponentTlsMode::None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+pub enum ComponentTlsMode {
+    #[default]
+    #[serde(rename = "none")]
+    None,
+    #[serde(rename = "direct")]
+    Direct,
+}
+
+impl ComponentTlsMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Direct => "direct",
         }
     }
 }

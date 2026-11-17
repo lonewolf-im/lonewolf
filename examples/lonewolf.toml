@@ -427,6 +427,10 @@
 # Endpoints must not overlap client, server, metrics, or HTTP challenge endpoints.
 # [[components.listeners]]
 # address = "127.0.0.1:5347"
+# Choose "direct" when components send TLS before XML.
+# SNI selects a configured host certificate; connections without SNI use the default host certificate.
+# Lonewolf does not check component certificates; the shared secret still authenticates the component.
+# tls_mode = "none"
 
 # The domain and path below are examples; the domain must not be a configured host.
 # [components.domains."muc.example.com"]

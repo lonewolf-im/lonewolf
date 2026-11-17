@@ -1409,3 +1409,130 @@ fn direct_sni_selects_host_policy_and_one_certificate_generation() -> TestResult
         Ok(())
     })
 }
+
+#[test]
+fn component_tls_omits_host_client_auth_and_alpn_without_mutating_host_config() -> TestResult {
+    use super::test_support::handshake_named;
+    use std::sync::Arc;
+
+    compio::runtime::Runtime::new()?.block_on(async {
+        let fixture = super::client_identity::tests::Fixture::new()?;
+        let mut tls = test_tls_files(&fixture.directory, "localhost", "component")?;
+        tls.client_auth = Some(fixture.config.clone());
+        let hosts = Hosts::new(
+            &BTreeMap::from([(
+                "localhost".into(),
+                HostConfig {
+                    tls: Some(tls),
+                    ..HostConfig::default()
+                },
+            )]),
+            None,
+        )?;
+        let snapshot = hosts.snapshot("localhost").ok_or("missing snapshot")?;
+        assert!(hosts.client_certificate_policy("localhost").is_some());
+        let config = hosts
+            .component_tls_config("localhost")
+            .ok_or("missing component config")?;
+        assert!(config.alpn_protocols.is_empty());
+        assert!(config.require_ems);
+        assert!(!Arc::ptr_eq(&config, &snapshot.config));
+        assert_eq!(
+            config.send_tls13_tickets,
+            snapshot.config.send_tls13_tickets
+        );
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(hosts.certified_key("localhost").ok_or("missing key")?.cert[0].clone())?;
+        let mut client = rustls::ClientConfig::builder_with_provider(hosts.crypto_provider())
+            .with_safe_default_protocol_versions()?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        client.alpn_protocols.push(b"xmpp-client".to_vec());
+        let (peer, _) = handshake_named(Arc::new(client), config, "localhost")?;
+        assert!(peer.alpn_protocol().is_none());
+        assert!(Arc::ptr_eq(
+            &snapshot.config,
+            &hosts
+                .snapshot("localhost")
+                .ok_or("missing snapshot")?
+                .config
+        ));
+        assert!(hosts.component_tls_config("unknown.example").is_none());
+        Ok(())
+    })
+}
+
+#[test]
+fn component_tls_rejects_unavailable_expired_and_future_snapshots() -> TestResult {
+    use super::test_support::material;
+    use rustls::pki_types::UnixTime;
+    use std::sync::Arc;
+
+    let hosts = super::test_support::managed_hosts()?;
+    assert!(hosts.component_tls_config("example.com").is_none());
+    for validity in [(0, UnixTime::now().as_secs()), (u64::MAX - 1, u64::MAX)] {
+        let (leaf, key) = material(CertificateParams::new(vec!["example.com".into()])?)?;
+        let mut prepared = hosts.prepare_managed_certificate("example.com", vec![leaf], key)?;
+        Arc::get_mut(&mut prepared.snapshot)
+            .ok_or("shared snapshot")?
+            .validity = Some(validity);
+        prepared.activate();
+        assert!(hosts.component_tls_config("example.com").is_none());
+    }
+    Ok(())
+}
+
+#[test]
+fn component_tls_connections_isolate_resumption_state_for_tls12_and_tls13() -> TestResult {
+    use super::test_support::handshake_named;
+    use std::sync::Arc;
+
+    let hosts = Hosts::new(&Config::default().hosts, None)?;
+    let snapshot = hosts.snapshot("localhost").ok_or("missing snapshot")?;
+    for version in [&rustls::version::TLS12, &rustls::version::TLS13] {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(
+            hosts
+                .certified_key("localhost")
+                .ok_or("missing certificate")?
+                .cert[0]
+                .clone(),
+        )?;
+        let client = Arc::new(
+            rustls::ClientConfig::builder_with_provider(hosts.crypto_provider())
+                .with_protocol_versions(&[version])?
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let first_config = hosts
+            .component_tls_config("localhost")
+            .ok_or("missing first config")?;
+        let (first, _) =
+            handshake_named(Arc::clone(&client), Arc::clone(&first_config), "localhost")?;
+        assert_eq!(first.handshake_kind(), Some(rustls::HandshakeKind::Full));
+        let second_config = hosts
+            .component_tls_config("localhost")
+            .ok_or("missing second config")?;
+        assert!(!Arc::ptr_eq(
+            &first_config.session_storage,
+            &second_config.session_storage
+        ));
+        assert!(!Arc::ptr_eq(
+            &first_config.session_storage,
+            &snapshot.config.session_storage
+        ));
+        assert!(!Arc::ptr_eq(
+            &second_config.session_storage,
+            &snapshot.config.session_storage
+        ));
+        let (second, _) =
+            handshake_named(Arc::clone(&client), Arc::clone(&second_config), "localhost")?;
+        assert_eq!(second.handshake_kind(), Some(rustls::HandshakeKind::Full));
+        let (reused, _) = handshake_named(client, second_config, "localhost")?;
+        assert_eq!(
+            reused.handshake_kind(),
+            Some(rustls::HandshakeKind::Resumed)
+        );
+    }
+    Ok(())
+}

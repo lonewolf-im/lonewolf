@@ -47,6 +47,11 @@ impl ComponentClient {
         })
     }
 
+    pub fn reset(self) -> TestResult {
+        socket2::SockRef::from(&self.socket).set_linger(Some(std::time::Duration::ZERO))?;
+        Ok(())
+    }
+
     pub fn authenticated(suite: &C2sSuite, domain: &str, secret: &str) -> TestResult<Self> {
         let mut client = Self::connect(suite.component_address(0)?)?;
         let header = client.open(domain, None)?;

@@ -8,7 +8,7 @@ use lonewolf_xmpp::stanza::{
 
 use super::checks::{self, Snapshot};
 use super::{Origin, rejection_reply};
-use crate::stages::message::{self, DeliveryOutcome};
+use crate::stages::message::{self, DeliveryOutcome, MissingRecipientPolicy};
 use crate::stages::{Stage, StageFailure, archive};
 
 pub(crate) enum Reply<A: ChunkAllocator> {
@@ -91,7 +91,12 @@ pub(crate) async fn handle<A: ChunkAllocator + Clone + 'static>(
         || (parties.local_recipient
             && !stage.router.message_observers(to.domainpart()).is_empty()))
     .then(|| stanza.clone());
-    let outcome = message::deliver(stage, stanza, kind).await?;
+    let missing_recipient = if matches!(origin, Origin::Service { .. }) {
+        MissingRecipientPolicy::Reject
+    } else {
+        MissingRecipientPolicy::Discard
+    };
+    let outcome = message::deliver(stage, stanza, kind, missing_recipient).await?;
     let rejection = match (&observed, origin.session(), &outcome) {
         (
             Some(_),

@@ -407,6 +407,308 @@ fn presence_errors_use_bounded_mailboxes_and_keep_replacement_registrations() ->
 }
 
 #[test]
+fn subscription_presence_preserves_addresses_order_and_the_available_account_audience() -> TestResult
+{
+    run_test(async {
+        let router = setup()?;
+        let handle = router.handle();
+        let owner = account("alice@localhost")?;
+        let limit = NonZeroUsize::new(3).ok_or("zero limit")?;
+        let desk = handle.register(&owner, Some("desk"), limit).await?;
+        let phone = handle.register(&owner, Some("phone"), limit).await?;
+        let quiet = handle.register(&owner, Some("quiet"), limit).await?;
+        for (resource, priority) in [(&desk, 1), (&phone, -1)] {
+            resource
+                .handle()
+                .set_presence(Some(priority), presence(resource.resource()).await?, None)
+                .await?;
+        }
+        let update = receive_routed(&desk).await?;
+        assert_eq!(
+            update.resolve()?.stanza_type(),
+            StanzaType::Presence(lonewolf_xmpp::stanza::PresenceType::Available)
+        );
+        assert_eq!(
+            update
+                .resolve()?
+                .from()?
+                .ok_or("missing presence sender")?
+                .as_str(),
+            "alice@localhost/phone"
+        );
+        assert!(phone.take_queued().is_empty());
+        let mut expected = Vec::new();
+        for target in [
+            "alice@localhost",
+            "alice@localhost/desk",
+            "alice@localhost/absent",
+        ] {
+            for kind in ["subscribe", "subscribed", "unsubscribe", "unsubscribed"] {
+                for n in 0..3 {
+                    let stanza = parse_stanza(&format!("<presence type='{kind}' from='room@muc.localhost/member' to='{target}' id='{kind}-{n}'><x xmlns='urn:test:subscription'>{n}</x></presence>")).await?;
+                    if target.contains('/') {
+                        assert_eq!(
+                            handle.route_presence(stanza.clone()).await,
+                            Err(RouterError::InvalidTarget)
+                        );
+                    }
+                    let mut xml = String::new();
+                    stanza.resolve()?.write_xml(&mut xml)?;
+                    expected.push(xml);
+                    handle.route_subscription_presence(stanza).await?;
+                }
+            }
+        }
+        for resource in [&desk, &phone] {
+            for expected in &expected {
+                let mut actual = String::new();
+                receive_routed(resource)
+                    .await?
+                    .resolve()?
+                    .write_xml(&mut actual)?;
+                assert_eq!(&actual, expected);
+            }
+            assert!(resource.take_queued().is_empty());
+        }
+        assert!(quiet.take_queued().is_empty());
+        assert_eq!(handle.metrics().sessions(), 3);
+        for outcome in crate::router::metrics::MessageOutcome::ALL {
+            assert_eq!(handle.metrics().messages(outcome), 0);
+        }
+        drop((desk, phone, quiet));
+        router.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn subscription_presence_validates_kinds_and_targets_without_relaxing_ordinary_presence()
+-> TestResult {
+    run_test(async {
+        let router = setup()?;
+        let handle = router.handle();
+        for xml in [
+            "<presence from='muc.localhost' to='alice@localhost/desk'/>",
+            "<presence type='unavailable' from='muc.localhost' to='alice@localhost'/>",
+            "<presence type='probe' from='muc.localhost' to='alice@localhost'/>",
+            "<presence type='error' from='muc.localhost' to='alice@localhost'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>",
+            "<message from='muc.localhost' to='alice@localhost'/>",
+            "<iq type='get' id='not-presence' from='muc.localhost' to='alice@localhost'><query xmlns='urn:test'/></iq>",
+            "<presence type='subscribe' from='muc.localhost'/>",
+            "<presence type='subscribe' from='muc.localhost' to='localhost'/>",
+            "<presence type='subscribe' from='muc.localhost' to='localhost/server'/>",
+        ] {
+            assert_eq!(
+                handle
+                    .route_subscription_presence(parse_stanza(xml).await?)
+                    .await,
+                Err(RouterError::InvalidTarget)
+            );
+        }
+        for target in [
+            "alice@remote.test",
+            "alice@remote.test/desk",
+            "remote.test",
+            "room@muc.localhost",
+        ] {
+            let stanza = parse_stanza(&format!(
+                "<presence type='subscribe' from='muc.localhost' to='{target}'/>"
+            ))
+            .await?;
+            assert_eq!(
+                handle.route_subscription_presence(stanza).await,
+                Err(RouterError::RemoteUnsupported)
+            );
+        }
+        let quiet = handle
+            .register(
+                &account("quiet@localhost")?,
+                Some("desk"),
+                NonZeroUsize::MIN,
+            )
+            .await?;
+        for target in [
+            "absent@localhost",
+            "absent@localhost/desk",
+            "quiet@localhost",
+            "quiet@localhost/desk",
+        ] {
+            for kind in ["subscribe", "subscribed", "unsubscribe", "unsubscribed"] {
+                let stanza = parse_stanza(&format!(
+                    "<presence type='{kind}' from='muc.localhost' to='{target}'/>"
+                ))
+                .await?;
+                assert_eq!(
+                    handle.route_subscription_presence(stanza).await,
+                    Err(RouterError::NotFound)
+                );
+            }
+        }
+        assert!(quiet.take_queued().is_empty());
+        drop(quiet);
+        router.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn subscription_presence_keeps_bounded_queues_partial_success_and_replacement_registrations()
+-> TestResult {
+    run_test(async {
+        let router = setup()?;
+        let handle = router.handle();
+        let owner = account("alice@localhost")?;
+        let limit = NonZeroUsize::new(2).ok_or("zero limit")?;
+        let full = handle.register(&owner, Some("full"), limit).await?;
+        let healthy = handle.register(&owner, Some("healthy"), limit).await?;
+        for resource in [&full, &healthy] {
+            resource
+                .handle()
+                .set_presence(Some(0), presence(resource.resource()).await?, None)
+                .await?;
+        }
+        let update = receive_routed(&full).await?;
+        assert_eq!(
+            update.resolve()?.stanza_type(),
+            StanzaType::Presence(lonewolf_xmpp::stanza::PresenceType::Available)
+        );
+        assert_eq!(
+            update
+                .resolve()?
+                .from()?
+                .ok_or("missing presence sender")?
+                .as_str(),
+            "alice@localhost/healthy"
+        );
+        assert!(healthy.take_queued().is_empty());
+        for n in 0..64 {
+            handle
+                .route_full(
+                    parse_stanza(&format!(
+                        "<message to='alice@localhost/full' id='queued-{n}'/>"
+                    ))
+                    .await?,
+                )
+                .await?;
+        }
+        let subscription = parse_stanza("<presence type='subscribe' from='room@muc.localhost/member' to='alice@localhost/missing' id='fanout'><x xmlns='urn:test:subscription'>preserved</x></presence>").await?;
+        let mut expected = String::new();
+        subscription.resolve()?.write_xml(&mut expected)?;
+        handle
+            .route_subscription_presence(subscription.clone())
+            .await?;
+        assert_eq!(
+            full.wait_retired().await?.cause,
+            RetireCause::MailboxOverflow
+        );
+        let queued = full.take_queued();
+        assert_eq!(queued.len(), 64);
+        for (n, entry) in queued.into_iter().enumerate() {
+            assert_eq!(
+                entry.stanza.resolve()?.id()?,
+                Some(format!("queued-{n}").as_str())
+            );
+        }
+        assert!(full.recv().await.is_none());
+        let mut actual = String::new();
+        receive_routed(&healthy)
+            .await?
+            .resolve()?
+            .write_xml(&mut actual)?;
+        assert_eq!(actual, expected);
+        assert_eq!(handle.metrics().sessions(), 1);
+        let replacement = handle.register(&owner, Some("full"), limit).await?;
+        replacement
+            .handle()
+            .set_presence(Some(0), presence("full").await?, None)
+            .await?;
+        let update = receive_routed(&healthy).await?;
+        assert_eq!(
+            update.resolve()?.stanza_type(),
+            StanzaType::Presence(lonewolf_xmpp::stanza::PresenceType::Available)
+        );
+        assert_eq!(
+            update
+                .resolve()?
+                .from()?
+                .ok_or("missing presence sender")?
+                .as_str(),
+            "alice@localhost/full"
+        );
+        drop(full);
+        handle
+            .route_subscription_presence(subscription.clone())
+            .await?;
+        for resource in [&replacement, &healthy] {
+            let mut actual = String::new();
+            receive_routed(resource)
+                .await?
+                .resolve()?
+                .write_xml(&mut actual)?;
+            assert_eq!(actual, expected);
+        }
+        assert_eq!(handle.metrics().sessions(), 2);
+        healthy
+            .handle()
+            .set_presence(None, unavailable_presence("healthy").await?, None)
+            .await?;
+        let update = receive_routed(&replacement).await?;
+        assert_eq!(
+            update.resolve()?.stanza_type(),
+            StanzaType::Presence(lonewolf_xmpp::stanza::PresenceType::Unavailable)
+        );
+        assert_eq!(
+            update
+                .resolve()?
+                .from()?
+                .ok_or("missing presence sender")?
+                .as_str(),
+            "alice@localhost/healthy"
+        );
+        for n in 0..64 {
+            handle
+                .route_full(
+                    parse_stanza(&format!(
+                        "<message to='alice@localhost/full' id='replacement-{n}'/>"
+                    ))
+                    .await?,
+                )
+                .await?;
+        }
+        assert_eq!(
+            handle
+                .route_subscription_presence(subscription.clone())
+                .await,
+            Err(RouterError::Busy)
+        );
+        assert_eq!(
+            replacement.wait_retired().await?.cause,
+            RetireCause::MailboxOverflow
+        );
+        let queued = replacement.take_queued();
+        assert_eq!(queued.len(), 64);
+        for (n, entry) in queued.into_iter().enumerate() {
+            assert_eq!(
+                entry.stanza.resolve()?.id()?,
+                Some(format!("replacement-{n}").as_str())
+            );
+        }
+        assert_eq!(handle.metrics().sessions(), 1);
+        assert_eq!(
+            handle.route_subscription_presence(subscription).await,
+            Err(RouterError::NotFound)
+        );
+        assert!(healthy.take_queued().is_empty());
+        for outcome in crate::router::metrics::MessageOutcome::ALL {
+            assert_eq!(handle.metrics().messages(outcome), 0);
+        }
+        drop((replacement, healthy));
+        router.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
 fn absent_account_message_targets_distinguish_offline_from_missing_resources() -> TestResult {
     run_test(async {
         let router = setup()?;

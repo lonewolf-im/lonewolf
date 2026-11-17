@@ -70,7 +70,7 @@ fn client_messages_iqs_and_directed_presence_reach_component_with_original_conte
 }
 
 #[test]
-fn fifty_client_messages_preserve_fifo_and_interim_replies_return_to_component() -> TestResult {
+fn fifty_client_messages_preserve_fifo_and_unauthorized_iqs_return_to_component() -> TestResult {
     let mut suite = C2sSuite::with_components(CONFIG)?;
     suite.create_account("alice", PASSWORD)?;
     let mut alice = suite.connect("alice", PASSWORD, "desk")?;

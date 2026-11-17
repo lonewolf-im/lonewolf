@@ -17,6 +17,12 @@ use crate::delivery::{
 use crate::router::metrics::MessageOutcome;
 use crate::router::{Admitted, Destination, RoutedStanza, RouterError};
 
+#[derive(Clone, Copy)]
+pub(crate) enum MissingRecipientPolicy {
+    Discard,
+    Reject,
+}
+
 pub(crate) enum DeliveryOutcome<A: ChunkAllocator> {
     Routed {
         admitted: Admitted,
@@ -47,8 +53,9 @@ pub(crate) async fn deliver<A: ChunkAllocator + Clone + 'static>(
     stage: &Stage<'_, A>,
     routed: RoutedStanza<A>,
     kind: MessageType,
+    missing_recipient: MissingRecipientPolicy,
 ) -> Result<DeliveryOutcome<A>, StageFailure> {
-    let result = deliver_unrecorded(stage, routed, kind).await;
+    let result = deliver_unrecorded(stage, routed, kind, missing_recipient).await;
     let outcome = match &result {
         Ok(DeliveryOutcome::Routed { .. }) => MessageOutcome::Routed,
         Ok(DeliveryOutcome::Stored { .. }) => MessageOutcome::Stored,
@@ -64,6 +71,7 @@ async fn deliver_unrecorded<A: ChunkAllocator + Clone + 'static>(
     stage: &Stage<'_, A>,
     routed: RoutedStanza<A>,
     kind: MessageType,
+    missing_recipient: MissingRecipientPolicy,
 ) -> Result<DeliveryOutcome<A>, StageFailure> {
     let (bare, destination) = {
         let view = routed.resolve()?;
@@ -95,7 +103,7 @@ async fn deliver_unrecorded<A: ChunkAllocator + Clone + 'static>(
             if error == RouterError::Offline
                 && matches!(kind, MessageType::Normal | MessageType::Chat)
             {
-                return store(stage, routed).await;
+                return store(stage, routed, missing_recipient).await;
             }
             let condition = match error {
                 RouterError::Busy
@@ -129,6 +137,7 @@ async fn deliver_unrecorded<A: ChunkAllocator + Clone + 'static>(
 async fn store<A: ChunkAllocator + Clone + 'static>(
     stage: &Stage<'_, A>,
     routed: RoutedStanza<A>,
+    missing_recipient: MissingRecipientPolicy,
 ) -> Result<DeliveryOutcome<A>, StageFailure> {
     let recipient = AccountKey::try_from(routed.resolve()?.to()?.ok_or(StageFailure)?.bare())
         .map_err(|_| StageFailure)?;
@@ -181,9 +190,19 @@ async fn store<A: ChunkAllocator + Clone + 'static>(
                     error,
                 }
             }
-            Ok(StoreOutcome::Discarded | StoreOutcome::NoRecipient) => {
+            Ok(StoreOutcome::Discarded) => {
                 drop(transaction);
                 StorePreparation::Discarded
+            }
+            Ok(StoreOutcome::NoRecipient) => {
+                drop(transaction);
+                match missing_recipient {
+                    MissingRecipientPolicy::Discard => StorePreparation::Discarded,
+                    MissingRecipientPolicy::Reject => StorePreparation::Rejected {
+                        stanza: routed,
+                        error: StanzaErrorCondition::ServiceUnavailable.into(),
+                    },
+                }
             }
             Ok(StoreOutcome::Stored(sequence)) => StorePreparation::Committed(commit_and_store(
                 stage.work.start(),

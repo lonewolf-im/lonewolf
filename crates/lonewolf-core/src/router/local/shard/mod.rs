@@ -1156,6 +1156,31 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
         )
     }
 
+    pub(super) fn deliver_subscription_presence(
+        &mut self,
+        stanza: RoutedStanza<A>,
+    ) -> Result<(), RouterError> {
+        let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
+        let to = view
+            .to()
+            .map_err(|_| RouterError::InvalidTarget)?
+            .ok_or(RouterError::InvalidTarget)?;
+        if to.localpart().is_none()
+            || !matches!(
+                view.stanza_type(),
+                StanzaType::Presence(
+                    PresenceType::Subscribe
+                        | PresenceType::Subscribed
+                        | PresenceType::Unsubscribe
+                        | PresenceType::Unsubscribed
+                )
+            )
+        {
+            return Err(RouterError::InvalidTarget);
+        }
+        self.deliver_presence_where(stanza, |session| session.priority.is_some())
+    }
+
     pub(super) fn deliver_presence_to_tagged(
         &mut self,
         tag: SessionTag,
@@ -1195,6 +1220,7 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
             .to()
             .map_err(|_| RouterError::InvalidTarget)?
             .ok_or(RouterError::InvalidTarget)?
+            .bare()
             .as_str();
         let sessions = self.accounts.get(account).ok_or(RouterError::NotFound)?;
         let mut delivered = false;

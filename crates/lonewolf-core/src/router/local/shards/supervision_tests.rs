@@ -131,6 +131,133 @@ fn normal_stop_is_not_a_failure() -> TestResult {
     })
 }
 
+fn subscription(to: &str, id: &str) -> TestResult<RoutedStanza<GlobalChunkAllocator>> {
+    let mut arena = Arena::try_new(Default::default())?;
+    let from = Jid::parse_in("room@muc.localhost/member", &mut arena)?;
+    let to = Jid::parse_in(to, &mut arena)?;
+    let stanza = Stanza::builder_in(
+        StanzaType::Presence(PresenceType::Subscribe),
+        StanzaNamespace::Client,
+        &mut arena,
+    )
+    .from(Some(from))?
+    .to(Some(to))?
+    .id(Some(id))?
+    .build()?;
+    Ok(RoutedStanza::from_parts(stanza, arena))
+}
+
+fn cached_presence(resource: &str) -> TestResult<RoutedStanza<GlobalChunkAllocator>> {
+    let mut arena = Arena::try_new(Default::default())?;
+    let from = Jid::parse_in(&format!("alice@localhost/{resource}"), &mut arena)?;
+    let stanza = Stanza::builder_in(
+        StanzaType::Presence(PresenceType::Available),
+        StanzaNamespace::Client,
+        &mut arena,
+    )
+    .from(Some(from))?
+    .build()?;
+    Ok(RoutedStanza::from_parts(stanza, arena))
+}
+
+#[test]
+fn subscription_presence_cancellation_while_waiting_for_the_shard_never_enqueues() -> TestResult {
+    run(async {
+        let router = LocalRouter::new(GlobalChunkAllocator);
+        let handle = router.handle();
+        let owner = account("alice@localhost")?;
+        let desk = handle
+            .register(&owner, Some("desk"), NonZeroUsize::MIN)
+            .await?;
+        desk.handle()
+            .set_presence(Some(0), cached_presence("desk")?, None)
+            .await?;
+        let index = handle.shard_index(owner.as_str());
+        let guard = handle.inner.slots[index].shard.lock().await;
+        {
+            let mut pending =
+                pin!(handle.deliver_subscription_presence(subscription(
+                    "alice@localhost/desk",
+                    "cancelled"
+                )?));
+            assert!(futures_util::poll!(pending.as_mut()).is_pending());
+        }
+        drop(guard);
+        handle
+            .deliver_subscription_presence(subscription("alice@localhost/desk", "after")?)
+            .await?;
+        let entry = desk.recv().await.ok_or("missing completed subscription")?;
+        assert_eq!(entry.stanza.resolve()?.id()?, Some("after"));
+        assert!(desk.take_queued().is_empty());
+        assert_eq!(handle.metrics().sessions(), 1);
+        drop(desk);
+        router.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn subscription_presence_evicts_closed_mailboxes_and_keeps_live_recipients() -> TestResult {
+    run(async {
+        let router = LocalRouter::new(GlobalChunkAllocator);
+        let handle = router.handle();
+        let owner = account("alice@localhost")?;
+        let limit = NonZeroUsize::MIN.saturating_add(1);
+        let closed = handle.register(&owner, Some("closed"), limit).await?;
+        let healthy = handle.register(&owner, Some("healthy"), limit).await?;
+        for resource in [&closed, &healthy] {
+            resource
+                .handle()
+                .set_presence(Some(0), cached_presence(resource.resource())?, None)
+                .await?;
+        }
+        let updates = closed.take_queued();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(
+            updates[0]
+                .stanza
+                .resolve()?
+                .from()?
+                .ok_or("missing presence sender")?
+                .as_str(),
+            "alice@localhost/healthy"
+        );
+        assert!(healthy.take_queued().is_empty());
+        closed.links.inbound.close();
+        handle
+            .deliver_subscription_presence(subscription("alice@localhost/absent", "partial")?)
+            .await?;
+        assert_eq!(closed.wait_retired().await?.cause, RetireCause::Evicted);
+        let entry = healthy.recv().await.ok_or("missing live recipient")?;
+        assert_eq!(entry.stanza.resolve()?.id()?, Some("partial"));
+        assert_eq!(
+            entry
+                .stanza
+                .resolve()?
+                .to()?
+                .ok_or("missing target")?
+                .as_str(),
+            "alice@localhost/absent"
+        );
+        assert_eq!(handle.metrics().sessions(), 1);
+        healthy.links.inbound.close();
+        assert_eq!(
+            handle
+                .deliver_subscription_presence(subscription("alice@localhost/absent", "closed")?)
+                .await,
+            Err(RouterError::NotFound)
+        );
+        assert_eq!(healthy.wait_retired().await?.cause, RetireCause::Evicted);
+        assert_eq!(handle.metrics().sessions(), 0);
+        for outcome in crate::router::metrics::MessageOutcome::ALL {
+            assert_eq!(handle.metrics().messages(outcome), 0);
+        }
+        drop((closed, healthy));
+        router.shutdown().await?;
+        Ok(())
+    })
+}
+
 #[test]
 fn a_panic_while_stopping_makes_shutdown_fail_without_changing_state() -> TestResult {
     run(async {

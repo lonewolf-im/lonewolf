@@ -324,7 +324,7 @@ pub(crate) async fn handle<A: ChunkAllocator + Clone + 'static>(
         }
     }
     if destination == Destination::Remote
-        && origin.session().is_some()
+        && !matches!(origin, Origin::Remote { .. })
         && stage.router.federation_enabled()
     {
         let stanza = input.into_routed()?;
@@ -373,7 +373,7 @@ pub(crate) async fn handle<A: ChunkAllocator + Clone + 'static>(
         return Ok(IqDisposition::Done);
     };
     if !matches!(destination, Destination::Account | Destination::Server) {
-        if destination == Destination::Remote && origin.session().is_none() {
+        if destination == Destination::Remote && matches!(origin, Origin::Remote { .. }) {
             return Err(StageFailure);
         }
         let response = if matches!(&input, IqInput::Owned { .. }) {

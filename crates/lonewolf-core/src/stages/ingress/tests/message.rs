@@ -490,3 +490,91 @@ fn observer_failures_preserve_delivery_and_its_single_metric() -> TestResult {
         Ok(())
     }))?
 }
+
+#[test]
+fn missing_recipient_rejections_depend_on_origin_and_record_one_delivery_outcome() -> TestResult {
+    Runtime::new()?.block_on(compio::time::timeout(Duration::from_secs(5), async {
+        let mut fixture = Fixture::new(Verdict::Allow, false, false)?;
+        let mut extensions = Extensions::default();
+        extensions.register(Arc::new(lonewolf_extension::offline::Offline::new(
+            BTreeMap::new(),
+        )))?;
+        fixture.router = fixture.router.with_extensions(BTreeMap::from([(
+            "localhost".into(),
+            extensions.enable_host("localhost", ["offline"])?,
+        )]));
+        fixture.handle = fixture.router.handle();
+        let sender = account("alice@localhost")?;
+        let session = fixture
+            .handle
+            .register(&sender, Some("desk"), NonZeroUsize::MIN)
+            .await?;
+        for kind in [MessageType::Normal, MessageType::Chat] {
+            for origin in [
+                Origin::Session(&session),
+                Origin::Remote {
+                    local: "localhost",
+                    remote: "remote.test",
+                },
+                Origin::Service {
+                    domain: "service.test",
+                },
+            ] {
+                let from = match origin {
+                    Origin::Session(_) => "alice@localhost/desk",
+                    Origin::Remote { .. } => "alice@remote.test/desk",
+                    Origin::Service { .. } => "service.test",
+                };
+                let mut arena = Arena::try_new(Default::default())?;
+                let sender = Jid::parse_in(from, &mut arena)?;
+                let target = Jid::parse_in("unknown@localhost", &mut arena)?;
+                let stanza = Stanza::builder_in(
+                    StanzaType::Message(kind),
+                    StanzaNamespace::Client,
+                    &mut arena,
+                )
+                .from(Some(sender))?
+                .to(Some(target))?
+                .build()?;
+                let routed = lonewolf_xmpp::stanza::RoutedStanza::from_parts(stanza, arena);
+                let mut expected = String::new();
+                routed.resolve()?.write_xml(&mut expected)?;
+                let before =
+                    MetricOutcome::ALL.map(|outcome| fixture.handle.metrics().messages(outcome));
+                let disposition = handle(&fixture.stage(), &origin, routed, kind)
+                    .await
+                    .map_err(|_| "missing-recipient delivery failed")?;
+                let outcome = if matches!(origin, Origin::Service { .. }) {
+                    let MessageDisposition::Reply(Reply::Error {
+                        stanza,
+                        condition,
+                        application,
+                        text,
+                    }) = disposition
+                    else {
+                        return Err("service origin must reject a missing recipient".into());
+                    };
+                    assert_eq!(condition, StanzaErrorCondition::ServiceUnavailable);
+                    assert!(application.is_none());
+                    assert_eq!(text, condition.default_text());
+                    let mut actual = String::new();
+                    stanza.resolve()?.write_xml(&mut actual)?;
+                    assert_eq!(actual, expected);
+                    MetricOutcome::Rejected
+                } else {
+                    assert!(matches!(disposition, MessageDisposition::Done));
+                    MetricOutcome::Discarded
+                };
+                for (candidate, before) in MetricOutcome::ALL.into_iter().zip(before) {
+                    assert_eq!(
+                        fixture.handle.metrics().messages(candidate),
+                        before + u64::from(candidate == outcome)
+                    );
+                }
+            }
+        }
+        drop(session);
+        fixture.router.shutdown().await?;
+        Ok(())
+    }))?
+}

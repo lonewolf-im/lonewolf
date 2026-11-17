@@ -155,7 +155,7 @@ fn rejected_stanza_replies_keep_attachment_affinity_after_failed_authentication(
 }
 
 #[test]
-fn interim_dispatch_preserves_input_fifo_and_drops_non_requests_without_reply() -> TestResult {
+fn missing_account_rejections_preserve_input_fifo_and_do_not_reply_to_non_requests() -> TestResult {
     let mut suite = C2sSuite::with_components(CONFIG)?;
     let mut component = ComponentClient::authenticated(&suite, DOMAIN, SECRET)?;
     for index in 0..50 {
@@ -222,6 +222,7 @@ fn interim_dispatch_preserves_input_fifo_and_drops_non_requests_without_reply() 
         ))?;
     }
     component.send("<iq type='get' id='barrier' from='room@muc.localhost/member' to='alice@localhost/desk'><query xmlns='urn:test'/></iq>")?;
+    component.expect_xml("<presence xmlns='jabber:component:accept' type='unsubscribed' from='alice@localhost' to='room@muc.localhost/member'/>")?;
     assert_error(
         &component.receive()?,
         "iq",
@@ -232,7 +233,7 @@ fn interim_dispatch_preserves_input_fifo_and_drops_non_requests_without_reply() 
     component.close()?;
     suite.wait_for_metric("lonewolf_component_streams 0")?;
     let metrics = suite.scrape_metrics()?;
-    for (kind, received, sent) in [("message", 6, 5), ("iq", 54, 51), ("presence", 8, 0)] {
+    for (kind, received, sent) in [("message", 6, 5), ("iq", 54, 51), ("presence", 8, 1)] {
         assert_counter(
             &metrics,
             &format!("lonewolf_component_stanzas_received_total{{kind=\"{kind}\"}}"),

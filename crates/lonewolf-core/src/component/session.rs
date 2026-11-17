@@ -17,6 +17,7 @@ use lonewolf_xmpp::stanza::{RoutedStanza, StanzaNamespace};
 use lonewolf_xmpp::stream::StreamErrorCondition;
 use tokio::io::AsyncBufRead;
 
+use super::bounce;
 use super::ingress::{self, Context, IngressFailure};
 use super::metrics::{ComponentMetrics, DropReason, StreamClose};
 use super::negotiate::Authenticated;
@@ -467,15 +468,23 @@ where
         &mut authenticated,
         &context,
         settings,
-        shutdown,
+        shutdown.clone(),
         dispatch,
         clock,
         abort,
     )
     .await;
+    if matches!(outcome, StreamClose::Shutdown) || shutdown.clone().now_or_never().is_some() {
+        authenticated.link.discard();
+    } else {
+        let detached = authenticated.link.detach();
+        bounce::undelivered(&context, &authenticated.domain, detached.stranded, async {
+            shutdown.await;
+        })
+        .await;
+    }
     drop(context);
     group.drain().await;
-    drop(authenticated.link);
     drop(authenticated.stream_accounting);
     drop(authenticated.stream_gauge);
     outcome

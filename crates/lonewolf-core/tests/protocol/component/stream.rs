@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::io::Cursor;
+
 use crate::support::component::{ComponentClient, NAMESPACE};
-use crate::support::xml::{Element, STREAM_NAMESPACE};
+use crate::support::xml::{Element, STREAM_NAMESPACE, XmlStream};
 use crate::support::{ALTERNATE_PASSWORD, C2sSuite, PASSWORD, TestResult, barrier};
 
 const DOMAIN: &str = "muc.localhost";
@@ -313,6 +315,75 @@ fn fill_queue(suite: &C2sSuite, alice: &mut crate::support::Client) -> TestResul
     Err("component socket buffers did not fill within the payload bound".into())
 }
 
+fn load_body() -> String {
+    "x".repeat(
+        lonewolf_core::config::Config::default()
+            .limits
+            .components
+            .max_stanza_bytes
+            .get()
+            / 2,
+    )
+}
+
+fn assert_load_message(message: &Element, index: usize, body: &str) -> TestResult {
+    message.assert_xml(&format!("<message xmlns='{NAMESPACE}' type='chat' to='room@muc.localhost' from='alice@localhost/desk' id='load{index}'><body>{body}</body></message>"))
+}
+
+fn bounce_count(suite: &C2sSuite) -> TestResult<usize> {
+    suite
+        .scrape_metrics()?
+        .lines()
+        .find_map(|line| line.strip_prefix("lonewolf_component_bounces_total "))
+        .unwrap_or("0")
+        .parse()
+        .map_err(Into::into)
+}
+
+fn expect_load_bounces(
+    suite: &C2sSuite,
+    alice: &mut crate::support::Client,
+    ids: std::ops::Range<usize>,
+    body: &str,
+) -> TestResult {
+    let count = ids.len();
+    for index in ids {
+        alice.receive()?.assert_xml(&format!("<message xmlns='jabber:client' type='error' from='room@muc.localhost' to='alice@localhost/desk' id='load{index}'><body>{body}</body><error type='wait'><remote-server-timeout xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The service at this domain is not connected. Try again later.</text></error></message>"))?;
+    }
+    assert_eq!(bounce_count(suite)?, count);
+    suite.wait_for_metric("lonewolf_component_queued_stanzas 0")?;
+    Ok(())
+}
+
+fn complete_load_prefix(bytes: &[u8], body: &str) -> TestResult<(usize, usize)> {
+    let mut start = 0;
+    let mut received = 0;
+    let end_tag = b"</message>";
+    while let Some(offset) = bytes[start..]
+        .windows(end_tag.len())
+        .position(|window| window == end_tag)
+    {
+        let end = start + offset + end_tag.len();
+        let mut stream = XmlStream::new(Cursor::new(&bytes[start..end]));
+        assert_load_message(&stream.receive()?, received, body)?;
+        start = end;
+        received += 1;
+    }
+    let partial = &bytes[start..];
+    if !partial.is_empty() {
+        assert!(b"<message".starts_with(partial) || partial.starts_with(b"<message"));
+        assert!(
+            partial
+                .windows(b"<message".len())
+                .filter(|window| *window == b"<message")
+                .count()
+                <= 1
+        );
+        assert!(partial.len() < body.len() + 1024);
+    }
+    Ok((received, partial.len()))
+}
+
 #[test]
 fn bounded_connection_queue_rejects_pressure_then_closes_at_a_stanza_boundary() -> TestResult {
     let mut suite = C2sSuite::with_components_limits(
@@ -322,7 +393,8 @@ fn bounded_connection_queue_rejects_pressure_then_closes_at_a_stanza_boundary() 
     suite.create_account("alice", PASSWORD)?;
     let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     let mut component = ComponentClient::authenticated(&suite, DOMAIN, SECRET)?;
-    let _sent = fill_queue(&suite, &mut alice)?;
+    let admitted = fill_queue(&suite, &mut alice)? - 1;
+    let body = load_body();
     component.send("</stream:stream>")?;
     let mut received = 0;
     while let Some(stanza) = component.receive_or_footer()? {
@@ -331,12 +403,15 @@ fn bounded_connection_queue_rejects_pressure_then_closes_at_a_stanza_boundary() 
             stanza.attribute("id"),
             Some(format!("load{received}").as_str())
         );
+        assert_load_message(&stanza, received, &body)?;
         received += 1;
     }
     assert!(received > 0);
     component.shutdown_write()?;
     component.expect_eof()?;
     suite.wait_for_metric("lonewolf_component_streams 0")?;
+    assert!(received <= admitted);
+    expect_load_bounces(&suite, &mut alice, received..admitted, &body)?;
     alice.close()?;
     suite.stop()
 }
@@ -352,7 +427,8 @@ fn no_progress_timeout_aborts_a_component_that_stops_reading_without_closing_xml
     suite.create_account("alice", PASSWORD)?;
     let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     let component = ComponentClient::authenticated(&suite, DOMAIN, SECRET)?;
-    let _sent = fill_queue(&suite, &mut alice)?;
+    let admitted = fill_queue(&suite, &mut alice)? - 1;
+    let body = load_body();
     metric(
         &suite,
         "streams_closed_total",
@@ -372,6 +448,18 @@ fn no_progress_timeout_aborts_a_component_that_stops_reading_without_closing_xml
             .any(|v| v == b"<stream:error")
     );
     suite.wait_for_metric("lonewolf_component_connections 0")?;
+    let (received, partial_bytes) = complete_load_prefix(&bytes, &body)?;
+    let bounced = bounce_count(&suite)?;
+    assert!(received + bounced <= admitted);
+    let unrecovered = admitted - received - bounced;
+    assert!(
+        unrecovered <= 1,
+        "only the active write may remain unrecovered"
+    );
+    if partial_bytes != 0 {
+        assert_eq!(unrecovered, 1);
+    }
+    expect_load_bounces(&suite, &mut alice, admitted - bounced..admitted, &body)?;
     alice.close()?;
     suite.stop()
 }

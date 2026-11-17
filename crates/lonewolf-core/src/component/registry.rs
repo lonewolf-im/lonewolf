@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::collections::{BTreeMap, hash_map::RandomState};
 use std::hash::BuildHasher;
 use std::sync::Arc;
@@ -22,6 +20,12 @@ pub(crate) const NOT_CONNECTED_TEXT: &str =
 
 pub(crate) struct ComponentRegistry<A: ChunkAllocator> {
     inner: Arc<Inner<A>>,
+}
+
+impl<A: ChunkAllocator> ComponentRegistry<A> {
+    pub(crate) fn metrics(&self) -> &ComponentMetrics {
+        &self.inner.metrics
+    }
 }
 
 impl<A: ChunkAllocator> Clone for ComponentRegistry<A> {
@@ -449,13 +453,11 @@ impl<A: ChunkAllocator> Drop for ComponentLink<A> {
         if self.receiver.is_none() {
             return;
         }
-        let reason = if self.registry.inner.stopped.load(Ordering::Acquire) {
-            DropReason::Shutdown
-        } else {
-            DropReason::NotBounceable
-        };
         let (_, dropped) = self.cleanup(false);
-        self.registry.inner.metrics.dropped(reason, dropped);
+        self.registry
+            .inner
+            .metrics
+            .dropped(DropReason::Shutdown, dropped);
     }
 }
 

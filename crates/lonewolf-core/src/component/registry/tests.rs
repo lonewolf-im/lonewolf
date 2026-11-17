@@ -507,7 +507,7 @@ fn stop_and_link_cleanup_record_drops_once_and_clear_queue_gauges() -> TestResul
     drop(first);
     sample(
         &registry,
-        "lonewolf_component_dropped_stanzas_total{reason=\"not_bounceable\"} 1",
+        "lonewolf_component_dropped_stanzas_total{reason=\"shutdown\"} 1",
     )?;
     registry.stop();
     assert_eq!(
@@ -527,9 +527,10 @@ fn stop_and_link_cleanup_record_drops_once_and_clear_queue_gauges() -> TestResul
         Err(EnqueueError::Stopped)
     );
     assert_eq!(second.discard(), 1);
+    assert!(!render(&registry)?.contains("reason=\"not_bounceable\""));
     sample(
         &registry,
-        "lonewolf_component_dropped_stanzas_total{reason=\"shutdown\"} 1",
+        "lonewolf_component_dropped_stanzas_total{reason=\"shutdown\"} 2",
     )?;
     sample(
         &registry,
@@ -714,9 +715,10 @@ fn closed_attachment_rejects_without_spilling_and_releases_failed_reservations()
         .map_err(|_| "second queue")?;
     registry.stop();
     drop(second);
+    assert!(!render(&registry)?.contains("reason=\"not_bounceable\""));
     sample(
         &registry,
-        "lonewolf_component_dropped_stanzas_total{reason=\"shutdown\"} 1",
+        "lonewolf_component_dropped_stanzas_total{reason=\"shutdown\"} 2",
     )?;
     sample(&registry, "lonewolf_component_queued_stanzas 0")?;
     sample(&registry, "lonewolf_component_queued_bytes 0")?;

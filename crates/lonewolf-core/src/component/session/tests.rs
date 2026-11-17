@@ -17,6 +17,8 @@ use crate::component::stream::WriteProgress;
 use crate::config::{ComponentsConfig, limits::ComponentLimits};
 use crate::xml_stream::traffic::TrafficObserver;
 
+mod loss;
+
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 fn run(test: impl Future<Output = TestResult>) -> TestResult {
@@ -696,6 +698,7 @@ async fn abort_with_work(outer_deadline: bool) -> TestResult {
     };
     let global = crate::admission::global_limit::GlobalLimit::new(1);
     let permit = global.reserve(Instant::now()).map_err(|_| "permit")?;
+    let queued_connection = fixture.authenticated.link.id();
     let mut serving = Box::pin(async {
         let _permit = permit;
         serve_with(
@@ -713,6 +716,11 @@ async fn abort_with_work(outer_deadline: bool) -> TestResult {
     assert!(poll!(serving.as_mut()).is_pending());
     assert!(entered.get());
     assert_eq!(fixture.output.bytes.borrow().len(), 64);
+    fixture
+        .settings
+        .registry
+        .reply("muc.localhost", queued_connection, stanza("queued")?)
+        .map_err(|_| "queued admission")?;
     stop.send(clock.now() + Duration::from_secs(20))
         .map_err(|_| "shutdown receiver")?;
     assert!(poll!(serving.as_mut()).is_pending());
@@ -731,10 +739,14 @@ async fn abort_with_work(outer_deadline: bool) -> TestResult {
             .streams_closed_total,
         0
     );
-    assert!(matches!(
-        fixture.settings.registry.attach("muc.localhost"),
-        Err(super::super::registry::AttachError::Conflict)
-    ));
+    loss::metrics(&fixture.settings.metrics, 0, 0, 0, 1, 0)?;
+    drop(
+        fixture
+            .settings
+            .registry
+            .attach("muc.localhost")
+            .map_err(|_| "attachment retained during drain")?,
+    );
     if outer_deadline {
         let active = futures_util::stream::FuturesUnordered::new();
         active.push(crate::connection::socket::ConnectionTask {
@@ -786,8 +798,7 @@ async fn abort_with_work(outer_deadline: bool) -> TestResult {
     Ok(())
 }
 #[test]
-fn transport_abort_precedes_work_drain_while_permit_attachment_and_gauges_stay_owned() -> TestResult
-{
+fn transport_abort_detaches_before_work_drain_while_permit_and_gauges_stay_owned() -> TestResult {
     run(abort_with_work(false))
 }
 #[test]

@@ -16,8 +16,9 @@ pub struct ServiceContext<'a, A: ChunkAllocator, S: Storage> {
 pub trait ServiceOutbound<A: ChunkAllocator>: HostLookup {
     fn arena(&self) -> Result<Arena<A>, DeliveryError>;
 
-    /// Requires a sender in the service domain and a local account or resource destination.
-    /// Messages follow client delivery rules, including offline storage.
+    /// Requires a sender in the service domain. Local messages follow client delivery rules.
+    /// A component IQ request permits one result or error with the same ID and reversed addresses.
+    /// The reply prefers the requesting connection, and queue rejection consumes the attempt.
     fn route<'a>(&'a self, stanza: RoutedStanza<A>) -> DeliveryFuture<'a>;
 }
 

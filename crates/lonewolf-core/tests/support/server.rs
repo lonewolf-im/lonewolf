@@ -506,15 +506,19 @@ max_resources_per_account = {resources}
         permit: C2sSuitePermit,
     ) -> TestResult<Self> {
         let directory = tempfile::tempdir()?;
+        let mut certificate_names = Vec::with_capacity(1 + host.certificate_names.len());
+        certificate_names.push(host.domain.as_str());
+        certificate_names.extend(host.certificate_names.iter().map(String::as_str));
         if let Some(url) = &host.revocation.crl_url {
             host.ca.server_with_crl_urls(
                 directory.path(),
                 "host",
-                &[&host.domain],
+                &certificate_names,
                 std::slice::from_ref(url),
             )?;
         } else {
-            host.ca.server(directory.path(), "host", &[&host.domain])?;
+            host.ca
+                .server(directory.path(), "host", &certificate_names)?;
         }
         if host.revocation.public_destinations_only {
             fs::write(directory.path().join("crl-public-destinations-only"), [])?;

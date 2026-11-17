@@ -45,6 +45,7 @@ pub struct HostRevocation {
 
 pub struct FederatedHost {
     pub domain: String,
+    pub certificate_names: Vec<String>,
     pub revocation: HostRevocation,
     pub enabled: Option<bool>,
     pub bidirectional: Option<bool>,
@@ -58,6 +59,8 @@ pub struct FederatedHost {
 
 pub struct PairOptions {
     pub crl_files: bool,
+    pub a_certificate_names: Vec<String>,
+    pub b_certificate_names: Vec<String>,
     pub a_revocation: HostRevocation,
     pub b_revocation: HostRevocation,
     pub a_enabled: Option<bool>,
@@ -79,6 +82,8 @@ impl Default for PairOptions {
     fn default() -> Self {
         Self {
             crl_files: false,
+            a_certificate_names: Vec::new(),
+            b_certificate_names: Vec::new(),
             a_revocation: HostRevocation::default(),
             b_revocation: HostRevocation::default(),
             a_enabled: Some(true),
@@ -142,6 +147,7 @@ impl FederatedPair {
         };
         let a_host = FederatedHost {
             domain: a.into(),
+            certificate_names: options.a_certificate_names,
             revocation: options.a_revocation,
             enabled: options.a_enabled,
             bidirectional: options.a_bidirectional,
@@ -154,6 +160,7 @@ impl FederatedPair {
         };
         let b_host = FederatedHost {
             domain: b.into(),
+            certificate_names: options.b_certificate_names,
             revocation: options.b_revocation,
             enabled: options.b_enabled,
             bidirectional: options.b_bidirectional,

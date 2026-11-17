@@ -709,6 +709,7 @@ fn inbound_direct_tls_listener_does_not_override_global_or_host_federation_opt_o
         let mut dns = FakeDns::start()?;
         let mut suite = C2sSuite::federated(FederatedHost {
             domain: "a.test".into(),
+            certificate_names: Vec::new(),
             revocation: Default::default(),
             enabled: Some(global),
             bidirectional: Some(false),

@@ -2,6 +2,7 @@
 
 mod bidi;
 mod bidi_pair;
+mod components;
 mod direct_tls;
 mod failures;
 mod iq;
@@ -300,6 +301,7 @@ fn raw_peer_workflow() -> TestResult {
     ] {
         let mut suite = C2sSuite::federated(super::support::federation::FederatedHost {
             domain: "local.test".into(),
+            certificate_names: Vec::new(),
             revocation: Default::default(),
             enabled,
             bidirectional: Some(false),
@@ -378,6 +380,7 @@ fn raw_version_workflow(
     let completion = Arc::new(PlMutex::new(ProcessCompletions::default()));
     let mut suite = C2sSuite::federated(FederatedHost {
         domain: "local.test".into(),
+        certificate_names: Vec::new(),
         revocation: Default::default(),
         enabled: Some(true),
         bidirectional: Some(false),

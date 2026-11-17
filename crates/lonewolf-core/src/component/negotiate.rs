@@ -135,7 +135,14 @@ pub(super) async fn negotiate<A: ChunkAllocator + Clone>(
     accounting: Accounting,
 ) -> Result<Authenticated<A, Input, Output>, ComponentError> {
     let mut state = Negotiation {
-        connection: None,
+        connection: match settings.tls_mode {
+            ComponentTlsMode::None => Some(
+                transport(tcp, settings)
+                    .await
+                    .map_err(|failure| failure.error)?,
+            ),
+            ComponentTlsMode::Direct => None,
+        },
         progress: Progress {
             domain: None,
             header_sent: false,
@@ -145,7 +152,9 @@ pub(super) async fn negotiate<A: ChunkAllocator + Clone>(
     };
     let result = {
         let flow = pin!(async {
-            state.connection = Some(transport(tcp, settings).await?);
+            if state.connection.is_none() {
+                state.connection = Some(transport(tcp, settings).await?);
+            }
             let (reader, writer) = state.connection.as_mut().ok_or(ComponentError::Internal)?;
             run(reader, writer, settings, &mut state.progress).await
         });

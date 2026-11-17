@@ -1481,3 +1481,58 @@ fn component_tls_rejects_unavailable_expired_and_future_snapshots() -> TestResul
     }
     Ok(())
 }
+
+#[test]
+fn component_tls_connections_isolate_resumption_state_for_tls12_and_tls13() -> TestResult {
+    use super::test_support::handshake_named;
+    use std::sync::Arc;
+
+    let hosts = Hosts::new(&Config::default().hosts, None)?;
+    let snapshot = hosts.snapshot("localhost").ok_or("missing snapshot")?;
+    for version in [&rustls::version::TLS12, &rustls::version::TLS13] {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(
+            hosts
+                .certified_key("localhost")
+                .ok_or("missing certificate")?
+                .cert[0]
+                .clone(),
+        )?;
+        let client = Arc::new(
+            rustls::ClientConfig::builder_with_provider(hosts.crypto_provider())
+                .with_protocol_versions(&[version])?
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let first_config = hosts
+            .component_tls_config("localhost")
+            .ok_or("missing first config")?;
+        let (first, _) =
+            handshake_named(Arc::clone(&client), Arc::clone(&first_config), "localhost")?;
+        assert_eq!(first.handshake_kind(), Some(rustls::HandshakeKind::Full));
+        let second_config = hosts
+            .component_tls_config("localhost")
+            .ok_or("missing second config")?;
+        assert!(!Arc::ptr_eq(
+            &first_config.session_storage,
+            &second_config.session_storage
+        ));
+        assert!(!Arc::ptr_eq(
+            &first_config.session_storage,
+            &snapshot.config.session_storage
+        ));
+        assert!(!Arc::ptr_eq(
+            &second_config.session_storage,
+            &snapshot.config.session_storage
+        ));
+        let (second, _) =
+            handshake_named(Arc::clone(&client), Arc::clone(&second_config), "localhost")?;
+        assert_eq!(second.handshake_kind(), Some(rustls::HandshakeKind::Full));
+        let (reused, _) = handshake_named(client, second_config, "localhost")?;
+        assert_eq!(
+            reused.handshake_kind(),
+            Some(rustls::HandshakeKind::Resumed)
+        );
+    }
+    Ok(())
+}

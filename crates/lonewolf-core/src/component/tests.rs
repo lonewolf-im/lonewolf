@@ -288,3 +288,103 @@ fn pending_direct_tls_acceptor_records_shutdown_once_and_restores_admission()
 -> Result<(), Box<dyn std::error::Error>> {
     cancelled_connection(true, ComponentTlsMode::Direct)
 }
+
+#[test]
+fn already_ready_shutdown_on_first_plaintext_serve_poll_sends_xml_and_releases_owners()
+-> Result<(), Box<dyn std::error::Error>> {
+    use compio::io::compat::AsyncStream;
+    use futures_util::future::join;
+    use futures_util::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use lonewolf_util::arena::GlobalChunkAllocator;
+
+    use crate::connection::socket::{ConnectionSocket, ConnectionTask};
+    use crate::hosts::Hosts;
+    use crate::router::{Router, local::LocalRouter};
+
+    compio::runtime::Runtime::new()?.block_on(compio::time::timeout(Duration::from_secs(5), async {
+        let config = crate::Config {
+            components: toml::from_str("[domains.'muc.localhost']\nsecret='component-test-secret-0001'")?,
+            ..crate::Config::default()
+        };
+        let hosts = Hosts::new(&config.hosts, None)?;
+        let router = Router::new(hosts.clone(), LocalRouter::new(GlobalChunkAllocator));
+        let directory = tempfile::tempdir()?;
+        let metrics = ComponentMetrics::new(1, 1);
+        let admission = Arc::new(AdmissionLimits {
+            attempts: AttemptLimiter::new(&config.limits.components.connection_attempts_per_ip),
+            global: GlobalLimit::new(1),
+        });
+        let handler = ComponentAcceptor {
+            admission: Arc::clone(&admission),
+            settings: Settings {
+                hosts,
+                tls_mode: ComponentTlsMode::None,
+                registry: ComponentRegistry::new(&config.components, credentials::load(&config.components)?,
+                    &config.limits.components, Arc::clone(&metrics)),
+                limits: config.limits.components,
+                timeout: Duration::from_secs(30),
+                services: ComponentServices {
+                    router: router.handle(),
+                    storage: RedbStorage::open(directory.path().join("state.redb"))?,
+                    allocator: GlobalChunkAllocator,
+                },
+                metrics: Arc::clone(&metrics),
+            },
+        };
+        let listener = crate::connection::bind(([127, 0, 0, 1], 0).into()).await?;
+        let peer = TcpStream::connect(listener.local_addr()?).await?;
+        let (socket, address) = listener.accept().await?;
+        let permit = handler.admit(address.ip()).await.map_err(|_| "admission rejected")?;
+        let task = ConnectionTask {
+            _socket: ConnectionSocket(socket.clone()),
+            future: Box::pin(handler.serve(
+                ListenerSlot { listener_id: 0, worker_id: 0 }, socket, permit,
+                std::future::ready(Instant::now() + Duration::from_secs(4)).boxed_local().shared(),
+            )),
+        };
+        assert_eq!(admission.global.active(), 1);
+        let close_peer = async {
+            let mut peer = Box::pin(AsyncStream::new(peer));
+            let mut response = Vec::new();
+            let mut buffer = [0; 256];
+            while !response.ends_with(b"</stream:stream>") {
+                let count = peer.read(&mut buffer).await?;
+                assert_ne!(count, 0, "connection closed before shutdown XML: {response:?}");
+                response.extend_from_slice(&buffer[..count]);
+            }
+            let response = std::str::from_utf8(&response)?;
+            let prefix = "<?xml version='1.0'?><stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:component:accept' id='";
+            let tail = response.strip_prefix(prefix).ok_or("missing response header")?;
+            let (id, terminal) = tail.split_once("'>").ok_or("incomplete response header")?;
+            assert_eq!(id.len(), 32);
+            assert!(id.bytes().all(|byte| byte.is_ascii_hexdigit()));
+            assert_eq!(terminal, crate::xml_stream::stream_error_xml(
+                lonewolf_xmpp::stream::StreamErrorCondition::SystemShutdown));
+            peer.write_all(b"</stream:stream>").await?;
+            peer.flush().await?;
+            assert_eq!(peer.read(&mut buffer).await?, 0);
+            Ok::<(), Box<dyn std::error::Error>>(())
+        };
+        let ((), response) = join(task, close_peer).await;
+        response?;
+        assert_eq!(admission.global.active(), 0);
+        drop(handler.admit(address.ip()).await.map_err(|_| "admission not restored")?);
+        let mut root = prometheus_client::registry::Registry::default();
+        metrics.register(root.sub_registry_with_prefix("lonewolf"));
+        let mut output = String::new();
+        prometheus_client::encoding::text::encode(&mut output, &root)?;
+        for sample in [
+            "lonewolf_component_connections_accepted_total{listener=\"0\"} 1",
+            "lonewolf_component_authentications_total{outcome=\"shutdown\"} 1",
+            "lonewolf_component_negotiation_duration_seconds_count 1",
+            "lonewolf_component_connections 0",
+            "lonewolf_component_streams 0",
+        ] {
+            assert!(output.lines().any(|line| line == sample), "missing {sample}: {output}");
+        }
+        assert_eq!(output.lines().filter(|line| line.starts_with("lonewolf_component_authentications_total{")).count(), 1);
+        assert!(!output.contains("lonewolf_component_streams_closed_total"));
+        listener.close().await?;
+        Ok(())
+    }))?
+}

@@ -6,8 +6,10 @@ use std::time::{Duration, Instant};
 
 use compio::io::compat::{AsyncReadStream, AsyncStream};
 use compio::net::TcpStream;
+use futures_rustls::LazyConfigAcceptor;
 use futures_util::FutureExt as _;
 use futures_util::future::{Either, select};
+use futures_util::io::{AsyncReadExt as _, ReadHalf, WriteHalf};
 use lonewolf_auth::component::handshake_matches;
 use lonewolf_util::arena::{Arena, ArenaConfig, ChunkAllocator};
 use lonewolf_xmpp::jid::Jid;
@@ -21,13 +23,17 @@ use super::metrics::{AuthOutcome, ComponentMetrics, GaugeGuard};
 use super::registry::{AttachError, ComponentLink};
 use super::stream::{self, ComponentError, ComponentReader, ComponentWriter, WriteProgress};
 use super::{Settings, StreamAccounting};
+use crate::config::ComponentTlsMode;
 use crate::connection::ShutdownSignal;
 use crate::xml_stream::traffic::{ObservedIo, TrafficObserver};
 
 const NAMESPACE: &str = "jabber:component:accept";
-type Input =
-    BufReader<Compat<Pin<Box<AsyncReadStream<ObservedIo<TcpStream, ComponentByteObserver>>>>>>;
-type Output = Pin<Box<AsyncStream<ObservedIo<TcpStream, ComponentByteObserver>>>>;
+type PlainInput = Pin<Box<AsyncReadStream<ObservedIo<TcpStream, ComponentByteObserver>>>>;
+type PlainOutput = Pin<Box<AsyncStream<ObservedIo<TcpStream, ComponentByteObserver>>>>;
+type TlsTransport = futures_rustls::server::TlsStream<PlainOutput>;
+type Input = BufReader<Compat<Either<PlainInput, ReadHalf<TlsTransport>>>>;
+type Output = Either<PlainOutput, WriteHalf<TlsTransport>>;
+type Connection<A> = (ComponentReader<A, Input>, ComponentWriter<Output>);
 
 pub(crate) struct Authenticated<A: ChunkAllocator, R, W> {
     pub(crate) domain: Arc<str>,
@@ -90,6 +96,12 @@ struct Progress {
     peer_footer: bool,
 }
 
+struct Negotiation<A: ChunkAllocator> {
+    connection: Option<Connection<A>>,
+    progress: Progress,
+    shutdown_deadline: Option<Instant>,
+}
+
 struct Failure {
     error: ComponentError,
     outcome: AuthOutcome,
@@ -120,63 +132,153 @@ pub(super) async fn negotiate<A: ChunkAllocator + Clone>(
     settings: &Settings<A>,
     shutdown: ShutdownSignal,
     connection_id: u64,
-    mut accounting: Accounting,
+    accounting: Accounting,
 ) -> Result<Authenticated<A, Input, Output>, ComponentError> {
-    let progress = WriteProgress::new(Instant::now());
-    let input = Box::pin(AsyncReadStream::new(ObservedIo::new(
-        tcp.clone(),
-        ComponentByteObserver::new(Arc::clone(&settings.metrics), progress.clone()),
-    )))
-    .compat();
-    let mut reader = ComponentReader::new(
-        BufReader::new(input),
-        &settings.limits,
-        settings.services.allocator.clone(),
-        Arc::clone(&settings.metrics),
-    );
-    let mut writer = ComponentWriter::new(
-        Box::pin(AsyncStream::new(ObservedIo::new(
-            tcp.clone(),
-            ComponentByteObserver::new(Arc::clone(&settings.metrics), progress.clone()),
-        ))),
-        progress,
-    );
-    let mut progress = Progress {
-        domain: None,
-        header_sent: false,
-        peer_footer: false,
+    let mut state = Negotiation {
+        connection: None,
+        progress: Progress {
+            domain: None,
+            header_sent: false,
+            peer_footer: false,
+        },
+        shutdown_deadline: None,
     };
-    let mut shutdown_deadline = None;
     let result = {
-        let flow = pin!(run(&mut reader, &mut writer, settings, &mut progress));
-        match select(
-            pin!(shutdown.clone()),
-            pin!(compio::time::timeout_at(
-                accounting.started + settings.timeout,
-                flow
-            )),
+        let flow = pin!(async {
+            state.connection = Some(transport(tcp, settings).await?);
+            let (reader, writer) = state.connection.as_mut().ok_or(ComponentError::Internal)?;
+            run(reader, writer, settings, &mut state.progress).await
+        });
+        let (result, deadline) = select_terminal(
+            flow,
+            shutdown.clone(),
+            accounting.started + settings.timeout,
         )
-        .await
-        {
-            Either::Left((deadline, _)) => {
-                shutdown_deadline = Some(deadline);
-                Err(reject(
-                    StreamErrorCondition::SystemShutdown,
-                    AuthOutcome::Shutdown,
-                ))
-            }
-            Either::Right((Err(_), _)) => Err(reject(
+        .await;
+        state.shutdown_deadline = deadline;
+        result
+    };
+    finish(
+        tcp,
+        settings,
+        shutdown,
+        connection_id,
+        accounting,
+        state,
+        result,
+    )
+    .await
+}
+
+async fn select_terminal<A: ChunkAllocator>(
+    flow: impl std::future::Future<Output = Result<ComponentLink<A>, Failure>>,
+    shutdown: ShutdownSignal,
+    deadline: Instant,
+) -> (Result<ComponentLink<A>, Failure>, Option<Instant>) {
+    match select(
+        pin!(shutdown),
+        pin!(compio::time::timeout_at(deadline, flow)),
+    )
+    .await
+    {
+        Either::Left((deadline, _)) => (
+            Err(reject(
+                StreamErrorCondition::SystemShutdown,
+                AuthOutcome::Shutdown,
+            )),
+            Some(deadline),
+        ),
+        Either::Right((Err(_), _)) => (
+            Err(reject(
                 StreamErrorCondition::ConnectionTimeout,
                 AuthOutcome::Timeout,
             )),
-            Either::Right((Ok(result), _)) => result,
+            None,
+        ),
+        Either::Right((Ok(result), _)) => (result, None),
+    }
+}
+
+async fn transport<A: ChunkAllocator + Clone>(
+    tcp: &TcpStream,
+    settings: &Settings<A>,
+) -> Result<Connection<A>, Failure> {
+    let progress = WriteProgress::new(Instant::now());
+    let observer = ComponentByteObserver::new(Arc::clone(&settings.metrics), progress.clone());
+    let (input, output) = match settings.tls_mode {
+        ComponentTlsMode::None => (
+            Either::Left(Box::pin(AsyncReadStream::new(ObservedIo::new(
+                tcp.clone(),
+                observer.clone(),
+            )))),
+            Either::Left(Box::pin(AsyncStream::new(ObservedIo::new(
+                tcp.clone(),
+                observer,
+            )))),
+        ),
+        ComponentTlsMode::Direct => {
+            let tls = accept_direct(tcp, settings, observer).await?;
+            let (input, output) = tls.split();
+            (Either::Right(input), Either::Right(output))
         }
     };
+    Ok((
+        ComponentReader::new(
+            BufReader::new(input.compat()),
+            &settings.limits,
+            settings.services.allocator.clone(),
+            Arc::clone(&settings.metrics),
+        ),
+        ComponentWriter::new(output, progress),
+    ))
+}
+
+async fn accept_direct<A: ChunkAllocator>(
+    tcp: &TcpStream,
+    settings: &Settings<A>,
+    observer: ComponentByteObserver,
+) -> Result<TlsTransport, Failure> {
+    let failure = || Failure {
+        error: ComponentError::Io,
+        outcome: AuthOutcome::TlsFailure,
+    };
+    let accepted = LazyConfigAcceptor::new(
+        rustls::server::Acceptor::default(),
+        Box::pin(AsyncStream::new(ObservedIo::new(tcp.clone(), observer))),
+    )
+    .await
+    .map_err(|_| failure())?;
+    let domain = match accepted.client_hello().server_name() {
+        Some(sni) => settings.hosts.host_for_sni(Some(sni)).ok_or_else(failure)?,
+        None => settings.hosts.default_host_name(),
+    };
+    let config = settings
+        .hosts
+        .component_tls_config(domain)
+        .ok_or_else(failure)?;
+    accepted.into_stream(config).await.map_err(|_| failure())
+}
+
+async fn finish<A: ChunkAllocator + Clone>(
+    tcp: &TcpStream,
+    settings: &Settings<A>,
+    shutdown: ShutdownSignal,
+    connection_id: u64,
+    mut accounting: Accounting,
+    state: Negotiation<A>,
+    result: Result<ComponentLink<A>, Failure>,
+) -> Result<Authenticated<A, Input, Output>, ComponentError> {
+    let Negotiation {
+        mut connection,
+        mut progress,
+        shutdown_deadline,
+    } = state;
     accounting.elapsed = Some(accounting.started.elapsed());
     match result {
         Ok(link) => {
             accounting.outcome = AuthOutcome::Success;
             let domain = progress.domain.take().ok_or(ComponentError::Internal)?;
+            let (reader, writer) = connection.take().ok_or(ComponentError::Internal)?;
             Ok(Authenticated {
                 domain,
                 connection_id,
@@ -198,10 +300,12 @@ pub(super) async fn negotiate<A: ChunkAllocator + Clone>(
                     "component authentication failed"
                 );
             }
-            if !matches!(
-                failure.error,
-                ComponentError::Io | ComponentError::Timeout | ComponentError::PeerError(_)
-            ) && (!matches!(failure.error, ComponentError::Eof) || progress.peer_footer)
+            if let Some((reader, writer)) = connection.as_mut()
+                && !matches!(
+                    failure.error,
+                    ComponentError::Io | ComponentError::Timeout | ComponentError::PeerError(_)
+                )
+                && (!matches!(failure.error, ComponentError::Eof) || progress.peer_footer)
             {
                 let started_closing = Instant::now();
                 let deadline = shutdown_deadline
@@ -220,8 +324,8 @@ pub(super) async fn negotiate<A: ChunkAllocator + Clone>(
                         _ => None,
                     };
                     stream::close(
-                        &mut reader,
-                        &mut writer,
+                        reader,
+                        writer,
                         condition,
                         progress.peer_footer,
                         Some(deadline),
@@ -355,3 +459,6 @@ async fn run<A: ChunkAllocator + Clone>(
     writer.send("<handshake/>").await?;
     Ok(link)
 }
+
+#[cfg(test)]
+mod tests;

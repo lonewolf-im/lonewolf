@@ -341,7 +341,7 @@ impl Fixture {
         let directory = tempfile::tempdir()?;
         let hosts = crate::hosts::Hosts::new(&config.hosts, None)?;
         let router = crate::router::Router::new(
-            hosts,
+            hosts.clone(),
             crate::router::local::LocalRouter::new(GlobalChunkAllocator),
         );
         let services = ComponentServices {
@@ -360,6 +360,8 @@ impl Fixture {
         };
         Ok(Self {
             settings: Settings {
+                hosts,
+                tls_mode: crate::config::ComponentTlsMode::None,
                 limits: config.limits.components,
                 timeout: Duration::from_secs(30),
                 registry,

@@ -18,7 +18,10 @@ fn accepted_socket_enables_keepalive() -> Result<(), Box<dyn std::error::Error>>
     })
 }
 
-fn cancelled_connection(poll_read: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn cancelled_connection(
+    poll_read: bool,
+    tls_mode: ComponentTlsMode,
+) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Read as _;
     use std::num::NonZeroUsize;
 
@@ -38,7 +41,7 @@ fn cancelled_connection(poll_read: bool) -> Result<(), Box<dyn std::error::Error
         };
         config.limits.components.max_inbound_connections = NonZeroUsize::MIN;
         let hosts = Hosts::new(&config.hosts, None)?;
-        let router = Router::new(hosts, LocalRouter::new(GlobalChunkAllocator));
+        let router = Router::new(hosts.clone(), LocalRouter::new(GlobalChunkAllocator));
         let directory = tempfile::tempdir()?;
         let metrics = ComponentMetrics::new(1, 1);
         let registry = ComponentRegistry::new(
@@ -54,6 +57,8 @@ fn cancelled_connection(poll_read: bool) -> Result<(), Box<dyn std::error::Error
         let handler = ComponentAcceptor {
             admission: Arc::clone(&admission),
             settings: Settings {
+                hosts,
+                tls_mode,
                 limits: config.limits.components.clone(),
                 timeout: Duration::from_secs(30),
                 registry,
@@ -129,13 +134,13 @@ fn cancelled_connection(poll_read: bool) -> Result<(), Box<dyn std::error::Error
 #[test]
 fn unpolled_admitted_connection_records_shutdown_once_and_releases_socket_and_permit()
 -> Result<(), Box<dyn std::error::Error>> {
-    cancelled_connection(false)
+    cancelled_connection(false, ComponentTlsMode::None)
 }
 
 #[test]
 fn pending_negotiation_records_shutdown_once_and_releases_socket_and_permit()
 -> Result<(), Box<dyn std::error::Error>> {
-    cancelled_connection(true)
+    cancelled_connection(true, ComponentTlsMode::None)
 }
 
 fn cancelled_authenticated_stream(closing: bool) -> Result<(), Box<dyn std::error::Error>> {
@@ -164,12 +169,14 @@ fn cancelled_authenticated_stream(closing: bool) -> Result<(), Box<dyn std::erro
         };
         config.limits.components.max_inbound_connections = NonZeroUsize::MIN;
         let hosts = Hosts::new(&config.hosts, None)?;
-        let router = Router::new(hosts, LocalRouter::new(GlobalChunkAllocator));
+        let router = Router::new(hosts.clone(), LocalRouter::new(GlobalChunkAllocator));
         let directory = tempfile::tempdir()?;
         let metrics = ComponentMetrics::new(1, 1);
         let registry = ComponentRegistry::new(&config.components, credentials::load(&config.components)?, &config.limits.components, Arc::clone(&metrics));
         let admission = Arc::new(AdmissionLimits { attempts: AttemptLimiter::new(&config.limits.components.connection_attempts_per_ip), global: GlobalLimit::new(1) });
         let handler = ComponentAcceptor { admission: Arc::clone(&admission), settings: Settings {
+                hosts,
+                tls_mode: crate::config::ComponentTlsMode::None,
             limits: config.limits.components.clone(), timeout: Duration::from_secs(30), registry: registry.clone(),
             services: ComponentServices { router: router.handle(), storage: RedbStorage::open(directory.path().join("state.redb"))?, allocator: GlobalChunkAllocator }, metrics: Arc::clone(&metrics),
         }};
@@ -274,4 +281,10 @@ fn authenticated_pending_read_cancellation_records_shutdown_and_releases_all_own
 fn outer_deadline_during_closure_records_the_selected_outcome_and_releases_all_owners()
 -> Result<(), Box<dyn std::error::Error>> {
     cancelled_authenticated_stream(true)
+}
+
+#[test]
+fn pending_direct_tls_acceptor_records_shutdown_once_and_restores_admission()
+-> Result<(), Box<dyn std::error::Error>> {
+    cancelled_connection(true, ComponentTlsMode::Direct)
 }

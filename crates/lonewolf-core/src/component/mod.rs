@@ -20,12 +20,13 @@ use self::metrics::{ComponentMetrics, ConnectionRejection, StreamClose, Transpor
 use self::registry::ComponentRegistry;
 use crate::admission::attempt_limit::{Admission, AttemptLimiter};
 use crate::admission::global_limit::{GlobalLimit, GlobalPermit};
-use crate::config::ComponentsConfig;
 use crate::config::limits::ComponentLimits;
+use crate::config::{ComponentTlsMode, ComponentsConfig};
 use crate::connection::{
     AcceptHandler, ListenerKind, ListenerSet, ListenerSlot, ListenerSpec, ShutdownSignal,
     StartError,
 };
+use crate::hosts::Hosts;
 use crate::router::RouterHandle;
 
 mod ingress;
@@ -71,6 +72,8 @@ pub(crate) struct ComponentServices<A: ChunkAllocator> {
 #[derive(Clone)]
 struct Settings<A: ChunkAllocator> {
     limits: ComponentLimits,
+    hosts: Hosts,
+    tls_mode: ComponentTlsMode,
     timeout: Duration,
     registry: ComponentRegistry<A>,
     services: ComponentServices<A>,
@@ -90,6 +93,7 @@ impl ComponentListeners {
     pub(crate) async fn start<A: ChunkAllocator + Clone>(
         config: &ComponentsConfig,
         limits: &ComponentLimits,
+        hosts: Hosts,
         registry: ComponentRegistry<A>,
         dispatcher: &DispatchHandle,
         services: ComponentServices<A>,
@@ -101,17 +105,20 @@ impl ComponentListeners {
         });
         let settings = Settings {
             limits: limits.clone(),
+            hosts,
+            tls_mode: ComponentTlsMode::None,
             timeout: Duration::from_secs(limits.negotiation_timeout_secs.get()),
             registry,
             services,
             metrics,
         };
         let specs = config.listeners.iter().enumerate().map(|(listener_id, config)| {
-            if !config.address.ip().is_loopback() {
+            if config.tls_mode == ComponentTlsMode::None && !config.address.ip().is_loopback() {
                 tracing::warn!(listener_id, port = config.address.port(), "component listener accepts unencrypted connections on a non-loopback address");
             }
             let admission = &admission;
-            let settings = &settings;
+            let mut settings = settings.clone();
+            settings.tls_mode = config.tls_mode;
             ListenerSpec { address: config.address, handler: move |_| ComponentAcceptor { admission: Arc::clone(admission), settings: settings.clone() } }
         }).collect();
         ListenerSet::start(ListenerKind::Component, dispatcher, specs).await
@@ -126,9 +133,13 @@ impl<A: ChunkAllocator + Clone> AcceptHandler for ComponentAcceptor<A> {
     type Permit = GlobalPermit;
     type Rejection = Rejection;
     fn listener_bound(&self, slot: ListenerSlot) -> impl Sized + 'static {
-        self.settings
-            .metrics
-            .listener_bound(slot.listener_id, Transport::Plain)
+        self.settings.metrics.listener_bound(
+            slot.listener_id,
+            match self.settings.tls_mode {
+                ComponentTlsMode::None => Transport::Plain,
+                ComponentTlsMode::Direct => Transport::DirectTls,
+            },
+        )
     }
     async fn admit(&self, peer: IpAddr) -> Result<GlobalPermit, Rejection> {
         let now = Instant::now();

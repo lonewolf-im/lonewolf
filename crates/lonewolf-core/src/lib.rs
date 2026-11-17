@@ -420,7 +420,7 @@ fn run_internal(
                         s2s::inbound::S2sListeners::start(
                             &config.s2s,
                             &config.limits.s2s,
-                            hosts,
+                            hosts.clone(),
                             peers,
                             &dispatcher.handle(),
                             s2s::ingress::IngressServices {
@@ -439,7 +439,7 @@ fn run_internal(
                 }
                 if let (Some(metrics), Some(registry)) = (component_metrics, serving.components.as_ref()) {
                     serving.component = Some(component::ComponentListeners::start(
-                        &config.components, &config.limits.components, registry.clone(), &dispatcher.handle(),
+                        &config.components, &config.limits.components, hosts, registry.clone(), &dispatcher.handle(),
                         component::ComponentServices { router: router_handle, storage, allocator: Arc::clone(&stanza_pool) }, metrics,
                     ).await.map_err(|failure| {
                         shutdown_deadline = Some(failure.deadline);

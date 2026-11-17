@@ -339,6 +339,24 @@ impl Hosts {
         self.tls_handshake_with_alpn(domain, Some(protocol)).await
     }
 
+    pub(crate) fn component_tls_config(&self, domain: &str) -> Option<Arc<rustls::ServerConfig>> {
+        let host = self.find_host(domain)?;
+        let snapshot = self.snapshot(domain)?;
+        if snapshot.validity.is_some_and(|(start, end)| {
+            let now = UnixTime::now().as_secs();
+            now < start || now >= end
+        }) {
+            return None;
+        }
+        let mut config = host
+            .tls_builder
+            .clone()
+            .with_client_cert_verifier(rustls::server::WebPkiClientVerifier::no_client_auth())
+            .with_cert_resolver(snapshot.resolver.clone());
+        config.require_ems = true;
+        Some(Arc::new(config))
+    }
+
     async fn tls_handshake_with_alpn(
         &self,
         domain: &str,

@@ -16,6 +16,8 @@ use super::*;
 use crate::component::registry::{ComponentRegistry, EnqueueError};
 use crate::router::{Router, ServiceRoute};
 
+mod semantic_xml;
+
 const DOMAIN: &str = "muc.localhost";
 const FROM: &str = "sender@pubsub.localhost/source";
 const TO: &str = "room@muc.localhost/member";
@@ -83,7 +85,7 @@ fn input(kind: &str, id: &str) -> String {
     };
     format!("<{name} {attributes} id='{id}' from='{FROM}' to='{TO}'>{payload}</{name}>")
 }
-async fn expected_bounce(kind: &str, id: &str) -> TestResult<String> {
+async fn expected_bounce(kind: &str, id: &str) -> TestResult<semantic_xml::Stanza> {
     let (name, payload) = if kind == "iq" {
         (
             "iq",
@@ -92,7 +94,7 @@ async fn expected_bounce(kind: &str, id: &str) -> TestResult<String> {
     } else {
         ("message", "<body>keep payload</body>")
     };
-    xml(&parsed(&format!("<{name} type='error' id='{id}' from='{TO}' to='{FROM}'>{payload}<error type='wait'><remote-server-timeout xmlns='{ERRORS}'/><text xmlns='{ERRORS}' xml:lang='en'>{TEXT}</text></error></{name}>")).await?, StanzaNamespace::Client)
+    semantic_xml::stanza(&parsed(&format!("<{name} type='error' id='{id}' from='{TO}' to='{FROM}'>{payload}<error type='wait'><remote-server-timeout xmlns='{ERRORS}'/><text xmlns='{ERRORS}' xml:lang='en'>{TEXT}</text></error></{name}>")).await?)
 }
 async fn fixture(clock: &TestClock) -> TestResult<(Fixture, Arc<Capture>)> {
     let mut fixture = Fixture::new(clock).await?;
@@ -232,7 +234,7 @@ async fn mixed_loss(reset: bool) -> TestResult {
         .0
         .lock()
         .iter()
-        .map(|stanza| xml(stanza, StanzaNamespace::Client))
+        .map(semantic_xml::stanza)
         .collect::<TestResult<Vec<_>>>()?;
     assert_eq!(
         actual,
@@ -340,7 +342,7 @@ async fn failover(prefill: usize) -> TestResult {
         .0
         .lock()
         .iter()
-        .map(|stanza| xml(stanza, StanzaNamespace::Client))
+        .map(semantic_xml::stanza)
         .collect::<TestResult<Vec<_>>>()?;
     assert_eq!(actual_replies, expected_replies);
     metrics(

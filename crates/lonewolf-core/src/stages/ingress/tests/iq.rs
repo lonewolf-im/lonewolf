@@ -1075,3 +1075,61 @@ fn unsupported_remote_iq_responses_are_silent() -> TestResult {
         Ok(())
     })
 }
+
+#[test]
+fn remote_iq_destinations_reject_remote_origins_but_service_origins_get_federation_errors()
+-> TestResult {
+    Runtime::new()?.block_on(async {
+        let fixture = Fixture::new(false)?;
+        for origin in [
+            Origin::Remote {
+                local: "localhost",
+                remote: "muc.localhost",
+            },
+            Origin::Service {
+                domain: "muc.localhost",
+            },
+        ] {
+            let (stanza, arena, _) = request(
+                GlobalChunkAllocator,
+                "room@muc.localhost",
+                "user@remote.example",
+                "payload",
+            )?;
+            let disposition = super::super::iq::handle(
+                &fixture.stage(),
+                &origin,
+                IqInput::Routed(RoutedStanza::from_parts(stanza, arena)),
+                Destination::Remote,
+                IqType::Get,
+            )
+            .await;
+            if matches!(origin, Origin::Remote { .. }) {
+                assert!(disposition.is_err());
+            } else {
+                let IqDisposition::Unavailable {
+                    condition,
+                    input: IqInput::Routed(input),
+                    ..
+                } = disposition.map_err(|_| "service IQ must return an unavailable disposition")?
+                else {
+                    return Err("service IQ did not preserve the unavailable request".into());
+                };
+                assert_eq!(
+                    condition,
+                    lonewolf_xmpp::stanza::StanzaErrorCondition::RemoteServerNotFound
+                );
+                assert_eq!(
+                    input.resolve()?.from()?.ok_or("missing sender")?.as_str(),
+                    "room@muc.localhost"
+                );
+                assert_eq!(
+                    input.resolve()?.to()?.ok_or("missing target")?.as_str(),
+                    "user@remote.example"
+                );
+            }
+        }
+        fixture.router.shutdown().await?;
+        Ok(())
+    })
+}

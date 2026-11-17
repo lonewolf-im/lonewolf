@@ -4,6 +4,7 @@ use crate::support::{C2sSuite, TestResult};
 
 mod negotiation;
 mod registry;
+mod routing;
 mod stream;
 mod stream_conformance;
 

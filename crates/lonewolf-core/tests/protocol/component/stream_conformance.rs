@@ -155,7 +155,7 @@ fn rejected_stanza_replies_keep_attachment_affinity_after_failed_authentication(
 }
 
 #[test]
-fn interim_dispatch_preserves_input_fifo_and_drops_non_requests_without_reply() -> TestResult {
+fn missing_account_rejections_preserve_input_fifo_and_do_not_reply_to_non_requests() -> TestResult {
     let mut suite = C2sSuite::with_components(CONFIG)?;
     let mut component = ComponentClient::authenticated(&suite, DOMAIN, SECRET)?;
     for index in 0..50 {

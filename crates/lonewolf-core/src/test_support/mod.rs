@@ -14,8 +14,12 @@ use lonewolf_util::arena::{Arena, ArenaConfig};
 use lonewolf_xmpp::jid::Jid;
 use parking_lot::Mutex as PlMutex;
 
+pub(crate) mod component_write;
 mod process;
 
+pub use component_write::{
+    ComponentWriteProbe, ComponentWriteProbeEvent, install_component_write_probe,
+};
 pub use process::spawn_child;
 
 static S2S_REVALIDATION_MILLIS: AtomicU64 = AtomicU64::new(0);

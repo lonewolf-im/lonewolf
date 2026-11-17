@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use lonewolf_core::test_support::{StreamProbe, StreamProbeEvent, install_stream_probe};
+use lonewolf_core::test_support::{
+    ComponentWriteProbe, ComponentWriteProbeEvent, StreamProbe, StreamProbeEvent,
+    install_component_write_probe, install_stream_probe,
+};
 use lonewolf_extension::archive::{
     ArchiveDirection, ArchiveFuture, ArchiveHandler, ArchiveId, ArchiveOutcome, ArchiveRequest,
 };
@@ -169,6 +172,9 @@ pub fn catalog() -> TestResult<Extensions<Arc<PooledChunkAllocator>, RedbStorage
     }))?;
     extensions.register(Arc::new(TestStreamProbe {
         probe: PlMutex::new(None),
+    }))?;
+    extensions.register(Arc::new(TestComponentWriteProbe {
+        probes: PlMutex::new(BTreeMap::new()),
     }))?;
     extensions.register(Arc::new(TestAccountAccess))?;
     extensions.register(Arc::new(TestIqResults))?;
@@ -704,6 +710,120 @@ impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for TestStreamProbe {
                     return compio::time::timeout(Duration::from_secs(5), waiting)
                         .await
                         .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+                }
+                _ => return Err(StanzaErrorCondition::BadRequest.into()),
+            }
+            Ok(IqReply::new(None, Effects::none()))
+        })
+    }
+}
+
+pub(super) const COMPONENT_WRITE_PROBE_NAMESPACE: &str = "urn:lonewolf:test:component-write-probe";
+
+struct TestComponentWriteProbe {
+    probes: PlMutex<BTreeMap<std::net::SocketAddr, ComponentWriteProbe>>,
+}
+
+impl<A: ChunkAllocator> Extension<A, RedbStorage> for TestComponentWriteProbe {
+    fn name(&self) -> &'static str {
+        "test-component-write-probe"
+    }
+
+    fn register(
+        self: Arc<Self>,
+        _host: &str,
+        slots: &mut Slots<'_, A, RedbStorage>,
+    ) -> Result<(), RegistrationError> {
+        for name in ["install", "arm", "event", "release", "remove"] {
+            slots.iq(
+                IqRoute {
+                    scope: IqScope::Server,
+                    kind: IqRequestType::Get,
+                    namespace: COMPONENT_WRITE_PROBE_NAMESPACE,
+                    name,
+                },
+                self.clone(),
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for TestComponentWriteProbe {
+    fn get<'a>(
+        &'a self,
+        request: IqRequest<'a, A>,
+        _transaction: &'a RedbRead,
+        response: &'a mut Arena<A>,
+    ) -> IqFuture<'a, A> {
+        Box::pin(async move {
+            let attribute = |name| {
+                request
+                    .payload
+                    .attribute(name, "")
+                    .map_err(|_| StanzaErrorCondition::BadRequest)
+            };
+            let peer = attribute("peer")?
+                .ok_or(StanzaErrorCondition::BadRequest)?
+                .parse::<std::net::SocketAddr>()
+                .map_err(|_| StanzaErrorCondition::BadRequest)?;
+            match request.payload.name() {
+                "install" => {
+                    let mut probes = self.probes.lock();
+                    if probes.contains_key(&peer) {
+                        return Err(StanzaErrorCondition::Conflict.into());
+                    }
+                    probes.insert(
+                        peer,
+                        install_component_write_probe(peer)
+                            .map_err(|_| StanzaErrorCondition::BadRequest)?,
+                    );
+                }
+                "arm" => {
+                    let bytes = attribute("bytes")?
+                        .ok_or(StanzaErrorCondition::BadRequest)?
+                        .parse()
+                        .map_err(|_| StanzaErrorCondition::BadRequest)?;
+                    self.probes
+                        .lock()
+                        .get(&peer)
+                        .ok_or(StanzaErrorCondition::BadRequest)?
+                        .hold_after_bytes(bytes)
+                        .map_err(|_| StanzaErrorCondition::BadRequest)?;
+                }
+                "release" => self
+                    .probes
+                    .lock()
+                    .get(&peer)
+                    .ok_or(StanzaErrorCondition::BadRequest)?
+                    .release_write()
+                    .map_err(|_| StanzaErrorCondition::BadRequest)?,
+                "remove" => {
+                    self.probes
+                        .lock()
+                        .remove(&peer)
+                        .ok_or(StanzaErrorCondition::BadRequest)?;
+                }
+                "event" => {
+                    let event = self
+                        .probes
+                        .lock()
+                        .get(&peer)
+                        .ok_or(StanzaErrorCondition::BadRequest)?
+                        .next_event();
+                    let event = compio::time::timeout(Duration::from_secs(5), event)
+                        .await
+                        .map_err(|_| StanzaErrorCondition::InternalServerError)?
+                        .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+                    let name = match event {
+                        ComponentWriteProbeEvent::Held => "held",
+                    };
+                    let payload =
+                        Element::builder_in("event", COMPONENT_WRITE_PROBE_NAMESPACE, response)
+                            .and_then(|builder| builder.attribute("name", "", name))
+                            .and_then(|builder| builder.build())
+                            .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+                    return Ok(IqReply::new(Some(payload), Effects::none()));
                 }
                 _ => return Err(StanzaErrorCondition::BadRequest.into()),
             }

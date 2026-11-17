@@ -422,6 +422,12 @@ where
     R: AsyncBufRead + Unpin + 'static,
     W: AsyncWrite + Unpin,
 {
+    #[cfg(feature = "test-support")]
+    let mut authenticated = authenticated;
+    #[cfg(feature = "test-support")]
+    if let Ok(peer) = tcp.peer_addr() {
+        authenticated.writer.bind_write_probe(peer);
+    }
     let aborted = Cell::new(false);
     let abort = || {
         if !aborted.replace(true) {

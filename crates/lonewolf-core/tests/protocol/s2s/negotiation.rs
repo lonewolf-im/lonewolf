@@ -46,6 +46,7 @@ impl SingleServer {
         let dns = FakeDns::start()?;
         let suite = C2sSuite::federated(FederatedHost {
             domain: "a.test".into(),
+            certificate_names: Vec::new(),
             revocation,
             enabled: None,
             bidirectional,
@@ -214,6 +215,7 @@ fn disabled_federation_opens_no_listener() -> TestResult {
     let mut dns = FakeDns::start()?;
     let mut suite = C2sSuite::federated(FederatedHost {
         domain: "a.test".into(),
+        certificate_names: Vec::new(),
         revocation: Default::default(),
         enabled: Some(false),
         bidirectional: Some(false),

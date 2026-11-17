@@ -62,6 +62,7 @@ fn revoked_peers_are_rejected_with_a_crl_file_in_both_directions_transport(
     );
     let suite = C2sSuite::federated(FederatedHost {
         domain: "a.test".into(),
+        certificate_names: Vec::new(),
         revocation: HostRevocation {
             crls_path: Some(path),
             fetch_crls: Some(true),
@@ -131,6 +132,7 @@ fn crl_file_state_at_startup() -> TestResult {
     let path = directory.path().join("crls.pem");
     let host = || FederatedHost {
         domain: "a.test".into(),
+        certificate_names: Vec::new(),
         revocation: HostRevocation {
             crls_path: Some(path.clone()),
             ..Default::default()
@@ -550,6 +552,7 @@ fn shutdown_with_crl_file_checks_is_clean() -> TestResult {
     )?;
     let mut suite = C2sSuite::federated(FederatedHost {
         domain: "a.test".into(),
+        certificate_names: Vec::new(),
         revocation: HostRevocation {
             crls_path: Some(path.clone()),
             ..Default::default()

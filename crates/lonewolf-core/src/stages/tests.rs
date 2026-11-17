@@ -9,20 +9,25 @@ use std::time::Duration;
 use compio::runtime::Runtime;
 use lonewolf_extension::ExtensionFuture;
 use lonewolf_extension::delivery::HandlerError;
+use lonewolf_extension::message::{
+    MessageHandler, StoreFuture, StoreOutcome, UndeliverableMessage,
+};
 use lonewolf_extension::service::{ServiceContext, ServiceHandler};
-use lonewolf_storage::RedbStorage;
+use lonewolf_extension::{Extension, Extensions, RegistrationError, Slots};
 use lonewolf_storage::account::AccountKey;
+use lonewolf_storage::{RedbStorage, RedbWrite};
 use lonewolf_util::arena::{Arena, ArenaConfig, GlobalChunkAllocator};
 use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::parser::{ParserConfig, StreamEvent, XmppParser};
 use lonewolf_xmpp::stanza::{MessageType, StanzaErrorCondition};
 use parking_lot::Mutex as PlMutex;
 
-use super::{DeliveryOutcome, deliver};
+use super::{DeliveryOutcome, MissingRecipientPolicy, deliver};
 use crate::config::Config;
 use crate::delivery::{WorkGroup, WorkHandle};
 use crate::hosts::Hosts;
 use crate::router::local::LocalRouter;
+use crate::router::metrics::MessageOutcome as MetricOutcome;
 use crate::router::{RoutedStanza, Router, RouterHandle, ServiceRoute};
 use crate::stages::Stage;
 
@@ -71,6 +76,19 @@ fn account(value: &str) -> TestResult<AccountKey> {
     Ok(AccountKey::try_from(jid.resolve(&arena)?)?)
 }
 
+fn assert_message_increment(
+    router: &RouterHandle<GlobalChunkAllocator>,
+    before: [u64; MetricOutcome::ALL.len()],
+    outcome: MetricOutcome,
+) {
+    for (candidate, before) in MetricOutcome::ALL.into_iter().zip(before) {
+        assert_eq!(
+            router.metrics().messages(candidate),
+            before + u64::from(candidate == outcome)
+        );
+    }
+}
+
 async fn parsed(xml: &str) -> TestResult<RoutedStanza<GlobalChunkAllocator>> {
     let input = format!(
         "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client'>{xml}"
@@ -109,7 +127,7 @@ fn deliver_routes_a_chat_message_to_a_bound_resource() -> TestResult {
         let mut expected = String::new();
         stanza.resolve()?.write_xml(&mut expected)?;
 
-        let outcome = deliver(&fixture.stage(), stanza, MessageType::Chat).await;
+        let outcome = deliver(&fixture.stage(), stanza, MessageType::Chat, MissingRecipientPolicy::Discard).await;
 
         assert!(matches!(outcome, Ok(DeliveryOutcome::Routed { .. })));
         let delivered = registration.recv().await.ok_or("missing routed message")?;
@@ -155,7 +173,7 @@ fn deliver_records_each_completed_outcome_once() -> TestResult {
                 MessageOutcome::Failed,
             ),
         ] {
-            let result = deliver(&fixture.stage(), parsed(xml).await?, kind).await;
+            let result = deliver(&fixture.stage(), parsed(xml).await?, kind, MissingRecipientPolicy::Discard).await;
             match outcome {
                 MessageOutcome::Routed => assert!(matches!(result, Ok(DeliveryOutcome::Routed { .. }))),
                 MessageOutcome::Discarded => {
@@ -184,7 +202,13 @@ fn deliver_rejects_a_bare_groupchat_message() -> TestResult {
             parsed("<message from='alice@localhost/laptop' to='bob@localhost' type='groupchat'/>")
                 .await?;
 
-        let outcome = deliver(&fixture.stage(), stanza, MessageType::Groupchat).await;
+        let outcome = deliver(
+            &fixture.stage(),
+            stanza,
+            MessageType::Groupchat,
+            MissingRecipientPolicy::Discard,
+        )
+        .await;
 
         assert!(matches!(
             outcome,
@@ -233,7 +257,13 @@ fn deliver_keeps_service_fallback_errors_separate_from_remote_errors() -> TestRe
                 ))
                 .await?;
                 assert!(matches!(
-                    deliver(&fixture.stage(), stanza, kind).await,
+                    deliver(
+                        &fixture.stage(),
+                        stanza,
+                        kind,
+                        MissingRecipientPolicy::Discard
+                    )
+                    .await,
                     Ok(DeliveryOutcome::Rejected {
                         condition: StanzaErrorCondition::ServiceUnavailable,
                         ..
@@ -255,7 +285,13 @@ fn deliver_rejects_remote_bare_and_full_groupchat_messages() -> TestResult {
                 "<message from='alice@localhost/laptop' to='{target}' type='groupchat'/>"
             ))
             .await?;
-            let outcome = deliver(&fixture.stage(), stanza, MessageType::Groupchat).await;
+            let outcome = deliver(
+                &fixture.stage(),
+                stanza,
+                MessageType::Groupchat,
+                MissingRecipientPolicy::Discard,
+            )
+            .await;
             assert!(matches!(
                 outcome,
                 Ok(DeliveryOutcome::Rejected {
@@ -275,7 +311,7 @@ fn deliver_discards_remote_bare_and_full_error_messages() -> TestResult {
         let fixture = Fixture::new()?;
         for target in ["bob@remote.example", "bob@remote.example/phone"] {
             let stanza = parsed(&format!("<message from='alice@localhost/laptop' to='{target}' type='error'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>" )).await?;
-            assert!(matches!(deliver(&fixture.stage(), stanza, MessageType::Error).await, Ok(DeliveryOutcome::Discarded)));
+            assert!(matches!(deliver(&fixture.stage(), stanza, MessageType::Error, MissingRecipientPolicy::Discard).await, Ok(DeliveryOutcome::Discarded)));
         }
         fixture.router.shutdown().await?;
         Ok(())
@@ -291,7 +327,7 @@ fn deliver_discards_an_error_message_to_an_absent_account() -> TestResult {
         )
         .await?;
 
-        let outcome = deliver(&fixture.stage(), stanza, MessageType::Error).await;
+        let outcome = deliver(&fixture.stage(), stanza, MessageType::Error, MissingRecipientPolicy::Discard).await;
 
         assert!(matches!(outcome, Ok(DeliveryOutcome::Discarded)));
         fixture.router.shutdown().await?;
@@ -312,7 +348,13 @@ fn deliver_rejects_a_chat_message_without_an_offline_handler() -> TestResult {
             parsed("<message from='alice@localhost/laptop' to='bob@localhost' type='chat'/>")
                 .await?;
 
-        let outcome = deliver(&fixture.stage(), stanza, MessageType::Chat).await;
+        let outcome = deliver(
+            &fixture.stage(),
+            stanza,
+            MessageType::Chat,
+            MissingRecipientPolicy::Discard,
+        )
+        .await;
 
         assert!(matches!(
             outcome,
@@ -343,10 +385,114 @@ fn deliver_discards_messages_when_offline_storage_reports_no_recipient() -> Test
             let stanza = parsed(&format!(
                 "<message from='alice@localhost/laptop' to='unknown@localhost' type='{attribute}'><body>Hello</body></message>"
             )).await?;
+            let before = MetricOutcome::ALL
+                .map(|outcome| fixture.handle.metrics().messages(outcome));
             assert!(matches!(
-                deliver(&fixture.stage(), stanza, kind).await,
+                deliver(&fixture.stage(), stanza, kind, MissingRecipientPolicy::Discard).await,
                 Ok(DeliveryOutcome::Discarded)
             ));
+            assert_message_increment(&fixture.handle, before, MetricOutcome::Discarded);
+        }
+        fixture.router.shutdown().await?;
+        Ok(())
+    }))?
+}
+
+#[test]
+fn deliver_rejects_messages_when_offline_storage_reports_no_recipient() -> TestResult {
+    Runtime::new()?.block_on(compio::time::timeout(Duration::from_secs(5), async {
+        let mut fixture = Fixture::new()?;
+        let mut extensions = Extensions::default();
+        extensions.register(Arc::new(lonewolf_extension::offline::Offline::new(
+            BTreeMap::new(),
+        )))?;
+        fixture.router = fixture.router.with_extensions(BTreeMap::from([(
+            "localhost".into(),
+            extensions.enable_host("localhost", ["offline"])?,
+        )]));
+        fixture.handle = fixture.router.handle();
+        for (kind, attribute) in [(MessageType::Normal, "normal"), (MessageType::Chat, "chat")] {
+            let stanza = parsed(&format!(
+                "<message from='alice@localhost/laptop' to='unknown@localhost' type='{attribute}'><body>Hello</body></message>"
+            )).await?;
+            let mut expected = String::new();
+            stanza.resolve()?.write_xml(&mut expected)?;
+            let before = MetricOutcome::ALL
+                .map(|outcome| fixture.handle.metrics().messages(outcome));
+            let outcome = deliver(
+                &fixture.stage(),
+                stanza,
+                kind,
+                MissingRecipientPolicy::Reject,
+            )
+            .await
+            .map_err(|_| "missing-recipient delivery failed")?;
+            let DeliveryOutcome::Rejected { stanza, condition, text } = outcome else {
+                return Err("expected missing-recipient rejection".into());
+            };
+            assert_eq!(condition, StanzaErrorCondition::ServiceUnavailable);
+            assert_eq!(text, condition.default_text());
+            let mut actual = String::new();
+            stanza.resolve()?.write_xml(&mut actual)?;
+            assert_eq!(actual, expected);
+            assert_message_increment(&fixture.handle, before, MetricOutcome::Rejected);
+        }
+        fixture.router.shutdown().await?;
+        Ok(())
+    }))?
+}
+
+struct DiscardingOffline;
+
+impl Extension<GlobalChunkAllocator, RedbStorage> for DiscardingOffline {
+    fn name(&self) -> &'static str {
+        "discarding-offline"
+    }
+
+    fn register(
+        self: Arc<Self>,
+        _: &str,
+        slots: &mut Slots<'_, GlobalChunkAllocator, RedbStorage>,
+    ) -> Result<(), RegistrationError> {
+        slots.offline(self)
+    }
+}
+
+impl MessageHandler<GlobalChunkAllocator, RedbStorage> for DiscardingOffline {
+    fn store<'a>(
+        &'a self,
+        _: UndeliverableMessage<'a, GlobalChunkAllocator>,
+        _: &'a mut RedbWrite,
+        _: &'a mut Arena<GlobalChunkAllocator>,
+    ) -> StoreFuture<'a> {
+        Box::pin(async { Ok(StoreOutcome::Discarded) })
+    }
+}
+
+#[test]
+fn genuine_offline_discards_remain_silent_under_both_missing_recipient_policies() -> TestResult {
+    Runtime::new()?.block_on(compio::time::timeout(Duration::from_secs(5), async {
+        let mut fixture = Fixture::new()?;
+        let mut extensions = Extensions::default();
+        extensions.register(Arc::new(DiscardingOffline))?;
+        fixture.router = fixture.router.with_extensions(BTreeMap::from([(
+            "localhost".into(),
+            extensions.enable_host("localhost", ["discarding-offline"])?,
+        )]));
+        fixture.handle = fixture.router.handle();
+        for policy in [MissingRecipientPolicy::Discard, MissingRecipientPolicy::Reject] {
+            for (kind, attribute) in [(MessageType::Normal, "normal"), (MessageType::Chat, "chat")] {
+                let stanza = parsed(&format!(
+                    "<message from='alice@localhost/laptop' to='bob@localhost' type='{attribute}'><body>Hello</body></message>"
+                )).await?;
+                let before = MetricOutcome::ALL
+                    .map(|outcome| fixture.handle.metrics().messages(outcome));
+                assert!(matches!(
+                    deliver(&fixture.stage(), stanza, kind, policy).await,
+                    Ok(DeliveryOutcome::Discarded)
+                ));
+                assert_message_increment(&fixture.handle, before, MetricOutcome::Discarded);
+            }
         }
         fixture.router.shutdown().await?;
         Ok(())
@@ -941,7 +1087,7 @@ fn remote_message_admission_preserves_error_and_headline_rules() -> TestResult {
                         assert_eq!(handle.route_stored_message(stanza.clone(), release).await, Err(crate::router::RouterError::InvalidTarget));
                         assert_eq!(remote.occupancy(), before);
                     }
-                    let outcome = deliver(&stage, stanza, kind).await;
+                    let outcome = deliver(&stage, stanza, kind, MissingRecipientPolicy::Discard).await;
                     if mode == "success" {
                         assert!(matches!(outcome, Ok(DeliveryOutcome::Routed { admitted: Admitted::None })), "{target} {kind:?} {mode}");
                         assert_eq!(remote.occupancy(), (1, expected.len()));

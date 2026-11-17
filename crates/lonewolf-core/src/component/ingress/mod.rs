@@ -1,21 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use lonewolf_storage::RedbStorage;
-use lonewolf_util::arena::ChunkAllocator;
-use lonewolf_xmpp::stanza::{IqType, MessageType, RoutedStanza, StanzaErrorCondition, StanzaType};
+use lonewolf_util::arena::{Arena, ChunkAllocator};
+use lonewolf_xmpp::stanza::{
+    ApplicationCondition, IqType, MessageType, RoutedStanza, StanzaErrorCondition, StanzaErrorText,
+    StanzaType,
+};
 
 use super::registry::ComponentRegistry;
 use crate::delivery::WorkHandle;
 use crate::router::RouterHandle;
-use crate::stages::{StageFailure, ingress::rejection_reply};
+use crate::stages::ingress::Origin;
+use crate::stages::{
+    Stage, StageFailure,
+    service::{self, ServiceOutcome},
+};
+
+mod iq;
+mod message;
+mod presence;
 
 pub(crate) struct Context<A: ChunkAllocator> {
-    #[allow(dead_code)]
     pub(crate) router: RouterHandle<A>,
-    #[allow(dead_code)]
     pub(crate) storage: RedbStorage,
     pub(crate) allocator: A,
-    #[allow(dead_code)]
     pub(crate) work: WorkHandle,
     pub(crate) registry: ComponentRegistry<A>,
     pub(crate) connection_id: u64,
@@ -29,33 +37,72 @@ impl From<StageFailure> for IngressFailure {
     }
 }
 
+pub(crate) fn reply_error<A: ChunkAllocator + Clone + 'static>(
+    context: &Context<A>,
+    domain: &str,
+    original: &RoutedStanza<A>,
+    condition: StanzaErrorCondition,
+    application: Option<ApplicationCondition>,
+    text: StanzaErrorText,
+) -> Result<(), IngressFailure> {
+    let source = original.resolve().map_err(|_| IngressFailure)?;
+    if !matches!(source.stanza_type(), StanzaType::Message(kind) if kind != MessageType::Error)
+        && !matches!(
+            source.stanza_type(),
+            StanzaType::Iq(IqType::Get | IqType::Set)
+        )
+    {
+        return Ok(());
+    }
+    let mut arena = Arena::try_new_in(Default::default(), context.allocator.clone())
+        .map_err(|_| IngressFailure)?;
+    let source = source.clone_in(&mut arena).map_err(|_| IngressFailure)?;
+    let reply = source
+        .error_reply_described_in(&mut arena, condition, application, text)
+        .map_err(|_| IngressFailure)?
+        .build()
+        .map_err(|_| IngressFailure)?;
+    let _ = context.registry.reply(
+        domain,
+        context.connection_id,
+        RoutedStanza::from_parts(reply, arena),
+    );
+    Ok(())
+}
+
 pub(crate) async fn dispatch<A: ChunkAllocator + Clone + 'static>(
     context: &Context<A>,
     domain: &str,
     stanza: RoutedStanza<A>,
 ) -> Result<(), IngressFailure> {
+    let stage = Stage {
+        router: &context.router,
+        storage: &context.storage,
+        allocator: &context.allocator,
+        work: &context.work,
+    };
+    let origin = Origin::Service { domain };
     let view = stanza.resolve().map_err(|_| IngressFailure)?;
-    if matches!(view.stanza_type(), StanzaType::Message(kind) if kind != MessageType::Error)
-        || matches!(
-            view.stanza_type(),
-            StanzaType::Iq(IqType::Get | IqType::Set)
-        )
-    {
-        let condition = StanzaErrorCondition::ServiceUnavailable;
-        let reply = rejection_reply(
-            &context.allocator,
-            &stanza,
+    let target = view
+        .to()
+        .map_err(|_| IngressFailure)?
+        .ok_or(IngressFailure)?;
+    if let Some(route) = context.router.service(target.domainpart()) {
+        if let ServiceOutcome::Rejected {
+            stanza,
             condition,
-            None,
-            condition.default_text(),
-        )?;
-        let _ = context.registry.reply(domain, context.connection_id, reply);
-    } else {
-        tracing::debug!(
-            component_domain = domain,
-            stanza_kind = view.kind().as_str(),
-            "component stanza dropped"
-        );
+            text,
+        } = service::dispatch(&stage, route, stanza).await?
+        {
+            reply_error(context, domain, &stanza, condition, None, text)?;
+        }
+        return Ok(());
     }
-    Ok(())
+    match view.stanza_type() {
+        StanzaType::Message(kind) => {
+            message::handle(context, domain, &stage, &origin, stanza, kind).await
+        }
+        StanzaType::Iq(kind) => iq::handle(context, domain, &stage, &origin, stanza, kind).await,
+        StanzaType::Presence(kind) => presence::handle(context, domain, stanza, kind).await,
+    }
 }

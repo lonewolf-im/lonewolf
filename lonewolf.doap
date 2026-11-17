@@ -116,7 +116,7 @@
         <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0114.html"/>
         <xmpp:status>partial</xmpp:status>
         <xmpp:version>1.6</xmpp:version>
-        <xmpp:note>External components authenticate on a TCP listener and receive client messages, IQs and directed presence. Incoming component addresses are validated; IQ requests and non-error messages receive service-unavailable errors. Routing from components and the connect method are not supported. Not in a release yet.</xmpp:note>
+        <xmpp:note>External components authenticate on a TCP listener and exchange messages, IQs and presence with local users, the server and services. The server answers presence probes. Component domains can federate when a host certificate covers them. Subscription stanzas pass through without roster updates; roster presence broadcasts and probes do not reach component JIDs. The connect method is not supported. Not in a release yet.</xmpp:note>
       </xmpp:SupportedXep>
     </implements>
     <implements>

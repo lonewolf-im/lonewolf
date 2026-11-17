@@ -447,3 +447,218 @@ fn shutdown_discards_the_exact_tail_once_without_moving_or_bouncing() -> TestRes
         Ok(())
     })
 }
+
+struct BounceWork {
+    work: PlMutex<Option<crate::delivery::WorkHandle>>,
+    release: PlMutex<Option<futures_channel::oneshot::Receiver<()>>>,
+    completed: PlMutex<Option<futures_channel::oneshot::Sender<()>>>,
+    started: PlMutex<Option<futures_channel::oneshot::Sender<()>>>,
+    entered: std::sync::atomic::AtomicUsize,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct BounceForeground(Arc<std::sync::atomic::AtomicBool>);
+impl Drop for BounceForeground {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl ServiceHandler<GlobalChunkAllocator, RedbStorage> for BounceWork {
+    fn route<'a>(
+        &'a self,
+        stanza: RoutedStanza<GlobalChunkAllocator>,
+        _: ServiceContext<'a, GlobalChunkAllocator, RedbStorage>,
+    ) -> ExtensionFuture<'a, Result<(), HandlerError>> {
+        Box::pin(async move {
+            let view = stanza
+                .resolve()
+                .map_err(|_| lonewolf_xmpp::stanza::StanzaErrorCondition::InternalServerError)?;
+            assert_eq!(
+                view.id().map_err(|_| {
+                    lonewolf_xmpp::stanza::StanzaErrorCondition::InternalServerError
+                })?,
+                Some("bounce-work")
+            );
+            let guard = self
+                .work
+                .lock()
+                .as_ref()
+                .ok_or(lonewolf_xmpp::stanza::StanzaErrorCondition::InternalServerError)?
+                .start();
+            let release = self
+                .release
+                .lock()
+                .take()
+                .ok_or(lonewolf_xmpp::stanza::StanzaErrorCondition::InternalServerError)?;
+            let completed = self
+                .completed
+                .lock()
+                .take()
+                .ok_or(lonewolf_xmpp::stanza::StanzaErrorCondition::InternalServerError)?;
+            compio::runtime::spawn(async move {
+                guard
+                    .run(async {
+                        let _ = release.await;
+                    })
+                    .await;
+                let _ = completed.send(());
+            })
+            .detach();
+            let _foreground = BounceForeground(Arc::clone(&self.cancelled));
+            self.entered
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Some(started) = self.started.lock().take() {
+                let _ = started.send(());
+            }
+            std::future::pending().await
+        })
+    }
+}
+
+async fn cancelled_bounce_work(outer_deadline: bool) -> TestResult {
+    let clock = TestClock::new();
+    let (mut fixture, _) = fixture(&clock).await?;
+    let (release, released) = futures_channel::oneshot::channel();
+    let (completed, completion) = futures_channel::oneshot::channel();
+    let (started, starting) = futures_channel::oneshot::channel();
+    let state = Arc::new(BounceWork {
+        work: PlMutex::new(None),
+        release: PlMutex::new(Some(released)),
+        completed: PlMutex::new(Some(completed)),
+        started: PlMutex::new(Some(started)),
+        entered: std::sync::atomic::AtomicUsize::new(0),
+        cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    });
+    let router = Router::new(
+        fixture.settings.hosts.clone(),
+        crate::router::local::LocalRouter::new(GlobalChunkAllocator),
+    )
+    .with_services(BTreeMap::from([(
+        "pubsub.localhost".into(),
+        ServiceRoute {
+            domain: Arc::from("pubsub.localhost"),
+            handler: state.clone(),
+        },
+    )]));
+    fixture.settings.services.router = router.handle();
+    let id = fixture.authenticated.link.id();
+    fixture
+        .settings
+        .registry
+        .reply(DOMAIN, id, stanza("started")?)
+        .map_err(|_| "first admission")?;
+    fixture.peer.write_all(b"<message from='room@muc.localhost' to='alice@localhost/desk' id='receive-work-handle'/>").await?;
+    let dispatch = async |context: &Context<GlobalChunkAllocator>,
+                          _: &str,
+                          _: RoutedStanza<GlobalChunkAllocator>| {
+        *state.work.lock() = Some(context.work.clone());
+        Ok(())
+    };
+    let (stop, stopped) = futures_channel::oneshot::channel();
+    let shutdown = async {
+        stopped
+            .await
+            .unwrap_or_else(|_| Instant::now() + Duration::from_secs(20))
+    }
+    .boxed_local()
+    .shared();
+    let aborted = Cell::new(false);
+    let abort = || aborted.set(true);
+    let global = crate::admission::global_limit::GlobalLimit::new(1);
+    let permit = global.reserve(Instant::now()).map_err(|_| "permit")?;
+    let mut serving = Box::pin(async {
+        let _permit = permit;
+        serve_with(
+            fixture.authenticated,
+            &fixture.settings,
+            &fixture.settings.services,
+            shutdown,
+            dispatch,
+            &clock,
+            &abort,
+        )
+        .await
+    });
+    fixture.output.release(64);
+    assert!(poll!(serving.as_mut()).is_pending());
+    assert!(state.work.lock().is_some());
+    assert_eq!(fixture.output.bytes.borrow().len(), 64);
+    admit(&fixture.settings.registry, id, "chat", "bounce-work").await?;
+    admit(&fixture.settings.registry, id, "presence", "unstarted").await?;
+    fixture.peer.write_all(b"</stream:stream>").await?;
+    fixture.peer.shutdown().await?;
+    assert!(poll!(serving.as_mut()).is_pending());
+    fixture.output.release(usize::MAX);
+    match futures_util::future::select(Box::pin(starting), serving.as_mut()).await {
+        Either::Left((result, _)) => result?,
+        Either::Right(_) => return Err("session ended before bounce dispatch entered".into()),
+    }
+    assert_eq!(state.entered.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert!(!state.cancelled.load(std::sync::atomic::Ordering::Acquire));
+    metrics(&fixture.settings.metrics, 0, 0, 0, 0, 0)?;
+    stop.send(clock.now() + Duration::from_secs(20))
+        .map_err(|_| "shutdown receiver")?;
+    assert!(poll!(serving.as_mut()).is_pending());
+    assert!(state.cancelled.load(std::sync::atomic::Ordering::Acquire));
+    metrics(&fixture.settings.metrics, 0, 1, 0, 1, 0)?;
+    assert_eq!(state.entered.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(global.active(), 1);
+    assert_eq!(fixture.settings.metrics.shutdown_state().streams, 1);
+    assert_eq!(
+        fixture
+            .settings
+            .metrics
+            .shutdown_state()
+            .streams_closed_total,
+        0
+    );
+    drop(
+        fixture
+            .settings
+            .registry
+            .attach(DOMAIN)
+            .map_err(|_| "attachment retained during work drain")?,
+    );
+    if outer_deadline {
+        let active = futures_util::stream::FuturesUnordered::new();
+        active.push(crate::connection::socket::ConnectionTask {
+            _socket: (),
+            future: Box::pin(async {
+                let _ = serving.await;
+            }),
+        });
+        let error = crate::connection::drain_connections(
+            active,
+            Instant::now(),
+            crate::connection::ListenerKind::Component,
+            |_| panic!("work completed before listener deadline"),
+        )
+        .await
+        .err()
+        .ok_or("missing drain failure")?;
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(
+            error.to_string(),
+            "component connections exceeded shutdown deadline"
+        );
+        release.send(()).map_err(|_| "background receiver")?;
+    } else {
+        release.send(()).map_err(|_| "background receiver")?;
+        assert!(matches!(serving.await, StreamClose::StreamEnd));
+    }
+    completion.await?;
+    assert_eq!(global.active(), 0);
+    assert_closed(&fixture.settings.metrics, StreamClose::StreamEnd)?;
+    metrics(&fixture.settings.metrics, 0, 1, 0, 1, 0)
+}
+
+#[test]
+fn cancelled_bounce_keeps_admitted_work_owned_until_explicit_completion() -> TestResult {
+    run(cancelled_bounce_work(false))
+}
+
+#[test]
+fn cancelled_bounce_keeps_admitted_work_owned_until_the_listener_deadline() -> TestResult {
+    run(cancelled_bounce_work(true))
+}

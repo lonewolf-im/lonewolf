@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -641,7 +639,7 @@ impl Collector for ComponentCollector {
             ),
             (
                 "component_bounces",
-                "Error replies for component stanzas still queued at disconnect.",
+                "Error-reply dispatch attempts for component stanzas still queued at disconnect.",
                 &metrics.bounces,
             ),
         ] {

@@ -2,7 +2,7 @@
 
 use std::io::Cursor;
 
-use crate::support::component::{ComponentClient, NAMESPACE};
+use crate::support::component::{ComponentClient, NAMESPACE, completed_stanzas};
 use crate::support::xml::{Element, STREAM_NAMESPACE, XmlStream};
 use crate::support::{ALTERNATE_PASSWORD, C2sSuite, PASSWORD, TestResult, barrier};
 
@@ -282,37 +282,132 @@ fn two_instances_keep_source_fifo_reply_affinity_and_independent_failure() -> Te
     suite.stop()
 }
 
-fn fill_queue(suite: &C2sSuite, alice: &mut crate::support::Client) -> TestResult<usize> {
-    let payload_len = lonewolf_core::config::Config::default()
-        .limits
-        .components
-        .max_stanza_bytes
-        .get()
-        / 2;
-    let body = "x".repeat(payload_len);
+enum PressureGoal {
+    QueueFull,
+    StalledWrite,
+}
+
+struct Load {
+    accepted: Vec<usize>,
+    bounces: Vec<Element>,
+}
+
+fn component_sample(metrics: &str, name: &str) -> TestResult<usize> {
+    Ok(metrics
+        .lines()
+        .find_map(|line| line.strip_prefix(name)?.strip_prefix(' '))
+        .unwrap_or("0")
+        .parse()?)
+}
+
+fn fill_queue(
+    suite: &C2sSuite,
+    alice: &mut crate::support::Client,
+    goal: PressureGoal,
+) -> TestResult<Load> {
+    const FULL: &str = "lonewolf_component_admission_rejections_total{reason=\"queue_full\"}";
+    const DISCONNECTED: &str =
+        "lonewolf_component_admission_rejections_total{reason=\"not_connected\"}";
+    const STALLED: &str = "lonewolf_component_streams_closed_total{outcome=\"stalled_write\"}";
+    const QUEUED: &str = "lonewolf_component_queued_stanzas";
+    let body = load_body();
+    let mut load = Load {
+        accepted: Vec::new(),
+        bounces: Vec::new(),
+    };
+    let initial = suite.scrape_metrics()?;
+    let mut full_before = component_sample(&initial, FULL)?;
+    let mut disconnected_before = component_sample(&initial, DISCONNECTED)?;
     for n in 0..256 {
         alice.send(&format!("<message type='chat' to='room@muc.localhost' id='load{n}'><body>{body}</body></message>"))?;
         alice.send("<iq type='get' id='admitted'><query xmlns='urn:test:barrier'/></iq>")?;
-        let response = alice.receive()?;
-        if response.name == "message" {
-            assert_eq!(response.attribute("id"), Some(format!("load{n}").as_str()));
+        let id = format!("load{n}");
+        let mut current_reply = None;
+        loop {
+            let response = alice.receive()?;
+            if response.name == "iq" {
+                response.assert_name("jabber:client", "iq");
+                assert_eq!(response.attribute("id"), Some("admitted"));
+                break;
+            }
+            response.assert_name("jabber:client", "message");
+            let reply_id = response.attribute("id").ok_or("load reply without id")?;
+            if reply_id == id {
+                assert!(
+                    current_reply
+                        .replace((load.bounces.len(), response))
+                        .is_none()
+                );
+            } else {
+                let index = reply_id
+                    .strip_prefix("load")
+                    .ok_or("unexpected message during pressure")?
+                    .parse::<usize>()?;
+                assert!(
+                    load.accepted.contains(&index),
+                    "bounce for unaccepted input"
+                );
+                assert_load_bounce(&response, index, &body)?;
+                load.bounces.push(response);
+            }
+        }
+        let mut metrics = suite.scrape_metrics()?;
+        let full = component_sample(&metrics, FULL)?;
+        let disconnected = component_sample(&metrics, DISCONNECTED)?;
+        let rejected = full
+            .checked_sub(full_before)
+            .ok_or("queue counter decreased")?;
+        let offline = disconnected
+            .checked_sub(disconnected_before)
+            .ok_or("disconnect counter decreased")?;
+        assert!(rejected + offline <= 1, "multiple admissions for one input");
+        if rejected == 1 {
+            let (_, response) = current_reply.ok_or("missing queue rejection")?;
+            assert_eq!(response.attribute("type"), Some("error"));
             response
                 .child("jabber:client", "error")?
                 .child("urn:ietf:params:xml:ns:xmpp-stanzas", "resource-constraint")?;
-            let barrier = alice.receive()?;
-            assert_eq!(barrier.attribute("id"), Some("admitted"));
-            metric(
-                suite,
-                "admission_rejections_total",
-                "reason=\"queue_full\"",
-                1,
-            )?;
-            return Ok(n + 1);
+            if matches!(goal, PressureGoal::QueueFull) {
+                assert_eq!(full, 1);
+                return Ok(load);
+            }
+        } else if offline == 1 {
+            let (_, response) = current_reply.ok_or("missing disconnected reply")?;
+            assert_load_bounce(&response, n, &body)?;
+        } else {
+            load.accepted.push(n);
+            if let Some((position, response)) = current_reply {
+                assert_load_bounce(&response, n, &body)?;
+                load.bounces.insert(position, response);
+            }
         }
-        response.assert_name("jabber:client", "iq");
-        assert_eq!(response.attribute("id"), Some("admitted"));
+        full_before = full;
+        disconnected_before = disconnected;
+        if matches!(goal, PressureGoal::StalledWrite) {
+            if rejected == 1 {
+                suite.wait_for_metrics("component queue drain or stalled write", |metrics| {
+                    component_sample(metrics, QUEUED).is_ok_and(|value| value == 0)
+                        || component_sample(metrics, STALLED).is_ok_and(|value| value > 0)
+                })?;
+                metrics = suite.scrape_metrics()?;
+            }
+            if offline == 1 || component_sample(&metrics, STALLED)? != 0 {
+                return Ok(load);
+            }
+        } else if offline == 1 {
+            return Err("component disconnected before queue pressure".into());
+        }
     }
-    Err("component socket buffers did not fill within the payload bound".into())
+    if matches!(goal, PressureGoal::StalledWrite) {
+        metric(
+            suite,
+            "streams_closed_total",
+            "outcome=\"stalled_write\"",
+            1,
+        )?;
+        return Ok(load);
+    }
+    Err("component queue did not fill within the payload bound".into())
 }
 
 fn load_body() -> String {
@@ -343,19 +438,35 @@ fn bounce_count(suite: &C2sSuite) -> TestResult<usize> {
 fn expect_load_bounces(
     suite: &C2sSuite,
     alice: &mut crate::support::Client,
-    ids: std::ops::Range<usize>,
+    ids: &[usize],
     body: &str,
+    received: Vec<Element>,
 ) -> TestResult {
     let count = ids.len();
-    for index in ids {
-        alice.receive()?.assert_xml(&format!("<message xmlns='jabber:client' type='error' from='room@muc.localhost' to='alice@localhost/desk' id='load{index}'><body>{body}</body><error type='wait'><remote-server-timeout xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The service at this domain is not connected. Try again later.</text></error></message>"))?;
+    assert!(received.len() <= count, "too many bounces during pressure");
+    let mut received = received.into_iter();
+    for &index in ids {
+        let response = match received.next() {
+            Some(response) => response,
+            None => alice.receive()?,
+        };
+        assert_load_bounce(&response, index, body)?;
     }
+    assert!(received.next().is_none());
     assert_eq!(bounce_count(suite)?, count);
     suite.wait_for_metric("lonewolf_component_queued_stanzas 0")?;
     Ok(())
 }
 
-fn complete_load_prefix(bytes: &[u8], body: &str) -> TestResult<(usize, usize)> {
+fn assert_load_bounce(message: &Element, index: usize, body: &str) -> TestResult {
+    message.assert_xml(&format!("<message xmlns='jabber:client' type='error' from='room@muc.localhost' to='alice@localhost/desk' id='load{index}'><body>{body}</body><error type='wait'><remote-server-timeout xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The service at this domain is not connected. Try again later.</text></error></message>"))
+}
+
+fn complete_load_prefix(
+    bytes: &[u8],
+    body: &str,
+    accepted: &[usize],
+) -> TestResult<(usize, usize)> {
     let mut start = 0;
     let mut received = 0;
     let end_tag = b"</message>";
@@ -365,7 +476,10 @@ fn complete_load_prefix(bytes: &[u8], body: &str) -> TestResult<(usize, usize)> 
     {
         let end = start + offset + end_tag.len();
         let mut stream = XmlStream::new(Cursor::new(&bytes[start..end]));
-        assert_load_message(&stream.receive()?, received, body)?;
+        let index = *accepted
+            .get(received)
+            .ok_or("unadmitted component output")?;
+        assert_load_message(&stream.receive()?, index, body)?;
         start = end;
         received += 1;
     }
@@ -393,25 +507,31 @@ fn bounded_connection_queue_rejects_pressure_then_closes_at_a_stanza_boundary() 
     suite.create_account("alice", PASSWORD)?;
     let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     let mut component = ComponentClient::authenticated(&suite, DOMAIN, SECRET)?;
-    let admitted = fill_queue(&suite, &mut alice)? - 1;
+    let load = fill_queue(&suite, &mut alice, PressureGoal::QueueFull)?;
     let body = load_body();
     component.send("</stream:stream>")?;
     let mut received = 0;
     while let Some(stanza) = component.receive_or_footer()? {
         stanza.assert_name(NAMESPACE, "message");
-        assert_eq!(
-            stanza.attribute("id"),
-            Some(format!("load{received}").as_str())
-        );
-        assert_load_message(&stanza, received, &body)?;
+        let index = *load
+            .accepted
+            .get(received)
+            .ok_or("unadmitted component output")?;
+        assert_load_message(&stanza, index, &body)?;
         received += 1;
     }
     assert!(received > 0);
     component.shutdown_write()?;
     component.expect_eof()?;
     suite.wait_for_metric("lonewolf_component_streams 0")?;
-    assert!(received <= admitted);
-    expect_load_bounces(&suite, &mut alice, received..admitted, &body)?;
+    assert!(received <= load.accepted.len());
+    expect_load_bounces(
+        &suite,
+        &mut alice,
+        &load.accepted[received..],
+        &body,
+        load.bounces,
+    )?;
     alice.close()?;
     suite.stop()
 }
@@ -427,7 +547,8 @@ fn no_progress_timeout_aborts_a_component_that_stops_reading_without_closing_xml
     suite.create_account("alice", PASSWORD)?;
     let mut alice = suite.connect("alice", PASSWORD, "desk")?;
     let component = ComponentClient::authenticated(&suite, DOMAIN, SECRET)?;
-    let admitted = fill_queue(&suite, &mut alice)? - 1;
+    let load = fill_queue(&suite, &mut alice, PressureGoal::StalledWrite)?;
+    let admitted = load.accepted.len();
     let body = load_body();
     metric(
         &suite,
@@ -448,18 +569,31 @@ fn no_progress_timeout_aborts_a_component_that_stops_reading_without_closing_xml
             .any(|v| v == b"<stream:error")
     );
     suite.wait_for_metric("lonewolf_component_connections 0")?;
-    let (received, partial_bytes) = complete_load_prefix(&bytes, &body)?;
+    let (received, partial_bytes) = complete_load_prefix(&bytes, &body, &load.accepted)?;
+    let written = completed_stanzas(&suite.scrape_metrics()?)?;
     let bounced = bounce_count(&suite)?;
-    assert!(received + bounced <= admitted);
-    let unrecovered = admitted - received - bounced;
+    let active = admitted
+        .checked_sub(written + bounced)
+        .ok_or("completed writes or bounces exceeded admissions")?;
     assert!(
-        unrecovered <= 1,
-        "only the active write may remain unrecovered"
+        active <= 1,
+        "only the active stanza can lack a completed write or bounce: admitted={admitted}, written={written}, received={received}, bounced={bounced}, partial_bytes={partial_bytes}"
     );
-    if partial_bytes != 0 {
-        assert_eq!(unrecovered, 1);
-    }
-    expect_load_bounces(&suite, &mut alice, admitted - bounced..admitted, &body)?;
+    assert!(received <= written, "peer received uncompleted stanzas");
+    assert!(
+        received + usize::from(partial_bytes != 0) <= written + active,
+        "wire prefix extends into the recovered suffix"
+    );
+    let recovered_from = admitted
+        .checked_sub(bounced)
+        .ok_or("bounces exceeded admissions")?;
+    expect_load_bounces(
+        &suite,
+        &mut alice,
+        &load.accepted[recovered_from..],
+        &body,
+        load.bounces,
+    )?;
     alice.close()?;
     suite.stop()
 }

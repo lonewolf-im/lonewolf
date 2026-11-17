@@ -4,7 +4,7 @@ use std::io::{Read as _, Write as _};
 use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
-use crate::support::component::{ComponentClient, NAMESPACE};
+use crate::support::component::{ComponentClient, NAMESPACE, completed_stanzas};
 use crate::support::xml::Element;
 use crate::support::{C2sSuite, Client, PASSWORD, STREAM_ERRORS, TestResult, barrier};
 
@@ -260,15 +260,7 @@ fn reset_recovers_a_nonempty_eligible_tail_without_bouncing_written_stanzas() ->
     component.reset()?;
     suite.wait_for_metric("lonewolf_component_connections 0")?;
     let metrics = suite.scrape_metrics()?;
-    let written: usize = ["message", "iq", "presence"]
-        .into_iter()
-        .map(|kind| {
-            counter(
-                &metrics,
-                &format!("lonewolf_component_stanzas_sent_total{{kind=\"{kind}\"}}"),
-            ) as usize
-        })
-        .sum();
+    let written = completed_stanzas(&metrics)?;
     let bounced = counter(&metrics, "lonewolf_component_bounces_total") as usize;
     let dropped = counter(
         &metrics,
@@ -437,15 +429,7 @@ fn reset_with_a_pressured_survivor_bounces_tail_that_cannot_move() -> TestResult
     survivor.close()?;
     suite.wait_for_metric("lonewolf_component_connections 0")?;
     let final_metrics = suite.scrape_metrics()?;
-    let sent: usize = ["message", "iq", "presence"]
-        .into_iter()
-        .map(|kind| {
-            counter(
-                &final_metrics,
-                &format!("lonewolf_component_stanzas_sent_total{{kind=\"{kind}\"}}"),
-            ) as usize
-        })
-        .sum();
+    let sent = completed_stanzas(&final_metrics)?;
     let control_stanzas = ["owner", "first", "second", "end"].len();
     let written = sent
         .checked_sub(target_admitted + moved + control_stanzas)

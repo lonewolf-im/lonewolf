@@ -22,6 +22,26 @@ pub fn tcp(address: SocketAddr) -> TestResult<TcpStream> {
 
 pub const NAMESPACE: &str = "jabber:component:accept";
 
+/// Counts locally completed stanzas, including unflushed output.
+pub fn completed_stanzas(metrics: &str) -> TestResult<usize> {
+    let mut total = 0_usize;
+    for prefix in [
+        "lonewolf_component_stanzas_sent_total{kind=\"message\"} ",
+        "lonewolf_component_stanzas_sent_total{kind=\"iq\"} ",
+        "lonewolf_component_stanzas_sent_total{kind=\"presence\"} ",
+    ] {
+        let count = metrics
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix))
+            .unwrap_or("0")
+            .parse::<usize>()?;
+        total = total
+            .checked_add(count)
+            .ok_or("component stanza count overflow")?;
+    }
+    Ok(total)
+}
+
 pub struct ResponseHeader {
     pub id: String,
     pub from: Option<String>,

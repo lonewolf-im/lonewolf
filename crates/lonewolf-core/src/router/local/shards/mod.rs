@@ -324,6 +324,23 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
             .await?
     }
 
+    pub(crate) async fn deliver_subscription_presence(
+        &self,
+        stanza: RoutedStanza<A>,
+    ) -> Result<(), RouterError> {
+        let shard = {
+            let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
+            let to = view
+                .to()
+                .map_err(|_| RouterError::InvalidTarget)?
+                .ok_or(RouterError::InvalidTarget)?;
+            to.localpart().ok_or(RouterError::InvalidTarget)?;
+            self.shard_index(to.bare().as_str())
+        };
+        self.with_shard(shard, |shard| shard.deliver_subscription_presence(stanza))
+            .await?
+    }
+
     pub(crate) async fn deliver_presence_guarded(
         &self,
         stanza: RoutedStanza<A>,

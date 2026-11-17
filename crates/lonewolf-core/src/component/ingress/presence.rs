@@ -82,14 +82,15 @@ pub(super) async fn handle<A: ChunkAllocator + Clone + 'static>(
     {
         return Ok(());
     }
-    let result = if destination == Destination::Resource
-        && !matches!(
-            kind,
-            PresenceType::Subscribe
-                | PresenceType::Subscribed
-                | PresenceType::Unsubscribe
-                | PresenceType::Unsubscribed
-        ) {
+    let result = if matches!(
+        kind,
+        PresenceType::Subscribe
+            | PresenceType::Subscribed
+            | PresenceType::Unsubscribe
+            | PresenceType::Unsubscribed
+    ) {
+        context.router.route_subscription_presence(routed).await
+    } else if destination == Destination::Resource {
         context.router.route_full(routed).await
     } else {
         context.router.route_presence(routed).await

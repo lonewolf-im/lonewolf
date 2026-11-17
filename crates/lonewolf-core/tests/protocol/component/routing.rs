@@ -343,6 +343,50 @@ fn component_subscription_types_pass_through_to_available_resources_without_rost
 }
 
 #[test]
+fn component_full_jid_subscriptions_preserve_addresses_and_fan_out_without_roster_changes()
+-> TestResult {
+    let mut suite = C2sSuite::with_components(CONFIG)?;
+    suite.create_account("alice", PASSWORD)?;
+    let mut desk = suite.connect("alice", PASSWORD, "desk")?;
+    let mut phone = suite.connect("alice", PASSWORD, "phone")?;
+    available_pair(&mut desk, &mut phone)?;
+    let mut component = ComponentClient::authenticated(&suite, DOMAIN, SECRET)?;
+    for kind in ["subscribe", "subscribed", "unsubscribe", "unsubscribed"] {
+        component.send(&format!("<presence type='{kind}' from='bot@muc.localhost' to='alice@localhost/desk' id='{kind}'><status>full target subscription</status></presence>"))?;
+        ping(&mut component, kind)?;
+        ping_result(&mut component, kind)?;
+        for (client, resource) in [(&mut desk, "desk"), (&mut phone, "phone")] {
+            client.expect_xml(&format!("<presence xmlns='jabber:client' type='{kind}' from='bot@muc.localhost' to='alice@localhost/desk' id='{kind}'><status>full target subscription</status></presence>"))?;
+            client.send("<iq type='get' id='roster'><query xmlns='jabber:iq:roster'/></iq>")?;
+            client.expect_xml(&format!("<iq xmlns='jabber:client' type='result' id='roster' to='alice@localhost/{resource}'><query xmlns='jabber:iq:roster'/></iq>"))?;
+        }
+    }
+    component.close()?;
+    suite.wait_for_metric("lonewolf_component_streams 0")?;
+    traffic(&suite, "presence", 4, 0)?;
+    traffic(&suite, "iq", 4, 4)?;
+    close_available_pair(desk, phone)?;
+    suite.stop()
+}
+
+#[test]
+fn component_subscriptions_to_missing_full_jids_are_silent_and_keep_the_stream_usable() -> TestResult
+{
+    let mut suite = C2sSuite::with_components(CONFIG)?;
+    let mut component = ComponentClient::authenticated(&suite, DOMAIN, SECRET)?;
+    for kind in ["subscribe", "subscribed", "unsubscribe", "unsubscribed"] {
+        component.send(&format!("<presence type='{kind}' from='bot@muc.localhost' to='nobody@localhost/desk' id='{kind}'><status>missing full target</status></presence>"))?;
+        ping(&mut component, kind)?;
+        ping_result(&mut component, kind)?;
+    }
+    component.close()?;
+    suite.wait_for_metric("lonewolf_component_streams 0")?;
+    traffic(&suite, "presence", 4, 0)?;
+    traffic(&suite, "iq", 4, 4)?;
+    suite.stop()
+}
+
+#[test]
 fn component_stanzas_route_to_other_and_own_service_domains_without_recursive_dispatch()
 -> TestResult {
     let mut suite = C2sSuite::with_components(CONFIG)?;

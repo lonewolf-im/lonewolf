@@ -15,7 +15,7 @@ use crate::delivery::{
     report_failure, report_handler_failure, storage_failure,
 };
 use crate::order::Ticket;
-use crate::router::{Destination, RoutedStanza, RouterHandle};
+use crate::router::{DeliveryScope, Destination, RoutedStanza, RouterHandle};
 use crate::stages::{Stage, StageFailure};
 
 pub(crate) struct ProbeGrant {
@@ -137,6 +137,11 @@ pub(crate) async fn authorize_probe<A: ChunkAllocator + Clone + 'static>(
     Ok(Some(ProbeGrant { subscribed, ticket }))
 }
 
+pub(crate) enum SubscriptionIngress {
+    Federated,
+    Component,
+}
+
 pub(crate) enum SubscriptionReceipt<A: ChunkAllocator> {
     Done,
     NoHandler {
@@ -157,6 +162,7 @@ pub(crate) async fn receive_subscription<A: ChunkAllocator + Clone + 'static>(
     stage: &Stage<'_, A>,
     routed: RoutedStanza<A>,
     kind: PresenceRequestType,
+    ingress: SubscriptionIngress,
 ) -> Result<SubscriptionReceipt<A>, StageFailure> {
     let view = routed.resolve()?;
     let target = view.to()?.ok_or(StageFailure)?;
@@ -220,7 +226,11 @@ pub(crate) async fn receive_subscription<A: ChunkAllocator + Clone + 'static>(
             });
         }
     };
-    let delivery = RouterDelivery::new(stage.router, stage.allocator, None);
+    let scope = match ingress {
+        SubscriptionIngress::Federated => DeliveryScope::FederationOnly,
+        SubscriptionIngress::Component => DeliveryScope::ComponentAware,
+    };
+    let delivery = RouterDelivery::new(stage.router, stage.allocator, None).with_scope(scope);
     let effects = match handler
         .receive(
             PresenceRequest {

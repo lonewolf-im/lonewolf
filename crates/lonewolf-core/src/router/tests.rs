@@ -17,8 +17,8 @@ use crate::delivery::RouterDelivery;
 use crate::hosts::Hosts;
 use crate::router::local::{LocalRouter, RetireCause};
 use crate::router::{
-    Admitted, Destination, Registration, RoutedStanza, Router, RouterError, ServiceRoute,
-    StoredRelease,
+    Admitted, DeliveryScope, Destination, Registration, RoutedStanza, Router, RouterError,
+    ServiceRoute, StoredRelease,
 };
 use compio::runtime::Runtime;
 use compio::time::timeout;
@@ -369,9 +369,19 @@ fn current_and_unavailable_presence_reach_component_contacts_without_federation(
             for kind in [PresenceType::Available, PresenceType::Unavailable] {
                 match kind {
                     PresenceType::Available => {
-                        handle.route_current_presence(&owner, contact).await?
+                        handle
+                            .route_current_presence(&owner, contact, DeliveryScope::ComponentAware)
+                            .await?
                     }
-                    _ => handle.route_unavailable_presence(&owner, contact).await?,
+                    _ => {
+                        handle
+                            .route_unavailable_presence(
+                                &owner,
+                                contact,
+                                DeliveryScope::ComponentAware,
+                            )
+                            .await?
+                    }
                 }
                 let mut sources = Vec::new();
                 while let Some(stanza) = link.try_next() {
@@ -2339,7 +2349,7 @@ fn withdrawal_sees_disconnecting_presence_until_terminal_delivery_finishes() -> 
         assert!(alice_desk.end_presence().await?.unavailable.is_some());
         assert!(handle.local.presence_snapshot(&alice).await?.is_empty());
         handle
-            .route_unavailable_presence(&alice, bob_account.as_str())
+            .route_unavailable_presence(&alice, bob_account.as_str(), DeliveryScope::ComponentAware)
             .await?;
         let unavailable = receive_routed(&bob).await?;
         let view = unavailable.resolve()?;

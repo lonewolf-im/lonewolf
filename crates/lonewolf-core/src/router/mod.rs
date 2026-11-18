@@ -179,6 +179,18 @@ impl<A: ChunkAllocator> Clone for ServiceRoute<A> {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum DeliveryScope {
+    ComponentAware,
+    FederationOnly,
+}
+
+impl DeliveryScope {
+    pub(crate) const fn allows_components(self) -> bool {
+        matches!(self, Self::ComponentAware)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Destination {
     Server,
@@ -843,10 +855,11 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         &self,
         source: &AccountKey,
         target: &str,
+        scope: DeliveryScope,
     ) -> Result<(), RouterError> {
         let domain = bare_jid_domain(target);
         let remote = !self.hosts.is_local_host(domain);
-        let component = self.is_component_domain(domain);
+        let component = scope.allows_components() && self.is_component_domain(domain);
         if !self.hosts.is_local_host(source.domain())
             || (remote && !component && !self.federation_enabled())
         {
@@ -924,10 +937,11 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         &self,
         source: &AccountKey,
         target: &str,
+        scope: DeliveryScope,
     ) -> Result<(), RouterError> {
         let domain = bare_jid_domain(target);
         let remote = !self.hosts.is_local_host(domain);
-        let component = self.is_component_domain(domain);
+        let component = scope.allows_components() && self.is_component_domain(domain);
         if !self.hosts.is_local_host(source.domain())
             || (remote && !component && !self.federation_enabled())
         {

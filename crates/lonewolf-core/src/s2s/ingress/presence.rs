@@ -11,7 +11,7 @@ use crate::router::{Destination, RoutedStanza, RouterError};
 use crate::stages::Stage;
 use crate::stages::ingress::{
     checks::{Snapshot, check_from},
-    presence::{SubscriptionReceipt, authorize_probe, receive_subscription},
+    presence::{SubscriptionIngress, SubscriptionReceipt, authorize_probe, receive_subscription},
 };
 
 pub(crate) async fn handle<A: ChunkAllocator + Clone + 'static>(
@@ -106,7 +106,7 @@ async fn subscription<A: ChunkAllocator + Clone + 'static>(
         allocator: &context.allocator,
         work: &context.work,
     };
-    match receive_subscription(&stage, routed, kind).await? {
+    match receive_subscription(&stage, routed, kind, SubscriptionIngress::Federated).await? {
         SubscriptionReceipt::Done => Ok(()),
         SubscriptionReceipt::NoHandler { stanza } => {
             let condition = StanzaErrorCondition::ServiceUnavailable;

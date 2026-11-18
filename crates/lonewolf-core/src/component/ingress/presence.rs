@@ -11,7 +11,7 @@ use crate::router::{Destination, RoutedStanza, RouterError};
 use crate::stages::Stage;
 use crate::stages::ingress::{
     checks::{Snapshot, check_from},
-    presence::{authorize_probe, receive_subscription},
+    presence::{SubscriptionIngress, authorize_probe, receive_subscription},
 };
 
 pub(super) async fn handle<A: ChunkAllocator + Clone + 'static>(
@@ -54,7 +54,8 @@ pub(super) async fn handle<A: ChunkAllocator + Clone + 'static>(
             .and_then(|handlers| handlers.find(kind))
             .is_some()
     {
-        let receipt = receive_subscription(stage, routed, kind).await?;
+        let receipt =
+            receive_subscription(stage, routed, kind, SubscriptionIngress::Component).await?;
         apply_subscription_receipt(context, domain, receipt);
         return Ok(());
     }

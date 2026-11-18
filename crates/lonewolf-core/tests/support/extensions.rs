@@ -147,7 +147,10 @@ pub fn catalog() -> TestResult<Extensions<Arc<PooledChunkAllocator>, RedbStorage
     extensions.register(Arc::new(TestSecondArchive))?;
     extensions.register(Arc::new(TestDiscovery))?;
     extensions.register(Arc::new(TestPolicy {
-        enabled: AtomicBool::new(true),
+        settings: PlMutex::new(TestPolicySettings {
+            enabled: true,
+            blocked_peer: None,
+        }),
     }))?;
     for kind in [
         ServiceLifecycleKind::OfflineWithdrawal,
@@ -2047,7 +2050,12 @@ impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for RouterFailureIq {
 }
 
 struct TestPolicy {
-    enabled: AtomicBool,
+    settings: PlMutex<TestPolicySettings>,
+}
+
+struct TestPolicySettings {
+    enabled: bool,
+    blocked_peer: Option<Box<str>>,
 }
 
 impl<A: ChunkAllocator> Extension<A, RedbStorage> for TestPolicy {
@@ -2077,8 +2085,14 @@ impl<A: ChunkAllocator> Extension<A, RedbStorage> for TestPolicy {
 impl PolicyHandler<RedbStorage> for TestPolicy {
     fn check<'a>(&'a self, request: PolicyRequest<'a>, _: &'a RedbRead) -> PolicyFuture<'a> {
         Box::pin(async move {
-            if !self.enabled.load(Ordering::Relaxed) {
+            let settings = self.settings.lock();
+            if !settings.enabled {
                 return Ok(Verdict::Allow);
+            }
+            if request.direction == Direction::Outbound
+                && settings.blocked_peer.as_deref() == Some(request.peer.bare().as_str())
+            {
+                return Ok(Verdict::Drop);
             }
             Ok(match (request.peer.localpart(), request.direction) {
                 (Some("blocked"), Direction::Outbound) => Verdict::Reject {
@@ -2128,7 +2142,15 @@ impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for TestPolicy {
                 Some("false") => false,
                 _ => return Err(StanzaErrorCondition::BadRequest.into()),
             };
-            self.enabled.store(enabled, Ordering::Relaxed);
+            let blocked_peer = request
+                .payload
+                .attribute("peer", "")
+                .map_err(|_| StanzaErrorCondition::InternalServerError)?
+                .map(Box::from);
+            *self.settings.lock() = TestPolicySettings {
+                enabled,
+                blocked_peer,
+            };
             Ok(IqReply::new(None, Effects::none()))
         })
     }

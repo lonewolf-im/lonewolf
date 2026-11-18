@@ -120,10 +120,7 @@ async fn fixture(clock: &TestClock) -> TestResult<(Fixture, Arc<Capture>)> {
     )
     .with_services(BTreeMap::from([(
         "pubsub.localhost".into(),
-        ServiceRoute {
-            domain: Arc::from("pubsub.localhost"),
-            handler: captured.clone(),
-        },
+        ServiceRoute::extension(Arc::from("pubsub.localhost"), captured.clone()),
     )]));
     fixture.settings.services.router = router.handle();
     Ok((fixture, captured))
@@ -536,10 +533,7 @@ async fn cancelled_bounce_work(outer_deadline: bool) -> TestResult {
     )
     .with_services(BTreeMap::from([(
         "pubsub.localhost".into(),
-        ServiceRoute {
-            domain: Arc::from("pubsub.localhost"),
-            handler: state.clone(),
-        },
+        ServiceRoute::extension(Arc::from("pubsub.localhost"), state.clone()),
     )]));
     fixture.settings.services.router = router.handle();
     let id = fixture.authenticated.link.id();

@@ -24,10 +24,13 @@ use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::roster::RosterJid;
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::{Jid, JidRef};
-use lonewolf_xmpp::stanza::StanzaErrorCondition;
 use lonewolf_xmpp::stanza::{Element, PresenceType, Stanza, StanzaNamespace, StanzaType};
+use lonewolf_xmpp::stanza::{StanzaErrorCondition, StanzaErrorText};
 use prometheus_client::registry::Registry;
 
+use crate::component::registry::{ComponentRegistry, EnqueueError, NOT_CONNECTED_TEXT};
+#[cfg(test)]
+use crate::component::service::ComponentService;
 use crate::hosts::Hosts;
 use crate::order::Order;
 use crate::stages::service::{ServicePresenceGate, ServicePresenceGates};
@@ -142,6 +145,30 @@ pub(crate) struct RouterHandle<A: ChunkAllocator> {
 pub(crate) struct ServiceRoute<A: ChunkAllocator> {
     pub(crate) domain: Arc<str>,
     pub(crate) handler: Arc<dyn ServiceHandler<A, RedbStorage>>,
+    pub(crate) component: Option<ComponentRegistry<A>>,
+}
+
+impl<A: ChunkAllocator + Clone + 'static> ServiceRoute<A> {
+    pub(crate) fn extension(
+        domain: Arc<str>,
+        handler: Arc<dyn ServiceHandler<A, RedbStorage>>,
+    ) -> Self {
+        Self {
+            domain,
+            handler,
+            component: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn component(domain: Arc<str>, registry: ComponentRegistry<A>) -> Self {
+        let handler = Arc::new(ComponentService::new(Arc::clone(&domain), registry.clone()));
+        Self {
+            domain,
+            handler,
+            component: Some(registry),
+        }
+    }
 }
 
 impl<A: ChunkAllocator> Clone for ServiceRoute<A> {
@@ -149,6 +176,7 @@ impl<A: ChunkAllocator> Clone for ServiceRoute<A> {
         Self {
             domain: Arc::clone(&self.domain),
             handler: Arc::clone(&self.handler),
+            component: self.component.clone(),
         }
     }
 }
@@ -341,6 +369,81 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
             .map_err(|_| RouterError::Stopped)
     }
 
+    pub(crate) fn route_to_component(&self, stanza: RoutedStanza<A>) -> Result<(), RouterError> {
+        let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
+        let to = view
+            .to()
+            .map_err(|_| RouterError::InvalidTarget)?
+            .ok_or(RouterError::InvalidTarget)?;
+        let from = view
+            .from()
+            .map_err(|_| RouterError::InvalidTarget)?
+            .ok_or(RouterError::InvalidTarget)?;
+        let route = self
+            .service(to.domainpart())
+            .ok_or(RouterError::InvalidTarget)?;
+        let registry = route.component.as_ref().ok_or(RouterError::InvalidTarget)?;
+        if !self.hosts.is_local_host(from.domainpart()) {
+            return Err(RouterError::InvalidTarget);
+        }
+        if self.state() != RouterState::Running {
+            return Err(RouterError::Stopped);
+        }
+        registry
+            .enqueue(&route.domain, stanza)
+            .map_err(|error| match error {
+                EnqueueError::NotConnected | EnqueueError::Stopped => RouterError::Offline,
+                EnqueueError::Busy => RouterError::Busy,
+            })
+    }
+
+    pub(crate) async fn route_to_component_or_bounce(
+        &self,
+        stanza: RoutedStanza<A>,
+    ) -> Result<(), RouterError> {
+        let (condition, text) = match self.route_to_component(stanza.clone()) {
+            Err(RouterError::Offline) => (
+                StanzaErrorCondition::RemoteServerTimeout,
+                StanzaErrorText::Static(NOT_CONNECTED_TEXT),
+            ),
+            Err(RouterError::Busy) => (
+                StanzaErrorCondition::ResourceConstraint,
+                StanzaErrorCondition::ResourceConstraint.default_text(),
+            ),
+            Err(error @ (RouterError::Stopped | RouterError::Unavailable)) => return Err(error),
+            _ => return Ok(()),
+        };
+        let view = stanza.resolve().map_err(|_| RouterError::Unavailable)?;
+        if !matches!(
+            view.stanza_type(),
+            StanzaType::Presence(
+                PresenceType::Subscribe
+                    | PresenceType::Subscribed
+                    | PresenceType::Unsubscribe
+                    | PresenceType::Unsubscribed
+            )
+        ) {
+            return Ok(());
+        }
+        let mut arena = Arena::try_new_in(Default::default(), self.local.allocator())
+            .map_err(|_| RouterError::Unavailable)?;
+        let reply = view
+            .clone_in(&mut arena)
+            .map_err(|_| RouterError::Unavailable)?
+            .error_reply_described_in(&mut arena, condition, None, text)
+            .map_err(|_| RouterError::Unavailable)?
+            .bare_to()
+            .build()
+            .map_err(|_| RouterError::Unavailable)?;
+        match self
+            .route_presence_error(RoutedStanza::from_parts(reply, arena))
+            .await
+        {
+            Err(error @ (RouterError::Stopped | RouterError::Unavailable)) => Err(error),
+            _ => Ok(()),
+        }
+    }
+
     pub(crate) fn iq_requests(&self) -> &Arc<IqRequests<A>> {
         &self.iq_requests
     }
@@ -375,6 +478,11 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
             (Some(_), None) => Destination::Account,
             (Some(_), Some(_)) => Destination::Resource,
         }
+    }
+
+    pub(crate) fn is_component_domain(&self, domain: &str) -> bool {
+        self.service(domain)
+            .is_some_and(|route| route.component.is_some())
     }
 
     pub(crate) fn service(&self, domain: &str) -> Option<&ServiceRoute<A>> {
@@ -736,25 +844,19 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
     pub(crate) async fn route_current_presence(
         &self,
         source: &AccountKey,
-        target: &AccountKey,
+        target: &str,
     ) -> Result<(), RouterError> {
+        let domain = bare_jid_domain(target);
+        let remote = !self.hosts.is_local_host(domain);
+        let component = self.is_component_domain(domain);
         if !self.hosts.is_local_host(source.domain())
-            || (!self.hosts.is_local_host(target.domain()) && !self.federation_enabled())
+            || (remote && !component && !self.federation_enabled())
         {
             return Err(RouterError::RemoteUnsupported);
         }
-        let remote = !self.hosts.is_local_host(target.domain());
         for stanza in self.current_presence(source, target).await? {
-            if remote {
-                if let Err(RouterError::Stopped) = self.route_remote_or_bounce(stanza) {
-                    return Err(RouterError::Stopped);
-                }
-            } else {
-                match self.local.deliver_presence(stanza).await {
-                    Ok(()) | Err(RouterError::NotFound | RouterError::Busy) => {}
-                    Err(error) => return Err(error),
-                }
-            }
+            self.route_roster_presence(stanza, component, remote)
+                .await?;
         }
         Ok(())
     }
@@ -790,7 +892,7 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
     pub(crate) async fn current_presence(
         &self,
         source: &AccountKey,
-        target: &AccountKey,
+        target: &str,
     ) -> Result<Vec<RoutedStanza<A>>, RouterError> {
         let snapshot = self.local.presence_snapshot(source).await?;
         let mut stanzas = Vec::with_capacity(snapshot.len());
@@ -803,12 +905,11 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
     fn readdress(
         &self,
         stanza: &RoutedStanza<A>,
-        target: &AccountKey,
+        target: &str,
     ) -> Result<RoutedStanza<A>, RouterError> {
         let mut arena = Arena::try_new_in(Default::default(), self.local.allocator())
             .map_err(|_| RouterError::Unavailable)?;
-        let target =
-            Jid::parse_in(target.as_str(), &mut arena).map_err(|_| RouterError::InvalidTarget)?;
+        let target = Jid::parse_in(target, &mut arena).map_err(|_| RouterError::InvalidTarget)?;
         let stanza = stanza
             .resolve()
             .map_err(|_| RouterError::Unavailable)?
@@ -824,14 +925,16 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
     pub(crate) async fn route_unavailable_presence(
         &self,
         source: &AccountKey,
-        target: &AccountKey,
+        target: &str,
     ) -> Result<(), RouterError> {
+        let domain = bare_jid_domain(target);
+        let remote = !self.hosts.is_local_host(domain);
+        let component = self.is_component_domain(domain);
         if !self.hosts.is_local_host(source.domain())
-            || (!self.hosts.is_local_host(target.domain()) && !self.federation_enabled())
+            || (remote && !component && !self.federation_enabled())
         {
             return Err(RouterError::RemoteUnsupported);
         }
-        let remote = !self.hosts.is_local_host(target.domain());
         for stanza in self.local.withdrawal_snapshot(source).await? {
             let mut arena = Arena::try_new_in(Default::default(), self.local.allocator())
                 .map_err(|_| RouterError::Unavailable)?;
@@ -843,8 +946,8 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
                 .ok_or(RouterError::Unavailable)?;
             let from =
                 Jid::parse_in(from.as_str(), &mut arena).map_err(|_| RouterError::Unavailable)?;
-            let target = Jid::parse_in(target.as_str(), &mut arena)
-                .map_err(|_| RouterError::InvalidTarget)?;
+            let target =
+                Jid::parse_in(target, &mut arena).map_err(|_| RouterError::InvalidTarget)?;
             let stanza = Stanza::builder_in(
                 StanzaType::Presence(PresenceType::Unavailable),
                 StanzaNamespace::Client,
@@ -857,18 +960,34 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
             .build()
             .map_err(|_| RouterError::Unavailable)?;
             let stanza = RoutedStanza::from_parts(stanza, arena);
-            if remote {
-                if let Err(RouterError::Stopped) = self.route_remote_or_bounce(stanza) {
-                    return Err(RouterError::Stopped);
-                }
-                continue;
-            }
-            match self.local.deliver_presence(stanza).await {
-                Ok(()) | Err(RouterError::NotFound | RouterError::Busy) => {}
-                Err(error) => return Err(error),
-            }
+            self.route_roster_presence(stanza, component, remote)
+                .await?;
         }
         Ok(())
+    }
+
+    async fn route_roster_presence(
+        &self,
+        stanza: RoutedStanza<A>,
+        component: bool,
+        remote: bool,
+    ) -> Result<(), RouterError> {
+        if component {
+            match self.route_to_component(stanza) {
+                Ok(()) | Err(RouterError::Offline | RouterError::Busy) => Ok(()),
+                Err(error) => Err(error),
+            }
+        } else if remote {
+            match self.route_remote_or_bounce(stanza) {
+                Err(RouterError::Stopped) => Err(RouterError::Stopped),
+                _ => Ok(()),
+            }
+        } else {
+            match self.local.deliver_presence(stanza).await {
+                Ok(()) | Err(RouterError::NotFound | RouterError::Busy) => Ok(()),
+                Err(error) => Err(error),
+            }
+        }
     }
 
     pub(crate) async fn broadcast_presence(
@@ -1167,6 +1286,10 @@ impl fmt::Display for RouterError {
 }
 
 impl std::error::Error for RouterError {}
+
+fn bare_jid_domain(jid: &str) -> &str {
+    jid.split_once('@').map_or(jid, |(_, domain)| domain)
+}
 
 #[cfg(test)]
 mod tests;

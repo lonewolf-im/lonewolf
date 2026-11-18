@@ -104,10 +104,7 @@ async fn fixture(service: Arc<TestService>) -> TestResult<Fixture> {
         .router
         .with_services(BTreeMap::from([(
             "echo.localhost".into(),
-            ServiceRoute {
-                domain: Arc::from("echo.localhost"),
-                handler: service,
-            },
+            ServiceRoute::extension(Arc::from("echo.localhost"), service),
         )]))
         .with_extensions(BTreeMap::from([(
             "localhost".into(),

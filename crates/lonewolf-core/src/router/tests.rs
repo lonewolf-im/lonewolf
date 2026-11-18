@@ -9,7 +9,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use crate::config::Config;
+use crate::component::credentials;
+use crate::component::metrics::ComponentMetrics;
+use crate::component::registry::{ComponentRegistry, NOT_CONNECTED_TEXT};
+use crate::config::{ComponentLimits, ComponentsConfig, Config};
+use crate::delivery::RouterDelivery;
 use crate::hosts::Hosts;
 use crate::router::local::{LocalRouter, RetireCause};
 use crate::router::{
@@ -19,7 +23,7 @@ use crate::router::{
 use compio::runtime::Runtime;
 use compio::time::timeout;
 use lonewolf_extension::ExtensionFuture;
-use lonewolf_extension::delivery::{BoundResource, HandlerError};
+use lonewolf_extension::delivery::{BoundResource, Delivery, HandlerError, HostLookup};
 use lonewolf_extension::delivery::{DeliveryError, SessionTag};
 use lonewolf_extension::offline::Offline;
 use lonewolf_extension::service::{ServiceContext, ServiceHandler};
@@ -31,7 +35,9 @@ use lonewolf_util::core_dispatcher::CoreDispatcher;
 use lonewolf_util::pool::{PoolConfig, PooledChunkAllocator};
 use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::parser::{ParserConfig, StreamEvent, XmppParser};
-use lonewolf_xmpp::stanza::{Element, IqType, Stanza, StanzaKind, StanzaNamespace, StanzaType};
+use lonewolf_xmpp::stanza::{
+    Element, IqType, PresenceType, Stanza, StanzaKind, StanzaNamespace, StanzaType,
+};
 
 type TestResult = Result<(), Box<dyn Error>>;
 type TestRosterPush = Result<RoutedStanza<GlobalChunkAllocator>, RouterError>;
@@ -59,10 +65,7 @@ fn destination_classifies_each_address_shape() -> TestResult {
     run_test(async {
         let router = setup()?.with_services(BTreeMap::from([(
             "echo.localhost".into(),
-            ServiceRoute {
-                domain: Arc::from("echo.localhost"),
-                handler: Arc::new(TestService),
-            },
+            ServiceRoute::extension(Arc::from("echo.localhost"), Arc::new(TestService)),
         )]));
         let handle = router.handle();
         let mut arena = Arena::try_new(ArenaConfig::default())?;
@@ -80,6 +83,328 @@ fn destination_classifies_each_address_shape() -> TestResult {
             assert_eq!(handle.destination(jid.resolve(&arena)?), expected);
         }
         router.shutdown().await?;
+        Ok(())
+    })
+}
+
+const COMPONENT_DOMAIN: &str = "irc.example.test";
+const COMPONENT_CONTACTS: [&str; 2] =
+    [COMPONENT_DOMAIN, "irc-server.example.test@irc.example.test"];
+
+struct ComponentRouting {
+    router: Router<GlobalChunkAllocator>,
+    registry: ComponentRegistry<GlobalChunkAllocator>,
+    metrics: Arc<ComponentMetrics>,
+}
+
+impl ComponentRouting {
+    fn new(capacity: NonZeroUsize) -> Result<Self, Box<dyn Error>> {
+        let config: ComponentsConfig =
+            toml::from_str("[domains.'irc.example.test']\nsecret = 'component-test-secret-0001'")?;
+        let limits = ComponentLimits {
+            max_queued_stanzas: capacity,
+            ..ComponentLimits::default()
+        };
+        let metrics = ComponentMetrics::new(1, 1);
+        let registry = ComponentRegistry::new(
+            &config,
+            credentials::load(&config)?,
+            &limits,
+            metrics.clone(),
+        );
+        let router = setup()?.with_services(BTreeMap::from([
+            (
+                COMPONENT_DOMAIN.into(),
+                ServiceRoute::component(Arc::from(COMPONENT_DOMAIN), registry.clone()),
+            ),
+            (
+                "echo.localhost".into(),
+                ServiceRoute::extension(Arc::from("echo.localhost"), Arc::new(TestService)),
+            ),
+        ]));
+        Ok(Self {
+            router,
+            registry,
+            metrics,
+        })
+    }
+
+    fn assert_rejections(&self, reason: &str, count: usize) -> TestResult {
+        let mut root = prometheus_client::registry::Registry::default();
+        self.metrics
+            .register(root.sub_registry_with_prefix("lonewolf"));
+        let mut samples = String::new();
+        prometheus_client::encoding::text::encode(&mut samples, &root)?;
+        let expected = format!(
+            r#"lonewolf_component_admission_rejections_total{{reason="{reason}"}} {count}"#
+        );
+        assert!(samples.lines().any(|line| line == expected), "{samples}");
+        Ok(())
+    }
+}
+
+#[test]
+fn route_to_component_enqueues_unchanged_stanzas_for_domain_and_localpart_targets() -> TestResult {
+    run_test(async {
+        let fixture = ComponentRouting::new(NonZeroUsize::MIN)?;
+        let handle = fixture.router.handle();
+        let mut link = fixture
+            .registry
+            .attach(COMPONENT_DOMAIN)
+            .map_err(|_| "attach")?;
+        for contact in COMPONENT_CONTACTS {
+            handle.route_to_component(parse_stanza(&format!(
+                "<presence from='alice@localhost' to='{contact}' type='subscribe' id='request'/>"
+            )).await?)?;
+            let queued = link.try_next().ok_or("queued subscription")?;
+            let view = queued.resolve()?;
+            assert_eq!(view.from()?.ok_or("sender")?.as_str(), "alice@localhost");
+            assert_eq!(view.to()?.ok_or("recipient")?.as_str(), contact);
+            assert_eq!(
+                view.stanza_type(),
+                StanzaType::Presence(PresenceType::Subscribe)
+            );
+            assert_eq!(view.id()?, Some("request"));
+            assert!(link.try_next().is_none());
+        }
+        drop(link);
+        fixture.router.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn route_to_component_rejects_extension_services_remote_domains_and_nonlocal_senders() -> TestResult
+{
+    run_test(async {
+        let fixture = ComponentRouting::new(NonZeroUsize::MIN)?;
+        let handle = fixture.router.handle();
+        let mut link = fixture
+            .registry
+            .attach(COMPONENT_DOMAIN)
+            .map_err(|_| "attach")?;
+        for (from, to) in [
+            ("alice@localhost", "echo.localhost"),
+            ("alice@localhost", "bot@echo.localhost"),
+            ("alice@localhost", "remote.example.test"),
+            ("alice@localhost", "bot@remote.example.test"),
+            ("bob@remote.example.test", COMPONENT_CONTACTS[0]),
+            ("bob@remote.example.test", COMPONENT_CONTACTS[1]),
+        ] {
+            let stanza = parse_stanza(&format!(
+                "<presence from='{from}' to='{to}' type='subscribe'/>"
+            ))
+            .await?;
+            assert_eq!(
+                handle.route_to_component(stanza),
+                Err(RouterError::InvalidTarget)
+            );
+        }
+        assert!(link.try_next().is_none());
+        fixture.assert_rejections("not_connected", 0)?;
+        drop(link);
+        fixture.router.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn component_bounce_answers_each_subscription_type_when_not_connected() -> TestResult {
+    run_test(async {
+        let fixture = ComponentRouting::new(NonZeroUsize::MIN)?;
+        let handle = fixture.router.handle();
+        let owner = account("alice@localhost")?;
+        let desk = handle
+            .register(&owner, Some("desk"), NonZeroUsize::MIN)
+            .await?;
+        desk.handle()
+            .set_presence(Some(0), presence("desk").await?, None)
+            .await?;
+        let mut attempts = 0;
+        for contact in COMPONENT_CONTACTS {
+            for kind in ["subscribe", "subscribed", "unsubscribe", "unsubscribed"] {
+                handle.route_to_component_or_bounce(parse_stanza(&format!(
+                    "<presence from='alice@localhost' to='{contact}' type='{kind}' id='{kind}'/>"
+                )).await?).await?;
+                let entries = desk.take_queued();
+                assert_eq!(entries.len(), 1);
+                let error = entries[0].stanza.resolve()?;
+                assert_eq!(error.from()?.ok_or("sender")?.as_str(), contact);
+                assert_eq!(error.to()?.ok_or("recipient")?.as_str(), "alice@localhost");
+                assert_eq!(error.id()?, Some(kind));
+                assert_eq!(
+                    error.stanza_type(),
+                    StanzaType::Presence(PresenceType::Error)
+                );
+                let mut xml = String::new();
+                error.write_xml(&mut xml)?;
+                assert!(
+                    xml.contains("<error type='wait'") || xml.contains(r#"<error type="wait""#),
+                    "{xml}"
+                );
+                assert!(xml.contains("<remote-server-timeout"), "{xml}");
+                assert!(xml.contains(NOT_CONNECTED_TEXT), "{xml}");
+                attempts += 1;
+                fixture.assert_rejections("not_connected", attempts)?;
+            }
+            for attribute in ["", " type='unavailable'", " type='probe'"] {
+                handle
+                    .route_to_component_or_bounce(
+                        parse_stanza(&format!(
+                            "<presence from='alice@localhost' to='{contact}'{attribute}/>"
+                        ))
+                        .await?,
+                    )
+                    .await?;
+                assert!(desk.take_queued().is_empty());
+                attempts += 1;
+                fixture.assert_rejections("not_connected", attempts)?;
+            }
+        }
+        drop(desk);
+        fixture.router.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn component_bounce_reports_resource_constraint_when_the_queue_is_full() -> TestResult {
+    run_test(async {
+        let fixture = ComponentRouting::new(NonZeroUsize::MIN)?;
+        let handle = fixture.router.handle();
+        let owner = account("alice@localhost")?;
+        let desk = handle
+            .register(&owner, Some("desk"), NonZeroUsize::MIN)
+            .await?;
+        desk.handle()
+            .set_presence(Some(0), presence("desk").await?, None)
+            .await?;
+        let mut link = fixture
+            .registry
+            .attach(COMPONENT_DOMAIN)
+            .map_err(|_| "attach")?;
+        for (index, contact) in COMPONENT_CONTACTS.into_iter().enumerate() {
+            handle.route_to_component(
+                parse_stanza(&format!(
+                    "<presence from='alice@localhost' to='{contact}' type='probe' id='queued'/>"
+                ))
+                .await?,
+            )?;
+            handle.route_to_component_or_bounce(parse_stanza(&format!(
+                "<presence from='alice@localhost' to='{contact}' type='subscribe' id='busy'/>"
+            )).await?).await?;
+            let entries = desk.take_queued();
+            assert_eq!(entries.len(), 1);
+            let error = entries[0].stanza.resolve()?;
+            assert_eq!(error.from()?.ok_or("sender")?.as_str(), contact);
+            assert_eq!(error.id()?, Some("busy"));
+            assert_eq!(
+                error.stanza_type(),
+                StanzaType::Presence(PresenceType::Error)
+            );
+            let mut xml = String::new();
+            error.write_xml(&mut xml)?;
+            assert!(xml.contains("<resource-constraint"), "{xml}");
+            let queued = link.try_next().ok_or("queued probe")?;
+            assert_eq!(queued.resolve()?.id()?, Some("queued"));
+            assert!(link.try_next().is_none());
+            fixture.assert_rejections("queue_full", index + 1)?;
+        }
+        drop((link, desk));
+        fixture.router.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn stopped_component_registry_is_reported_as_offline() -> TestResult {
+    run_test(async {
+        let fixture = ComponentRouting::new(NonZeroUsize::MIN)?;
+        let handle = fixture.router.handle();
+        let delivery = RouterDelivery::new(&handle, &GlobalChunkAllocator, None);
+        fixture.registry.stop();
+        for (index, contact) in COMPONENT_CONTACTS.into_iter().enumerate() {
+            let stanza = parse_stanza(&format!(
+                "<presence from='alice@localhost' to='{contact}' type='subscribe'/>"
+            ))
+            .await?;
+            assert_eq!(
+                handle.route_to_component(stanza.clone()),
+                Err(RouterError::Offline)
+            );
+            delivery.to_remote(stanza).await?;
+            fixture.assert_rejections("stopped", (index + 1) * 2)?;
+        }
+        fixture.router.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn current_and_unavailable_presence_reach_component_contacts_without_federation() -> TestResult {
+    run_test(async {
+        let limit = NonZeroUsize::MIN.saturating_add(1);
+        let fixture = ComponentRouting::new(limit)?;
+        let handle = fixture.router.handle();
+        assert!(!handle.federation_enabled());
+        let owner = account("alice@localhost")?;
+        let desk = handle.register(&owner, Some("desk"), limit).await?;
+        let phone = handle.register(&owner, Some("phone"), limit).await?;
+        for resource in [&desk, &phone] {
+            resource
+                .handle()
+                .set_presence(
+                    Some(0),
+                    presence(resource.resource()).await?,
+                    Some(unavailable_presence(resource.resource()).await?),
+                )
+                .await?;
+        }
+        let mut link = fixture
+            .registry
+            .attach(COMPONENT_DOMAIN)
+            .map_err(|_| "attach")?;
+        for contact in COMPONENT_CONTACTS {
+            for kind in [PresenceType::Available, PresenceType::Unavailable] {
+                match kind {
+                    PresenceType::Available => {
+                        handle.route_current_presence(&owner, contact).await?
+                    }
+                    _ => handle.route_unavailable_presence(&owner, contact).await?,
+                }
+                let mut sources = Vec::new();
+                while let Some(stanza) = link.try_next() {
+                    let view = stanza.resolve()?;
+                    assert_eq!(view.stanza_type(), StanzaType::Presence(kind));
+                    assert_eq!(view.to()?.ok_or("recipient")?.as_str(), contact);
+                    sources.push(view.from()?.ok_or("sender")?.as_str().to_owned());
+                }
+                sources.sort_unstable();
+                assert_eq!(sources, ["alice@localhost/desk", "alice@localhost/phone"]);
+            }
+        }
+        drop((desk, phone, link));
+        fixture.router.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn component_domain_lookup_distinguishes_components_from_services_and_hosts() -> TestResult {
+    run_test(async {
+        let fixture = ComponentRouting::new(NonZeroUsize::MIN)?;
+        let handle = fixture.router.handle();
+        let delivery = RouterDelivery::new(&handle, &GlobalChunkAllocator, None);
+        for (domain, expected) in [
+            (COMPONENT_DOMAIN, true),
+            ("echo.localhost", false),
+            ("localhost", false),
+            ("remote.example.test", false),
+        ] {
+            assert_eq!(handle.is_component_domain(domain), expected);
+            assert_eq!(delivery.is_component_domain(domain), expected);
+        }
+        fixture.router.shutdown().await?;
         Ok(())
     })
 }
@@ -2013,7 +2338,7 @@ fn withdrawal_sees_disconnecting_presence_until_terminal_delivery_finishes() -> 
         assert!(alice_desk.end_presence().await?.unavailable.is_some());
         assert!(handle.local.presence_snapshot(&alice).await?.is_empty());
         handle
-            .route_unavailable_presence(&alice, &bob_account)
+            .route_unavailable_presence(&alice, bob_account.as_str())
             .await?;
         let unavailable = receive_routed(&bob).await?;
         let view = unavailable.resolve()?;

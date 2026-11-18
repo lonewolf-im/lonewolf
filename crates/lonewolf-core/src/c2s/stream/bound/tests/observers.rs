@@ -398,10 +398,10 @@ fn service_events_report_holders_and_rejections() -> TestResult {
         let (mut fixture, recorder) = fixture(false).await?;
         fixture.router = fixture.router.with_services(BTreeMap::from([(
             "echo.localhost".into(),
-            ServiceRoute {
-                domain: Arc::from("echo.localhost"),
-                handler: Arc::new(TestService { reply: None }),
-            },
+            ServiceRoute::extension(
+                Arc::from("echo.localhost"),
+                Arc::new(TestService { reply: None }),
+            ),
         )]));
         let desk = register(&fixture, "alice@localhost", "desk").await?;
         let sender = desk.session_id();
@@ -459,10 +459,10 @@ fn service_received_events_hold_the_admitted_session() -> TestResult {
         );
         fixture.router = fixture.router.with_services(BTreeMap::from([(
             "echo.localhost".into(),
-            ServiceRoute {
-                domain: Arc::from("echo.localhost"),
-                handler: Arc::new(TestService { reply: Some(reply) }),
-            },
+            ServiceRoute::extension(
+                Arc::from("echo.localhost"),
+                Arc::new(TestService { reply: Some(reply) }),
+            ),
         )]));
         let desk = register(&fixture, "alice@localhost", "desk").await?;
         let sender = desk.session_id();

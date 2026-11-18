@@ -70,7 +70,7 @@ struct RecordingDelivery {
     available: RefCell<Vec<String>>,
     unavailable: Cell<usize>,
     current: Cell<usize>,
-    presence_targets: RefCell<Vec<(AccountKey, AccountKey)>>,
+    presence_targets: RefCell<Vec<(AccountKey, String)>>,
     failing_deliveries: Cell<usize>,
 }
 
@@ -169,27 +169,19 @@ impl Delivery<GlobalChunkAllocator> for RecordingDelivery {
         Box::pin(async { Ok(()) })
     }
 
-    fn current_presence<'a>(
-        &'a self,
-        from: &'a AccountKey,
-        to: &'a AccountKey,
-    ) -> DeliveryFuture<'a> {
+    fn current_presence<'a>(&'a self, from: &'a AccountKey, to: &'a str) -> DeliveryFuture<'a> {
         self.presence_targets
             .borrow_mut()
-            .push((from.clone(), to.clone()));
+            .push((from.clone(), to.to_owned()));
         self.events.borrow_mut().push("current");
         self.current.set(self.current.get() + 1);
         Box::pin(async { Ok(()) })
     }
 
-    fn unavailable_presence<'a>(
-        &'a self,
-        from: &'a AccountKey,
-        to: &'a AccountKey,
-    ) -> DeliveryFuture<'a> {
+    fn unavailable_presence<'a>(&'a self, from: &'a AccountKey, to: &'a str) -> DeliveryFuture<'a> {
         self.presence_targets
             .borrow_mut()
-            .push((from.clone(), to.clone()));
+            .push((from.clone(), to.to_owned()));
         self.events.borrow_mut().push("unavailable");
         self.unavailable.set(self.unavailable.get() + 1);
         Box::pin(async { Ok(()) })
@@ -2530,6 +2522,80 @@ fn remote_removal_and_account_deletion_notify_only_the_remote_contact()
     Ok(())
 }
 
+#[test]
+fn federated_cleanup_skips_stored_full_jids() -> Result<(), Box<dyn std::error::Error>> {
+    for deleting in [false, true] {
+        let (_directory, fixture) = roster();
+        let owner = account("alice@example.com");
+        create_account(&fixture, &owner);
+        let mut arena = Arena::try_new(Default::default())?;
+        let full = Jid::parse_in("bob@remote.invalid/desk", &mut arena)?;
+        let pending_sender = Jid::parse_in("other@remote.invalid/phone", &mut arena)?;
+        let contact = RosterJid::from(full.resolve(&arena)?);
+        let pending_sender = RosterJid::from(pending_sender.resolve(&arena)?);
+        let delivery = RecordingDelivery {
+            federated: true,
+            ..Default::default()
+        };
+        block_on(async {
+            let mut tx = fixture.storage.begin_write().await?;
+            tx.put_roster_item(
+                &owner,
+                &subscribed(contact.clone(), SubscriptionState::Both),
+                RosterQuota::default(),
+            )
+            .await?;
+            if deleting {
+                tx.put_pending_request(
+                    &owner,
+                    PendingSubscription {
+                        sender: pending_sender,
+                        stanza: b"pending".as_slice().into(),
+                    },
+                    std::num::NonZeroUsize::MIN,
+                )
+                .await?;
+            }
+            tx.commit().await?;
+            let mut tx = fixture.storage.begin_write().await?;
+            let deliver = if deleting {
+                let before = Arc::new(fixture.storage.begin_read().await?);
+                tx.delete_account(&owner).await?;
+                TestAccountHandler::forget_account(
+                    &Roster::default(),
+                    &mut tx,
+                    &owner,
+                    before,
+                    &delivery,
+                )
+                .await
+                .map_err(|error| format!("{error:?}"))?
+            } else {
+                super::subscription::remove_item(
+                    &Roster::default(),
+                    &mut tx,
+                    owner.clone(),
+                    contact,
+                    RosterJid::from(&owner),
+                    &delivery,
+                )
+                .await
+                .map_err(|error| format!("{error:?}"))?
+                .deliver
+            };
+            tx.commit().await?;
+            deliver(&delivery).await?;
+            Ok::<_, Box<dyn std::error::Error>>(())
+        })?;
+        assert!(delivery.remote.borrow().is_empty());
+        assert_eq!(delivery.unavailable.get(), 0);
+        assert_eq!(delivery.pushes.borrow().len(), usize::from(!deleting));
+        assert!(snapshot(&fixture, &owner).items.is_empty());
+        assert!(pending(&fixture, &owner).is_empty());
+    }
+    Ok(())
+}
+
 fn remote_request(
     kind: PresenceRequestType,
     sender: &str,
@@ -2825,7 +2891,7 @@ fn remote_inbound_subscription_table() -> Result<(), Box<dyn std::error::Error>>
             assert_eq!(targets.len(), usize::from(unavailable));
             if let Some((from, to)) = targets.first() {
                 assert_eq!(from, &owner);
-                assert_eq!(to, &remote);
+                assert_eq!(to, remote.as_str());
             }
             for xml in delivery.remote.borrow().iter() {
                 assert!(

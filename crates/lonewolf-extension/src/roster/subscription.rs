@@ -223,10 +223,12 @@ async fn send_remote_subscription<A: ChunkAllocator, W: WriteTransaction>(
                         push_change(&owner, mutation, delivery).await?;
                     }
                     if grant {
-                        delivery.current_presence(&owner, &contact).await?;
+                        delivery.current_presence(&owner, contact.as_str()).await?;
                     }
                     if revoke {
-                        delivery.unavailable_presence(&owner, &contact).await?;
+                        delivery
+                            .unavailable_presence(&owner, contact.as_str())
+                            .await?;
                     }
                     Ok(())
                 }
@@ -436,17 +438,18 @@ pub(super) async fn receive_remote<A: ChunkAllocator, W: WriteTransaction>(
                     .await?;
             }
             if cancel || current_presence || unavailable_presence {
-                let contact = AccountKey::try_from(&contact).map_err(|_| DeliveryError)?;
                 if cancel {
                     let (_, reply) =
-                        xml::subscription_withdrawals(&owner, &contact, delivery.arena()?)?;
+                        xml::subscription_withdrawals(&owner, contact.as_str(), delivery.arena()?)?;
                     delivery.to_remote(reply).await?;
                 }
                 if current_presence {
-                    delivery.current_presence(&owner, &contact).await?;
+                    delivery.current_presence(&owner, contact.as_str()).await?;
                 }
                 if unavailable_presence {
-                    delivery.unavailable_presence(&owner, &contact).await?;
+                    delivery
+                        .unavailable_presence(&owner, contact.as_str())
+                        .await?;
                 }
             }
             Ok(())
@@ -554,7 +557,7 @@ pub(super) async fn request_subscription<A: ChunkAllocator, W: WriteTransaction>
                         if let Some(mutation) = approved {
                             push_change(&sender, mutation, delivery).await?;
                         }
-                        delivery.current_presence(&target, &sender).await
+                        delivery.current_presence(&target, sender.as_str()).await
                     }
                     RequestOutcome::PreApproved { grantor, requester } => {
                         if let Some(mutation) = grantor {
@@ -565,7 +568,7 @@ pub(super) async fn request_subscription<A: ChunkAllocator, W: WriteTransaction>
                         if let Some(mutation) = requester {
                             push_change(&sender, mutation, delivery).await?;
                         }
-                        delivery.current_presence(&target, &sender).await
+                        delivery.current_presence(&target, sender.as_str()).await
                     }
                     RequestOutcome::AutoApproved { .. } | RequestOutcome::ContactMissing => Ok(()),
                 }
@@ -669,7 +672,7 @@ pub(super) async fn approve_subscription<A: ChunkAllocator, W: WriteTransaction>
                     push_change(&sender, mutation, delivery).await?;
                 }
                 if sender_changed {
-                    delivery.current_presence(&sender, &target).await?;
+                    delivery.current_presence(&sender, target.as_str()).await?;
                 }
                 if let Some(mutation) = pre_approval {
                     push_change(&sender, mutation, delivery).await?;
@@ -728,7 +731,9 @@ pub(super) async fn cancel_subscription<A: ChunkAllocator, W: WriteTransaction>(
             retirements.extract(&sender, &mut outcome.grantor);
             let result = async {
                 if outcome.send_unavailable {
-                    delivery.unavailable_presence(&sender, &target).await?;
+                    delivery
+                        .unavailable_presence(&sender, target.as_str())
+                        .await?;
                 }
                 if outcome.route {
                     delivery.to_tagged(SessionTag::Interested, stanza).await?;
@@ -802,7 +807,9 @@ pub(super) async fn withdraw_subscription<A: ChunkAllocator, W: WriteTransaction
                     push_change(&sender, mutation, delivery).await?;
                 }
                 if outcome.send_unavailable {
-                    delivery.unavailable_presence(&target, &sender).await?;
+                    delivery
+                        .unavailable_presence(&target, sender.as_str())
+                        .await?;
                 }
                 Ok(())
             }
@@ -853,10 +860,10 @@ pub(super) async fn remove_item<A: ChunkAllocator, W: WriteTransaction>(
                 retirements.extract(contact, &mut removal.contact);
             }
             let result = async {
-                if let Some(remote_contact) = &remote_contact {
+                if remote_contact {
                     notify_removed_remote_contact(
                         &owner,
-                        remote_contact,
+                        contact.as_str(),
                         removal.subscription,
                         removal.pending_request,
                         delivery,
@@ -869,7 +876,7 @@ pub(super) async fn remove_item<A: ChunkAllocator, W: WriteTransaction>(
                         notify_removed_contact(&owner, &contact_account, removal, delivery).await?;
                     if contact_granted {
                         delivery
-                            .unavailable_presence(&contact_account, &owner)
+                            .unavailable_presence(&contact_account, owner.as_str())
                             .await?;
                     }
                 }
@@ -1116,16 +1123,14 @@ pub(super) async fn forget_account<
                     {
                         failure.get_or_insert(error);
                     }
-                } else if federated
-                    && let Some(remote) = federated_contact(&owner, &contact, delivery)
-                {
+                } else if federated && federated_contact(&owner, &contact, delivery) {
                     let pending = before
                         .pending_request_exists(&owner, &contact)
                         .await
                         .map_err(|_| DeliveryError)?;
                     if let Err(error) = notify_removed_remote_contact(
                         &owner,
-                        &remote,
+                        contact.as_str(),
                         subscription,
                         pending,
                         delivery,
@@ -1186,10 +1191,10 @@ pub(super) async fn forget_account<
                             failure.get_or_insert(error);
                         }
                     } else if federated
-                        && let Some(remote) = federated_contact(&owner, &sender, delivery)
+                        && federated_contact(&owner, &sender, delivery)
                         && let Err(error) = notify_removed_remote_contact(
                             &owner,
-                            &remote,
+                            sender.as_str(),
                             RosterSubscription::default(),
                             true,
                             delivery,
@@ -1268,7 +1273,8 @@ async fn notify_cancelled_requester<A: ChunkAllocator>(
     delivery: &dyn Delivery<A>,
 ) -> Result<(), DeliveryError> {
     if cancellation.route {
-        let (_, cancelled) = xml::subscription_withdrawals(owner, sender, delivery.arena()?)?;
+        let (_, cancelled) =
+            xml::subscription_withdrawals(owner, sender.as_str(), delivery.arena()?)?;
         delivery
             .to_tagged(SessionTag::Interested, cancelled)
             .await?;
@@ -1291,11 +1297,13 @@ async fn notify_removed_contact<A: ChunkAllocator>(
     let contact_granted = grants(removal.contact_before.unwrap_or_default().state);
     let cancel = owner_granted || removal.pending_request;
     if owner_granted {
-        delivery.unavailable_presence(owner, contact).await?;
+        delivery
+            .unavailable_presence(owner, contact.as_str())
+            .await?;
     }
     if contact_granted || cancel {
         let (withdrawal, cancellation) =
-            xml::subscription_withdrawals(owner, contact, delivery.arena()?)?;
+            xml::subscription_withdrawals(owner, contact.as_str(), delivery.arena()?)?;
         if contact_granted {
             delivery
                 .to_tagged(SessionTag::Interested, withdrawal)
@@ -1319,24 +1327,16 @@ fn local_candidate(jid: &RosterJid, hosts: &dyn HostLookup) -> Option<AccountKey
         .filter(|account| hosts.is_local_host(account.domain()))
 }
 
-fn federated_contact(
-    owner: &AccountKey,
-    jid: &RosterJid,
-    hosts: &dyn HostLookup,
-) -> Option<AccountKey> {
-    if !hosts.federates(owner.domain()) {
-        return None;
-    }
-    let (_, domain) = jid.as_str().split_once('@')?;
-    if hosts.is_local_host(domain) {
-        return None;
-    }
-    AccountKey::try_from(jid).ok()
+fn federated_contact(owner: &AccountKey, jid: &RosterJid, hosts: &dyn HostLookup) -> bool {
+    hosts.federates(owner.domain())
+        && !jid.as_str().contains('/')
+        && jid.as_str().contains('@')
+        && !hosts.is_local_host(jid.domain())
 }
 
 async fn notify_removed_remote_contact<A: ChunkAllocator>(
     owner: &AccountKey,
-    contact: &AccountKey,
+    contact: &str,
     subscription: RosterSubscription,
     pending: bool,
     delivery: &dyn Delivery<A>,

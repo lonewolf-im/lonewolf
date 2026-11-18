@@ -174,11 +174,11 @@ pub(super) fn build_removed_item<A: ChunkAllocator>(
 
 pub(super) fn subscription_withdrawals<A: ChunkAllocator>(
     owner: &AccountKey,
-    contact: &AccountKey,
+    contact: &str,
     mut arena: Arena<A>,
 ) -> Result<(RoutedStanza<A>, RoutedStanza<A>), DeliveryError> {
     let from = Jid::parse_in(owner.as_str(), &mut arena)?;
-    let to = Jid::parse_in(contact.as_str(), &mut arena)?;
+    let to = Jid::parse_in(contact, &mut arena)?;
     let withdrawal = Stanza::builder_in(
         StanzaType::Presence(PresenceType::Unsubscribe),
         StanzaNamespace::Client,

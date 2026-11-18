@@ -69,10 +69,8 @@ impl Fixture {
         let storage = RedbStorage::open(directory.path().join("lonewolf.dat"))?;
         let config = Config::default();
         let hosts = Hosts::new(&config.hosts, None)?;
-        let route = ServiceRoute {
-            domain: Arc::from("echo.localhost"),
-            handler: Arc::new(RejectingService),
-        };
+        let route =
+            ServiceRoute::extension(Arc::from("echo.localhost"), Arc::new(RejectingService));
         services.insert("echo.localhost".into(), route);
         let router =
             Router::new(hosts, LocalRouter::new(GlobalChunkAllocator)).with_services(services);
@@ -174,6 +172,7 @@ secret = 'component-test-secret-0002'",
                 let route = ServiceRoute {
                     domain: Arc::from(domain.as_str()),
                     handler: Arc::new(UnexpectedComponentHandler),
+                    component: Some(registry.clone()),
                 };
                 (domain, route)
             })
@@ -192,6 +191,20 @@ secret = 'component-test-secret-0002'",
             connection_id,
         })
     }
+}
+
+#[test]
+fn outbound_component_domain_lookup_excludes_extension_services_and_hosts() -> TestResult {
+    run(async {
+        let fixture = ComponentFixture::new()?;
+        let outbound = fixture.service.outbound();
+        assert!(outbound.is_component_domain("muc.localhost"));
+        for domain in ["echo.localhost", "localhost", "remote.example.test"] {
+            assert!(!outbound.is_component_domain(domain));
+        }
+        fixture.service.router.shutdown().await?;
+        Ok(())
+    })
 }
 
 struct ReplyingService {
@@ -226,13 +239,13 @@ async fn replying_route(
     for (xml, accepted) in replies {
         stanzas.push((parsed(xml).await?, *accepted));
     }
-    Ok(ServiceRoute {
-        domain: Arc::from("echo.localhost"),
-        handler: Arc::new(ReplyingService {
+    Ok(ServiceRoute::extension(
+        Arc::from("echo.localhost"),
+        Arc::new(ReplyingService {
             replies: stanzas,
             result,
         }),
-    })
+    ))
 }
 
 const GET: &str = concat!(
@@ -606,10 +619,10 @@ fn registered_service_federation_requires_the_global_gate_and_certificate_covera
                     .map(|domain| {
                         (
                             domain.into(),
-                            ServiceRoute {
-                                domain: Arc::from(domain),
-                                handler: Arc::new(RejectingService) as _,
-                            },
+                            ServiceRoute::extension(
+                                Arc::from(domain),
+                                Arc::new(RejectingService) as _,
+                            ),
                         )
                     })
                     .collect(),
@@ -647,7 +660,7 @@ fn service_remote_outbound_uses_real_admission_and_maps_each_failure() -> TestRe
         for initial in [AdmissionState::Link, AdmissionState::Backoff(RemoteFailure::NotFound), AdmissionState::Backoff(RemoteFailure::Timeout)] {
             let link = matches!(initial, AdmissionState::Link);
             let mut remote = RemoteFixture::with_hosts_and_pair(initial, NonZeroUsize::MIN, hosts.clone(), ("echo.example.com".into(), "remote.test".into()))?;
-            let router = Router::new(hosts.clone(), LocalRouter::new(GlobalChunkAllocator)).with_remote(remote.remote()).with_services(BTreeMap::from([("echo.example.com".into(), ServiceRoute { domain: Arc::from("echo.example.com"), handler: Arc::new(RejectingService) })]));
+            let router = Router::new(hosts.clone(), LocalRouter::new(GlobalChunkAllocator)).with_remote(remote.remote()).with_services(BTreeMap::from([("echo.example.com".into(), ServiceRoute::extension(Arc::from("echo.example.com"), Arc::new(RejectingService)))]));
             let handle = router.handle();
             let mut work = WorkGroup::new();
             let outbound = Outbound { router: &handle, storage: &storage, allocator: &GlobalChunkAllocator, work: &work.handle(), domain: "echo.example.com", component_reply: None };

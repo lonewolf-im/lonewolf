@@ -233,10 +233,10 @@ fn run_internal(
                         }
                         services.insert(
                             domain.clone(),
-                            ServiceRoute {
-                                domain: Arc::from(domain.as_str()),
-                                handler: Arc::clone(handler),
-                            },
+                            ServiceRoute::extension(
+                                Arc::from(domain.as_str()),
+                                Arc::clone(handler),
+                            ),
                         );
                         tracing::info!(service_domain = %domain, "service registered");
                     }
@@ -298,10 +298,13 @@ fn run_internal(
                             return Err(RunError::ServiceDomain { domain: domain.clone() });
                         }
                         let service_domain: Arc<str> = Arc::from(domain.as_str());
-                        services.insert(domain.clone(), ServiceRoute {
-                            domain: Arc::clone(&service_domain),
-                            handler: Arc::new(component::service::ComponentService::new(service_domain, registry.clone())),
-                        });
+                        services.insert(
+                            domain.clone(),
+                            ServiceRoute::extension(
+                                Arc::clone(&service_domain),
+                                Arc::new(component::service::ComponentService::new(service_domain, registry.clone())),
+                            ),
+                        );
                         if configured.discoverable {
                             let parent = component::service::discovery_parent(domain, config.hosts.keys().map(String::as_str));
                             if let Some(parent) = parent

@@ -2818,7 +2818,7 @@ impl<A: ChunkAllocator + Clone> PresenceWork<A> {
             // The ticket keeps subscription revocation behind these deliveries.
             for contact in &audience.contacts {
                 let presence = router
-                    .current_presence(contact, &account)
+                    .current_presence(contact, account.as_str())
                     .await
                     .map_err(|_| CloseOutcome::InternalError)?;
                 replay.extend(presence);

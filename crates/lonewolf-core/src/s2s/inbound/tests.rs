@@ -1318,11 +1318,11 @@ fn direct_sni_normalizes_idna_and_checks_registration_coverage_and_federation()
             BTreeMap::from_iter(["echo.example.com", "echo.other.test"].map(|domain| {
                 (
                     domain.into(),
-                    ServiceRoute {
-                        domain: Arc::from(domain),
-                        handler: Arc::new(UncalledService)
+                    ServiceRoute::extension(
+                        Arc::from(domain),
+                        Arc::new(UncalledService)
                             as Arc<dyn ServiceHandler<GlobalChunkAllocator, RedbStorage>>,
-                    },
+                    ),
                 )
             }))
         };

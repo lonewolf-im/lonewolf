@@ -135,10 +135,11 @@ impl ComponentRouting {
             .register(root.sub_registry_with_prefix("lonewolf"));
         let mut samples = String::new();
         prometheus_client::encoding::text::encode(&mut samples, &root)?;
-        let expected = format!(
-            r#"lonewolf_component_admission_rejections_total{{reason="{reason}"}} {count}"#
-        );
-        assert!(samples.lines().any(|line| line == expected), "{samples}");
+        let prefix =
+            format!(r#"lonewolf_component_admission_rejections_total{{reason="{reason}"}} "#);
+        let sample = samples.lines().find(|line| line.starts_with(&prefix));
+        let expected = (count > 0).then(|| format!("{prefix}{count}"));
+        assert_eq!(sample, expected.as_deref(), "{samples}");
         Ok(())
     }
 }

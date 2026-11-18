@@ -284,7 +284,8 @@ pub trait Delivery<A: ChunkAllocator>: HostLookup {
     /// Sends current presence from each available resource to a bare JID, which may be domain-only.
     fn current_presence<'a>(&'a self, from: &'a AccountKey, to: &'a str) -> DeliveryFuture<'a>;
 
-    /// Sends unavailable presence from each available resource to a bare JID, which may be domain-only.
+    /// Sends unavailable presence to a bare JID, which may be domain-only.
+    /// Includes each available resource and each retiring resource with a pending withdrawal.
     fn unavailable_presence<'a>(&'a self, from: &'a AccountKey, to: &'a str) -> DeliveryFuture<'a>;
 }
 

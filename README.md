@@ -188,6 +188,9 @@ The certificates and ACME account live in `./data/lonewolf/acme.redb`, so keep i
 on durable storage. To test against Let's Encrypt's staging server first, see
 `directory_url` in the config reference.
 
+Running behind a web proxy or in a container? The [deployment guide](docs/DEPLOYMENT.md)
+covers ports, DNS, proxy setup, container permissions and common errors.
+
 ## Managing accounts
 
 `lonewolfctl` talks to the running server over a local Unix socket, which is

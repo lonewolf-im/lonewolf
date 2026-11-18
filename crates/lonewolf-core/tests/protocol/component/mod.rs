@@ -9,6 +9,7 @@ mod registry;
 mod routing;
 mod stream;
 mod stream_conformance;
+mod workflows;
 
 #[test]
 fn configured_component_domains_register_the_component_catalog() -> TestResult {

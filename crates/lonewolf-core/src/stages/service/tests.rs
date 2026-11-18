@@ -2,13 +2,14 @@
 
 use std::collections::BTreeMap;
 use std::error::Error;
+use std::future::Future;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
 use compio::runtime::Runtime;
 use lonewolf_extension::ExtensionFuture;
-use lonewolf_extension::delivery::HandlerError;
+use lonewolf_extension::delivery::{Failure, FailureKind, HandlerError};
 use lonewolf_extension::service::ServiceHandler;
 use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::{ArenaConfig, GlobalChunkAllocator};
@@ -16,13 +17,18 @@ use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::parser::{ParserConfig, StreamEvent, XmppParser};
 
 use super::*;
-use crate::config::Config;
+use crate::component::{credentials, metrics::ComponentMetrics};
+use crate::config::{ComponentLimits, ComponentsConfig, Config};
 use crate::delivery::WorkGroup;
 use crate::hosts::Hosts;
 use crate::router::Router;
 use crate::router::local::LocalRouter;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+
+fn run(test: impl Future<Output = TestResult>) -> TestResult {
+    Runtime::new()?.block_on(compio::time::timeout(Duration::from_secs(5), test))?
+}
 
 struct RejectingService;
 
@@ -53,6 +59,12 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> TestResult<Self> {
+        Self::with_services(BTreeMap::new())
+    }
+
+    fn with_services(
+        mut services: BTreeMap<String, ServiceRoute<GlobalChunkAllocator>>,
+    ) -> TestResult<Self> {
         let directory = tempfile::tempdir()?;
         let storage = RedbStorage::open(directory.path().join("lonewolf.dat"))?;
         let config = Config::default();
@@ -61,8 +73,9 @@ impl Fixture {
             domain: Arc::from("echo.localhost"),
             handler: Arc::new(RejectingService),
         };
-        let router = Router::new(hosts, LocalRouter::new(GlobalChunkAllocator))
-            .with_services(BTreeMap::from([("echo.localhost".into(), route)]));
+        services.insert("echo.localhost".into(), route);
+        let router =
+            Router::new(hosts, LocalRouter::new(GlobalChunkAllocator)).with_services(services);
         let handle = router.handle();
         Ok(Self {
             _directory: directory,
@@ -89,6 +102,7 @@ impl Fixture {
             allocator: &GlobalChunkAllocator,
             work: &self.work,
             domain: "echo.localhost",
+            component_reply: None,
         }
     }
 }
@@ -113,6 +127,340 @@ async fn parsed(xml: &str) -> TestResult<RoutedStanza<GlobalChunkAllocator>> {
         Some(StreamEvent::Stanza(stanza)) => Ok(RoutedStanza::from_parsed(stanza)),
         _ => Err("expected stanza".into()),
     }
+}
+
+struct ComponentFixture {
+    service: Fixture,
+    registry: ComponentRegistry<GlobalChunkAllocator>,
+    metrics: Arc<ComponentMetrics>,
+}
+
+struct UnexpectedComponentHandler;
+
+impl ServiceHandler<GlobalChunkAllocator, RedbStorage> for UnexpectedComponentHandler {
+    fn route<'a>(
+        &'a self,
+        _stanza: RoutedStanza<GlobalChunkAllocator>,
+        _context: ServiceContext<'a, GlobalChunkAllocator, RedbStorage>,
+    ) -> ExtensionFuture<'a, Result<(), HandlerError>> {
+        panic!("the reply path dispatched to a component service handler")
+    }
+}
+
+impl ComponentFixture {
+    fn new() -> TestResult<Self> {
+        let config: ComponentsConfig = toml::from_str(
+            "[domains.'muc.localhost']
+secret = 'component-test-secret-0001'
+max_connections = 2
+[domains.'other.localhost']
+secret = 'component-test-secret-0002'",
+        )?;
+        let limits = ComponentLimits {
+            max_queued_stanzas: NonZeroUsize::MIN,
+            ..ComponentLimits::default()
+        };
+        let metrics = ComponentMetrics::new(1, config.domains.len());
+        let registry = ComponentRegistry::new(
+            &config,
+            credentials::load(&config)?,
+            &limits,
+            metrics.clone(),
+        );
+        let services = config
+            .domains
+            .into_keys()
+            .map(|domain| {
+                let route = ServiceRoute {
+                    domain: Arc::from(domain.as_str()),
+                    handler: Arc::new(UnexpectedComponentHandler),
+                };
+                (domain, route)
+            })
+            .collect();
+        Ok(Self {
+            service: Fixture::with_services(services)?,
+            registry,
+            metrics,
+        })
+    }
+
+    fn target(&self, connection_id: u64) -> Option<ComponentReplyTarget<'_, GlobalChunkAllocator>> {
+        Some(ComponentReplyTarget {
+            registry: &self.registry,
+            domain: "muc.localhost",
+            connection_id,
+        })
+    }
+}
+
+struct ReplyingService {
+    replies: Vec<(RoutedStanza<GlobalChunkAllocator>, bool)>,
+    result: Result<(), HandlerError>,
+}
+
+impl ServiceHandler<GlobalChunkAllocator, RedbStorage> for ReplyingService {
+    fn route<'a>(
+        &'a self,
+        _stanza: RoutedStanza<GlobalChunkAllocator>,
+        context: ServiceContext<'a, GlobalChunkAllocator, RedbStorage>,
+    ) -> ExtensionFuture<'a, Result<(), HandlerError>> {
+        Box::pin(async move {
+            for (index, (reply, accepted)) in self.replies.iter().enumerate() {
+                assert_eq!(
+                    context.outbound.route(reply.clone()).await.is_ok(),
+                    *accepted,
+                    "outbound response {index}"
+                );
+            }
+            self.result
+        })
+    }
+}
+
+async fn replying_route(
+    replies: &[(&str, bool)],
+    result: Result<(), HandlerError>,
+) -> TestResult<ServiceRoute<GlobalChunkAllocator>> {
+    let mut stanzas = Vec::with_capacity(replies.len());
+    for (xml, accepted) in replies {
+        stanzas.push((parsed(xml).await?, *accepted));
+    }
+    Ok(ServiceRoute {
+        domain: Arc::from("echo.localhost"),
+        handler: Arc::new(ReplyingService {
+            replies: stanzas,
+            result,
+        }),
+    })
+}
+
+const GET: &str = concat!(
+    "<iq type='get' id='reply' from='Visitor@MUC.LOCALHOST/nick' to='Room@ECHO.LOCALHOST/handler'>",
+    "<query xmlns='urn:test'/></iq>"
+);
+const RESULT: &str = concat!(
+    "<iq type='result' id='reply' from='room@echo.localhost/handler' ",
+    "to='visitor@muc.localhost/nick'/>"
+);
+
+const HANDLER_FAILURE: HandlerError = HandlerError::Internal {
+    condition: StanzaErrorCondition::InternalServerError,
+    failure: Failure {
+        kind: FailureKind::Delivery,
+        operation: "test_service_reply",
+    },
+};
+
+#[test]
+fn component_dispatch_claims_one_correlated_result_or_error_per_request() -> TestResult {
+    run(async {
+        let fixture = ComponentFixture::new()?;
+        let mut link = fixture
+            .registry
+            .attach("muc.localhost")
+            .map_err(|_| "attach origin")?;
+        let mut spare = fixture
+            .registry
+            .attach("muc.localhost")
+            .map_err(|_| "attach spare")?;
+        let stage = fixture.service.stage();
+        let set = concat!(
+            "<iq type='set' id='reply' from='visitor@muc.localhost/nick' to='room@echo.localhost/handler'>",
+            "<query xmlns='urn:test'/></iq>"
+        );
+        let error = concat!(
+            "<iq type='error' id='reply' from='room@echo.localhost/handler' to='visitor@muc.localhost/nick'>",
+            "<error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>"
+        );
+        for (request, response, kind) in
+            [(GET, RESULT, IqType::Result), (set, error, IqType::Error)]
+        {
+            let route =
+                replying_route(&[(response, true), (response, false)], Err(HANDLER_FAILURE))
+                    .await?;
+            let outcome = dispatch_with_component_reply(
+                &stage,
+                &route,
+                parsed(request).await?,
+                fixture.target(link.id()),
+            )
+            .await
+            .map_err(|_| "dispatch failed")?;
+            assert!(matches!(outcome, ServiceOutcome::Handled));
+            let delivered = link.try_next().ok_or("missing affine reply")?;
+            let view = delivered.resolve()?;
+            assert_eq!(view.stanza_type(), StanzaType::Iq(kind));
+            assert_eq!(view.id()?, Some("reply"));
+            assert_eq!(
+                view.from()?.map(|jid| jid.as_str()),
+                Some("room@echo.localhost/handler")
+            );
+            assert_eq!(
+                view.to()?.map(|jid| jid.as_str()),
+                Some("visitor@muc.localhost/nick")
+            );
+            assert!(link.try_next().is_none());
+            assert!(spare.try_next().is_none());
+        }
+        fixture.service.router.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn component_dispatch_rejects_uncorrelated_stanzas_and_requires_origin_context() -> TestResult {
+    run(async {
+        let fixture = ComponentFixture::new()?;
+        let mut link = fixture
+            .registry
+            .attach("muc.localhost")
+            .map_err(|_| "attach origin")?;
+        let mut other = fixture
+            .registry
+            .attach("other.localhost")
+            .map_err(|_| "attach other domain")?;
+        let stage = fixture.service.stage();
+        let route = replying_route(&[
+            ("<iq type='result' id='reply' from='outside.localhost' to='visitor@muc.localhost/nick'/>", false),
+            ("<iq type='result' id='reply' from='room@echo.localhost/other' to='visitor@muc.localhost/nick'/>", false),
+            ("<iq type='result' id='reply' from='room@echo.localhost/handler' to='other@muc.localhost/nick'/>", false),
+            ("<iq type='result' id='reply' from='room@echo.localhost/handler' to='visitor@muc.localhost/other'/>", false),
+            ("<iq type='result' id='reply' from='room@echo.localhost/handler' to='visitor@other.localhost/nick'/>", false),
+            ("<iq type='result' id='different' from='room@echo.localhost/handler' to='visitor@muc.localhost/nick'/>", false),
+            ("<iq type='get' id='reply' from='room@echo.localhost/handler' to='visitor@muc.localhost/nick'><query xmlns='urn:test'/></iq>", false),
+            ("<message type='chat' id='reply' from='room@echo.localhost/handler' to='visitor@muc.localhost/nick'/>", false),
+        ], Err(HANDLER_FAILURE)).await?;
+        let outcome = dispatch_with_component_reply(
+            &stage,
+            &route,
+            parsed(GET).await?,
+            fixture.target(link.id()),
+        )
+        .await
+        .map_err(|_| "dispatch failed")?;
+        assert!(matches!(
+            outcome,
+            ServiceOutcome::Rejected {
+                condition: StanzaErrorCondition::InternalServerError,
+                ..
+            }
+        ));
+
+        let route = replying_route(&[(RESULT, false)], Err(HANDLER_FAILURE)).await?;
+        let outcome = dispatch(&stage, &route, parsed(GET).await?)
+            .await
+            .map_err(|_| "dispatch failed")?;
+        assert!(matches!(
+            outcome,
+            ServiceOutcome::Rejected {
+                condition: StanzaErrorCondition::InternalServerError,
+                ..
+            }
+        ));
+
+        let nonrequest = parsed("<iq type='result' id='reply' from='visitor@muc.localhost/nick' to='room@echo.localhost/handler'/>").await?;
+        let outcome =
+            dispatch_with_component_reply(&stage, &route, nonrequest, fixture.target(link.id()))
+                .await
+                .map_err(|_| "dispatch failed")?;
+        assert!(matches!(outcome, ServiceOutcome::Handled));
+
+        let other_origin = parsed("<iq type='get' id='reply' from='visitor@other.localhost/nick' to='room@echo.localhost/handler'><query xmlns='urn:test'/></iq>").await?;
+        let other_reply = "<iq type='result' id='reply' from='room@echo.localhost/handler' to='visitor@other.localhost/nick'/>";
+        let route = replying_route(&[(other_reply, false)], Err(HANDLER_FAILURE)).await?;
+        let outcome =
+            dispatch_with_component_reply(&stage, &route, other_origin, fixture.target(link.id()))
+                .await
+                .map_err(|_| "dispatch failed")?;
+        assert!(matches!(
+            outcome,
+            ServiceOutcome::Rejected {
+                condition: StanzaErrorCondition::InternalServerError,
+                ..
+            }
+        ));
+
+        assert!(link.try_next().is_none());
+        assert!(other.try_next().is_none());
+        fixture.service.router.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn component_dispatch_consumes_one_full_queue_attempt_and_falls_back_after_detach() -> TestResult {
+    run(async {
+        let fixture = ComponentFixture::new()?;
+        let mut link = fixture
+            .registry
+            .attach("muc.localhost")
+            .map_err(|_| "attach origin")?;
+        let mut spare = fixture
+            .registry
+            .attach("muc.localhost")
+            .map_err(|_| "attach spare")?;
+        let origin = link.id();
+        let stage = fixture.service.stage();
+        let queued = parsed(
+            "<message id='occupied' from='echo.localhost' to='visitor@muc.localhost/nick'/>",
+        )
+        .await?;
+        fixture
+            .registry
+            .reply("muc.localhost", origin, queued)
+            .map_err(|_| "fill origin queue")?;
+
+        let route =
+            replying_route(&[(RESULT, true), (RESULT, false)], Err(HANDLER_FAILURE)).await?;
+        let outcome = dispatch_with_component_reply(
+            &stage,
+            &route,
+            parsed(GET).await?,
+            fixture.target(origin),
+        )
+        .await
+        .map_err(|_| "dispatch failed")?;
+        assert!(matches!(outcome, ServiceOutcome::Handled));
+        assert!(spare.try_next().is_none());
+        let occupied = link.try_next().ok_or("missing queued stanza")?;
+        assert_eq!(occupied.resolve()?.id()?, Some("occupied"));
+        assert!(link.try_next().is_none());
+
+        let detached = link.detach();
+        assert!(detached.stranded.is_empty());
+        assert_eq!(detached.moved, 0);
+        let outcome = dispatch_with_component_reply(
+            &stage,
+            &route,
+            parsed(GET).await?,
+            fixture.target(origin),
+        )
+        .await
+        .map_err(|_| "dispatch failed")?;
+        assert!(matches!(outcome, ServiceOutcome::Handled));
+        let delivered = spare.try_next().ok_or("missing fallback reply")?;
+        assert_eq!(
+            delivered.resolve()?.stanza_type(),
+            StanzaType::Iq(IqType::Result)
+        );
+        assert_eq!(delivered.resolve()?.id()?, Some("reply"));
+        assert!(spare.try_next().is_none());
+
+        let mut metrics = prometheus_client::registry::Registry::default();
+        fixture
+            .metrics
+            .register(metrics.sub_registry_with_prefix("lonewolf"));
+        let mut output = String::new();
+        prometheus_client::encoding::text::encode(&mut output, &metrics)?;
+        assert!(
+            output.lines().any(|line| line
+                == "lonewolf_component_admission_rejections_total{reason=\"queue_full\"} 1"),
+            "{output}"
+        );
+        fixture.service.router.shutdown().await?;
+        Ok(())
+    })
 }
 
 #[test]
@@ -302,7 +650,7 @@ fn service_remote_outbound_uses_real_admission_and_maps_each_failure() -> TestRe
             let router = Router::new(hosts.clone(), LocalRouter::new(GlobalChunkAllocator)).with_remote(remote.remote()).with_services(BTreeMap::from([("echo.example.com".into(), ServiceRoute { domain: Arc::from("echo.example.com"), handler: Arc::new(RejectingService) })]));
             let handle = router.handle();
             let mut work = WorkGroup::new();
-            let outbound = Outbound { router: &handle, storage: &storage, allocator: &GlobalChunkAllocator, work: &work.handle(), domain: "echo.example.com" };
+            let outbound = Outbound { router: &handle, storage: &storage, allocator: &GlobalChunkAllocator, work: &work.handle(), domain: "echo.example.com", component_reply: None };
             let xml = "<message type='chat' id='service-remote' from='room@echo.example.com/nick' to='alice@remote.test/desk'/>";
             assert_eq!(outbound.route(parsed(xml).await?).await.is_ok(), link);
             if link {
@@ -311,7 +659,7 @@ fn service_remote_outbound_uses_real_admission_and_maps_each_failure() -> TestRe
                 assert_eq!(received.resolve()?.from()?.ok_or("no sender")?.as_str(), "room@echo.example.com/nick");
                 assert_eq!(received.resolve()?.id()?, Some("service-remote"));
             }
-            let unsupported = Outbound { domain: "covered.example.com", ..outbound };
+            let unsupported = Outbound { domain: "covered.example.com", component_reply: None, ..outbound };
             assert!(unsupported.route(parsed("<message from='covered.example.com' to='alice@remote.test'/>").await?).await.is_err());
             let mut registry = prometheus_client::registry::Registry::default();
             remote.metrics().register(registry.sub_registry_with_prefix("lonewolf"));

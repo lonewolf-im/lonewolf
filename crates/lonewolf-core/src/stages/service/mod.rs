@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::cell::Cell;
+
 use lonewolf_extension::delivery::{DeliveryError, DeliveryFuture, HostLookup};
 use lonewolf_extension::policy::Verdict;
 use lonewolf_extension::service::{ServiceContext, ServiceOutbound};
 use lonewolf_storage::RedbStorage;
 use lonewolf_util::arena::{Arena, ChunkAllocator};
+use lonewolf_xmpp::jid::JidRef;
 use lonewolf_xmpp::stanza::{IqType, MessageType, PresenceType, StanzaErrorCondition, StanzaType};
 
 use super::ingress::{
@@ -13,6 +16,7 @@ use super::ingress::{
     message::{self, MessageDisposition},
 };
 use super::{Stage, StageFailure};
+use crate::component::registry::ComponentRegistry;
 use crate::delivery::WorkHandle;
 use crate::router::{Destination, RoutedStanza, RouterError, RouterHandle, ServiceRoute};
 
@@ -33,12 +37,32 @@ pub(crate) async fn dispatch<A: ChunkAllocator + Clone + 'static>(
     route: &ServiceRoute<A>,
     stanza: RoutedStanza<A>,
 ) -> Result<ServiceOutcome<A>, StageFailure> {
+    dispatch_with_component_reply(stage, route, stanza, None).await
+}
+
+pub(crate) struct ComponentReplyTarget<'a, A: ChunkAllocator> {
+    pub(crate) registry: &'a ComponentRegistry<A>,
+    pub(crate) domain: &'a str,
+    pub(crate) connection_id: u64,
+}
+
+pub(crate) async fn dispatch_with_component_reply<A: ChunkAllocator + Clone + 'static>(
+    stage: &Stage<'_, A>,
+    route: &ServiceRoute<A>,
+    stanza: RoutedStanza<A>,
+    target: Option<ComponentReplyTarget<'_, A>>,
+) -> Result<ServiceOutcome<A>, StageFailure> {
     let outbound = Outbound {
         router: stage.router,
         storage: stage.storage,
         allocator: stage.allocator,
         work: stage.work,
         domain: &route.domain,
+        component_reply: target.map(|target| ComponentReply {
+            target,
+            request: &stanza,
+            claimed: Cell::new(false),
+        }),
     };
     let result = route
         .handler
@@ -60,6 +84,13 @@ pub(crate) async fn dispatch<A: ChunkAllocator + Clone + 'static>(
                 "internal operation failed"
             );
         }
+        if outbound
+            .component_reply
+            .as_ref()
+            .is_some_and(|reply| reply.claimed.get())
+        {
+            return Ok(ServiceOutcome::Handled);
+        }
         let reject = match stanza.resolve()?.stanza_type() {
             StanzaType::Iq(IqType::Get | IqType::Set) => true,
             StanzaType::Message(kind) => kind != MessageType::Error,
@@ -76,12 +107,39 @@ pub(crate) async fn dispatch<A: ChunkAllocator + Clone + 'static>(
     Ok(ServiceOutcome::Handled)
 }
 
+struct ComponentReply<'a, A: ChunkAllocator> {
+    target: ComponentReplyTarget<'a, A>,
+    request: &'a RoutedStanza<A>,
+    claimed: Cell<bool>,
+}
+
+impl<A: ChunkAllocator> ComponentReply<'_, A> {
+    fn claim(&self, from: JidRef<'_>, to: JidRef<'_>, id: &str) -> Result<(), DeliveryError> {
+        if self.claimed.get() || to.domainpart() != self.target.domain {
+            return Err(DeliveryError);
+        }
+        let request = self.request.resolve()?;
+        if !matches!(
+            request.stanza_type(),
+            StanzaType::Iq(IqType::Get | IqType::Set)
+        ) || request.id()? != Some(id)
+            || request.to()? != Some(from)
+            || request.from()? != Some(to)
+        {
+            return Err(DeliveryError);
+        }
+        self.claimed.set(true);
+        Ok(())
+    }
+}
+
 struct Outbound<'a, A: ChunkAllocator> {
     router: &'a RouterHandle<A>,
     storage: &'a RedbStorage,
     allocator: &'a A,
     work: &'a WorkHandle,
     domain: &'a str,
+    component_reply: Option<ComponentReply<'a, A>>,
 }
 
 impl<A: ChunkAllocator + Clone> HostLookup for Outbound<'_, A> {
@@ -105,13 +163,10 @@ impl<A: ChunkAllocator + Clone + 'static> ServiceOutbound<A> for Outbound<'_, A>
     fn route<'a>(&'a self, stanza: RoutedStanza<A>) -> DeliveryFuture<'a> {
         Box::pin(async move {
             let view = stanza.resolve()?;
-            if view
-                .from()?
-                .is_none_or(|from| from.domainpart() != self.domain)
-            {
+            let Some(from) = view.from()?.filter(|from| from.domainpart() == self.domain) else {
                 tracing::warn!(service_domain = %self.domain, outcome = "invalid_from", "service stanza rejected");
                 return Err(DeliveryError);
-            }
+            };
             let to = view.to()?.ok_or(DeliveryError)?;
             let destination = self.router.destination(to);
             if matches!(destination, Destination::Account | Destination::Resource)
@@ -184,9 +239,22 @@ impl<A: ChunkAllocator + Clone + 'static> ServiceOutbound<A> for Outbound<'_, A>
                     }
                 },
                 Destination::Remote => self.router.route_remote(stanza).map_err(|_| DeliveryError),
-                Destination::Service | Destination::Server | Destination::ServerResource => {
-                    Err(DeliveryError)
+                Destination::Service => {
+                    let reply = self.component_reply.as_ref().ok_or(DeliveryError)?;
+                    if !matches!(
+                        view.stanza_type(),
+                        StanzaType::Iq(IqType::Result | IqType::Error)
+                    ) {
+                        return Err(DeliveryError);
+                    }
+                    reply.claim(from, to, view.id()?.ok_or(DeliveryError)?)?;
+                    let target = &reply.target;
+                    let _ = target
+                        .registry
+                        .reply(target.domain, target.connection_id, stanza);
+                    Ok(())
                 }
+                Destination::Server | Destination::ServerResource => Err(DeliveryError),
             }
         })
     }

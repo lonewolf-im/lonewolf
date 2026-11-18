@@ -37,7 +37,11 @@ fn handshake_ignores_version_and_accepts_uppercase_digest_without_features() -> 
     let mut previous_id = None;
     for (index, version) in [None, Some("1.0")].into_iter().enumerate() {
         let mut client = ComponentClient::connect(suite.component_address(0)?)?;
-        let header = client.open(DOMAIN, version)?;
+        let header = if version.is_some() {
+            client.open_with(&format!("<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='{NAMESPACE}' to='{DOMAIN}' from='ignored.example' version='1.0' xml:lang='fr'>"))?
+        } else {
+            client.open(DOMAIN, version)?
+        };
         assert_eq!(header.namespace, NAMESPACE);
         assert_eq!(header.from.as_deref(), Some(DOMAIN));
         assert!(header.version.is_none());
@@ -52,11 +56,11 @@ fn handshake_ignores_version_and_accepts_uppercase_digest_without_features() -> 
         previous_id = Some(header.id.clone());
         if version.is_some() {
             let digest = Sha1::digest(format!("{}{SECRET}", header.id));
-            let mut xml = String::from("<handshake ignored='yes'>");
+            let mut xml = String::from("<handshake ignored='yes'> \t\r\n");
             for byte in digest {
                 write!(xml, "{byte:02X}")?;
             }
-            xml.push_str("</handshake>");
+            xml.push_str("\t\r\n </handshake>");
             client.send(&xml)?;
         } else {
             client.send_handshake_for(SECRET, &header.id)?;
@@ -140,6 +144,11 @@ fn unsupported_content_namespaces_return_invalid_namespace() -> TestResult {
 fn default_domain_cap_rejects_second_handshake_and_releases_after_close() -> TestResult {
     let mut suite = C2sSuite::with_components(CONFIG)?;
     let mut first = ComponentClient::authenticated(&suite, DOMAIN, SECRET)?;
+    let mut mismatched = ComponentClient::connect(suite.component_address(0)?)?;
+    let header = mismatched.open(DOMAIN, None)?;
+    mismatched.send_handshake_for("different-component-test-secret", &header.id)?;
+    rejected(&mut mismatched, "not-authorized")?;
+    authentication(&suite, "not_authorized", 1)?;
     let mut second = ComponentClient::connect(suite.component_address(0)?)?;
     let header = second.open(DOMAIN, None)?;
     second.send_handshake_for(SECRET, &header.id)?;

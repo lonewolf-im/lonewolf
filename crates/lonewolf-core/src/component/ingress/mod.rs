@@ -13,7 +13,7 @@ use crate::router::RouterHandle;
 use crate::stages::ingress::Origin;
 use crate::stages::{
     Stage, StageFailure,
-    service::{self, ServiceOutcome},
+    service::{self, ComponentReplyTarget, ServiceOutcome},
 };
 
 mod iq;
@@ -88,11 +88,17 @@ pub(crate) async fn dispatch<A: ChunkAllocator + Clone + 'static>(
         .map_err(|_| IngressFailure)?
         .ok_or(IngressFailure)?;
     if let Some(route) = context.router.service(target.domainpart()) {
+        let reply_target = ComponentReplyTarget {
+            registry: &context.registry,
+            domain,
+            connection_id: context.connection_id,
+        };
         if let ServiceOutcome::Rejected {
             stanza,
             condition,
             text,
-        } = service::dispatch(&stage, route, stanza).await?
+        } = service::dispatch_with_component_reply(&stage, route, stanza, Some(reply_target))
+            .await?
         {
             reply_error(context, domain, &stanza, condition, None, text)?;
         }

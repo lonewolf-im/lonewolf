@@ -20,6 +20,7 @@ pub fn tcp(address: SocketAddr) -> TestResult<TcpStream> {
     Ok(socket)
 }
 
+pub const TEST_TIMEOUT: std::time::Duration = TIMEOUT;
 pub const NAMESPACE: &str = "jabber:component:accept";
 
 /// Counts locally completed stanzas, including unflushed output.

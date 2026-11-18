@@ -422,32 +422,27 @@
 # [components]
 
 # Connect only component software you trust to send from any address at its domain.
-# No listener opens while no component domain is configured.
 # Without TLS, the handshake and all traffic are unencrypted, so keep the loopback address unless the component runs on another machine.
 # Endpoints must not overlap client, server, metrics, or HTTP challenge endpoints.
 # [[components.listeners]]
 # address = "127.0.0.1:5347"
 # Choose "direct" when components send TLS before XML.
-# SNI selects a configured host certificate; connections without SNI use the default host certificate.
-# Lonewolf does not check component certificates; the shared secret still authenticates the component.
+# Set SNI to a configured host name, or omit SNI to use the default host certificate.
 # tls_mode = "none"
 
 # The domain and path below are examples; the domain must not be a configured host.
 # [components.domains."muc.example.com"]
-# Prefer a secret file; Lonewolf reads it at startup and removes one trailing line break.
+# Store this secret in a file with restricted access.
 # Use a long random secret of 16 to 1024 bytes.
 # secret_file = "./secrets/muc.example.com"
 # Choose whether the closest parent host lists this component in service discovery.
 # discoverable = true
-# Increase this domain's connection allowance only when its instances share state, because each instance receives only part of its traffic.
+# Increase this domain's connection allowance only when its instances share state.
 # Keep this no greater than limits.components.max_inbound_connections.
 # max_connections = 1
 # Choose "source" for affinity by full sender JID or "bare_source" for all resources of one account.
 # Choose "destination" or "bare_destination" for affinity by the full or bare addressed JID.
-# These policies keep each key on one connection while the set of connections stays the same.
 # Choose "random" to spread traffic without preserving stanza order.
-# Answers to an instance's own requests can reach another instance.
-# When instances connect or disconnect, some senders move between instances.
 # balancing = "source"
 
 # Use an inline secret instead of secret_file only when file storage is unsuitable.

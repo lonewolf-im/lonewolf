@@ -91,6 +91,16 @@ pub type SendFuture<'a, A> = PresenceFuture<'a, PresenceSend<A>>;
 pub type ReceiveFuture<'a, A> = ExtensionFuture<'a, Result<Effects<A>, HandlerError>>;
 
 pub trait PresenceHandler<A: ChunkAllocator, S: Storage>: Send + Sync {
+    /// Checks whether the owner accepts available presence from the contact's bare JID to the owner's bare JID.
+    fn accepts_presence<'a>(
+        &'a self,
+        _owner: &'a AccountKey,
+        _contact: JidRef<'a>,
+        _transaction: &'a S::Read,
+    ) -> PresenceFuture<'a, bool> {
+        Box::pin(async { Ok(true) })
+    }
+
     fn visibility<'a>(
         &'a self,
         _owner: &'a AccountKey,

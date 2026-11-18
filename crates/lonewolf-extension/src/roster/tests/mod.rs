@@ -866,6 +866,67 @@ fn forgetting_an_account_cleans_storage_even_when_a_notification_fails() {
 }
 
 #[test]
+fn accepts_presence_follows_the_roster_subscription() -> Result<(), Box<dyn std::error::Error>> {
+    use SubscriptionState::{Both, From, None, To};
+
+    let (_directory, fixture) = roster();
+    let owner = account("alice@example.com");
+    create_account(&fixture, &owner);
+    let policy = Roster::default();
+    for contact in [
+        "irc.example.test",
+        "irc-server.example.test@irc.example.test",
+    ] {
+        let mut arena = Arena::try_new(Default::default())?;
+        let bare = Jid::parse_in(contact, &mut arena)?;
+        let full = Jid::parse_in(&format!("{contact}/desktop"), &mut arena)?;
+        let bare = bare.resolve(&arena)?;
+        let full = full.resolve(&arena)?;
+        let roster_jid = RosterJid::from(bare);
+        block_on(async {
+            let read = fixture.storage.begin_read().await?;
+            for sender in [bare, full] {
+                assert!(
+                    TestPresenceHandler::accepts_presence(&policy, &owner, sender, &read)
+                        .await
+                        .map_err(|error| format!("{error:?}"))?,
+                    "{contact} without a roster item"
+                );
+            }
+            drop(read);
+            for (state, pending_out, expected) in [
+                (None, false, false),
+                (None, true, false),
+                (From, false, false),
+                (To, false, true),
+                (Both, false, true),
+            ] {
+                let mut write = fixture.storage.begin_write().await?;
+                let mut item = subscribed(roster_jid.clone(), state);
+                item.subscription.pending_out = pending_out;
+                write
+                    .put_roster_item(&owner, &item, RosterQuota::default())
+                    .await?;
+                write.commit().await?;
+
+                let read = fixture.storage.begin_read().await?;
+                for sender in [bare, full] {
+                    assert_eq!(
+                        TestPresenceHandler::accepts_presence(&policy, &owner, sender, &read)
+                            .await
+                            .map_err(|error| format!("{error:?}"))?,
+                        expected,
+                        "{contact} with {state:?} and pending_out={pending_out}"
+                    );
+                }
+            }
+            Ok::<_, Box<dyn std::error::Error>>(())
+        })?;
+    }
+    Ok(())
+}
+
+#[test]
 fn visibility_uses_owner_grant_and_keeps_its_read_snapshot() {
     let (_directory, roster) = roster();
     let owner = account("alice@example.com");

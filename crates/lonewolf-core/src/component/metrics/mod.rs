@@ -194,16 +194,23 @@ pub(crate) enum DropReason {
     NotBounceable,
     Shutdown,
     Invalid,
+    PresenceNotSubscribed,
 }
 
 impl DropReason {
-    const ALL: [Self; 3] = [Self::NotBounceable, Self::Shutdown, Self::Invalid];
+    const ALL: [Self; 4] = [
+        Self::NotBounceable,
+        Self::Shutdown,
+        Self::Invalid,
+        Self::PresenceNotSubscribed,
+    ];
 
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::NotBounceable => "not_bounceable",
             Self::Shutdown => "shutdown",
             Self::Invalid => "invalid",
+            Self::PresenceNotSubscribed => "presence_not_subscribed",
         }
     }
 }

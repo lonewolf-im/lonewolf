@@ -7,7 +7,7 @@ use std::io;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::component::credentials;
 use crate::component::metrics::ComponentMetrics;
@@ -30,6 +30,7 @@ use lonewolf_extension::service::{ServiceContext, ServiceHandler};
 use lonewolf_storage::RedbStorage;
 use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::offline::OfflineSequence;
+use lonewolf_storage::roster::RosterJid;
 use lonewolf_util::arena::{Arena, ArenaConfig, GlobalChunkAllocator};
 use lonewolf_util::core_dispatcher::CoreDispatcher;
 use lonewolf_util::pool::{PoolConfig, PooledChunkAllocator};
@@ -396,6 +397,113 @@ fn current_and_unavailable_presence_reach_component_contacts_without_federation(
         }
         drop((desk, phone, link));
         fixture.router.shutdown().await?;
+        Ok(())
+    })
+}
+
+fn roster_jid(text: &str) -> Result<RosterJid, Box<dyn Error>> {
+    let mut arena = Arena::try_new(Default::default())?;
+    let jid = Jid::parse_in(text, &mut arena)?;
+    Ok(RosterJid::from(jid.resolve(&arena)?))
+}
+
+#[test]
+fn broadcast_component_presence_reaches_only_component_subscribers() -> TestResult {
+    run_test(async {
+        let fixture = ComponentRouting::new(NonZeroUsize::MIN.saturating_add(1))?;
+        let handle = fixture.router.handle();
+        let mut link = fixture
+            .registry
+            .attach(COMPONENT_DOMAIN)
+            .map_err(|_| "attach")?;
+        let [gateway, server] = COMPONENT_CONTACTS;
+        let subscribers = [
+            roster_jid("bob@localhost")?,
+            roster_jid(gateway)?,
+            roster_jid("bob@remote.test")?,
+            roster_jid(server)?,
+        ];
+        for (kind, attribute) in [
+            (PresenceType::Available, ""),
+            (PresenceType::Unavailable, "type='unavailable'"),
+        ] {
+            let source = parse_stanza(&format!("<presence from='alice@localhost/desk' id='notice' {attribute}><status>At the desk</status></presence>")).await?;
+            handle
+                .broadcast_component_presence(&source, &subscribers)
+                .await?;
+            for contact in [gateway, server] {
+                let stanza = link.try_next().ok_or("component broadcast")?;
+                let view = stanza.resolve()?;
+                assert_eq!(view.stanza_type(), StanzaType::Presence(kind));
+                assert_eq!(view.id()?, Some("notice"));
+                assert_eq!(
+                    view.from()?.ok_or("sender")?.as_str(),
+                    "alice@localhost/desk"
+                );
+                assert_eq!(view.to()?.ok_or("recipient")?.as_str(), contact);
+                assert_eq!(
+                    view.child("status", "jabber:client")?
+                        .ok_or("status")?
+                        .text()?,
+                    Some("At the desk")
+                );
+            }
+            assert!(link.try_next().is_none());
+        }
+        for xml in [
+            "<presence type='probe' from='alice@localhost/desk'/>",
+            "<presence type='subscribe' from='alice@localhost/desk'/>",
+            "<message from='alice@localhost/desk'><body>hello</body></message>",
+        ] {
+            let source = parse_stanza(xml).await?;
+            assert_eq!(
+                handle
+                    .broadcast_component_presence(&source, &subscribers)
+                    .await,
+                Err(RouterError::InvalidTarget)
+            );
+        }
+        assert!(link.try_next().is_none());
+        drop(link);
+        fixture.router.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn broadcast_presence_skips_component_subscribers() -> TestResult {
+    use crate::s2s::outbound::test_support::{AdmissionState, Fixture as RemoteFixture};
+
+    run_test(async {
+        let mut remote = RemoteFixture::new(AdmissionState::Link)?;
+        let fixture = ComponentRouting::new(NonZeroUsize::MIN)?;
+        let router = fixture.router.with_remote(remote.remote());
+        let handle = router.handle();
+        assert!(handle.federation_enabled());
+        let mut link = fixture
+            .registry
+            .attach(COMPONENT_DOMAIN)
+            .map_err(|_| "attach")?;
+        let [gateway, server] = COMPONENT_CONTACTS;
+        let subscribers = [roster_jid(gateway)?, roster_jid(server)?];
+        let source = parse_stanza("<presence from='alice@localhost/desk'/>").await?;
+        handle.broadcast_presence(&source, &subscribers).await?;
+        assert!(link.try_next().is_none());
+        assert!(remote.receive()?.is_none());
+        let mut root = prometheus_client::registry::Registry::default();
+        remote
+            .metrics()
+            .register(root.sub_registry_with_prefix("lonewolf"));
+        let mut samples = String::new();
+        prometheus_client::encoding::text::encode(&mut samples, &root)?;
+        assert!(
+            !samples.lines().any(|sample| sample
+                .starts_with("lonewolf_s2s_admission_rejections_total{reason=\"unsupported\"}")),
+            "{samples}"
+        );
+        drop(link);
+        remote.finish(Instant::now() + TIMEOUT).await?;
+        router.shutdown().await?;
         Ok(())
     })
 }

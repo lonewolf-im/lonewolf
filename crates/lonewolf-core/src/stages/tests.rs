@@ -892,6 +892,90 @@ fn filter_audience_without_policies_does_not_allocate_an_arena() -> TestResult {
     })
 }
 
+#[test]
+fn filter_audience_blocks_probes_to_component_contacts_without_federation() -> TestResult {
+    use crate::component::metrics::ComponentMetrics;
+    use crate::component::{credentials, registry::ComponentRegistry};
+    use crate::stages::policy::filter_audience;
+    use lonewolf_extension::policy::{Direction, Verdict};
+    use lonewolf_extension::presence::PresenceAudience;
+    use lonewolf_storage::Storage;
+    use lonewolf_storage::roster::RosterJid;
+    use lonewolf_xmpp::stanza::{PresenceType, StanzaType};
+
+    Runtime::new()?.block_on(async {
+        let fixture = Fixture::new()?;
+        let config: Config = toml::from_str(
+            "[components.domains.'irc.example.test']\nsecret='component-test-secret-0001'",
+        )?;
+        let registry = ComponentRegistry::new(
+            &config.components,
+            credentials::load(&config.components)?,
+            &config.limits.components,
+            ComponentMetrics::new(1, 1),
+        );
+        let calls = Arc::new(PlMutex::new(Vec::new()));
+        let mut extensions = Extensions::default();
+        extensions.register(Arc::new(RecordingPolicy {
+            name: "block-presence",
+            verdict: Verdict::Drop,
+            fail: false,
+            calls: Arc::clone(&calls),
+        }))?;
+        let router = fixture
+            .router
+            .with_services(BTreeMap::from([(
+                "irc.example.test".into(),
+                ServiceRoute::component(Arc::from("irc.example.test"), registry),
+            )]))
+            .with_extensions(BTreeMap::from([(
+                "localhost".into(),
+                extensions.enable_host("localhost", ["block-presence"])?,
+            )]));
+        let handle = router.handle();
+        assert!(!handle.federation_enabled());
+        let mut arena = Arena::try_new(Default::default())?;
+        let gateway = Jid::parse_in("irc.example.test", &mut arena)?;
+        let server = Jid::parse_in("irc-server.example.test@irc.example.test", &mut arena)?;
+        let sender = Jid::parse_in("alice@localhost/desk", &mut arena)?;
+        let local = RosterJid::from(&account("bob@localhost")?);
+        let non_component_remote = RosterJid::from(&account("bob@remote.test")?);
+        let mut audience = PresenceAudience {
+            probes: vec![
+                local.clone(),
+                RosterJid::from(gateway.resolve(&arena)?),
+                non_component_remote.clone(),
+                RosterJid::from(server.resolve(&arena)?),
+            ],
+            subscribers: Vec::new(),
+            pending: Vec::new(),
+            contacts: Vec::new(),
+        };
+        let owner = account("alice@localhost")?;
+        let read = fixture.storage.begin_read().await?;
+        filter_audience(
+            &handle,
+            &read,
+            &GlobalChunkAllocator,
+            &owner,
+            sender.resolve(&arena)?,
+            StanzaType::Presence(PresenceType::Available),
+            &mut audience,
+        )
+        .await
+        .map_err(|_| "audience filtering failed")?;
+        assert_eq!(audience.probes, [local, non_component_remote]);
+        let calls = std::mem::take(&mut *calls.lock());
+        assert_eq!(calls.len(), 2);
+        for call in calls {
+            assert_eq!(call.account, owner.as_str());
+            assert_eq!(call.direction, Direction::Outbound);
+        }
+        router.shutdown().await?;
+        Ok(())
+    })
+}
+
 struct RecordingArchive {
     selected: bool,
     outcome: lonewolf_extension::archive::ArchiveOutcome,

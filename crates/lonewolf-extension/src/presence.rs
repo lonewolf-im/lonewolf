@@ -77,7 +77,7 @@ pub struct PresenceAudience {
     pub pending: Vec<PendingSubscription>,
     /// Accounts whose current presence a newly available resource receives.
     pub contacts: Vec<AccountKey>,
-    /// Initial To/Both contacts; core probes those on non-local hosts.
+    /// Core probes these contacts at component domains and other non-local domains with federation.
     pub probes: Vec<RosterJid>,
 }
 

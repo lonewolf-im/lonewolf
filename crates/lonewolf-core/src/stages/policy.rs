@@ -119,7 +119,8 @@ pub(crate) async fn filter_audience<A: ChunkAllocator + Clone>(
         let domain = bare.split_once('@').map_or(bare, |(_, domain)| domain);
         !router.policies(domain).is_empty()
     };
-    if router.policies(owner.domain()).is_empty()
+    let owner_has_policy = !router.policies(owner.domain()).is_empty();
+    if !owner_has_policy
         && !audience
             .subscribers
             .iter()
@@ -204,15 +205,23 @@ pub(crate) async fn filter_audience<A: ChunkAllocator + Clone>(
         allowed.push(evaluate_in(router, transaction, kind, &checks).await? == Verdict::Allow);
     }
     retain_allowed(&mut audience.pending, allowed);
-    if router.federation_enabled() && !router.policies(owner.domain()).is_empty() {
+    let federated = router.federation_enabled();
+    if owner_has_policy
+        && (federated
+            || audience
+                .probes
+                .iter()
+                .any(|contact| router.is_component_domain(contact.domain())))
+    {
         let mut allowed = Vec::with_capacity(audience.probes.len());
         for contact in &audience.probes {
-            let jid = Jid::parse_in(contact.as_str(), &mut scratch)?;
-            let peer = jid.resolve(&scratch)?.bare();
-            if router.is_local_host(peer.domainpart()) {
+            let domain = contact.domain();
+            if router.is_local_host(domain) || (!federated && !router.is_component_domain(domain)) {
                 allowed.push(true);
                 continue;
             }
+            let jid = Jid::parse_in(contact.as_str(), &mut scratch)?;
+            let peer = jid.resolve(&scratch)?.bare();
             let checks = [Check {
                 account: owner,
                 direction: Direction::Outbound,

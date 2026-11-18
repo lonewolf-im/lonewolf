@@ -1408,11 +1408,6 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         parsed: Parsed<Stanza, A>,
         available: bool,
     ) -> Result<(), CloseOutcome> {
-        let completion = self.service_presence.as_ref().map(|_| {
-            let (completion, completed) = oneshot::channel();
-            self.service_pending = Some(completed.shared());
-            completion
-        });
         let priority = if available {
             let stanza = parsed.value().resolve(parsed.arena())?;
             match presence_priority(&stanza) {
@@ -1427,6 +1422,22 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         };
         let (source, mut arena) = parsed.into_parts();
         let (mut stamped, from, to) = self.stamp_in(source, &mut arena, true)?;
+        if self.service_presence.is_none()
+            && let Some(gate) = self
+                .router
+                .service_presence_gate(from.resolve(&arena)?.as_str())
+        {
+            let lease = self
+                .outbox
+                .drain_until(&self.registration, gate.acquire())
+                .await?;
+            self.service_presence = Some(Arc::new(lease));
+        }
+        let completion = self.service_presence.as_ref().map(|_| {
+            let (completion, completed) = oneshot::channel();
+            self.service_pending = Some(completed.shared());
+            completion
+        });
         let unavailable = if available {
             Some(
                 Stanza::builder_in(
@@ -2616,6 +2627,7 @@ impl<A: ChunkAllocator + Clone> TerminalPresenceWork<A> {
             .await
             .map_err(|_| CloseOutcome::InternalError)?;
         let notice = withdrawal.unavailable.as_ref().unwrap_or(&self.fallback);
+        let mut broadcast_components = false;
         let mut covered = Vec::new();
         let mut ticket = None;
         let broadcast = if withdrawal.unavailable.is_some() {
@@ -2692,6 +2704,7 @@ impl<A: ChunkAllocator + Clone> TerminalPresenceWork<A> {
                             .broadcast_presence(notice, &audience.subscribers)
                             .await
                             .map_err(|_| CloseOutcome::InternalError)?;
+                        broadcast_components = true;
                     }
                     covered = audience.subscribers;
                 }
@@ -2714,10 +2727,22 @@ impl<A: ChunkAllocator + Clone> TerminalPresenceWork<A> {
         if let Some(pending) = self.service_pending {
             let _ = pending.await;
         }
+        let components = if broadcast_components {
+            self.router
+                .broadcast_component_presence(notice, &covered)
+                .await
+                .map_err(|_| CloseOutcome::InternalError)
+        } else {
+            Ok(())
+        };
         let services =
             send_service_withdrawal(&stage, notice, &withdrawal.directed, &covered).await;
         drop(self.service_presence);
-        broadcast.and(local).and(finished).and(services)
+        broadcast
+            .and(local)
+            .and(finished)
+            .and(components)
+            .and(services)
     }
 }
 
@@ -2854,7 +2879,7 @@ impl<A: ChunkAllocator + Clone> PresenceWork<A> {
                 "initial presence prepared"
             );
         }
-        let probes = if change.became_available && router.federation_enabled() {
+        let probes = if change.became_available {
             audience
                 .as_mut()
                 .map(|audience| mem::take(&mut audience.probes))
@@ -2867,18 +2892,27 @@ impl<A: ChunkAllocator + Clone> PresenceWork<A> {
             && (available || change.became_unavailable)
             && !audience.subscribers.is_empty()
         {
-            router
-                .broadcast_presence(&routed, &audience.subscribers)
-                .await
-                .map(|()| covered = audience.subscribers)
-                .map_err(|_| CloseOutcome::InternalError)
+            async {
+                router
+                    .broadcast_presence(&routed, &audience.subscribers)
+                    .await?;
+                covered = audience.subscribers;
+                router.broadcast_component_presence(&routed, &covered).await
+            }
+            .await
+            .map_err(|_| CloseOutcome::InternalError)
         } else {
             Ok(())
         };
         let probing = if broadcast.is_ok() {
             async {
+                let federated = router.federation_enabled();
                 for contact in probes {
-                    if router.is_local_host(domain_of(contact.as_str())) {
+                    if router.is_local_host(contact.domain()) {
+                        continue;
+                    }
+                    let component = router.is_component_domain(contact.domain());
+                    if !component && !federated {
                         continue;
                     }
                     let mut arena = Arena::try_new_in(Default::default(), allocator.clone())?;
@@ -2892,8 +2926,13 @@ impl<A: ChunkAllocator + Clone> PresenceWork<A> {
                     .from(Some(from))?
                     .to(Some(to))?
                     .build()?;
-                    if let Err(RouterError::Stopped) =
-                        router.route_remote_or_bounce(RoutedStanza::from_parts(stanza, arena))
+                    let stanza = RoutedStanza::from_parts(stanza, arena);
+                    if component {
+                        match router.route_to_component(stanza) {
+                            Ok(()) | Err(RouterError::Offline | RouterError::Busy) => {}
+                            Err(_) => return Err(CloseOutcome::InternalError),
+                        }
+                    } else if let Err(RouterError::Stopped) = router.route_remote_or_bounce(stanza)
                     {
                         return Err(CloseOutcome::InternalError);
                     }

@@ -848,7 +848,8 @@ pub(super) async fn remove_item<A: ChunkAllocator, W: WriteTransaction>(
     .ok_or(StanzaErrorCondition::ItemNotFound)?;
     let mut accounts = vec![owner.clone()];
     accounts.extend(contact_account.clone());
-    let remote_contact = federated_contact(&owner, &contact, hosts);
+    let remote_contact =
+        federated_contact(&owner, &contact, hosts) || component_contact(&contact, hosts);
     Ok(Effects::new(accounts, move |delivery| {
         tracing::info!(
             operation = "remove",
@@ -1128,7 +1129,9 @@ pub(super) async fn forget_account<
                     {
                         failure.get_or_insert(error);
                     }
-                } else if federated && federated_contact(&owner, &contact, delivery) {
+                } else if (federated && federated_contact(&owner, &contact, delivery))
+                    || component_contact(&contact, delivery)
+                {
                     let pending = before
                         .pending_request_exists(&owner, &contact)
                         .await
@@ -1195,8 +1198,8 @@ pub(super) async fn forget_account<
                         {
                             failure.get_or_insert(error);
                         }
-                    } else if federated
-                        && federated_contact(&owner, &sender, delivery)
+                    } else if ((federated && federated_contact(&owner, &sender, delivery))
+                        || component_contact(&sender, delivery))
                         && let Err(error) = notify_removed_remote_contact(
                             &owner,
                             sender.as_str(),
@@ -1337,6 +1340,10 @@ fn federated_contact(owner: &AccountKey, jid: &RosterJid, hosts: &dyn HostLookup
         && !jid.as_str().contains('/')
         && jid.as_str().contains('@')
         && !hosts.is_local_host(jid.domain())
+}
+
+fn component_contact(jid: &RosterJid, hosts: &dyn HostLookup) -> bool {
+    !jid.as_str().contains('/') && hosts.is_component_domain(jid.domain())
 }
 
 async fn notify_removed_remote_contact<A: ChunkAllocator>(

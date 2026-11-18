@@ -2637,6 +2637,285 @@ fn federated_cleanup_skips_stored_full_jids() -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
+fn component_cleanup(
+    deleting: bool,
+    contact_text: &str,
+    state: SubscriptionState,
+    pending_out: bool,
+    pending_in: bool,
+    include_item: bool,
+    delivery: RecordingDelivery,
+) -> Result<RecordingDelivery, Box<dyn std::error::Error>> {
+    let (_directory, fixture) = roster();
+    let owner = account("alice@example.com");
+    let contact = roster_jid(contact_text)?;
+    create_account(&fixture, &owner);
+    block_on(async {
+        let mut tx = fixture.storage.begin_write().await?;
+        if include_item {
+            let mut item = subscribed(contact.clone(), state);
+            item.subscription.pending_out = pending_out;
+            tx.put_roster_item(&owner, &item, RosterQuota::default())
+                .await?;
+        }
+        if pending_in {
+            tx.put_pending_request(
+                &owner,
+                PendingSubscription {
+                    sender: contact.clone(),
+                    stanza: b"pending".as_slice().into(),
+                },
+                std::num::NonZeroUsize::MIN,
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })?;
+    block_on(async {
+        let mut tx = fixture.storage.begin_write().await?;
+        let deliver = if deleting {
+            let before = Arc::new(fixture.storage.begin_read().await?);
+            tx.delete_account(&owner).await?;
+            TestAccountHandler::forget_account(
+                &Roster::default(),
+                &mut tx,
+                &owner,
+                before,
+                &delivery,
+            )
+            .await
+            .map_err(|error| format!("{error:?}"))?
+        } else {
+            super::subscription::remove_item(
+                &Roster::default(),
+                &mut tx,
+                owner.clone(),
+                contact,
+                RosterJid::from(&owner),
+                &delivery,
+            )
+            .await
+            .map_err(|error| format!("{error:?}"))?
+            .deliver
+        };
+        tx.commit().await?;
+        deliver(&delivery).await?;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })?;
+    Ok(delivery)
+}
+
+fn assert_component_cleanup(
+    delivery: &RecordingDelivery,
+    contact_text: &str,
+    remote_kinds: &[&str],
+    unavailable: bool,
+    push: bool,
+) {
+    let remote = delivery.remote.borrow();
+    assert_eq!(remote.len(), remote_kinds.len());
+    for (xml, kind) in remote.iter().zip(remote_kinds) {
+        assert!(
+            xml.contains(&format!("type=\"{kind}\"")) || xml.contains(&format!("type='{kind}'")),
+            "{xml}"
+        );
+        assert!(
+            xml.contains("from=\"alice@example.com\"") || xml.contains("from='alice@example.com'"),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(&format!("to=\"{contact_text}\""))
+                || xml.contains(&format!("to='{contact_text}'")),
+            "{xml}"
+        );
+    }
+    let mut expected_events = Vec::new();
+    if unavailable {
+        expected_events.push("unavailable");
+    }
+    expected_events.extend(std::iter::repeat_n("remote", remote_kinds.len()));
+    if push {
+        expected_events.push("push");
+    }
+    assert_eq!(*delivery.events.borrow(), expected_events);
+    assert_eq!(delivery.unavailable.get(), usize::from(unavailable));
+    let targets = delivery.presence_targets.borrow();
+    if unavailable {
+        assert_eq!(
+            *targets,
+            vec![(account("alice@example.com"), contact_text.to_owned())]
+        );
+    } else {
+        assert!(targets.is_empty());
+    }
+}
+
+fn assert_component_cleanup_matrix(deleting: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let cases = [
+        (SubscriptionState::None, false, false, &[][..], false),
+        (
+            SubscriptionState::None,
+            true,
+            false,
+            &["unsubscribe"][..],
+            false,
+        ),
+        (
+            SubscriptionState::To,
+            false,
+            false,
+            &["unsubscribe"][..],
+            false,
+        ),
+        (
+            SubscriptionState::From,
+            false,
+            false,
+            &["unsubscribed"][..],
+            true,
+        ),
+        (
+            SubscriptionState::Both,
+            false,
+            false,
+            &["unsubscribe", "unsubscribed"][..],
+            true,
+        ),
+        (
+            SubscriptionState::None,
+            false,
+            true,
+            &["unsubscribed"][..],
+            false,
+        ),
+    ];
+    for contact in [
+        "irc.example.test",
+        "irc-server.example.test@irc.example.test",
+    ] {
+        for (state, pending_out, pending_in, kinds, unavailable) in cases {
+            let delivery = component_cleanup(
+                deleting,
+                contact,
+                state,
+                pending_out,
+                pending_in,
+                true,
+                RecordingDelivery {
+                    component: true,
+                    ..Default::default()
+                },
+            )?;
+            assert_component_cleanup(&delivery, contact, kinds, unavailable, !deleting);
+        }
+        if deleting {
+            let delivery = component_cleanup(
+                true,
+                contact,
+                SubscriptionState::None,
+                false,
+                true,
+                false,
+                RecordingDelivery {
+                    component: true,
+                    ..Default::default()
+                },
+            )?;
+            assert_component_cleanup(&delivery, contact, &["unsubscribed"], false, false);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn removing_component_contacts_sends_rfc_withdrawals_in_order()
+-> Result<(), Box<dyn std::error::Error>> {
+    assert_component_cleanup_matrix(false)
+}
+
+#[test]
+fn deleting_an_account_notifies_component_contacts_and_pending_senders()
+-> Result<(), Box<dyn std::error::Error>> {
+    assert_component_cleanup_matrix(true)
+}
+
+#[test]
+fn component_cleanup_skips_stored_full_jids() -> Result<(), Box<dyn std::error::Error>> {
+    for contact in [
+        "irc.example.test/resource@with-special",
+        "irc-server.example.test@irc.example.test/resource@with-special",
+    ] {
+        for deleting in [false, true] {
+            let delivery = component_cleanup(
+                deleting,
+                contact,
+                SubscriptionState::Both,
+                false,
+                true,
+                true,
+                RecordingDelivery {
+                    component: true,
+                    ..Default::default()
+                },
+            )?;
+            assert!(delivery.remote.borrow().is_empty());
+            assert_eq!(delivery.unavailable.get(), 0);
+        }
+        let pending_only = component_cleanup(
+            true,
+            contact,
+            SubscriptionState::None,
+            false,
+            true,
+            false,
+            RecordingDelivery {
+                component: true,
+                ..Default::default()
+            },
+        )?;
+        assert!(pending_only.remote.borrow().is_empty());
+        assert_eq!(pending_only.unavailable.get(), 0);
+    }
+    Ok(())
+}
+
+#[test]
+fn federated_cleanup_keeps_its_existing_s2s_gate() -> Result<(), Box<dyn std::error::Error>> {
+    let contact = "bob@remote.invalid";
+    let enabled = component_cleanup(
+        false,
+        contact,
+        SubscriptionState::Both,
+        false,
+        false,
+        true,
+        RecordingDelivery {
+            federated: true,
+            ..Default::default()
+        },
+    )?;
+    assert_component_cleanup(
+        &enabled,
+        contact,
+        &["unsubscribe", "unsubscribed"],
+        true,
+        true,
+    );
+    let disabled = component_cleanup(
+        false,
+        contact,
+        SubscriptionState::Both,
+        false,
+        false,
+        true,
+        RecordingDelivery::default(),
+    )?;
+    assert!(disabled.remote.borrow().is_empty());
+    assert_eq!(disabled.unavailable.get(), 0);
+    Ok(())
+}
+
 fn remote_request(
     kind: PresenceRequestType,
     sender: &str,

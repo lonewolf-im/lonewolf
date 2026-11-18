@@ -6,6 +6,7 @@ mod direct_tls;
 mod loss;
 mod negotiation;
 mod registry;
+mod roster;
 mod routing;
 mod stream;
 mod stream_conformance;

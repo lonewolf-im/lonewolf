@@ -1,16 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::sync::Arc;
+
 use lonewolf_extension::policy::Verdict;
-use lonewolf_extension::presence::PresenceRequestType;
+use lonewolf_extension::presence::{PresenceRequest, PresenceRequestType};
 use lonewolf_storage::account::{AccountKey, AccountReads};
 use lonewolf_storage::{RedbStorage, Storage};
-use lonewolf_util::arena::ChunkAllocator;
+use lonewolf_util::arena::{Arena, ChunkAllocator};
+use lonewolf_xmpp::stanza::{StanzaErrorCondition, StanzaErrorText};
 
 use super::checks::{Snapshot, check_from};
-use crate::delivery::{report_failure, report_handler_failure, storage_failure};
+use crate::delivery::{
+    EffectsDiagnostics, EffectsError, EffectsIdentity, RouterDelivery, commit_and_deliver,
+    report_failure, report_handler_failure, storage_failure,
+};
 use crate::order::Ticket;
-use crate::router::{RoutedStanza, RouterHandle};
-use crate::stages::StageFailure;
+use crate::router::{DeliveryScope, Destination, RoutedStanza, RouterHandle};
+use crate::stages::{Stage, StageFailure};
 
 pub(crate) struct ProbeGrant {
     pub(crate) subscribed: bool,
@@ -129,4 +135,144 @@ pub(crate) async fn authorize_probe<A: ChunkAllocator + Clone + 'static>(
     }
     ticket.turn().await;
     Ok(Some(ProbeGrant { subscribed, ticket }))
+}
+
+pub(crate) enum SubscriptionIngress {
+    Federated,
+    Component,
+}
+
+pub(crate) enum SubscriptionReceipt<A: ChunkAllocator> {
+    Done,
+    NoHandler {
+        stanza: RoutedStanza<A>,
+    },
+    Rejected {
+        stanza: RoutedStanza<A>,
+        condition: StanzaErrorCondition,
+        text: StanzaErrorText,
+    },
+    Failed {
+        stanza: RoutedStanza<A>,
+        committed: bool,
+    },
+}
+
+pub(crate) async fn receive_subscription<A: ChunkAllocator + Clone + 'static>(
+    stage: &Stage<'_, A>,
+    routed: RoutedStanza<A>,
+    kind: PresenceRequestType,
+    ingress: SubscriptionIngress,
+) -> Result<SubscriptionReceipt<A>, StageFailure> {
+    let view = routed.resolve()?;
+    let target = view.to()?.ok_or(StageFailure)?;
+    if !matches!(
+        stage.router.destination(target),
+        Destination::Account | Destination::Resource
+    ) {
+        return Ok(SubscriptionReceipt::Done);
+    }
+    let sender = view.from()?.ok_or(StageFailure)?;
+    let mut arena = Arena::try_new_in(Default::default(), stage.allocator.clone())?;
+    let sender = sender.bare().clone_in(&mut arena)?;
+    let target = target.bare().clone_in(&mut arena)?;
+    let stanza = view
+        .to_builder_in(&mut arena)?
+        .from(Some(sender))?
+        .to(Some(target))?
+        .build()?;
+    let routed = RoutedStanza::from_parts(stanza, arena);
+    let view = routed.resolve()?;
+    let target = view.to()?.ok_or(StageFailure)?;
+    let sender = view.from()?.ok_or(StageFailure)?;
+    let owner = AccountKey::try_from(target)?;
+    match check_from(
+        stage.router,
+        stage.storage,
+        None,
+        Some(&owner),
+        &view,
+        None,
+        Snapshot::Fresh,
+    )
+    .await
+    {
+        Ok(Verdict::Allow) => {}
+        Ok(_) => return Ok(SubscriptionReceipt::Done),
+        Err(_) => {
+            return Ok(SubscriptionReceipt::Failed {
+                stanza: routed,
+                committed: false,
+            });
+        }
+    }
+    let Some(handler) = stage
+        .router
+        .presence_handlers(target.domainpart())
+        .and_then(|handlers| handlers.find(kind))
+    else {
+        return Ok(SubscriptionReceipt::NoHandler { stanza: routed });
+    };
+    let mut transaction = match stage.storage.begin_write().await {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            report_failure(
+                storage_failure(error, "presence_subscription_begin_write"),
+                &owner,
+            );
+            return Ok(SubscriptionReceipt::Failed {
+                stanza: routed,
+                committed: false,
+            });
+        }
+    };
+    let scope = match ingress {
+        SubscriptionIngress::Federated => DeliveryScope::FederationOnly,
+        SubscriptionIngress::Component => DeliveryScope::ComponentAware,
+    };
+    let delivery = RouterDelivery::new(stage.router, stage.allocator, None).with_scope(scope);
+    let effects = match handler
+        .receive(
+            PresenceRequest {
+                kind,
+                sender,
+                target,
+                stanza: &routed,
+            },
+            &mut transaction,
+            &delivery,
+        )
+        .await
+    {
+        Ok(effects) => effects,
+        Err(error) => {
+            drop(transaction);
+            report_handler_failure(&error, &owner);
+            return Ok(SubscriptionReceipt::Rejected {
+                stanza: routed,
+                condition: error.condition(),
+                text: error.text(),
+            });
+        }
+    };
+    let pending = commit_and_deliver(
+        stage.work.start(),
+        Arc::clone(stage.router.order()),
+        transaction,
+        effects,
+        delivery,
+        None,
+        EffectsDiagnostics {
+            identity: EffectsIdentity::Account(owner),
+            commit_operation: "presence_subscription_commit",
+            delivery_operation: "presence_subscription_effects",
+        },
+    );
+    Ok(match pending.finished().await.ok_or(StageFailure)? {
+        Ok(_) => SubscriptionReceipt::Done,
+        Err(error) => SubscriptionReceipt::Failed {
+            stanza: routed,
+            committed: matches!(error, EffectsError::Delivery(_)),
+        },
+    })
 }

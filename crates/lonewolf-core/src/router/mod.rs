@@ -29,7 +29,6 @@ use lonewolf_xmpp::stanza::{StanzaErrorCondition, StanzaErrorText};
 use prometheus_client::registry::Registry;
 
 use crate::component::registry::{ComponentRegistry, EnqueueError, NOT_CONNECTED_TEXT};
-#[cfg(test)]
 use crate::component::service::ComponentService;
 use crate::hosts::Hosts;
 use crate::order::Order;
@@ -160,7 +159,6 @@ impl<A: ChunkAllocator + Clone + 'static> ServiceRoute<A> {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn component(domain: Arc<str>, registry: ComponentRegistry<A>) -> Self {
         let handler = Arc::new(ComponentService::new(Arc::clone(&domain), registry.clone()));
         Self {
@@ -178,6 +176,18 @@ impl<A: ChunkAllocator> Clone for ServiceRoute<A> {
             handler: Arc::clone(&self.handler),
             component: self.component.clone(),
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum DeliveryScope {
+    ComponentAware,
+    FederationOnly,
+}
+
+impl DeliveryScope {
+    pub(crate) const fn allows_components(self) -> bool {
+        matches!(self, Self::ComponentAware)
     }
 }
 
@@ -845,10 +855,11 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         &self,
         source: &AccountKey,
         target: &str,
+        scope: DeliveryScope,
     ) -> Result<(), RouterError> {
         let domain = bare_jid_domain(target);
         let remote = !self.hosts.is_local_host(domain);
-        let component = self.is_component_domain(domain);
+        let component = scope.allows_components() && self.is_component_domain(domain);
         if !self.hosts.is_local_host(source.domain())
             || (remote && !component && !self.federation_enabled())
         {
@@ -926,10 +937,11 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         &self,
         source: &AccountKey,
         target: &str,
+        scope: DeliveryScope,
     ) -> Result<(), RouterError> {
         let domain = bare_jid_domain(target);
         let remote = !self.hosts.is_local_host(domain);
-        let component = self.is_component_domain(domain);
+        let component = scope.allows_components() && self.is_component_domain(domain);
         if !self.hosts.is_local_host(source.domain())
             || (remote && !component && !self.federation_enabled())
         {

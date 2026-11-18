@@ -30,8 +30,8 @@ use lonewolf_xmpp::stanza::{IqType, StanzaType};
 use crate::order::{Order, Ticket};
 use crate::router::iq_requests::{ID_PREFIX, MAX_TIMEOUT};
 use crate::router::{
-    Admitted, Destination, Mailbox, MailboxEntry, Registration, RoutedStanza, RouterError,
-    RouterHandle, SessionHandle, StoredRelease,
+    Admitted, DeliveryScope, Destination, Mailbox, MailboxEntry, Registration, RoutedStanza,
+    RouterError, RouterHandle, SessionHandle, StoredRelease,
 };
 
 pub(crate) struct WorkGroup {
@@ -120,6 +120,7 @@ impl Drop for WorkGuard {
 pub(crate) struct RouterDelivery<A: ChunkAllocator> {
     router: RouterHandle<A>,
     allocator: A,
+    scope: DeliveryScope,
     /// The requesting resource; server-initiated work has none and cannot tag a session.
     session: Option<SessionHandle<A>>,
 }
@@ -137,8 +138,14 @@ impl<A: ChunkAllocator + Clone> RouterDelivery<A> {
         Self {
             router: router.clone(),
             allocator: allocator.clone(),
+            scope: DeliveryScope::ComponentAware,
             session: session.map(Registration::handle),
         }
+    }
+
+    pub(crate) fn with_scope(mut self, scope: DeliveryScope) -> Self {
+        self.scope = scope;
+        self
     }
 }
 
@@ -417,7 +424,7 @@ impl<A: ChunkAllocator + Clone> HostLookup for RouterDelivery<A> {
     }
 
     fn is_component_domain(&self, domain: &str) -> bool {
-        self.router.is_component_domain(domain)
+        self.scope.allows_components() && self.router.is_component_domain(domain)
     }
 }
 
@@ -493,6 +500,7 @@ impl<A: ChunkAllocator + Clone + 'static> Delivery<A> for RouterDelivery<A> {
         let delivery = RouterDelivery {
             router: self.router.clone(),
             allocator: self.allocator.clone(),
+            scope: self.scope,
             session: None,
         };
         compio::runtime::spawn(async move {
@@ -529,11 +537,12 @@ impl<A: ChunkAllocator + Clone + 'static> Delivery<A> for RouterDelivery<A> {
 
     fn to_remote<'a>(&'a self, stanza: RoutedStanza<A>) -> DeliveryFuture<'a> {
         Box::pin(async move {
-            let component = stanza
-                .resolve()
-                .ok()
-                .and_then(|view| view.to().ok().flatten())
-                .is_some_and(|to| self.router.is_component_domain(to.domainpart()));
+            let component = self.scope.allows_components()
+                && stanza
+                    .resolve()
+                    .ok()
+                    .and_then(|view| view.to().ok().flatten())
+                    .is_some_and(|to| self.router.is_component_domain(to.domainpart()));
             if component {
                 self.router
                     .route_to_component_or_bounce(stanza)
@@ -605,7 +614,7 @@ impl<A: ChunkAllocator + Clone + 'static> Delivery<A> for RouterDelivery<A> {
     fn current_presence<'a>(&'a self, from: &'a AccountKey, to: &'a str) -> DeliveryFuture<'a> {
         Box::pin(async move {
             self.router
-                .route_current_presence(from, to)
+                .route_current_presence(from, to, self.scope)
                 .await
                 .map_err(|_| DeliveryError)
         })
@@ -614,7 +623,7 @@ impl<A: ChunkAllocator + Clone + 'static> Delivery<A> for RouterDelivery<A> {
     fn unavailable_presence<'a>(&'a self, from: &'a AccountKey, to: &'a str) -> DeliveryFuture<'a> {
         Box::pin(async move {
             self.router
-                .route_unavailable_presence(from, to)
+                .route_unavailable_presence(from, to, self.scope)
                 .await
                 .map_err(|_| DeliveryError)
         })

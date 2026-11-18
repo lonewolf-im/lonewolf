@@ -309,81 +309,139 @@ fn component_presence_errors_reach_only_the_addressed_full_or_available_bare_res
     suite.stop()
 }
 
+fn without_roster() -> TestResult<C2sSuite> {
+    C2sSuite::with_components(&format!(
+        "{}\n[hosts.localhost]\nextensions = ['ping']",
+        super::roster::CONFIG
+    ))
+}
+
+fn assert_roster_untouched(suite: &C2sSuite) -> TestResult {
+    use compio::runtime::Runtime;
+    use lonewolf_storage::account::AccountKey;
+    use lonewolf_storage::roster::RosterReads;
+    use lonewolf_storage::{RedbStorage, Storage};
+    use lonewolf_util::arena::{Arena, ArenaConfig};
+    use lonewolf_xmpp::jid::Jid;
+
+    let storage = RedbStorage::open(suite.fixture_path().join("data/lonewolf.dat"))?;
+    let mut arena = Arena::try_new(ArenaConfig::default())?;
+    let owner =
+        AccountKey::try_from(Jid::parse_in("alice@localhost", &mut arena)?.resolve(&arena)?)?;
+    Runtime::new()?.block_on(async {
+        let transaction = storage.begin_read().await?;
+        assert!(
+            transaction
+                .next_roster_subscription(&owner, None)
+                .await?
+                .is_none()
+        );
+        assert_eq!(transaction.roster_version(&owner).await?.get(), 0);
+        assert!(
+            transaction
+                .next_pending_sender(&owner, None)
+                .await?
+                .is_none()
+        );
+        Ok(())
+    })
+}
+
 #[test]
 fn component_subscription_types_pass_through_to_available_resources_without_roster_changes()
 -> TestResult {
-    let mut suite = C2sSuite::with_components(CONFIG)?;
-    suite.create_account("alice", PASSWORD)?;
-    let mut desk = suite.connect("alice", PASSWORD, "desk")?;
-    let mut phone = suite.connect("alice", PASSWORD, "phone")?;
-    available_pair(&mut desk, &mut phone)?;
-    let mut component = ComponentClient::authenticated(&suite, DOMAIN, SECRET)?;
     for kind in ["subscribe", "subscribed", "unsubscribe", "unsubscribed"] {
-        component.send(&format!("<presence type='{kind}' from='bot@muc.localhost' to='alice@localhost' id='{kind}'><status>subscription request</status></presence>"))?;
-        for client in [&mut desk, &mut phone] {
-            client.expect_xml(&format!("<presence xmlns='jabber:client' type='{kind}' from='bot@muc.localhost' to='alice@localhost' id='{kind}'><status>subscription request</status></presence>")).map_err(|error| crate::support::xml::context("component stanza delivery", error))?;
-            client.send("<iq type='get' id='roster'><query xmlns='jabber:iq:roster'/></iq>")?;
-            let reply = client.receive()?;
-            assert_eq!(reply.attribute("type"), Some("result"));
-            assert_eq!(reply.attribute("id"), Some("roster"));
-            assert!(
-                reply
-                    .child("jabber:iq:roster", "query")?
-                    .children
-                    .is_empty()
-            );
+        let mut suite = without_roster()?;
+        suite.create_account("alice", PASSWORD)?;
+        let mut desk = suite.connect("alice", PASSWORD, "desk")?;
+        let mut phone = suite.connect("alice", PASSWORD, "phone")?;
+        available_pair(&mut desk, &mut phone)?;
+        let mut component = super::roster::attach(&suite)?;
+        for contact in [super::roster::DOMAIN, super::roster::SERVER] {
+            component.send(&format!("<presence type='{kind}' from='{contact}' to='alice@localhost' id='{kind}'><status>subscription request</status></presence>"))?;
+            for client in [&mut desk, &mut phone] {
+                client.expect_xml(&format!("<presence xmlns='jabber:client' type='{kind}' from='{contact}' to='alice@localhost' id='{kind}'><status>subscription request</status></presence>"))?;
+                barrier(client)?;
+            }
         }
+        super::roster::component_barrier(&mut component)?;
+        traffic(&suite, "presence", 2, 0)?;
+        component.close()?;
+        close_available_pair(desk, phone)?;
+        suite.stop()?;
+        assert_roster_untouched(&suite)?;
     }
-    ping(&mut component, "done")?;
-    ping_result(&mut component, "done")?;
-    traffic(&suite, "presence", 4, 0)?;
-    component.close()?;
-    close_available_pair(desk, phone)?;
-    suite.stop()
+    Ok(())
 }
 
 #[test]
 fn component_full_jid_subscriptions_preserve_addresses_and_fan_out_without_roster_changes()
 -> TestResult {
-    let mut suite = C2sSuite::with_components(CONFIG)?;
-    suite.create_account("alice", PASSWORD)?;
-    let mut desk = suite.connect("alice", PASSWORD, "desk")?;
-    let mut phone = suite.connect("alice", PASSWORD, "phone")?;
-    available_pair(&mut desk, &mut phone)?;
-    let mut component = ComponentClient::authenticated(&suite, DOMAIN, SECRET)?;
     for kind in ["subscribe", "subscribed", "unsubscribe", "unsubscribed"] {
-        component.send(&format!("<presence type='{kind}' from='bot@muc.localhost' to='alice@localhost/desk' id='{kind}'><status>full target subscription</status></presence>"))?;
-        ping(&mut component, kind)?;
-        ping_result(&mut component, kind)?;
-        for (client, resource) in [(&mut desk, "desk"), (&mut phone, "phone")] {
-            client.expect_xml(&format!("<presence xmlns='jabber:client' type='{kind}' from='bot@muc.localhost' to='alice@localhost/desk' id='{kind}'><status>full target subscription</status></presence>"))?;
-            client.send("<iq type='get' id='roster'><query xmlns='jabber:iq:roster'/></iq>")?;
-            client.expect_xml(&format!("<iq xmlns='jabber:client' type='result' id='roster' to='alice@localhost/{resource}'><query xmlns='jabber:iq:roster'/></iq>"))?;
+        let mut suite = without_roster()?;
+        suite.create_account("alice", PASSWORD)?;
+        let mut desk = suite.connect("alice", PASSWORD, "desk")?;
+        let mut phone = suite.connect("alice", PASSWORD, "phone")?;
+        available_pair(&mut desk, &mut phone)?;
+        let mut component = super::roster::attach(&suite)?;
+        for contact in [super::roster::DOMAIN, super::roster::SERVER] {
+            component.send(&format!("<presence type='{kind}' from='{contact}/console' to='alice@localhost/desk' id='{kind}'><status>full target subscription</status></presence>"))?;
+            super::roster::component_barrier(&mut component)?;
+            for client in [&mut desk, &mut phone] {
+                client.expect_xml(&format!("<presence xmlns='jabber:client' type='{kind}' from='{contact}/console' to='alice@localhost/desk' id='{kind}'><status>full target subscription</status></presence>"))?;
+                barrier(client)?;
+            }
         }
+        component.close()?;
+        suite.wait_for_metric("lonewolf_component_streams 0")?;
+        traffic(&suite, "presence", 2, 0)?;
+        traffic(&suite, "iq", 2, 2)?;
+        close_available_pair(desk, phone)?;
+        suite.stop()?;
+        assert_roster_untouched(&suite)?;
     }
-    component.close()?;
-    suite.wait_for_metric("lonewolf_component_streams 0")?;
-    traffic(&suite, "presence", 4, 0)?;
-    traffic(&suite, "iq", 4, 4)?;
-    close_available_pair(desk, phone)?;
-    suite.stop()
+    Ok(())
 }
 
 #[test]
 fn component_subscriptions_to_missing_full_jids_are_silent_and_keep_the_stream_usable() -> TestResult
 {
-    let mut suite = C2sSuite::with_components(CONFIG)?;
-    let mut component = ComponentClient::authenticated(&suite, DOMAIN, SECRET)?;
-    for kind in ["subscribe", "subscribed", "unsubscribe", "unsubscribed"] {
-        component.send(&format!("<presence type='{kind}' from='bot@muc.localhost' to='nobody@localhost/desk' id='{kind}'><status>missing full target</status></presence>"))?;
-        ping(&mut component, kind)?;
-        ping_result(&mut component, kind)?;
+    let mut suite = without_roster()?;
+    let mut component = super::roster::attach(&suite)?;
+    for contact in [super::roster::DOMAIN, super::roster::SERVER] {
+        for kind in ["subscribe", "subscribed", "unsubscribe", "unsubscribed"] {
+            component.send(&format!("<presence type='{kind}' from='{contact}' to='nobody@localhost/desk' id='{kind}'><status>missing full target</status></presence>"))?;
+            super::roster::component_barrier(&mut component)?;
+        }
     }
     component.close()?;
     suite.wait_for_metric("lonewolf_component_streams 0")?;
-    traffic(&suite, "presence", 4, 0)?;
-    traffic(&suite, "iq", 4, 4)?;
+    traffic(&suite, "presence", 8, 0)?;
+    traffic(&suite, "iq", 8, 8)?;
     suite.stop()
+}
+
+#[test]
+fn client_subscriptions_to_components_pass_through_on_hosts_without_roster() -> TestResult {
+    for kind in ["subscribe", "subscribed", "unsubscribe", "unsubscribed"] {
+        let mut suite = without_roster()?;
+        suite.create_account("alice", PASSWORD)?;
+        let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+        let mut component = super::roster::attach(&suite)?;
+        for contact in [super::roster::DOMAIN, super::roster::SERVER] {
+            alice.send(&format!(
+                "<presence type='{kind}' to='{contact}/console' id='{kind}'/>"
+            ))?;
+            component.expect_xml(&format!("<presence xmlns='{NAMESPACE}' type='{kind}' from='alice@localhost/desk' to='{contact}/console' id='{kind}'/>"))?;
+        }
+        barrier(&mut alice)?;
+        traffic(&suite, "presence", 0, 2)?;
+        component.close()?;
+        alice.close()?;
+        suite.stop()?;
+        assert_roster_untouched(&suite)?;
+    }
+    Ok(())
 }
 
 #[test]

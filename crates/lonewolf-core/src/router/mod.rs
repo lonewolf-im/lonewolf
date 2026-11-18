@@ -1015,6 +1015,9 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
             return Err(RouterError::InvalidTarget);
         }
         for subscriber in subscribers {
+            if self.is_component_domain(subscriber.domain()) {
+                continue;
+            }
             let mut arena = Arena::try_new_in(Default::default(), self.local.allocator())
                 .map_err(|_| RouterError::Unavailable)?;
             let target = Jid::parse_in(subscriber.as_str(), &mut arena)
@@ -1045,6 +1048,30 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
             match self.route_presence(stanza).await {
                 Ok(()) | Err(RouterError::NotFound | RouterError::Busy) => {}
                 Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn broadcast_component_presence(
+        &self,
+        source: &RoutedStanza<A>,
+        subscribers: &[RosterJid],
+    ) -> Result<(), RouterError> {
+        let view = source.resolve().map_err(|_| RouterError::Unavailable)?;
+        if !matches!(
+            view.stanza_type(),
+            StanzaType::Presence(PresenceType::Available | PresenceType::Unavailable)
+        ) {
+            return Err(RouterError::InvalidTarget);
+        }
+        for subscriber in subscribers {
+            if self.is_component_domain(subscriber.domain()) {
+                let stanza = self.readdress(source, subscriber.as_str())?;
+                match self.route_to_component(stanza) {
+                    Ok(()) | Err(RouterError::Offline | RouterError::Busy) => {}
+                    Err(error) => return Err(error),
+                }
             }
         }
         Ok(())

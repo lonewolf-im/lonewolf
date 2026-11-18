@@ -29,7 +29,7 @@ pub use store::StateStore;
 pub use transport::{AcmeHttpClient, TransportOptions};
 pub use types::{
     AcmeError, AcmeErrorKind, AriWindow, AttemptFailure, AttemptSuccess, CertificateMaterial,
-    CertificateValidity, FailureKind, InstallError, Installer, ManagedHost, PendingOrder,
+    CertificateValidity, FailureKind, InstallError, Installer, IoCause, ManagedHost, PendingOrder,
     PreparedInstall, RetryState, StateError, StoredAccount, StoredCertificate, StoredHost,
     is_valid_profile_name,
 };

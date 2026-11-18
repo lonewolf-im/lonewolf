@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fs::{DirBuilder, OpenOptions};
+use std::io;
 use std::num::NonZeroUsize;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
@@ -21,7 +22,7 @@ use redb::{
 use serde::{Deserialize, Serialize};
 
 use crate::types::{
-    StateError, StoredAccount, StoredHost, decode, encode, validate_dns, validate_url,
+    IoCause, StateError, StoredAccount, StoredHost, decode, encode, validate_dns, validate_url,
 };
 
 const DIRECTORIES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("acme_directories");
@@ -117,7 +118,7 @@ impl StateStore {
                         .recursive(true)
                         .mode(0o700)
                         .create(parent)
-                        .map_err(|_| StateError::Unavailable)?;
+                        .map_err(unavailable)?;
                 }
                 let file = OpenOptions::new()
                     .read(true)
@@ -127,8 +128,8 @@ impl StateStore {
                     .mode(0o600)
                     .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
                     .open(path)
-                    .map_err(|_| StateError::Unavailable)?;
-                let metadata = file.metadata().map_err(|_| StateError::Unavailable)?;
+                    .map_err(unavailable)?;
+                let metadata = file.metadata().map_err(unavailable)?;
                 if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 {
                     return Err(StateError::UnsafePath);
                 }
@@ -389,7 +390,7 @@ impl Inner {
         let fault = std::mem::replace(&mut *self.fault.lock(), Fault::None);
         #[cfg(test)]
         match fault {
-            Fault::PreCommit => return Err(StateError::Unavailable),
+            Fault::PreCommit => return Err(StateError::Unavailable(io::ErrorKind::Other.into())),
             Fault::UncertainBefore => {
                 self.admission.lock().uncertain = true;
                 return Err(StateError::StateUncertain);
@@ -427,7 +428,7 @@ fn begin_write(database: &Database) -> Result<WriteTransaction, StateError> {
 
 fn commit_error(error: redb::CommitError) -> StateError {
     if matches!(error, redb::CommitError::TransactionPoisoned) {
-        StateError::Unavailable
+        StateError::Unavailable(io::ErrorKind::Other.into())
     } else {
         StateError::StateUncertain
     }
@@ -442,13 +443,24 @@ fn backend_error(error: impl Into<redb::Error>) -> StateError {
         | redb::Error::TypeDefinitionChanged { .. }
         | redb::Error::TableDoesNotExist(_) => StateError::CorruptData,
         redb::Error::UpgradeRequired(_) => StateError::UnsupportedData,
-        redb::Error::Io(_)
-        | redb::Error::DatabaseAlreadyOpen
-        | redb::Error::DatabaseClosed
-        | redb::Error::PreviousIo
-        | redb::Error::LockPoisoned(_) => StateError::Unavailable,
+        // The backend raises this kind itself for a file that is not a database.
+        redb::Error::Io(error)
+            if error.kind() == io::ErrorKind::InvalidData && error.raw_os_error().is_none() =>
+        {
+            StateError::CorruptData
+        }
+        redb::Error::Io(error) => unavailable(error),
+        redb::Error::Unsupported => StateError::Unavailable(io::ErrorKind::Unsupported.into()),
+        redb::Error::DatabaseAlreadyOpen | redb::Error::LockProtocolMismatch => StateError::Locked,
+        redb::Error::DatabaseClosed | redb::Error::PreviousIo | redb::Error::LockPoisoned(_) => {
+            StateError::Unavailable(io::ErrorKind::Other.into())
+        }
         _ => StateError::Other,
     }
+}
+
+fn unavailable(error: io::Error) -> StateError {
+    StateError::Unavailable(IoCause::from(&error))
 }
 
 #[cfg(test)]

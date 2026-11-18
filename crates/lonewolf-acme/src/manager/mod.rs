@@ -85,7 +85,12 @@ impl From<StateError> for ManagerError {
 }
 impl fmt::Display for ManagerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "ACME manager {self:?}")
+        match self {
+            Self::State(error) => error.fmt(formatter),
+            Self::Transport(error) => error.fmt(formatter),
+            Self::Task => formatter.write_str("ACME manager task failed"),
+            Self::Deadline => formatter.write_str("ACME manager drain deadline elapsed"),
+        }
     }
 }
 impl std::error::Error for ManagerError {}

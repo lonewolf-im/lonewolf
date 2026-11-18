@@ -1203,15 +1203,15 @@ fn automatic_setup_does_not_retry_port_zero_or_corrupt_locked_insecure_cache() -
         ),
         (
             "corrupt",
-            "ACME load failed: ACME manager State(Unavailable)",
+            "ACME load failed: acme/state.redb: corrupt ACME state",
         ),
         (
             "locked",
-            "ACME load failed: ACME manager State(Unavailable)",
+            "ACME load failed: acme/state.redb: ACME state is in use by another open instance",
         ),
         (
             "insecure",
-            "ACME load failed: ACME manager State(UnsafePath)",
+            "ACME load failed: acme/state.redb: ACME state path is not private regular storage",
         ),
     ] {
         let mut server = C2sSuite::managed(&ca)?;

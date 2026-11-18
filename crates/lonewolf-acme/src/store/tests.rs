@@ -186,9 +186,9 @@ fn directory_namespaces_and_clone_lifetimes_are_isolated() -> TestResult {
     block_on(first.save_account(account(1)))?;
     block_on(first.save_host(host(2)))?;
     let clone = first.clone();
-    assert!(matches!(open(&path), Err(StateError::Unavailable)));
+    assert!(matches!(open(&path), Err(StateError::Locked)));
     drop(first);
-    assert!(matches!(open(&path), Err(StateError::Unavailable)));
+    assert!(matches!(open(&path), Err(StateError::Locked)));
     drop(clone);
     let alternate = block_on(StateStore::open(
         path.clone(),
@@ -260,12 +260,32 @@ fn rejects_insecure_symlink_and_nonregular_files_without_modifying_them() -> Tes
 }
 
 #[test]
+fn open_failure_reports_the_operating_system_cause() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let file = directory.path().join("file");
+    fs::write(&file, b"not a directory")?;
+    let Err(StateError::Unavailable(cause)) = open(&file.join("nested/state.redb")) else {
+        return Err("open below a regular file must report the I/O cause".into());
+    };
+    assert_eq!(cause.kind(), io::ErrorKind::NotADirectory);
+    assert_eq!(cause.os_code(), Some(nix::libc::ENOTDIR));
+    assert_eq!(
+        StateError::Unavailable(cause).to_string(),
+        format!(
+            "ACME state unavailable: {}",
+            io::Error::from_raw_os_error(nix::libc::ENOTDIR)
+        )
+    );
+    Ok(())
+}
+
+#[test]
 fn corrupt_database_is_preserved_and_invalid_url_creates_nothing() -> TestResult {
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("invalid.redb");
     fs::write(&path, b"not a redb database")?;
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-    assert!(open(&path).is_err());
+    assert!(matches!(open(&path), Err(StateError::CorruptData)));
     assert_eq!(fs::read(path)?, b"not a redb database");
     let absent = directory.path().join("absent/state.redb");
     assert!(matches!(
@@ -449,7 +469,13 @@ fn namespace_collisions_and_record_host_disagreement_fail_closed() -> TestResult
 fn failed_and_uncertain_commits_preserve_atomic_material_and_require_reopen() -> TestResult {
     let directory = tempfile::tempdir()?;
     for (index, fault, expected, byte, pending) in [
-        (0, Fault::PreCommit, StateError::Unavailable, 1, true),
+        (
+            0,
+            Fault::PreCommit,
+            StateError::Unavailable(io::ErrorKind::Other.into()),
+            1,
+            true,
+        ),
         (
             1,
             Fault::UncertainBefore,
@@ -548,12 +574,12 @@ fn submitted_work_retains_lock_after_cancellation_and_expired_drain() -> TestRes
         block_on(store.drain(Instant::now())),
         Err(StateError::DeadlineElapsed)
     );
-    assert!(matches!(open(&path), Err(StateError::Unavailable)));
+    assert!(matches!(open(&path), Err(StateError::Locked)));
     assert!(matches!(block_on(store.account()), Err(StateError::Closed)));
     let weak = Arc::downgrade(&store.inner);
     let executor = store.inner.executor.clone();
     drop(store);
-    assert!(matches!(open(&path), Err(StateError::Unavailable)));
+    assert!(matches!(open(&path), Err(StateError::Locked)));
     release.send(())?;
     compio::runtime::Runtime::new()?
         .block_on(async { compio::time::timeout(TIMEOUT, executor.run(|| ())).await })?;
@@ -635,7 +661,12 @@ fn queued_mutations_stop_after_an_uncertain_commit() -> TestResult {
 fn account_key_credentials_and_retry_commit_together() -> TestResult {
     let directory = tempfile::tempdir()?;
     for (index, fault, expected, byte) in [
-        (0, Fault::PreCommit, StateError::Unavailable, 1),
+        (
+            0,
+            Fault::PreCommit,
+            StateError::Unavailable(io::ErrorKind::Other.into()),
+            1,
+        ),
         (1, Fault::UncertainBefore, StateError::StateUncertain, 1),
         (2, Fault::UncertainAfter, StateError::StateUncertain, 9),
     ] {
@@ -714,10 +745,7 @@ fn initializes_only_acme_tables_without_rewriting_account_records() -> TestResul
 fn exclusive_lock_rejects_another_process() -> TestResult {
     const CHILD_PATH: &str = "LONEWOLF_ACME_LOCK_TEST_PATH";
     if let Some(path) = std::env::var_os(CHILD_PATH) {
-        assert!(matches!(
-            open(Path::new(&path)),
-            Err(StateError::Unavailable)
-        ));
+        assert!(matches!(open(Path::new(&path)), Err(StateError::Locked)));
         return Ok(());
     }
     let directory = tempfile::tempdir()?;

@@ -1089,7 +1089,10 @@ fn material_and_commit_failures_never_activate() {
             1 => installer.invalid = Some(InstallError::Expired),
             2 => installer.invalid = Some(InstallError::NotYetValid),
             3 => engine.pem = "private remote detail".into(),
-            4 => memory.records.lock().fail_candidate = Some(StateError::Unavailable),
+            4 => {
+                memory.records.lock().fail_candidate =
+                    Some(StateError::Unavailable(std::io::ErrorKind::Other.into()))
+            }
             _ => memory.records.lock().fail_candidate = Some(StateError::StateUncertain),
         }
         let error = block_on(attempt(

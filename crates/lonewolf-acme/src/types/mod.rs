@@ -70,12 +70,57 @@ impl fmt::Display for AcmeError {
 
 impl std::error::Error for AcmeError {}
 
+/// Keeps only the kind and OS code of an I/O error, never its message or path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IoCause {
+    kind: io::ErrorKind,
+    os_code: Option<i32>,
+}
+
+impl IoCause {
+    pub fn kind(self) -> io::ErrorKind {
+        self.kind
+    }
+
+    pub fn os_code(self) -> Option<i32> {
+        self.os_code
+    }
+}
+
+impl From<&io::Error> for IoCause {
+    fn from(error: &io::Error) -> Self {
+        Self {
+            kind: error.kind(),
+            os_code: error.raw_os_error(),
+        }
+    }
+}
+
+impl From<io::ErrorKind> for IoCause {
+    fn from(kind: io::ErrorKind) -> Self {
+        Self {
+            kind,
+            os_code: None,
+        }
+    }
+}
+
+impl fmt::Display for IoCause {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.os_code {
+            Some(code) => io::Error::from_raw_os_error(code).fmt(formatter),
+            None => self.kind.fmt(formatter),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StateError {
     InvalidData,
     CorruptData,
     UnsupportedData,
-    Unavailable,
+    Unavailable(IoCause),
+    Locked,
     UnsafePath,
     StateUncertain,
     Closed,
@@ -89,7 +134,10 @@ impl fmt::Display for StateError {
             Self::InvalidData => "invalid ACME state input",
             Self::CorruptData => "corrupt ACME state",
             Self::UnsupportedData => "unsupported ACME state",
-            Self::Unavailable => "ACME state unavailable",
+            Self::Unavailable(cause) => {
+                return write!(formatter, "ACME state unavailable: {cause}");
+            }
+            Self::Locked => "ACME state is in use by another open instance",
             Self::UnsafePath => "ACME state path is not private regular storage",
             Self::StateUncertain => "ACME state commit is uncertain; reopen required",
             Self::Closed => "ACME state admission is closed",

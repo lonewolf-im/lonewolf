@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::fmt;
 use std::future::Future;
 use std::io;
 use std::panic::AssertUnwindSafe;
+use std::path::{Path, PathBuf};
 use std::pin::pin;
 use std::time::Instant;
 
@@ -10,7 +12,7 @@ use futures_util::FutureExt;
 use futures_util::future::{Either, select};
 use lonewolf_acme::{
     CertificateMaterial, CertificateValidity, Challenges, Http01Server, InstallError, Installer,
-    ManagedHost, Manager, ManagerError, ManagerOptions, PreparedInstall, StatusHandle,
+    ManagedHost, Manager, ManagerError, ManagerOptions, PreparedInstall, StateError, StatusHandle,
 };
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 
@@ -82,6 +84,7 @@ pub(crate) struct AcmeServices {
     http: Option<Http01Server>,
     manager: Manager<HostInstaller>,
     status: StatusHandle,
+    state_path: PathBuf,
 }
 
 impl AcmeServices {
@@ -159,7 +162,8 @@ impl AcmeServices {
             let _ = options;
             Manager::load(manager_options, challenges, installer).await
         };
-        let manager = manager.map_err(|error| failure("load", error))?;
+        let manager = manager
+            .map_err(|error| manager_failure("load", &config.letsencrypt.state_path, error))?;
         for (index, address) in http
             .local_addrs()
             .map_err(|error| io_failure("HTTP address", error))?
@@ -178,6 +182,7 @@ impl AcmeServices {
             http: Some(http),
             manager,
             status,
+            state_path: config.letsencrypt.state_path.clone(),
         })
     }
 
@@ -206,7 +211,7 @@ impl AcmeServices {
                 self.manager
                     .run(manager_stop)
                     .await
-                    .map_err(|error| failure("manager", error))
+                    .map_err(|error| manager_failure("manager", &self.state_path, error))
             },
             || shutdown.peek().is_some(),
         )
@@ -218,7 +223,7 @@ impl AcmeServices {
         self.manager
             .drain(deadline)
             .await
-            .map_err(|error| failure("drain", error))
+            .map_err(|error| manager_failure("drain", &self.state_path, error))
     }
 }
 
@@ -286,6 +291,33 @@ fn failure(
     RunError::Acme {
         phase,
         source: Box::new(source),
+    }
+}
+
+#[derive(Debug)]
+struct StateFailure {
+    path: PathBuf,
+    source: StateError,
+}
+
+impl fmt::Display for StateFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}: {}", self.path.display(), self.source)
+    }
+}
+
+impl std::error::Error for StateFailure {}
+
+fn manager_failure(phase: &'static str, state_path: &Path, error: ManagerError) -> RunError {
+    match error {
+        ManagerError::State(source) => failure(
+            phase,
+            StateFailure {
+                path: state_path.to_path_buf(),
+                source,
+            },
+        ),
+        other => failure(phase, other),
     }
 }
 

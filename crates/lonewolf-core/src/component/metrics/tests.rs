@@ -116,7 +116,12 @@ fn enum_labels_match_the_fixed_catalog() {
     );
     assert_eq!(
         DropReason::ALL.map(DropReason::as_str),
-        ["not_bounceable", "shutdown", "invalid",]
+        [
+            "not_bounceable",
+            "shutdown",
+            "invalid",
+            "presence_not_subscribed"
+        ]
     );
     assert_eq!(KINDS.map(StanzaKind::as_str), ["message", "presence", "iq"]);
 }
@@ -224,7 +229,12 @@ fn recording_methods_encode_the_exact_samples_and_histogram() -> Result<(), fmt:
             &format!("lonewolf_component_admission_rejections_total{{reason=\"{reason}\"}} 1"),
         );
     }
-    for reason in ["not_bounceable", "shutdown", "invalid"] {
+    for reason in [
+        "not_bounceable",
+        "shutdown",
+        "invalid",
+        "presence_not_subscribed",
+    ] {
         assert_sample(
             &output,
             &format!("lonewolf_component_dropped_stanzas_total{{reason=\"{reason}\"}} 5"),

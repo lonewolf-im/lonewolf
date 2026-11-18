@@ -66,7 +66,7 @@ pub(super) fn grants(state: SubscriptionState) -> bool {
     matches!(state, SubscriptionState::From | SubscriptionState::Both)
 }
 
-fn subscribed_to(state: SubscriptionState) -> bool {
+pub(super) fn subscribed_to(state: SubscriptionState) -> bool {
     matches!(state, SubscriptionState::To | SubscriptionState::Both)
 }
 

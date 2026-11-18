@@ -2,11 +2,14 @@
 
 use lonewolf_extension::policy::Verdict;
 use lonewolf_extension::presence::PresenceRequestType;
+use lonewolf_storage::Storage;
 use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::ChunkAllocator;
 use lonewolf_xmpp::stanza::PresenceType;
 
 use super::{Context, IngressFailure, apply_subscription_receipt};
+use crate::component::metrics::DropReason;
+use crate::delivery::{report_failure, report_handler_failure, storage_failure};
 use crate::router::{Destination, RoutedStanza, RouterError};
 use crate::stages::Stage;
 use crate::stages::ingress::{
@@ -97,6 +100,52 @@ pub(super) async fn handle<A: ChunkAllocator + Clone + 'static>(
         != Verdict::Allow
     {
         return Ok(());
+    }
+    if kind == PresenceType::Available
+        && destination == Destination::Account
+        && let Some(handler) = context
+            .router
+            .presence_handlers(account.domain())
+            .and_then(|handlers| handlers.find(PresenceRequestType::Available))
+    {
+        let sender = view
+            .from()
+            .map_err(|_| IngressFailure)?
+            .ok_or(IngressFailure)?
+            .bare();
+        let transaction = match context.storage.begin_read().await {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                report_failure(
+                    storage_failure(error, "presence_filter_begin_read"),
+                    &account,
+                );
+                return Ok(());
+            }
+        };
+        match handler
+            .accepts_presence(&account, sender, &transaction)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                context
+                    .registry
+                    .metrics()
+                    .dropped(DropReason::PresenceNotSubscribed, 1);
+                tracing::debug!(
+                    outcome = "not_subscribed",
+                    account_jid = ?account.as_str(),
+                    contact_jid = ?sender.as_str(),
+                    "component presence dropped"
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                report_handler_failure(&error, &account);
+                return Ok(());
+            }
+        }
     }
     let result = if subscription.is_some() {
         context.router.route_subscription_presence(routed).await

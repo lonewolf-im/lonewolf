@@ -390,6 +390,21 @@ where
     A: ChunkAllocator,
     S: Storage,
 {
+    fn accepts_presence<'a>(
+        &'a self,
+        owner: &'a AccountKey,
+        contact: JidRef<'a>,
+        transaction: &'a S::Read,
+    ) -> PresenceFuture<'a, bool> {
+        Box::pin(async move {
+            Ok(transaction
+                .roster_subscription(owner, &RosterJid::from(contact.bare()))
+                .await
+                .map_err(|error| roster_error(error, "roster_read"))?
+                .is_none_or(|item| state::subscribed_to(item.state)))
+        })
+    }
+
     fn visibility<'a>(
         &'a self,
         owner: &'a AccountKey,

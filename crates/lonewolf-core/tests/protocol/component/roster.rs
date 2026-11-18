@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::routing::traffic;
+use super::stream_conformance::assert_counter;
 use crate::support::component::{ComponentClient, NAMESPACE};
 use crate::support::xml::Element;
 use crate::support::{C2sSuite, Client, PASSWORD, TestResult, barrier};
@@ -190,6 +191,11 @@ subscription_scenarios!(
     removing_a_component_contact_notifies_the_component,
     removing_a_requested_component_contact_withdraws_the_request,
     deleting_an_account_notifies_its_component_contacts,
+    unsubscribe_stops_component_status_updates,
+    requested_component_contacts_show_presence_only_after_approval,
+    unavailable_and_full_jid_presence_from_unfollowed_contacts_is_delivered,
+    presence_from_component_jids_outside_the_roster_is_delivered,
+    hosts_without_roster_deliver_component_presence_unfiltered,
 );
 
 fn client_subscription_to_component_contact_is_approved_and_pushes_to(contact: &str) -> TestResult {
@@ -977,5 +983,122 @@ fn deleting_an_account_notifies_its_component_contacts(both: &str) -> TestResult
     expect_component_pong(&mut component)?;
     traffic(&suite, "presence", 4, 9)?;
     component.close()?;
+    suite.stop()
+}
+
+const NOT_SUBSCRIBED: &str =
+    "lonewolf_component_dropped_stanzas_total{reason=\"presence_not_subscribed\"}";
+
+fn unsubscribe_stops_component_status_updates(contact: &str) -> TestResult {
+    let (mut suite, mut alice, mut component) = online()?;
+    let followed = other_contact(contact);
+    follow(&mut alice, &mut component, followed)?;
+    follow(&mut alice, &mut component, contact)?;
+    grant(&mut alice, &mut component, contact, true, true)?;
+
+    alice.send(&format!("<presence type='unsubscribe' to='{contact}'/>"))?;
+    component_presence(&mut component, ALICE, contact, Some("unsubscribe"))?;
+    push(&mut alice, contact, "from", None, false)?;
+    contact_status(&mut component, contact, Some("unavailable"), "disconnected")?;
+    component.send(&format!("<presence type='unsubscribed' from='{contact}' to='{ALICE}'/><presence type='unsubscribe' from='{contact}' to='{ALICE}'/>"))?;
+    expect_contact_status(&mut alice, contact, Some("unavailable"), "disconnected")?;
+    client_receives(&mut alice, contact, "unsubscribe")?;
+    push(&mut alice, contact, "none", None, false)?;
+    component_presence(&mut component, ALICE, contact, Some("unsubscribed"))?;
+    component_presence(&mut component, DESK, contact, Some("unavailable"))?;
+
+    assert_counter(&suite.scrape_metrics()?, NOT_SUBSCRIBED, 0)?;
+    contact_status(&mut component, contact, None, "reconnected")?;
+    contact_status(&mut component, followed, None, "online")?;
+    traffic(&suite, "presence", 8, 7)?;
+    expect_contact_status(&mut alice, followed, None, "online")?;
+    assert_counter(&suite.scrape_metrics()?, NOT_SUBSCRIBED, 1)?;
+    component.close()?;
+    alice.close()?;
+    suite.stop()
+}
+
+fn requested_component_contacts_show_presence_only_after_approval(contact: &str) -> TestResult {
+    let (mut suite, mut alice, mut component) = online()?;
+    alice.send(&format!("<presence type='subscribe' to='{contact}'/>"))?;
+    component_presence(&mut component, ALICE, contact, Some("subscribe"))?;
+    push(&mut alice, contact, "none", Some("subscribe"), false)?;
+    assert_counter(&suite.scrape_metrics()?, NOT_SUBSCRIBED, 0)?;
+
+    contact_status(&mut component, contact, None, "before approval")?;
+    component.send(&format!("<presence type='subscribed' from='{contact}' to='{ALICE}'/><presence from='{contact}' to='{ALICE}'><status>after approval</status></presence>"))?;
+    traffic(&suite, "presence", 3, 1)?;
+    client_receives(&mut alice, contact, "subscribed")?;
+    push(&mut alice, contact, "to", None, false)?;
+    expect_contact_status(&mut alice, contact, None, "after approval")?;
+    assert_counter(&suite.scrape_metrics()?, NOT_SUBSCRIBED, 1)?;
+    component.close()?;
+    alice.close()?;
+    suite.stop()
+}
+
+fn unavailable_and_full_jid_presence_from_unfollowed_contacts_is_delivered(
+    contact: &str,
+) -> TestResult {
+    let (mut suite, mut alice, mut component) = online()?;
+    grant(&mut alice, &mut component, contact, false, true)?;
+    contact_status(&mut component, contact, Some("unavailable"), "disconnected")?;
+    expect_contact_status(&mut alice, contact, Some("unavailable"), "disconnected")?;
+    for sender in [
+        contact,
+        "#room%irc-server.example.test@irc.example.test/nick",
+    ] {
+        component.send(&format!("<presence from='{sender}' to='{DESK}'/>"))?;
+        assert_presence(&alice.receive()?, CLIENT, sender, DESK, None);
+    }
+    traffic(&suite, "presence", 4, 2)?;
+    assert_counter(&suite.scrape_metrics()?, NOT_SUBSCRIBED, 0)?;
+    component.close()?;
+    alice.close()?;
+    suite.stop()
+}
+
+fn presence_from_component_jids_outside_the_roster_is_delivered(contact: &str) -> TestResult {
+    let (mut suite, mut alice, mut component) = online()?;
+    for sender in [contact, "bot@irc.example.test"] {
+        contact_status(&mut component, sender, None, "online")?;
+        expect_contact_status(&mut alice, sender, None, "online")?;
+    }
+    traffic(&suite, "presence", 2, 0)?;
+    assert_counter(&suite.scrape_metrics()?, NOT_SUBSCRIBED, 0)?;
+    component.close()?;
+    alice.close()?;
+    suite.stop()
+}
+
+fn hosts_without_roster_deliver_component_presence_unfiltered(contact: &str) -> TestResult {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+
+    let (mut suite, mut alice, mut component) = unavailable_setup(CONFIG)?;
+    alice.send(&format!("<presence type='subscribe' to='{contact}'/>"))?;
+    component_presence(&mut component, ALICE, contact, Some("subscribe"))?;
+    push(&mut alice, contact, "none", Some("subscribe"), false)?;
+    component.close()?;
+    alice.close()?;
+    suite.stop()?;
+    writeln!(
+        OpenOptions::new()
+            .append(true)
+            .open(suite.fixture_path().join("lonewolf.toml"))?,
+        "\n[hosts.localhost]\nextensions = ['ping']"
+    )?;
+    suite.restart()?;
+
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    alice.send("<presence/>")?;
+    assert_presence(&alice.receive()?, CLIENT, DESK, ALICE, None);
+    let mut component = attach(&suite)?;
+    contact_status(&mut component, contact, None, "online")?;
+    expect_contact_status(&mut alice, contact, None, "online")?;
+    traffic(&suite, "presence", 1, 0)?;
+    assert_counter(&suite.scrape_metrics()?, NOT_SUBSCRIBED, 0)?;
+    component.close()?;
+    alice.close()?;
     suite.stop()
 }

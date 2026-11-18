@@ -9,10 +9,12 @@ use compio::runtime::Runtime;
 use futures_util::poll;
 use lonewolf_extension::delivery::DeliveryError;
 use lonewolf_extension::offline::Offline;
+use lonewolf_extension::roster::Roster;
 use lonewolf_extension::service::{ServiceContext, ServiceHandler};
 use lonewolf_extension::{ExtensionFuture, Extensions};
+use lonewolf_storage::roster::RosterReads;
 use lonewolf_util::arena::GlobalChunkAllocator;
-use parking_lot::Mutex;
+use parking_lot::Mutex as PlMutex;
 
 use super::tests::{ControlledWriter, Fixture};
 use super::*;
@@ -24,8 +26,9 @@ type Barrier = (oneshot::Sender<()>, oneshot::Receiver<()>);
 #[derive(Default)]
 struct TestService {
     delayed: Option<PresenceType>,
-    barrier: Mutex<Option<Barrier>>,
-    events: Mutex<Vec<PresenceType>>,
+    barrier: PlMutex<Option<Barrier>>,
+    events: PlMutex<Vec<PresenceType>>,
+    subscriptions: PlMutex<Vec<RoutedStanza<GlobalChunkAllocator>>>,
     joined: AtomicBool,
     offline: bool,
 }
@@ -37,7 +40,7 @@ impl TestService {
         (
             Arc::new(Self {
                 delayed: Some(kind),
-                barrier: Mutex::new(Some((notice, blocked))),
+                barrier: PlMutex::new(Some((notice, blocked))),
                 ..Self::default()
             }),
             entered,
@@ -58,6 +61,9 @@ impl ServiceHandler<GlobalChunkAllocator, RedbStorage> for TestService {
                 let StanzaType::Presence(kind) = view.stanza_type() else {
                     return Ok(());
                 };
+                if PresenceRequestType::from_subscription_stanza(kind).is_some() {
+                    self.subscriptions.lock().push(stanza.clone());
+                }
                 let barrier = (self.delayed == Some(kind))
                     .then(|| self.barrier.lock().take())
                     .flatten();
@@ -100,6 +106,7 @@ async fn fixture(service: Arc<TestService>) -> TestResult<Fixture> {
     let mut fixture = Fixture::new(&[]).await?;
     let mut catalog = Extensions::default();
     catalog.register(Arc::new(Offline::new(Default::default())))?;
+    catalog.register(Arc::new(Roster::default()))?;
     fixture.router = fixture
         .router
         .with_services(BTreeMap::from([(
@@ -108,7 +115,7 @@ async fn fixture(service: Arc<TestService>) -> TestResult<Fixture> {
         )]))
         .with_extensions(BTreeMap::from([(
             "localhost".into(),
-            catalog.enable_host("localhost", ["offline"])?,
+            catalog.enable_host("localhost", ["offline", "roster"])?,
         )]));
     Ok(fixture)
 }
@@ -385,4 +392,50 @@ fn domain_lookup_ignores_at_signs_in_resourceparts() {
     ] {
         assert_eq!(domain_of(jid), domain);
     }
+}
+
+#[test]
+fn subscriptions_to_extension_services_bypass_the_roster() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let service = Arc::new(TestService::default());
+        let mut fixture = fixture(service.clone()).await?;
+        let mut session = session(&fixture).await?;
+        for kind in ["subscribe", "subscribed", "unsubscribe", "unsubscribed"] {
+            handle(
+                &mut session,
+                &format!("<presence type='{kind}' to='bot@echo.localhost/inbox' id='{kind}'/>"),
+            )
+            .await?;
+        }
+        let subscriptions = std::mem::take(&mut *service.subscriptions.lock());
+        assert_eq!(subscriptions.len(), 4);
+        for (stanza, kind) in subscriptions.iter().zip([
+            PresenceType::Subscribe,
+            PresenceType::Subscribed,
+            PresenceType::Unsubscribe,
+            PresenceType::Unsubscribed,
+        ]) {
+            let stanza = stanza.resolve()?;
+            assert_eq!(stanza.stanza_type(), StanzaType::Presence(kind));
+            assert_eq!(stanza.id()?, stanza.stanza_type().as_str());
+            assert_eq!(
+                stanza.from()?.ok_or("sender")?.as_str(),
+                "bob@localhost/desk"
+            );
+            assert_eq!(
+                stanza.to()?.ok_or("target")?.as_str(),
+                "bot@echo.localhost/inbox"
+            );
+        }
+        let owner = fixture.registration.account();
+        let read = fixture.storage.begin_read().await?;
+        let roster = read.roster(owner, Default::default()).await?;
+        assert!(roster.items.is_empty());
+        assert_eq!(roster.version.get(), 0);
+        assert!(read.pending_requests(owner).await?.is_empty());
+        drop(read);
+        drop(session);
+        fixture.work.drain().await;
+        fixture.finish().await
+    })
 }

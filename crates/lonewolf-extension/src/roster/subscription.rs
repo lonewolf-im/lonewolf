@@ -62,10 +62,11 @@ pub(super) async fn send_subscription<A: ChunkAllocator, W: WriteTransaction>(
     request: PresenceRequest<'_, A>,
     hosts: &dyn HostLookup,
 ) -> Result<PresenceSend<A>, HandlerError> {
-    if hosts.federates(request.sender.domainpart())
-        && !hosts.is_local_host(request.target.domainpart())
+    if !hosts.is_local_host(request.target.domainpart())
+        && (hosts.federates(request.sender.domainpart())
+            || hosts.is_component_domain(request.target.domainpart()))
     {
-        return send_remote_subscription(roster, transaction, request).await;
+        return send_remote_subscription(roster, transaction, request, hosts).await;
     }
     if !matches!(
         request.kind,
@@ -138,12 +139,16 @@ async fn send_remote_subscription<A: ChunkAllocator, W: WriteTransaction>(
     roster: &super::Roster,
     transaction: &mut W,
     request: PresenceRequest<'_, A>,
+    hosts: &dyn HostLookup,
 ) -> Result<PresenceSend<A>, HandlerError> {
     let owner = AccountKey::try_from(request.sender.bare())
         .map_err(|_| StanzaErrorCondition::InternalServerError)?;
-    let contact = AccountKey::try_from(request.target.bare())
-        .map_err(|_| StanzaErrorCondition::ServiceUnavailable)?;
-    let jid = RosterJid::from(&contact);
+    if request.target.localpart().is_none()
+        && !hosts.is_component_domain(request.target.domainpart())
+    {
+        return Err(StanzaErrorCondition::ServiceUnavailable.into());
+    }
+    let jid = RosterJid::from(request.target.bare());
     require_account(transaction, &owner).await?;
     let current = transaction
         .roster_subscription(&owner, &jid)
@@ -223,12 +228,10 @@ async fn send_remote_subscription<A: ChunkAllocator, W: WriteTransaction>(
                         push_change(&owner, mutation, delivery).await?;
                     }
                     if grant {
-                        delivery.current_presence(&owner, contact.as_str()).await?;
+                        delivery.current_presence(&owner, jid.as_str()).await?;
                     }
                     if revoke {
-                        delivery
-                            .unavailable_presence(&owner, contact.as_str())
-                            .await?;
+                        delivery.unavailable_presence(&owner, jid.as_str()).await?;
                     }
                     Ok(())
                 }
@@ -279,9 +282,11 @@ pub(super) async fn receive_remote<A: ChunkAllocator, W: WriteTransaction>(
     roster: &super::Roster,
     request: PresenceRequest<'_, A>,
     transaction: &mut W,
-    _hosts: &dyn HostLookup,
+    hosts: &dyn HostLookup,
 ) -> Result<Effects<A>, HandlerError> {
-    if request.sender.bare().localpart().is_none() {
+    if request.sender.localpart().is_none()
+        && !hosts.is_component_domain(request.sender.domainpart())
+    {
         return Ok(Effects::none());
     }
     let owner = AccountKey::try_from(request.target)

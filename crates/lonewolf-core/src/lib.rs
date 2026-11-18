@@ -297,13 +297,9 @@ fn run_internal(
                         if hosts.is_local_host(domain) || services.contains_key(domain) {
                             return Err(RunError::ServiceDomain { domain: domain.clone() });
                         }
-                        let service_domain: Arc<str> = Arc::from(domain.as_str());
                         services.insert(
                             domain.clone(),
-                            ServiceRoute::extension(
-                                Arc::clone(&service_domain),
-                                Arc::new(component::service::ComponentService::new(service_domain, registry.clone())),
-                            ),
+                            ServiceRoute::component(Arc::from(domain.as_str()), registry.clone()),
                         );
                         if configured.discoverable {
                             let parent = component::service::discovery_parent(domain, config.hosts.keys().map(String::as_str));

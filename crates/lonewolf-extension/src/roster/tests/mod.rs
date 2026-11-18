@@ -60,6 +60,7 @@ struct TestRoster {
 #[derive(Default)]
 struct RecordingDelivery {
     federated: bool,
+    component: bool,
     remote: RefCell<Vec<String>>,
     events: RefCell<Vec<&'static str>>,
     tags: RefCell<Vec<SessionTag>>,
@@ -81,6 +82,10 @@ impl HostLookup for RecordingDelivery {
 
     fn federates(&self, local_domain: &str) -> bool {
         self.federated && local_domain == "example.com"
+    }
+
+    fn is_component_domain(&self, domain: &str) -> bool {
+        self.component && domain == "irc.example.test"
     }
 }
 
@@ -2103,6 +2108,32 @@ fn initial_probes_include_watched_contacts_without_reciprocal_grants()
 #[test]
 fn remote_outbound_subscription_table_and_disabled_behavior()
 -> Result<(), Box<dyn std::error::Error>> {
+    outbound_subscription_table(&[
+        ("bob@remote.invalid", true, false),
+        ("bob@remote.invalid", false, false),
+    ])
+}
+
+const COMPONENT_CONTACTS: [&str; 2] = [
+    "irc.example.test",
+    "irc-server.example.test@irc.example.test",
+];
+
+#[test]
+fn component_outbound_subscription_table_without_federation()
+-> Result<(), Box<dyn std::error::Error>> {
+    outbound_subscription_table(&COMPONENT_CONTACTS.map(|contact| (contact, false, true)))
+}
+
+fn roster_jid(text: &str) -> Result<RosterJid, Box<dyn std::error::Error>> {
+    let mut arena = Arena::try_new(Default::default())?;
+    let jid = Jid::parse_in(text, &mut arena)?;
+    Ok(RosterJid::from(jid.resolve(&arena)?))
+}
+
+fn outbound_subscription_table(
+    cases: &[(&str, bool, bool)],
+) -> Result<(), Box<dyn std::error::Error>> {
     use PresenceRequestType::{Subscribe, Subscribed, Unsubscribe, Unsubscribed};
     use SubscriptionState::{Both, From, None as NoSubscription, To};
     let rows = [
@@ -2206,7 +2237,9 @@ fn remote_outbound_subscription_table_and_disabled_behavior()
             ],
         ),
     ];
-    for federated in [true, false] {
+    for &(contact, federated, component) in cases {
+        let nonlocal = federated || component;
+        let contact_jid = roster_jid(contact)?;
         for (state, pending_out, pending_in, expected) in rows {
             for (index, kind) in [Subscribe, Unsubscribe, Subscribed, Unsubscribed]
                 .into_iter()
@@ -2214,7 +2247,6 @@ fn remote_outbound_subscription_table_and_disabled_behavior()
             {
                 let (_directory, fixture) = roster();
                 let owner = account("alice@example.com");
-                let contact = account("bob@remote.invalid");
                 create_account(&fixture, &owner);
                 let approved = kind == Unsubscribed || (kind == Subscribed && pending_in);
                 let original = RosterSubscription {
@@ -2228,7 +2260,7 @@ fn remote_outbound_subscription_table_and_disabled_behavior()
                         &owner,
                         &RosterItem {
                             subscription: original,
-                            ..subscribed(RosterJid::from(&contact), state)
+                            ..subscribed(contact_jid.clone(), state)
                         },
                         Default::default(),
                     )
@@ -2237,7 +2269,7 @@ fn remote_outbound_subscription_table_and_disabled_behavior()
                         tx.put_pending_request(
                             &owner,
                             PendingSubscription {
-                                sender: RosterJid::from(&contact),
+                                sender: contact_jid.clone(),
                                 stanza: b"pending request".as_slice().into(),
                             },
                             std::num::NonZeroUsize::MIN,
@@ -2251,9 +2283,10 @@ fn remote_outbound_subscription_table_and_disabled_behavior()
                 let stored_request = pending(&fixture, &owner);
                 let delivery = RecordingDelivery {
                     federated,
+                    component,
                     ..Default::default()
                 };
-                let mut call = SubscribeCall::new("alice@example.com/desk", "bob@remote.invalid");
+                let mut call = SubscribeCall::new("alice@example.com/desk", contact);
                 let mut arena = delivery.arena()?;
                 let stanza = call
                     .stanza
@@ -2286,7 +2319,7 @@ fn remote_outbound_subscription_table_and_disabled_behavior()
                 })?;
                 let granted = matches!(state, From | Both);
                 let (expected_subscription, expected_pending, route, current, unavailable) =
-                    if federated {
+                    if nonlocal {
                         let (state, pending_out, pending, route) = expected[index];
                         let approved = match kind {
                             Subscribed if !route && !granted => true,
@@ -2317,19 +2350,19 @@ fn remote_outbound_subscription_table_and_disabled_behavior()
                     };
                 assert_eq!(
                     handled,
-                    federated
+                    nonlocal
                         || ((kind == Subscribed || kind == Unsubscribed)
                             && !pending_in
                             && !granted)
                         || (kind == Subscribed && granted),
-                    "{federated} {state:?} {pending_out} {pending_in} {kind:?}"
+                    "{contact} {federated} {state:?} {pending_out} {pending_in} {kind:?}"
                 );
                 assert_eq!(
-                    item(&fixture, &owner, &RosterJid::from(&contact))
+                    item(&fixture, &owner, &contact_jid)
                         .ok_or("missing item")?
                         .subscription,
                     expected_subscription,
-                    "{federated} {state:?} {kind:?}"
+                    "{contact} {federated} {state:?} {kind:?}"
                 );
                 let changed = expected_subscription != original;
                 assert_eq!(
@@ -2352,8 +2385,8 @@ fn remote_outbound_subscription_table_and_disabled_behavior()
                         "{xml}"
                     );
                     assert!(
-                        xml.contains("to='bob@remote.invalid'")
-                            || xml.contains("to=\"bob@remote.invalid\""),
+                        xml.contains(&format!("to='{contact}'"))
+                            || xml.contains(&format!("to=\"{contact}\"")),
                         "{xml}"
                     );
                     assert!(!xml.contains("/desk"), "{xml}");
@@ -2375,8 +2408,16 @@ fn remote_outbound_subscription_table_and_disabled_behavior()
                     events.push("unavailable");
                 }
                 assert_eq!(*delivery.events.borrow(), events);
-                assert!(snapshot(&fixture, &contact).items.is_empty());
-                assert!(pending(&fixture, &contact).is_empty());
+                if let Ok(contact) = AccountKey::try_from(&contact_jid) {
+                    assert!(snapshot(&fixture, &contact).items.is_empty());
+                    assert!(pending(&fixture, &contact).is_empty());
+                }
+                let targets = delivery.presence_targets.borrow();
+                assert_eq!(targets.len(), usize::from(current || unavailable));
+                if let Some((from, target)) = targets.first() {
+                    assert_eq!(from, &owner);
+                    assert_eq!(target, contact);
+                }
                 assert!(delivery.controls.borrow().is_empty());
             }
         }
@@ -2667,6 +2708,22 @@ async fn receive_remote_request(
 
 #[test]
 fn remote_inbound_subscription_table() -> Result<(), Box<dyn std::error::Error>> {
+    inbound_subscription_table("bob@remote.test", false)
+}
+
+#[test]
+fn component_inbound_subscription_table_without_federation()
+-> Result<(), Box<dyn std::error::Error>> {
+    for contact in COMPONENT_CONTACTS {
+        inbound_subscription_table(contact, true)?;
+    }
+    Ok(())
+}
+
+fn inbound_subscription_table(
+    remote: &str,
+    component: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     use PresenceRequestType::{Subscribe, Subscribed, Unsubscribe, Unsubscribed};
     use SubscriptionState::{Both, From, None as N, To};
     let rows = [
@@ -2761,11 +2818,10 @@ fn remote_inbound_subscription_table() -> Result<(), Box<dyn std::error::Error>>
             let (_directory, fixture) = roster();
             let owner = account("alice@example.com");
             let other = account("other@example.com");
-            let remote = account("bob@remote.test");
-            let contact = RosterJid::from(&remote);
+            let contact = roster_jid(remote)?;
             create_account(&fixture, &owner);
             create_account(&fixture, &other);
-            let stanza = remote_request(kind, remote.as_str(), owner.as_str())?;
+            let stanza = remote_request(kind, remote, owner.as_str())?;
             block_on(async {
                 let mut tx = fixture.storage.begin_write().await?;
                 if state != N || pending_out {
@@ -2800,7 +2856,8 @@ fn remote_inbound_subscription_table() -> Result<(), Box<dyn std::error::Error>>
             let before = snapshot(&fixture, &owner);
             let unrelated = snapshot(&fixture, &other);
             let delivery = RecordingDelivery {
-                federated: true,
+                federated: !component,
+                component,
                 ..Default::default()
             };
             let effects = block_on(receive_remote_request(
@@ -2891,7 +2948,7 @@ fn remote_inbound_subscription_table() -> Result<(), Box<dyn std::error::Error>>
             assert_eq!(targets.len(), usize::from(unavailable));
             if let Some((from, to)) = targets.first() {
                 assert_eq!(from, &owner);
-                assert_eq!(to, remote.as_str());
+                assert_eq!(to, remote);
             }
             for xml in delivery.remote.borrow().iter() {
                 assert!(
@@ -2899,7 +2956,8 @@ fn remote_inbound_subscription_table() -> Result<(), Box<dyn std::error::Error>>
                         || xml.contains("from=\"alice@example.com\"")
                 );
                 assert!(
-                    xml.contains("to='bob@remote.test'") || xml.contains("to=\"bob@remote.test\"")
+                    xml.contains(&format!("to='{remote}'"))
+                        || xml.contains(&format!("to=\"{remote}\""))
                 );
                 let reply_kind = if kind == Subscribe {
                     "subscribed"
@@ -2912,18 +2970,20 @@ fn remote_inbound_subscription_table() -> Result<(), Box<dyn std::error::Error>>
                 );
             }
             assert_eq!(snapshot(&fixture, &other), unrelated);
-            block_on(async {
-                assert!(
-                    fixture
-                        .storage
-                        .begin_read()
-                        .await?
-                        .account(&remote)
-                        .await?
-                        .is_none()
-                );
-                Ok::<_, Box<dyn std::error::Error>>(())
-            })?;
+            if let Ok(remote) = AccountKey::try_from(&contact) {
+                block_on(async {
+                    assert!(
+                        fixture
+                            .storage
+                            .begin_read()
+                            .await?
+                            .account(&remote)
+                            .await?
+                            .is_none()
+                    );
+                    Ok::<_, Box<dyn std::error::Error>>(())
+                })?;
+            }
         }
     }
     Ok(())
@@ -2932,6 +2992,22 @@ fn remote_inbound_subscription_table() -> Result<(), Box<dyn std::error::Error>>
 #[test]
 fn remote_inbound_preapproval_bypasses_full_pending_queue() -> Result<(), Box<dyn std::error::Error>>
 {
+    inbound_preapproval_bypasses_full_pending_queue("bob@remote.test", false)
+}
+
+#[test]
+fn component_preapproval_bypasses_full_pending_queue_without_federation()
+-> Result<(), Box<dyn std::error::Error>> {
+    for contact in COMPONENT_CONTACTS {
+        inbound_preapproval_bypasses_full_pending_queue(contact, true)?;
+    }
+    Ok(())
+}
+
+fn inbound_preapproval_bypasses_full_pending_queue(
+    remote: &str,
+    component: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     for (state, pending_out, expected) in [
         (SubscriptionState::None, false, SubscriptionState::From),
         (SubscriptionState::None, true, SubscriptionState::From),
@@ -2940,7 +3016,7 @@ fn remote_inbound_preapproval_bypasses_full_pending_queue() -> Result<(), Box<dy
         let (_directory, fixture) = roster();
         let owner = account("alice@example.com");
         create_account(&fixture, &owner);
-        let contact = RosterJid::from(&account("bob@remote.test"));
+        let contact = roster_jid(remote)?;
         block_on(async {
             let mut tx = fixture.storage.begin_write().await?;
             tx.put_roster_item(
@@ -2978,14 +3054,11 @@ fn remote_inbound_preapproval_bypasses_full_pending_queue() -> Result<(), Box<dy
         let before = pending(&fixture, &owner);
         let version = snapshot(&fixture, &owner).version;
         let delivery = RecordingDelivery {
-            federated: true,
+            federated: !component,
+            component,
             ..Default::default()
         };
-        let stanza = remote_request(
-            PresenceRequestType::Subscribe,
-            "bob@remote.test",
-            "alice@example.com",
-        )?;
+        let stanza = remote_request(PresenceRequestType::Subscribe, remote, "alice@example.com")?;
         let effects = block_on(receive_remote_request(
             &roster,
             &fixture,
@@ -3014,12 +3087,14 @@ fn remote_inbound_preapproval_bypasses_full_pending_queue() -> Result<(), Box<dy
         assert!(
             xml.contains("from='alice@example.com'") || xml.contains("from=\"alice@example.com\"")
         );
-        assert!(xml.contains("to='bob@remote.test'") || xml.contains("to=\"bob@remote.test\""));
+        assert!(
+            xml.contains(&format!("to='{remote}'")) || xml.contains(&format!("to=\"{remote}\""))
+        );
         assert_eq!(delivery.unavailable.get(), 0);
         let targets = delivery.presence_targets.borrow();
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].0, owner);
-        assert_eq!(targets[0].1.as_str(), "bob@remote.test");
+        assert_eq!(targets[0].1.as_str(), remote);
     }
     Ok(())
 }
@@ -3027,6 +3102,25 @@ fn remote_inbound_preapproval_bypasses_full_pending_queue() -> Result<(), Box<dy
 #[test]
 fn remote_inbound_repeats_keep_one_request_and_limit_errors_do_not_create_items()
 -> Result<(), Box<dyn std::error::Error>> {
+    inbound_pending_request_limit("bob@remote.test", "other@remote.test", false)
+}
+
+#[test]
+fn component_pending_request_limit_without_federation() -> Result<(), Box<dyn std::error::Error>> {
+    for [first, second] in [
+        COMPONENT_CONTACTS,
+        [COMPONENT_CONTACTS[1], COMPONENT_CONTACTS[0]],
+    ] {
+        inbound_pending_request_limit(first, second, true)?;
+    }
+    Ok(())
+}
+
+fn inbound_pending_request_limit(
+    remote: &str,
+    excess_sender: &str,
+    component: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (_directory, fixture) = roster();
     let owner = account("alice@example.com");
     create_account(&fixture, &owner);
@@ -3038,14 +3132,11 @@ fn remote_inbound_repeats_keep_one_request_and_limit_errors_do_not_create_items(
         },
     )]));
     let delivery = RecordingDelivery {
-        federated: true,
+        federated: !component,
+        component,
         ..Default::default()
     };
-    let stanza = remote_request(
-        PresenceRequestType::Subscribe,
-        "bob@remote.test",
-        owner.as_str(),
-    )?;
+    let stanza = remote_request(PresenceRequestType::Subscribe, remote, owner.as_str())?;
     for index in 0..2 {
         let effects = block_on(receive_remote_request(
             &roster,
@@ -3075,7 +3166,7 @@ fn remote_inbound_repeats_keep_one_request_and_limit_errors_do_not_create_items(
     let before = pending(&fixture, &owner);
     let excess = remote_request(
         PresenceRequestType::Subscribe,
-        "other@remote.test",
+        excess_sender,
         owner.as_str(),
     )?;
     let error = block_on(receive_remote_request(
@@ -3256,5 +3347,37 @@ fn remote_inbound_subscriptions_require_federation_and_keep_other_receive_kinds(
     }
     assert!(snapshot(&fixture, &owner).items.is_empty());
     assert!(pending(&fixture, &owner).is_empty());
+    Ok(())
+}
+
+#[test]
+fn domain_only_federated_subscription_target_is_rejected() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (_directory, fixture) = roster();
+    let owner = account("alice@example.com");
+    create_account(&fixture, &owner);
+    let delivery = RecordingDelivery {
+        federated: true,
+        ..Default::default()
+    };
+    let call = SubscribeCall::new("alice@example.com/desk", "remote.test");
+    block_on(async {
+        let mut transaction = fixture.storage.begin_write().await?;
+        let error = sender_hook(
+            &call,
+            PresenceRequestType::Subscribe,
+            &mut transaction,
+            &delivery,
+        )
+        .await
+        .err()
+        .ok_or("expected a rejected subscription")?;
+        assert_eq!(error.condition(), StanzaErrorCondition::ServiceUnavailable);
+        transaction.commit().await?;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })?;
+    assert!(snapshot(&fixture, &owner).items.is_empty());
+    assert!(pending(&fixture, &owner).is_empty());
+    assert!(delivery.events.borrow().is_empty());
     Ok(())
 }

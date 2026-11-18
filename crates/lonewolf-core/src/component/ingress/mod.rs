@@ -3,14 +3,14 @@
 use lonewolf_storage::RedbStorage;
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::stanza::{
-    ApplicationCondition, IqType, MessageType, RoutedStanza, StanzaErrorCondition, StanzaErrorText,
-    StanzaType,
+    ApplicationCondition, IqType, MessageType, PresenceType, RoutedStanza, StanzaErrorCondition,
+    StanzaErrorText, StanzaType,
 };
 
 use super::registry::ComponentRegistry;
 use crate::delivery::WorkHandle;
 use crate::router::RouterHandle;
-use crate::stages::ingress::Origin;
+use crate::stages::ingress::{Origin, presence::SubscriptionReceipt};
 use crate::stages::{
     Stage, StageFailure,
     service::{self, ComponentReplyTarget, ServiceOutcome},
@@ -50,6 +50,12 @@ pub(crate) fn reply_error<A: ChunkAllocator + Clone + 'static>(
         && !matches!(
             source.stanza_type(),
             StanzaType::Iq(IqType::Get | IqType::Set)
+                | StanzaType::Presence(
+                    PresenceType::Subscribe
+                        | PresenceType::Subscribed
+                        | PresenceType::Unsubscribe
+                        | PresenceType::Unsubscribed,
+                )
         )
     {
         return Ok(());
@@ -68,6 +74,36 @@ pub(crate) fn reply_error<A: ChunkAllocator + Clone + 'static>(
         RoutedStanza::from_parts(reply, arena),
     );
     Ok(())
+}
+
+pub(super) fn apply_subscription_receipt<A: ChunkAllocator + Clone + 'static>(
+    context: &Context<A>,
+    domain: &str,
+    receipt: SubscriptionReceipt<A>,
+) {
+    let (stanza, condition, text) = match receipt {
+        SubscriptionReceipt::Done
+        | SubscriptionReceipt::Failed {
+            committed: true, ..
+        } => return,
+        SubscriptionReceipt::NoHandler { stanza } => {
+            let condition = StanzaErrorCondition::ServiceUnavailable;
+            (stanza, condition, condition.default_text())
+        }
+        SubscriptionReceipt::Rejected {
+            stanza,
+            condition,
+            text,
+        } => (stanza, condition, text),
+        SubscriptionReceipt::Failed {
+            stanza,
+            committed: false,
+        } => {
+            let condition = StanzaErrorCondition::InternalServerError;
+            (stanza, condition, condition.default_text())
+        }
+    };
+    let _ = reply_error(context, domain, &stanza, condition, None, text);
 }
 
 pub(crate) async fn dispatch<A: ChunkAllocator + Clone + 'static>(
@@ -109,6 +145,6 @@ pub(crate) async fn dispatch<A: ChunkAllocator + Clone + 'static>(
             message::handle(context, domain, &stage, &origin, stanza, kind).await
         }
         StanzaType::Iq(kind) => iq::handle(context, domain, &stage, &origin, stanza, kind).await,
-        StanzaType::Presence(kind) => presence::handle(context, domain, stanza, kind).await,
+        StanzaType::Presence(kind) => presence::handle(context, domain, &stage, stanza, kind).await,
     }
 }

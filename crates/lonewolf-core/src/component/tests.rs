@@ -388,3 +388,127 @@ fn already_ready_shutdown_on_first_plaintext_serve_poll_sends_xml_and_releases_o
         Ok(())
     }))?
 }
+
+#[test]
+fn subscription_receipts_map_to_component_replies() -> Result<(), Box<dyn std::error::Error>> {
+    use lonewolf_util::arena::{Arena, GlobalChunkAllocator};
+    use lonewolf_xmpp::jid::Jid;
+    use lonewolf_xmpp::stanza::{
+        PresenceType, RoutedStanza, Stanza, StanzaErrorCondition, StanzaErrorText, StanzaNamespace,
+        StanzaType,
+    };
+
+    use super::ingress::{Context, apply_subscription_receipt};
+    use crate::delivery::WorkGroup;
+    use crate::router::{Router, local::LocalRouter};
+    use crate::stages::ingress::presence::SubscriptionReceipt;
+
+    let config = crate::Config {
+        components: toml::from_str(
+            "[domains.'irc.example.test']\nsecret='component-test-secret-0001'\nmax_connections=2",
+        )?,
+        ..crate::Config::default()
+    };
+    let registry = ComponentRegistry::new(
+        &config.components,
+        credentials::load(&config.components)?,
+        &config.limits.components,
+        ComponentMetrics::new(1, 1),
+    );
+    let domain = "irc.example.test";
+    let mut sender = registry.attach(domain).map_err(|_| "sender attachment")?;
+    let mut other = registry.attach(domain).map_err(|_| "other attachment")?;
+    let directory = tempfile::tempdir()?;
+    let router = Router::new(
+        Hosts::new(&config.hosts, None)?,
+        LocalRouter::new(GlobalChunkAllocator),
+    );
+    let work = WorkGroup::new();
+    let context = Context {
+        router: router.handle(),
+        storage: RedbStorage::open(directory.path().join("state.redb"))?,
+        allocator: GlobalChunkAllocator,
+        work: work.handle(),
+        connection_id: sender.id(),
+        registry,
+    };
+    let limit = StanzaErrorCondition::ResourceConstraint;
+    for contact in [domain, "irc-server.example.test@irc.example.test"] {
+        for kind in [
+            PresenceType::Subscribe,
+            PresenceType::Subscribed,
+            PresenceType::Unsubscribe,
+            PresenceType::Unsubscribed,
+        ] {
+            let mut arena = Arena::try_new(Default::default())?;
+            let from = Jid::parse_in(contact, &mut arena)?;
+            let to = Jid::parse_in("alice@localhost", &mut arena)?;
+            let stanza = Stanza::builder_in(
+                StanzaType::Presence(kind),
+                StanzaNamespace::ComponentAccept,
+                &mut arena,
+            )
+            .from(Some(from))?
+            .to(Some(to))?
+            .id(Some("subscription"))?
+            .build()?;
+            let stanza = RoutedStanza::from_parts(stanza, arena);
+            for (receipt, condition) in [
+                (SubscriptionReceipt::Done, None),
+                (
+                    SubscriptionReceipt::NoHandler {
+                        stanza: stanza.clone(),
+                    },
+                    Some(StanzaErrorCondition::ServiceUnavailable),
+                ),
+                (
+                    SubscriptionReceipt::Rejected {
+                        stanza: stanza.clone(),
+                        condition: limit,
+                        text: StanzaErrorText::Static("No room for this request."),
+                    },
+                    Some(limit),
+                ),
+                (
+                    SubscriptionReceipt::Failed {
+                        stanza: stanza.clone(),
+                        committed: false,
+                    },
+                    Some(StanzaErrorCondition::InternalServerError),
+                ),
+                (
+                    SubscriptionReceipt::Failed {
+                        stanza,
+                        committed: true,
+                    },
+                    None,
+                ),
+            ] {
+                apply_subscription_receipt(&context, domain, receipt);
+                if let Some(condition) = condition {
+                    let reply = sender.try_next().ok_or("missing subscription error")?;
+                    let reply = reply.resolve()?;
+                    assert_eq!(
+                        reply.stanza_type(),
+                        StanzaType::Presence(PresenceType::Error)
+                    );
+                    assert_eq!(reply.id()?, Some("subscription"));
+                    assert_eq!(
+                        reply.from()?.ok_or("reply sender")?.as_str(),
+                        "alice@localhost"
+                    );
+                    assert_eq!(reply.to()?.ok_or("reply target")?.as_str(), contact);
+                    let mut xml = String::new();
+                    reply.write_xml(&mut xml)?;
+                    assert!(xml.contains(&format!("<{}", condition.as_str())), "{xml}");
+                    if condition == limit {
+                        assert!(xml.contains("No room for this request."), "{xml}");
+                    }
+                }
+                assert!(sender.try_next().is_none());
+                assert!(other.try_next().is_none());
+            }
+        }
+    }
+    Ok(())
+}

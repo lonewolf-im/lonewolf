@@ -29,7 +29,6 @@ use lonewolf_xmpp::stanza::{StanzaErrorCondition, StanzaErrorText};
 use prometheus_client::registry::Registry;
 
 use crate::component::registry::{ComponentRegistry, EnqueueError, NOT_CONNECTED_TEXT};
-#[cfg(test)]
 use crate::component::service::ComponentService;
 use crate::hosts::Hosts;
 use crate::order::Order;
@@ -160,7 +159,6 @@ impl<A: ChunkAllocator + Clone + 'static> ServiceRoute<A> {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn component(domain: Arc<str>, registry: ComponentRegistry<A>) -> Self {
         let handler = Arc::new(ComponentService::new(Arc::clone(&domain), registry.clone()));
         Self {

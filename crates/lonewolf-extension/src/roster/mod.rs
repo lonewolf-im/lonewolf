@@ -460,8 +460,9 @@ where
         hosts: &'a dyn HostLookup,
     ) -> ReceiveFuture<'a, A> {
         Box::pin(async move {
-            if hosts.federates(request.target.domainpart())
-                && !hosts.is_local_host(request.sender.domainpart())
+            if !hosts.is_local_host(request.sender.domainpart())
+                && (hosts.federates(request.target.domainpart())
+                    || hosts.is_component_domain(request.sender.domainpart()))
                 && matches!(
                     request.kind,
                     PresenceRequestType::Subscribe

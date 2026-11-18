@@ -522,9 +522,19 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             parsed
         };
         let stanza = parsed.value().resolve(parsed.arena())?;
-        let service = stanza
-            .to()?
-            .and_then(|to| self.router.service(to.domainpart()).cloned());
+        let target = stanza.to()?;
+        if let StanzaType::Presence(kind) = stanza.stanza_type()
+            && let Some(kind) = PresenceRequestType::from_subscription_stanza(kind)
+            && target.is_some_and(|to| self.router.is_component_domain(to.domainpart()))
+            && self
+                .router
+                .presence_handlers(self.registration.account().domain())
+                .and_then(|handlers| handlers.find(kind))
+                .is_some()
+        {
+            return self.handle_subscription(parsed, kind).await;
+        }
+        let service = target.and_then(|to| self.router.service(to.domainpart()).cloned());
         if let Some(route) = service {
             return self.handle_service(parsed, route).await;
         }
@@ -1672,10 +1682,13 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         parsed: Parsed<Stanza, A>,
         kind: PresenceRequestType,
     ) -> Result<(), CloseOutcome> {
-        let remote = {
+        let (remote, component) = {
             let stanza = parsed.value().resolve(parsed.arena())?;
             let target = stanza.to()?.ok_or(CloseOutcome::InternalError)?;
-            self.router.destination(target) == Destination::Remote
+            (
+                self.router.destination(target) == Destination::Remote,
+                self.router.is_component_domain(target.domainpart()),
+            )
         };
         let federated = remote
             && self
@@ -1842,6 +1855,14 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                         }
                     }
                     drop(policy_snapshot);
+                    if component {
+                        drop(transaction);
+                        router
+                            .route_to_component_or_bounce(routed.clone())
+                            .await
+                            .map_err(|_| CloseOutcome::InternalError)?;
+                        return Ok(None);
+                    }
                     if remote {
                         if federated {
                             return Ok(Self::subscription_admission(

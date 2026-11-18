@@ -1,20 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use lonewolf_extension::policy::Verdict;
+use lonewolf_extension::presence::PresenceRequestType;
 use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::ChunkAllocator;
 use lonewolf_xmpp::stanza::PresenceType;
 
-use super::{Context, IngressFailure};
+use super::{Context, IngressFailure, apply_subscription_receipt};
 use crate::router::{Destination, RoutedStanza, RouterError};
+use crate::stages::Stage;
 use crate::stages::ingress::{
     checks::{Snapshot, check_from},
-    presence::authorize_probe,
+    presence::{authorize_probe, receive_subscription},
 };
 
 pub(super) async fn handle<A: ChunkAllocator + Clone + 'static>(
     context: &Context<A>,
     domain: &str,
+    stage: &Stage<'_, A>,
     routed: RoutedStanza<A>,
     kind: PresenceType,
 ) -> Result<(), IngressFailure> {
@@ -42,6 +45,18 @@ pub(super) async fn handle<A: ChunkAllocator + Clone + 'static>(
             | Err(RouterError::NotFound | RouterError::Busy | RouterError::InvalidTarget) => Ok(()),
             Err(_) => Err(IngressFailure),
         };
+    }
+    let subscription = PresenceRequestType::from_subscription_stanza(kind);
+    if let Some(kind) = subscription
+        && context
+            .router
+            .presence_handlers(target.domainpart())
+            .and_then(|handlers| handlers.find(kind))
+            .is_some()
+    {
+        let receipt = receive_subscription(stage, routed, kind).await?;
+        apply_subscription_receipt(context, domain, receipt);
+        return Ok(());
     }
     let account = AccountKey::try_from(target.bare()).map_err(|_| IngressFailure)?;
     if kind == PresenceType::Probe {
@@ -82,13 +97,7 @@ pub(super) async fn handle<A: ChunkAllocator + Clone + 'static>(
     {
         return Ok(());
     }
-    let result = if matches!(
-        kind,
-        PresenceType::Subscribe
-            | PresenceType::Subscribed
-            | PresenceType::Unsubscribe
-            | PresenceType::Unsubscribed
-    ) {
+    let result = if subscription.is_some() {
         context.router.route_subscription_presence(routed).await
     } else if destination == Destination::Resource {
         context.router.route_full(routed).await

@@ -1,23 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::Arc;
-
 use lonewolf_extension::policy::Verdict;
-use lonewolf_extension::presence::{PresenceRequest, PresenceRequestType};
-use lonewolf_storage::Storage;
+use lonewolf_extension::presence::PresenceRequestType;
 use lonewolf_storage::account::AccountKey;
-use lonewolf_util::arena::{Arena, ChunkAllocator};
+use lonewolf_util::arena::ChunkAllocator;
 use lonewolf_xmpp::stanza::{PresenceType, StanzaErrorCondition};
 
 use super::{InboundPeer, IngressContext, IngressFailure, reply_error};
-use crate::delivery::{
-    EffectsDiagnostics, EffectsIdentity, RouterDelivery, commit_and_deliver, report_failure,
-    report_handler_failure, storage_failure,
-};
 use crate::router::{Destination, RoutedStanza, RouterError};
+use crate::stages::Stage;
 use crate::stages::ingress::{
     checks::{Snapshot, check_from},
-    presence::authorize_probe,
+    presence::{SubscriptionReceipt, authorize_probe, receive_subscription},
 };
 
 pub(crate) async fn handle<A: ChunkAllocator + Clone + 'static>(
@@ -106,119 +100,23 @@ async fn subscription<A: ChunkAllocator + Clone + 'static>(
     routed: RoutedStanza<A>,
     kind: PresenceRequestType,
 ) -> Result<(), IngressFailure> {
-    let view = routed.resolve().map_err(|_| IngressFailure)?;
-    let target = view
-        .to()
-        .map_err(|_| IngressFailure)?
-        .ok_or(IngressFailure)?;
-    if !matches!(
-        context.router.destination(target),
-        Destination::Account | Destination::Resource
-    ) {
-        return Ok(());
-    }
-    let sender = view
-        .from()
-        .map_err(|_| IngressFailure)?
-        .ok_or(IngressFailure)?;
-    let mut arena = Arena::try_new_in(Default::default(), context.allocator.clone())
-        .map_err(|_| IngressFailure)?;
-    let sender = sender
-        .bare()
-        .clone_in(&mut arena)
-        .map_err(|_| IngressFailure)?;
-    let target = target
-        .bare()
-        .clone_in(&mut arena)
-        .map_err(|_| IngressFailure)?;
-    let stanza = view
-        .to_builder_in(&mut arena)
-        .map_err(|_| IngressFailure)?
-        .from(Some(sender))
-        .map_err(|_| IngressFailure)?
-        .to(Some(target))
-        .map_err(|_| IngressFailure)?
-        .build()
-        .map_err(|_| IngressFailure)?;
-    let routed = RoutedStanza::from_parts(stanza, arena);
-    let view = routed.resolve().map_err(|_| IngressFailure)?;
-    let target = view
-        .to()
-        .map_err(|_| IngressFailure)?
-        .ok_or(IngressFailure)?;
-    let sender = view
-        .from()
-        .map_err(|_| IngressFailure)?
-        .ok_or(IngressFailure)?;
-    let owner = AccountKey::try_from(target).map_err(|_| IngressFailure)?;
-    if check_from(
-        &context.router,
-        &context.storage,
-        None,
-        Some(&owner),
-        &view,
-        None,
-        Snapshot::Fresh,
-    )
-    .await?
-        != Verdict::Allow
-    {
-        return Ok(());
-    }
-    let Some(handler) = context
-        .router
-        .presence_handlers(target.domainpart())
-        .and_then(|handlers| handlers.find(kind))
-    else {
-        let condition = StanzaErrorCondition::ServiceUnavailable;
-        return reply_error(context, &routed, condition, None, condition.default_text());
+    let stage = Stage {
+        router: &context.router,
+        storage: &context.storage,
+        allocator: &context.allocator,
+        work: &context.work,
     };
-    let delivery = RouterDelivery::new(&context.router, &context.allocator, None);
-    let mut transaction = context.storage.begin_write().await.map_err(|error| {
-        report_failure(
-            storage_failure(error, "presence_subscription_begin_write"),
-            &owner,
-        );
-        IngressFailure
-    })?;
-    match handler
-        .receive(
-            PresenceRequest {
-                kind,
-                sender,
-                target,
-                stanza: &routed,
-            },
-            &mut transaction,
-            &delivery,
-        )
-        .await
-    {
-        Ok(effects) => {
-            let pending = commit_and_deliver(
-                context.work.start(),
-                Arc::clone(context.router.order()),
-                transaction,
-                effects,
-                delivery,
-                None,
-                EffectsDiagnostics {
-                    identity: EffectsIdentity::Account(owner),
-                    commit_operation: "presence_subscription_commit",
-                    delivery_operation: "presence_subscription_effects",
-                },
-            );
-            pending
-                .finished()
-                .await
-                .ok_or(IngressFailure)?
-                .map_err(|_| IngressFailure)?;
-            Ok(())
+    match receive_subscription(&stage, routed, kind).await? {
+        SubscriptionReceipt::Done => Ok(()),
+        SubscriptionReceipt::NoHandler { stanza } => {
+            let condition = StanzaErrorCondition::ServiceUnavailable;
+            reply_error(context, &stanza, condition, None, condition.default_text())
         }
-        Err(error) => {
-            drop(transaction);
-            report_handler_failure(&error, &owner);
-            reply_error(context, &routed, error.condition(), None, error.text())
-        }
+        SubscriptionReceipt::Rejected {
+            stanza,
+            condition,
+            text,
+        } => reply_error(context, &stanza, condition, None, text),
+        SubscriptionReceipt::Failed { .. } => Err(IngressFailure),
     }
 }

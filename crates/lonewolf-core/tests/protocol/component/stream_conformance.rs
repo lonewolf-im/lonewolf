@@ -9,7 +9,7 @@ const SECRET: &str = "component-test-secret-0001";
 const CONFIG: &str = "[components.domains.'muc.localhost']\nsecret='component-test-secret-0001'";
 const STANZA_ERRORS: &str = "urn:ietf:params:xml:ns:xmpp-stanzas";
 
-fn assert_counter(metrics: &str, sample: &str, expected: u64) -> TestResult {
+pub(super) fn assert_counter(metrics: &str, sample: &str, expected: u64) -> TestResult {
     let value = metrics
         .lines()
         .find_map(|line| {

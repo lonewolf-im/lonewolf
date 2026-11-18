@@ -187,6 +187,9 @@ subscription_scenarios!(
     component_probes_are_answered_only_under_a_grant,
     component_contact_presence_reaches_the_client,
     component_restart_recovers_presence_through_probes,
+    removing_a_component_contact_notifies_the_component,
+    removing_a_requested_component_contact_withdraws_the_request,
+    deleting_an_account_notifies_its_component_contacts,
 );
 
 fn client_subscription_to_component_contact_is_approved_and_pushes_to(contact: &str) -> TestResult {
@@ -275,12 +278,14 @@ fn expect_resource_pair(
     contact: &str,
     kind: Option<&str>,
 ) -> TestResult {
-    let pair = [component.receive()?, component.receive()?];
-    for stanza in &pair {
+    let mut receive_resource = || -> TestResult<Element> {
+        let stanza = component.receive()?;
         stanza.assert_name(NAMESPACE, "presence");
         assert_eq!(stanza.attribute("type"), kind);
         assert_eq!(stanza.attribute("to"), Some(contact));
-    }
+        Ok(stanza)
+    };
+    let pair = [receive_resource()?, receive_resource()?];
     let mut resources = pair.each_ref().map(|stanza| stanza.attribute("from"));
     resources.sort_unstable();
     assert_eq!(resources, [Some(DESK), Some(PHONE)]);
@@ -877,5 +882,100 @@ fn gateway_workflow_with_domain_and_server_contacts() -> TestResult {
     traffic(&suite, "message", 1, 0)?;
     component.close()?;
     alice.close()?;
+    suite.stop()
+}
+
+fn remove_contact(alice: &mut Client, contact: &str) -> TestResult {
+    alice.send(&format!(
+        "<iq type='set' id='remove'><query xmlns='{ROSTER}'><item jid='{contact}' subscription='remove'/></query></iq>"
+    ))?;
+    alice.expect_xml(&format!(
+        "<iq xmlns='{CLIENT}' type='result' id='remove' to='{DESK}'/>"
+    ))?;
+    push(alice, contact, "remove", None, false)?;
+    barrier(alice)
+}
+
+fn removing_a_component_contact_notifies_the_component(contact: &str) -> TestResult {
+    let (mut suite, mut alice, mut component) = online()?;
+    follow(&mut alice, &mut component, contact)?;
+    let mut phone = suite.connect("alice", PASSWORD, "phone")?;
+    phone.send("<presence/>")?;
+    phone.expect_xml(&format!(
+        "<presence xmlns='{CLIENT}' from='{DESK}' to='{ALICE}'/>"
+    ))?;
+    for client in [&mut phone, &mut alice] {
+        client.expect_xml(&format!(
+            "<presence xmlns='{CLIENT}' from='{PHONE}' to='{ALICE}'/>"
+        ))?;
+    }
+    component_presence(&mut component, ALICE, contact, Some("probe"))?;
+
+    request_from_component(&mut component, contact, "mutual")?;
+    client_receives(&mut alice, contact, "subscribe")?;
+    client_receives(&mut phone, contact, "subscribe")?;
+    alice.send(&format!("<presence type='subscribed' to='{contact}'/>"))?;
+    component_presence(&mut component, ALICE, contact, Some("subscribed"))?;
+    expect_resource_pair(&mut component, contact, None)?;
+    push(&mut alice, contact, "both", None, false)?;
+
+    remove_contact(&mut alice, contact)?;
+    send_component_ping(&mut component)?;
+    expect_resource_pair(&mut component, contact, Some("unavailable"))?;
+    component_presence(&mut component, ALICE, contact, Some("unsubscribe"))?;
+    component_presence(&mut component, ALICE, contact, Some("unsubscribed"))?;
+    expect_component_pong(&mut component)?;
+    traffic(&suite, "presence", 2, 9)?;
+    component.close()?;
+    phone.close()?;
+    alice.expect_xml(&format!(
+        "<presence xmlns='{CLIENT}' type='unavailable' from='{PHONE}' to='{ALICE}'/>"
+    ))?;
+    alice.close()?;
+    suite.stop()
+}
+
+fn removing_a_requested_component_contact_withdraws_the_request(contact: &str) -> TestResult {
+    let (mut suite, mut alice, mut component) = online()?;
+    alice.send(&format!("<presence type='subscribe' to='{contact}'/>"))?;
+    component_presence(&mut component, ALICE, contact, Some("subscribe"))?;
+    push(&mut alice, contact, "none", Some("subscribe"), false)?;
+
+    remove_contact(&mut alice, contact)?;
+    send_component_ping(&mut component)?;
+    component_presence(&mut component, ALICE, contact, Some("unsubscribe"))?;
+    expect_component_pong(&mut component)?;
+    traffic(&suite, "presence", 0, 2)?;
+    component.close()?;
+    alice.close()?;
+    suite.stop()
+}
+
+fn deleting_an_account_notifies_its_component_contacts(both: &str) -> TestResult {
+    let (mut suite, mut alice, mut component) = online()?;
+    follow(&mut alice, &mut component, both)?;
+    grant(&mut alice, &mut component, both, true, true)?;
+    follow(&mut alice, &mut component, other_contact(both))?;
+    request_from_component(&mut component, OTHER, "pending")?;
+    client_receives(&mut alice, OTHER, "subscribe")?;
+    component_barrier(&mut component)?;
+    traffic(&suite, "presence", 4, 4)?;
+
+    suite.delete_account("alice")?;
+    alice.expect_stream_error("not-authorized")?;
+    send_component_ping(&mut component)?;
+    for contact in [SERVER, DOMAIN] {
+        if contact == both {
+            component_presence(&mut component, DESK, contact, Some("unavailable"))?;
+        }
+        component_presence(&mut component, ALICE, contact, Some("unsubscribe"))?;
+        if contact == both {
+            component_presence(&mut component, ALICE, contact, Some("unsubscribed"))?;
+        }
+    }
+    component_presence(&mut component, ALICE, OTHER, Some("unsubscribed"))?;
+    expect_component_pong(&mut component)?;
+    traffic(&suite, "presence", 4, 9)?;
+    component.close()?;
     suite.stop()
 }

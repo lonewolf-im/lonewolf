@@ -116,7 +116,7 @@
         <xmpp:xep rdf:resource="https://xmpp.org/extensions/xep-0114.html"/>
         <xmpp:status>partial</xmpp:status>
         <xmpp:version>1.6</xmpp:version>
-        <xmpp:note>External components authenticate with a shared-secret handshake, exchange domain stanzas and may run across shared-state instances that can receive answers to one another's requests, and queued stanzas move after disconnects only to connections with room, with errors for stranded IQ requests or non-error messages when no connection remains or the selected queue is full. Lonewolf does not support the connect method, SASL, STARTTLS, privileged entities, namespace delegation or roster updates for component contacts, does not send presence when a component disconnects, does not resend sent stanzas, and federates component domains only when a host certificate covers them. Not in a release yet.</xmpp:note>
+        <xmpp:note>External components use the shared-secret handshake and spread traffic across up to the configured max_connections instances, which must share state because replies may reach any instance. Lonewolf does not support the connect method, and federation requires a host certificate that covers the component domain. Not in a release yet.</xmpp:note>
       </xmpp:SupportedXep>
     </implements>
     <implements>

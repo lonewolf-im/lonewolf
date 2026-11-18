@@ -427,7 +427,7 @@
 # [[components.listeners]]
 # address = "127.0.0.1:5347"
 # Choose "direct" when components send TLS before XML.
-# TLS uses the default host certificate unless the component sends SNI for a configured host.
+# Set SNI to a configured host name, or omit SNI to use the default host certificate.
 # tls_mode = "none"
 
 # The domain and path below are examples; the domain must not be a configured host.

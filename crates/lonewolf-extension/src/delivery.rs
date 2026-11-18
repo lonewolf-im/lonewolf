@@ -199,6 +199,11 @@ pub trait HostLookup {
     fn federates(&self, _local_domain: &str) -> bool {
         false
     }
+
+    /// Reports registered external component domains so roster contacts can route without federation.
+    fn is_component_domain(&self, _domain: &str) -> bool {
+        false
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -243,8 +248,8 @@ pub trait Delivery<A: ChunkAllocator>: HostLookup {
     /// An offline target is not an error.
     fn to_available<'a>(&'a self, stanza: RoutedStanza<A>) -> DeliveryFuture<'a>;
 
-    /// Routes to a non-local domain; `from` must be on a local host.
-    /// Overload and remote failures bounce to the sender instead of failing.
+    /// Routes from a local host to a non-local domain, including a registered component.
+    /// Remote failures and rejected component subscriptions bounce to the sender.
     fn to_remote<'a>(&'a self, _stanza: RoutedStanza<A>) -> DeliveryFuture<'a> {
         Box::pin(async { Err(DeliveryError) })
     }
@@ -276,19 +281,12 @@ pub trait Delivery<A: ChunkAllocator>: HostLookup {
     /// Evicts tagged resources whose committed roster state cannot be sent safely.
     fn retire_tagged<'a>(&'a self, account: &'a AccountKey, tag: SessionTag) -> DeliveryFuture<'a>;
 
-    /// Delivers the presence of every available resource of `from` to `to`.
-    fn current_presence<'a>(
-        &'a self,
-        from: &'a AccountKey,
-        to: &'a AccountKey,
-    ) -> DeliveryFuture<'a>;
+    /// Sends current presence from each available resource to a bare JID, which may be domain-only.
+    fn current_presence<'a>(&'a self, from: &'a AccountKey, to: &'a str) -> DeliveryFuture<'a>;
 
-    /// Delivers unavailable presence from every resource of `from` to `to`.
-    fn unavailable_presence<'a>(
-        &'a self,
-        from: &'a AccountKey,
-        to: &'a AccountKey,
-    ) -> DeliveryFuture<'a>;
+    /// Sends unavailable presence to a bare JID, which may be domain-only.
+    /// Includes each available resource and each retiring resource with a pending withdrawal.
+    fn unavailable_presence<'a>(&'a self, from: &'a AccountKey, to: &'a str) -> DeliveryFuture<'a>;
 }
 
 #[cfg(test)]

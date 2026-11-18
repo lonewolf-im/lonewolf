@@ -377,15 +377,11 @@ impl Delivery<GlobalChunkAllocator> for NoDelivery {
         Box::pin(async { Ok(()) })
     }
 
-    fn current_presence<'a>(&'a self, _: &'a AccountKey, _: &'a AccountKey) -> DeliveryFuture<'a> {
+    fn current_presence<'a>(&'a self, _: &'a AccountKey, _: &'a str) -> DeliveryFuture<'a> {
         Box::pin(async { Ok(()) })
     }
 
-    fn unavailable_presence<'a>(
-        &'a self,
-        _: &'a AccountKey,
-        _: &'a AccountKey,
-    ) -> DeliveryFuture<'a> {
+    fn unavailable_presence<'a>(&'a self, _: &'a AccountKey, _: &'a str) -> DeliveryFuture<'a> {
         Box::pin(async { Ok(()) })
     }
 }

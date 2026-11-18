@@ -172,10 +172,7 @@ async fn setup<'a>(
     .with_extensions(registries)
     .with_services(BTreeMap::from([(
         "svc.other.localhost".into(),
-        ServiceRoute {
-            domain: Arc::from("svc.other.localhost"),
-            handler: probe.clone(),
-        },
+        ServiceRoute::extension(Arc::from("svc.other.localhost"), probe.clone()),
     )]));
     let registration = router
         .handle()

@@ -240,10 +240,7 @@ fn deliver_keeps_service_fallback_errors_separate_from_remote_errors() -> TestRe
         let mut fixture = Fixture::new()?;
         fixture.router = fixture.router.with_services(BTreeMap::from([(
             "echo.localhost".into(),
-            ServiceRoute {
-                domain: Arc::from("echo.localhost"),
-                handler: Arc::new(UncalledService),
-            },
+            ServiceRoute::extension(Arc::from("echo.localhost"), Arc::new(UncalledService)),
         )]));
         fixture.handle = fixture.router.handle();
         for target in ["room@echo.localhost", "room@echo.localhost/nick"] {

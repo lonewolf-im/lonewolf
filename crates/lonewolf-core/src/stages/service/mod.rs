@@ -150,6 +150,10 @@ impl<A: ChunkAllocator + Clone> HostLookup for Outbound<'_, A> {
     fn federates(&self, local_domain: &str) -> bool {
         self.router.federates_domain(local_domain)
     }
+
+    fn is_component_domain(&self, domain: &str) -> bool {
+        self.router.is_component_domain(domain)
+    }
 }
 
 impl<A: ChunkAllocator + Clone + 'static> ServiceOutbound<A> for Outbound<'_, A> {

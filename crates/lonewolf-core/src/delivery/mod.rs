@@ -415,6 +415,10 @@ impl<A: ChunkAllocator + Clone> HostLookup for RouterDelivery<A> {
     fn federates(&self, local_domain: &str) -> bool {
         self.router.federates_domain(local_domain)
     }
+
+    fn is_component_domain(&self, domain: &str) -> bool {
+        self.router.is_component_domain(domain)
+    }
 }
 
 impl<A: ChunkAllocator + Clone> SessionLookup for RouterDelivery<A> {
@@ -525,9 +529,21 @@ impl<A: ChunkAllocator + Clone + 'static> Delivery<A> for RouterDelivery<A> {
 
     fn to_remote<'a>(&'a self, stanza: RoutedStanza<A>) -> DeliveryFuture<'a> {
         Box::pin(async move {
-            self.router
-                .route_remote_or_bounce(stanza)
-                .map_err(|_| DeliveryError)
+            let component = stanza
+                .resolve()
+                .ok()
+                .and_then(|view| view.to().ok().flatten())
+                .is_some_and(|to| self.router.is_component_domain(to.domainpart()));
+            if component {
+                self.router
+                    .route_to_component_or_bounce(stanza)
+                    .await
+                    .map_err(|_| DeliveryError)
+            } else {
+                self.router
+                    .route_remote_or_bounce(stanza)
+                    .map_err(|_| DeliveryError)
+            }
         })
     }
 
@@ -586,11 +602,7 @@ impl<A: ChunkAllocator + Clone + 'static> Delivery<A> for RouterDelivery<A> {
         })
     }
 
-    fn current_presence<'a>(
-        &'a self,
-        from: &'a AccountKey,
-        to: &'a AccountKey,
-    ) -> DeliveryFuture<'a> {
+    fn current_presence<'a>(&'a self, from: &'a AccountKey, to: &'a str) -> DeliveryFuture<'a> {
         Box::pin(async move {
             self.router
                 .route_current_presence(from, to)
@@ -599,11 +611,7 @@ impl<A: ChunkAllocator + Clone + 'static> Delivery<A> for RouterDelivery<A> {
         })
     }
 
-    fn unavailable_presence<'a>(
-        &'a self,
-        from: &'a AccountKey,
-        to: &'a AccountKey,
-    ) -> DeliveryFuture<'a> {
+    fn unavailable_presence<'a>(&'a self, from: &'a AccountKey, to: &'a str) -> DeliveryFuture<'a> {
         Box::pin(async move {
             self.router
                 .route_unavailable_presence(from, to)

@@ -2527,7 +2527,7 @@ fn registered_service_dispatch_bypasses_account_stages_for_all_kinds_and_replies
         config.hosts.insert("example.com".into(), crate::config::HostConfig { tls: Some(crate::config::HostTlsConfig { source: crate::config::HostTlsSource::Files { certificate_chain_path: chain_path, private_key_path: key_path }, client_auth: None }), ..Default::default() });
         let hosts = crate::hosts::Hosts::new(&config.hosts, Some("localhost"))?;
         fixture.remote = RemoteFixture::with_hosts_and_pair(AdmissionState::Link, NonZeroUsize::MIN, hosts.clone(), ("svc.example.com".into(), "remote.test".into()))?;
-        let route = crate::router::ServiceRoute { domain: Arc::from("svc.example.com"), handler: service.clone() };
+        let route = crate::router::ServiceRoute::extension(Arc::from("svc.example.com"), service.clone());
         fixture.router = Router::new(hosts, LocalRouter::new(GlobalChunkAllocator)).with_remote(fixture.remote.remote()).with_extensions(BTreeMap::from([("svc.example.com".into(), {
             let mut extensions = Extensions::default();
             extensions.register(messages.clone())?;

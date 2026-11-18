@@ -101,15 +101,11 @@ impl Delivery<GlobalChunkAllocator> for RecordingDelivery {
         panic!("observer must use copy delivery")
     }
 
-    fn current_presence<'a>(&'a self, _: &'a AccountKey, _: &'a AccountKey) -> DeliveryFuture<'a> {
+    fn current_presence<'a>(&'a self, _: &'a AccountKey, _: &'a str) -> DeliveryFuture<'a> {
         panic!("observer must use copy delivery")
     }
 
-    fn unavailable_presence<'a>(
-        &'a self,
-        _: &'a AccountKey,
-        _: &'a AccountKey,
-    ) -> DeliveryFuture<'a> {
+    fn unavailable_presence<'a>(&'a self, _: &'a AccountKey, _: &'a str) -> DeliveryFuture<'a> {
         panic!("observer must use copy delivery")
     }
 }

@@ -845,3 +845,44 @@ fn unknown_message_type_round_trips_through_offline_storage_with_inherited_langu
     alice.close()?;
     bob.close()
 }
+
+#[test]
+fn offline_backlog_larger_than_one_page_replays_in_order_and_reports_pages() -> TestResult {
+    let record_len = 262_144 / 2;
+    let messages: [String; 5] = std::array::from_fn(|index| {
+        let mut xml = format!(
+            "<message xmlns='jabber:client' to='bob@localhost' type='chat' id='page-{index}'><body>"
+        );
+        let suffix = "</body></message>";
+        xml.extend(std::iter::repeat_n(
+            'x',
+            record_len - xml.len() - suffix.len(),
+        ));
+        xml.push_str(suffix);
+        xml
+    });
+    let suite =
+        C2sSuite::with_extensions_and_setup("'offline', 'test-offline-inspect'", |directory| {
+            seed_replay_roster(directory)?;
+            seed_offline_records(directory, &messages.each_ref().map(String::as_bytes))
+        })?;
+    let mut bob = suite.connect("bob", OTHER_PASSWORD, "phone")?;
+    bob.send("<presence/>")?;
+    bob.expect_xml(
+        "<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'/>",
+    )?;
+    for message in &messages {
+        bob.expect_xml(message)?;
+    }
+    await_empty(&mut bob, "bob@localhost/phone")?;
+    suite.wait_for_metric(
+        r#"lonewolf_c2s_replay_pages_total{listener="0",kind="offline_message"} 3"#,
+    )?;
+    suite.wait_for_metric(&format!(
+        r#"lonewolf_c2s_replay_bytes_total{{listener="0",kind="offline_message"}} {}"#,
+        messages.len() * record_len
+    ))?;
+    suite.wait_for_metric(r#"lonewolf_c2s_replay_records_total{listener="0",kind="offline_message",outcome="delivered"} 5"#)?;
+    suite.wait_for_metric(r#"lonewolf_c2s_replay_records_total{listener="0",kind="offline_message",outcome="invalid"} 0"#)?;
+    bob.close()
+}

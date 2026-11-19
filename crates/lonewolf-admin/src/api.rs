@@ -745,6 +745,16 @@ mod tests {
             unreachable!()
         }
 
+        async fn pending_page(
+            &self,
+            _: &AccountKey,
+            _: Option<&roster::RosterJid>,
+            _: NonZeroUsize,
+            _: roster::PendingPage,
+        ) -> Result<roster::PendingPage, roster::RosterError> {
+            unreachable!()
+        }
+
         async fn pending_request(
             &self,
             _: &AccountKey,

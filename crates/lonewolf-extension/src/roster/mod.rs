@@ -12,8 +12,8 @@ use std::sync::Arc;
 use lonewolf_storage::Storage;
 use lonewolf_storage::account::{AccountError, AccountKey, AccountReads};
 use lonewolf_storage::roster::{
-    RosterError, RosterItem, RosterJid, RosterMutation, RosterQuota, RosterReads, RosterSnapshot,
-    RosterVersion, RosterWrites, SubscriptionState,
+    PendingPage, RosterError, RosterItem, RosterJid, RosterMutation, RosterQuota, RosterReads,
+    RosterSnapshot, RosterVersion, RosterWrites, SubscriptionState,
 };
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::JidRef;
@@ -434,16 +434,16 @@ where
                 .map_err(|error| roster_quota_error(error, "roster_read", self.quota(&owner)))?;
             let (subscribers, watched) = split_subscriptions(snapshot, &owner);
             let (pending, contacts, probes) = if update.transition == PresenceTransition::Initial {
-                let pending = transaction
-                    .pending_requests(&owner)
-                    .await
-                    .map_err(|error| roster_error(error, "roster_read"))?;
                 let contacts =
                     granting_contacts(transaction, RosterJid::from(update.sender.bare()), &watched)
                         .await?;
-                (pending, contacts, watched)
+                let pending = transaction
+                    .pending_page(&owner, None, crate::REPLAY_PAGE_BYTES, PendingPage::new())
+                    .await
+                    .map_err(|error| roster_error(error, "roster_read"))?;
+                (Some(pending), contacts, watched)
             } else {
-                (Vec::new(), Vec::new(), Vec::new())
+                (None, Vec::new(), Vec::new())
             };
             Ok(Some(PresenceAudience {
                 subscribers,
@@ -451,6 +451,21 @@ where
                 contacts,
                 probes,
             }))
+        })
+    }
+
+    fn pending_page<'a>(
+        &'a self,
+        owner: &'a AccountKey,
+        after: &'a RosterJid,
+        transaction: &'a S::Read,
+        page: PendingPage,
+    ) -> PresenceFuture<'a, PendingPage> {
+        Box::pin(async move {
+            transaction
+                .pending_page(owner, Some(after), crate::REPLAY_PAGE_BYTES, page)
+                .await
+                .map_err(|error| roster_error(error, "roster_read"))
         })
     }
 

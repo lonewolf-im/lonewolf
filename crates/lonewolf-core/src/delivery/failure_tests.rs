@@ -312,6 +312,16 @@ impl RosterReads for FailedCommit {
     ) -> Result<Vec<PendingSubscription>, RosterError> {
         unreachable!("commit test cannot use storage operations")
     }
+    async fn pending_page(
+        &self,
+        _: &AccountKey,
+        _: Option<&RosterJid>,
+        _: NonZeroUsize,
+        _: PendingPage,
+    ) -> Result<PendingPage, RosterError> {
+        unreachable!("commit test cannot use storage operations")
+    }
+
     async fn pending_request(
         &self,
         _owner: &AccountKey,

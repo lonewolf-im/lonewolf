@@ -9,10 +9,13 @@ use std::num::NonZeroUsize;
 
 use crate::StorageError;
 use crate::account::AccountKey;
+use crate::page::StoredPage;
 
 mod key;
 
 pub use key::RosterJid;
+
+pub type PendingPage = StoredPage<RosterJid>;
 
 /// Bounds XML node metadata independently of stored string bytes.
 pub const MAX_GROUPS_PER_ITEM: usize = 8;
@@ -158,7 +161,19 @@ pub trait RosterReads {
         sender: &RosterJid,
     ) -> impl Future<Output = Result<bool, RosterError>> + Send;
 
-    /// Returns pending requests in sender order.
+    /// Refills `page` with pending requests after the sender `after`, in sender order.
+    ///
+    /// The page holds at least one request when any remain, and stops before a request
+    /// that would take its stanza bytes over `max_bytes`.
+    fn pending_page(
+        &self,
+        owner: &AccountKey,
+        after: Option<&RosterJid>,
+        max_bytes: NonZeroUsize,
+        page: PendingPage,
+    ) -> impl Future<Output = Result<PendingPage, RosterError>> + Send;
+
+    /// Copies every pending request in sender order. Delivery paths read pages.
     fn pending_requests(
         &self,
         owner: &AccountKey,

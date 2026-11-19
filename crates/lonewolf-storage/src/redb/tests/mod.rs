@@ -102,6 +102,59 @@ fn fresh_database_initializes_all_tables() -> TestResult {
 }
 
 #[test]
+fn opening_a_database_without_blocklists_adds_an_empty_table_and_preserves_accounts() -> TestResult
+{
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("storage.redb");
+    let owner = key("alice@example.com")?;
+    let storage = RedbStorage::open(&path)?;
+    let account = new_account(owner.as_str(), 10)?;
+    block_on(write(&storage, async |tx| tx.create_account(account).await))?;
+
+    let existing_tables = [
+        ACCOUNTS.name(),
+        DECOY_SECRET.name(),
+        ITEMS.name(),
+        PENDING.name(),
+        VERSIONS.name(),
+        MESSAGES.name(),
+        SEQUENCES.name(),
+        VCARDS.name(),
+        ELEMENTS.name(),
+    ];
+    let transaction = storage.as_ref().begin_write()?;
+    for table in transaction.list_tables()?.collect::<Vec<_>>() {
+        if !existing_tables.contains(&table.name()) {
+            transaction.delete_table(table)?;
+        }
+    }
+    transaction.commit()?;
+    let account_record = |storage: &RedbStorage| -> TestResult<Vec<u8>> {
+        Ok(storage
+            .as_ref()
+            .begin_read()?
+            .open_table(ACCOUNTS)?
+            .get(owner.as_str())?
+            .ok_or("missing account")?
+            .value()
+            .to_vec())
+    };
+    let before = account_record(&storage)?;
+    drop(storage);
+
+    let reopened = RedbStorage::open(&path)?;
+    assert_eq!(account_record(&reopened)?, before);
+    let reader = reopened.as_ref().begin_read()?;
+    let mut added = reader
+        .list_tables()?
+        .filter(|table| !existing_tables.contains(&table.name()));
+    let table = added.next().ok_or("missing blocklist table")?;
+    assert!(reader.open_untyped_table(table)?.is_empty()?);
+    assert!(added.next().is_none());
+    Ok(())
+}
+
+#[test]
 fn unknown_tables_are_left_untouched() -> TestResult {
     let storage = storage()?;
     let before = decoy_salt(storage.scram_decoy())?;

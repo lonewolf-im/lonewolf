@@ -81,12 +81,16 @@ pub(crate) async fn evaluate_in<A: ChunkAllocator + Clone>(
                     }
                 }
             };
+            let next = match (check.direction, next) {
+                (Direction::Inbound, Verdict::OutboundBlocked) => Verdict::Drop,
+                (_, next) => next,
+            };
             let strictest = verdict.strictest(next);
             if strictest != verdict {
                 decided_by = Some((check, name));
             }
             verdict = strictest;
-            if verdict == Verdict::Drop {
+            if matches!(verdict, Verdict::Drop | Verdict::OutboundBlocked) {
                 break 'checks;
             }
         }

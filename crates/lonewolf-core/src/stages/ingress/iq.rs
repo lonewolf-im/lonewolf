@@ -164,6 +164,7 @@ impl<A: ChunkAllocator> IqPending<A> {
 
 pub(crate) enum IqDisposition<A: ChunkAllocator> {
     Done,
+    OutboundBlocked(IqInput<A>),
     PolicyRejected {
         input: IqInput<A>,
         condition: StanzaErrorCondition,
@@ -433,6 +434,7 @@ fn policy_needed<A: ChunkAllocator + Clone>(
 
 fn policy_disposition<A: ChunkAllocator>(input: IqInput<A>, verdict: Verdict) -> IqDisposition<A> {
     match verdict {
+        Verdict::OutboundBlocked => IqDisposition::OutboundBlocked(input),
         Verdict::Reject {
             condition,
             application,

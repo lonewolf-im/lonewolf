@@ -7,7 +7,7 @@ use lonewolf_xmpp::stanza::{
 };
 
 use super::checks::{self, Snapshot};
-use super::{Origin, rejection_reply};
+use super::{Origin, outbound_blocked_reply, rejection_reply};
 use crate::stages::message::{self, DeliveryOutcome, MissingRecipientPolicy};
 use crate::stages::{Stage, StageFailure, archive};
 
@@ -38,6 +38,10 @@ pub(crate) async fn handle<A: ChunkAllocator + Clone + 'static>(
     match checks::check(stage, origin, &view, &parties, Snapshot::Fresh).await? {
         Verdict::Allow => {}
         Verdict::Drop => return Ok(MessageDisposition::Done),
+        Verdict::OutboundBlocked => {
+            let reply = outbound_blocked_reply(stage.allocator, &routed)?;
+            return Ok(MessageDisposition::Reply(Reply::Built(reply)));
+        }
         Verdict::Reject {
             condition,
             application,

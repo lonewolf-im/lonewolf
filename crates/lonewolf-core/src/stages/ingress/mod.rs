@@ -4,7 +4,8 @@ use lonewolf_extension::delivery::Failure;
 use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::stanza::{
-    ApplicationCondition, RoutedStanza, StanzaErrorCondition, StanzaErrorText,
+    ApplicationCondition, BuildError, RoutedStanza, Stanza, StanzaBuilder, StanzaErrorClass,
+    StanzaErrorCondition, StanzaErrorText,
 };
 
 use super::StageFailure;
@@ -72,6 +73,32 @@ pub(crate) fn rejection_reply<A: ChunkAllocator + Clone>(
     let reply = source
         .error_reply_described_in(&mut arena, condition, application, text)?
         .build()?;
+    Ok(RoutedStanza::from_parts(reply, arena))
+}
+
+pub(crate) fn outbound_blocked_reply_in<'a, A: ChunkAllocator>(
+    source: &Stanza,
+    arena: &'a mut Arena<A>,
+) -> Result<StanzaBuilder<'a, A>, BuildError> {
+    source.error_reply_with_class_in(
+        arena,
+        StanzaErrorCondition::NotAcceptable,
+        StanzaErrorClass::Cancel,
+        Some(ApplicationCondition {
+            name: "blocked",
+            namespace: "urn:xmpp:blocking:errors",
+        }),
+        StanzaErrorText::Static("You have blocked communication with this address."),
+    )
+}
+
+pub(crate) fn outbound_blocked_reply<A: ChunkAllocator + Clone>(
+    allocator: &A,
+    source: &RoutedStanza<A>,
+) -> Result<RoutedStanza<A>, StageFailure> {
+    let mut arena = Arena::try_new_in(Default::default(), allocator.clone())?;
+    let source = source.resolve()?.clone_in(&mut arena)?;
+    let reply = outbound_blocked_reply_in(&source, &mut arena)?.build()?;
     Ok(RoutedStanza::from_parts(reply, arena))
 }
 

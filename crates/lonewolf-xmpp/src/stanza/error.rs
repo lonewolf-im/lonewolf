@@ -10,6 +10,27 @@ use super::{
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StanzaErrorClass {
+    Auth,
+    Cancel,
+    Continue,
+    Modify,
+    Wait,
+}
+
+impl StanzaErrorClass {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auth => "auth",
+            Self::Cancel => "cancel",
+            Self::Continue => "continue",
+            Self::Modify => "modify",
+            Self::Wait => "wait",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StanzaErrorText {
     Static(&'static str),
     TwoLimits {
@@ -66,6 +87,24 @@ pub fn error_element_in<A: ChunkAllocator>(
     text: StanzaErrorText,
     arena: &mut Arena<A>,
 ) -> Result<Element, BuildError> {
+    error_element_with_class_in(
+        namespace,
+        condition,
+        condition.error_class(),
+        application,
+        text,
+        arena,
+    )
+}
+
+pub(super) fn error_element_with_class_in<A: ChunkAllocator>(
+    namespace: StanzaNamespace,
+    condition: StanzaErrorCondition,
+    class: StanzaErrorClass,
+    application: Option<ApplicationCondition>,
+    text: StanzaErrorText,
+    arena: &mut Arena<A>,
+) -> Result<Element, BuildError> {
     let defined =
         Element::builder_in(condition.as_str(), STANZA_ERROR_NAMESPACE, arena)?.build()?;
     let mut buffer = std::io::Cursor::new([0u8; 512]);
@@ -100,7 +139,7 @@ pub fn error_element_in<A: ChunkAllocator>(
         })
         .transpose()?;
     let mut error = Element::builder_in("error", namespace.as_str(), arena)?
-        .attribute("type", "", condition.error_type())?
+        .attribute("type", "", class.as_str())?
         .child(defined)?
         .child(text)?;
     if let Some(application) = application {

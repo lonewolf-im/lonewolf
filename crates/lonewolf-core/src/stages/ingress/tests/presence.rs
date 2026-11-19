@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::stages::ingress::presence::ProbeAuthorization;
 use crate::stages::ingress::presence::authorize_probe;
 use futures_channel::oneshot;
 use futures_util::{
@@ -263,7 +264,7 @@ fn local_and_remote_probes_share_one_authorization() -> TestResult {
                 recorder.subscribed.store(subscribed, Ordering::SeqCst);
                 recorder.calls.lock().clear();
                 let routed = probe(Some(from), Some(to))?;
-                let grant = authorize_probe(
+                let ProbeAuthorization::Granted(grant) = authorize_probe(
                     fixture.handle.clone(),
                     fixture.storage.clone(),
                     source.map(account).transpose()?,
@@ -273,7 +274,9 @@ fn local_and_remote_probes_share_one_authorization() -> TestResult {
                 )
                 .await
                 .map_err(|_| "authorization")?
-                .ok_or("missing grant")?;
+                else {
+                    return Err("missing grant".into());
+                };
                 assert_eq!(grant.subscribed, visibility && subscribed);
                 let calls = recorder.calls.lock();
                 assert_eq!(calls.len(), usize::from(visibility) + directions.len());
@@ -351,7 +354,7 @@ fn local_and_remote_probes_share_one_authorization() -> TestResult {
                 ),
             ] {
                 let routed = probe(Some(from), Some(to))?;
-                assert!(
+                assert!(matches!(
                     authorize_probe(
                         fixture.handle.clone(),
                         fixture.storage.clone(),
@@ -361,9 +364,9 @@ fn local_and_remote_probes_share_one_authorization() -> TestResult {
                         exists_gate
                     )
                     .await
-                    .map_err(|_| "rejected authorization")?
-                    .is_none()
-                );
+                    .map_err(|_| "rejected authorization")?,
+                    ProbeAuthorization::Denied
+                ));
             }
         }
         recorder.calls.lock().clear();
@@ -494,10 +497,11 @@ fn probe_visibility_and_policy_keep_one_snapshot_while_waiting_for_turn() -> Tes
                 );
             }
             drop(blocker);
-            let grant = authorization
-                .await
-                .map_err(|_| "authorization")?
-                .ok_or("grant")?;
+            let ProbeAuthorization::Granted(grant) =
+                authorization.await.map_err(|_| "authorization")?
+            else {
+                return Err("missing grant".into());
+            };
             drop(grant.ticket);
             fixture.router.shutdown().await?;
         }

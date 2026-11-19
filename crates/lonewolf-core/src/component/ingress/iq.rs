@@ -46,7 +46,7 @@ pub(super) async fn handle<A: ChunkAllocator + Clone + 'static>(
     let disposition =
         ingress_iq::handle(stage, origin, IqInput::Routed(routed), destination, kind).await?;
     let answer = match disposition {
-        IqDisposition::Done => return Ok(()),
+        IqDisposition::Done | IqDisposition::OutboundBlocked(_) => return Ok(()),
         IqDisposition::PolicyRejected {
             input: IqInput::Routed(routed),
             condition,

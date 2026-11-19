@@ -10,16 +10,14 @@ use lonewolf_xmpp::stanza::{
 use crate::ExtensionFuture;
 use crate::delivery::HandlerError;
 
+/// Direction is relative to the account whose policy is checked.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Direction {
-    /// The account sends the stanza to the peer.
     Outbound,
-    /// The peer sends the stanza to the account.
     Inbound,
 }
 
 pub struct PolicyRequest<'a> {
-    /// The local account whose policy applies.
     pub account: &'a AccountKey,
     pub direction: Direction,
     /// The addressed recipient for outbound checks and sender for inbound checks.
@@ -30,6 +28,8 @@ pub struct PolicyRequest<'a> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Verdict {
     Allow,
+    /// Only an outbound check may disclose the account's own block.
+    OutboundBlocked,
     /// Rejections are suppressed for presence, error messages, and IQ responses.
     Reject {
         condition: StanzaErrorCondition,
@@ -41,9 +41,9 @@ pub enum Verdict {
 }
 
 impl Verdict {
-    /// Drop outranks Reject, which outranks Allow; the earlier rejection wins a tie.
     pub fn strictest(self, other: Self) -> Self {
         match (self, other) {
+            (Self::OutboundBlocked, _) | (_, Self::OutboundBlocked) => Self::OutboundBlocked,
             (Self::Drop, _) | (_, Self::Drop) => Self::Drop,
             (Self::Reject { .. }, _) => self,
             _ => other,
@@ -53,6 +53,11 @@ impl Verdict {
     /// Suppresses rejection replies that could cause loops and answers dropped IQ requests.
     pub fn for_stanza(self, kind: StanzaType) -> Self {
         match self {
+            Self::OutboundBlocked
+                if kind.is_error() || matches!(kind, StanzaType::Iq(IqType::Result)) =>
+            {
+                Self::Drop
+            }
             Self::Drop if matches!(kind, StanzaType::Iq(IqType::Get | IqType::Set)) => {
                 Self::Reject {
                     condition: StanzaErrorCondition::ServiceUnavailable,
@@ -92,7 +97,7 @@ mod tests {
     use lonewolf_xmpp::stanza::PresenceType;
 
     #[test]
-    fn drop_outranks_every_verdict_in_both_orders() {
+    fn drop_outranks_generic_verdicts_in_both_orders() {
         for verdict in [
             Verdict::Allow,
             Verdict::Drop,
@@ -104,6 +109,56 @@ mod tests {
         ] {
             assert_eq!(verdict.strictest(Verdict::Drop), Verdict::Drop);
             assert_eq!(Verdict::Drop.strictest(verdict), Verdict::Drop);
+        }
+    }
+
+    #[test]
+    fn outbound_block_reply_matrix() {
+        for (kind, expected) in [
+            (
+                StanzaType::Presence(PresenceType::Available),
+                Verdict::OutboundBlocked,
+            ),
+            (
+                StanzaType::Presence(PresenceType::Unavailable),
+                Verdict::OutboundBlocked,
+            ),
+            (
+                StanzaType::Presence(PresenceType::Subscribe),
+                Verdict::OutboundBlocked,
+            ),
+            (
+                StanzaType::Presence(PresenceType::Subscribed),
+                Verdict::OutboundBlocked,
+            ),
+            (
+                StanzaType::Presence(PresenceType::Unsubscribe),
+                Verdict::OutboundBlocked,
+            ),
+            (
+                StanzaType::Presence(PresenceType::Unsubscribed),
+                Verdict::OutboundBlocked,
+            ),
+            (
+                StanzaType::Presence(PresenceType::Probe),
+                Verdict::OutboundBlocked,
+            ),
+            (StanzaType::Presence(PresenceType::Error), Verdict::Drop),
+            (
+                StanzaType::Message(MessageType::Chat),
+                Verdict::OutboundBlocked,
+            ),
+            (StanzaType::Message(MessageType::Error), Verdict::Drop),
+            (StanzaType::Iq(IqType::Get), Verdict::OutboundBlocked),
+            (StanzaType::Iq(IqType::Set), Verdict::OutboundBlocked),
+            (StanzaType::Iq(IqType::Result), Verdict::Drop),
+            (StanzaType::Iq(IqType::Error), Verdict::Drop),
+        ] {
+            assert_eq!(
+                Verdict::OutboundBlocked.for_stanza(kind),
+                expected,
+                "{kind:?}"
+            );
         }
     }
 

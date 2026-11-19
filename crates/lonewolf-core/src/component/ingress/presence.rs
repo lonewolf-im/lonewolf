@@ -14,7 +14,7 @@ use crate::router::{Destination, RoutedStanza, RouterError};
 use crate::stages::Stage;
 use crate::stages::ingress::{
     checks::{Snapshot, check_from},
-    presence::{SubscriptionIngress, authorize_probe, receive_subscription},
+    presence::{ProbeAuthorization, SubscriptionIngress, authorize_probe, receive_subscription},
 };
 
 pub(super) async fn handle<A: ChunkAllocator + Clone + 'static>(
@@ -64,7 +64,7 @@ pub(super) async fn handle<A: ChunkAllocator + Clone + 'static>(
     }
     let account = AccountKey::try_from(target.bare()).map_err(|_| IngressFailure)?;
     if kind == PresenceType::Probe {
-        let Some(grant) = authorize_probe(
+        let ProbeAuthorization::Granted(grant) = authorize_probe(
             context.router.clone(),
             context.storage.clone(),
             None,

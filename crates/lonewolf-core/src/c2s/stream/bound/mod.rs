@@ -33,14 +33,14 @@ use lonewolf_extension::observer::{
 };
 use lonewolf_extension::policy::{Direction, Verdict};
 use lonewolf_extension::presence::{
-    PresenceAudience, PresenceRequest, PresenceRequestType, PresenceSend, PresenceTransition,
-    PresenceUpdate,
+    PresenceAudience, PresenceHandler, PresenceRequest, PresenceRequestType, PresenceSend,
+    PresenceTransition, PresenceUpdate,
 };
 #[cfg(test)]
 use lonewolf_storage::RedbRead;
 use lonewolf_storage::account::{AccountError, AccountKey, AccountReads};
 use lonewolf_storage::offline::OfflineSequence;
-use lonewolf_storage::roster::{PendingSubscription, RosterJid};
+use lonewolf_storage::roster::{PendingPage, RosterJid};
 use lonewolf_storage::{RedbStorage, RedbWrite, Storage, StorageError, WriteTransaction};
 use lonewolf_util::arena::{Arena, ArenaConfig, ArenaRead, ChunkAllocator, HandleError};
 use lonewolf_xmpp::jid::{Jid, JidError, JidRef};
@@ -138,8 +138,12 @@ enum Output<A: ChunkAllocator> {
         stanza: Stanza,
         arena: Arena<A>,
     },
-    /// Requests stay unparsed to bound backlog memory.
-    Requests(Vec<PendingSubscription>),
+    /// Each page stays unparsed until it is written, which bounds replay memory.
+    Requests {
+        page: PendingPage,
+        handler: Arc<dyn PresenceHandler<A, RedbStorage>>,
+        router: RouterHandle<A>,
+    },
     Offline {
         backlog: Backlog,
         handler: Arc<dyn MessageHandler<A, RedbStorage>>,
@@ -1469,7 +1473,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         let presence_handler = self
             .router
             .presence_handlers(self.registration.account().domain())
-            .and_then(|handlers| handlers.find(kind));
+            .and_then(|handlers| handlers.find_shared(kind));
         let message_handler = self
             .router
             .message_handler(self.registration.account().domain())
@@ -1478,10 +1482,8 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             .router
             .presence_decorations(self.registration.account().domain());
         let decorate = available && !decorations.is_empty();
-        let backlog_reader = message_handler
-            .as_deref()
-            .filter(|_| candidate)
-            .map(|handler| (handler, self.outbox.metrics.clone()));
+        let backlog_reader = message_handler.as_deref().filter(|_| candidate);
+        let metrics = self.outbox.metrics.clone();
         let registration = &self.registration;
         let router = &self.router;
         let storage = &self.storage;
@@ -1498,7 +1500,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                     })?;
                 let sender = from.resolve(&arena)?;
                 let mut result = async {
-                    let audience = match presence_handler {
+                    let audience = match presence_handler.as_deref() {
                         Some(handler) => {
                             handler
                                 .audience(PresenceUpdate { sender, transition }, &transaction)
@@ -1506,16 +1508,24 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                         }
                         None => None,
                     };
-                    let backlog = match &backlog_reader {
-                        Some((handler, metrics)) => handler
-                            .backlog(owner, &transaction)
-                            .await?
-                            .inspect(|backlog| {
-                                metrics.replay_page_read(
-                                    ReplayKind::OfflineMessage,
-                                    backlog.page.byte_len(),
-                                );
-                            }),
+                    if let Some(page) = audience
+                        .as_ref()
+                        .and_then(|audience| audience.pending.as_ref())
+                    {
+                        metrics.replay_page_read(ReplayKind::SubscriptionRequest, page.byte_len());
+                    }
+                    let backlog = match backlog_reader {
+                        Some(handler) => {
+                            handler
+                                .backlog(owner, &transaction)
+                                .await?
+                                .inspect(|backlog| {
+                                    metrics.replay_page_read(
+                                        ReplayKind::OfflineMessage,
+                                        backlog.page.byte_len(),
+                                    );
+                                })
+                        }
                         None => None,
                     };
                     Ok((audience, backlog))
@@ -1538,6 +1548,13 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                     )
                     .await
                     .map_err(|_| CloseOutcome::InternalError)?;
+                    if let Some(page) = &audience.pending {
+                        metrics.replay_records(
+                            ReplayKind::SubscriptionRequest,
+                            ReplayOutcome::Blocked,
+                            page.read_len() - page.len(),
+                        );
+                    }
                 }
                 if decorate {
                     let mut children = Vec::with_capacity(decorations.len());
@@ -1658,8 +1675,14 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         .then(|| outcome.echo.clone());
         self.outbox.push(Output::Routed(outcome.echo));
         self.outbox.routed(outcome.replay);
-        if !outcome.requests.is_empty() {
-            self.outbox.push(Output::Requests(outcome.requests));
+        if let (Some(page), Some(handler)) = (outcome.requests, presence_handler)
+            && (!page.is_empty() || !page.is_complete())
+        {
+            self.outbox.push(Output::Requests {
+                page,
+                handler,
+                router: self.router.clone(),
+            });
         }
         if let Some(backlog) = outcome.backlog
             && let Some(handler) = message_handler
@@ -2230,17 +2253,65 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> Outbox<'_, A, W> {
                     self.written = self.written.next();
                     self.writer.write(Outgoing::Owned { stanza, arena }).await?;
                 }
-                Output::Requests(requests) => {
-                    for subscription in requests {
-                        let stanza = self
-                            .parse_stored(
-                                &subscription.stanza,
-                                StoredKind::Subscription(&subscription.sender),
-                            )
-                            .await?;
-                        self.written = self.written.next();
-                        self.writer.write(Outgoing::Routed(stanza)).await?;
-                        pending_count += 1;
+                Output::Requests {
+                    mut page,
+                    handler,
+                    router,
+                } => {
+                    let kind = ReplayKind::SubscriptionRequest;
+                    loop {
+                        for (sender, bytes) in page.iter() {
+                            let stanza = self
+                                .parse_stored(bytes, StoredKind::Subscription(sender))
+                                .await?;
+                            self.written = self.written.next();
+                            self.writer.write(Outgoing::Routed(stanza)).await?;
+                            pending_count += 1;
+                            self.metrics
+                                .replay_records(kind, ReplayOutcome::Delivered, 1);
+                        }
+                        if page.is_complete() {
+                            break;
+                        }
+                        let Some(after) = page.resume_after().cloned() else {
+                            break;
+                        };
+                        let transaction = self.storage.begin_read().await.map_err(|error| {
+                            close_storage_failure(error, "pending_replay_begin_read", &self.account)
+                        })?;
+                        if !self.liveness.is_alive() {
+                            tracing::debug!(
+                                operation = "replay",
+                                outcome = "stale_session",
+                                owner_jid = ?self.account.as_str(),
+                                "pending replay stopped"
+                            );
+                            break;
+                        }
+                        page = handler
+                            .pending_page(&self.account, &after, &transaction, page)
+                            .await
+                            .map_err(|error| {
+                                report_handler_failure(&error, &self.account);
+                                CloseOutcome::InternalError
+                            })?;
+                        self.metrics.replay_page_read(kind, page.byte_len());
+                        policy::filter_pending(
+                            &router,
+                            &transaction,
+                            &self.allocator,
+                            &self.account,
+                            StanzaType::Presence(PresenceType::Available),
+                            &mut page,
+                        )
+                        .await
+                        .map_err(|_| CloseOutcome::InternalError)?;
+                        drop(transaction);
+                        self.metrics.replay_records(
+                            kind,
+                            ReplayOutcome::Blocked,
+                            page.read_len() - page.len(),
+                        );
                     }
                 }
                 Output::Offline { backlog, handler } => {
@@ -2885,7 +2956,7 @@ struct PresenceOutcome<A: ChunkAllocator> {
     change: PresenceChange<A>,
     echo: RoutedStanza<A>,
     replay: Vec<RoutedStanza<A>>,
-    requests: Vec<PendingSubscription>,
+    requests: Option<PendingPage>,
     backlog: Option<Backlog>,
 }
 
@@ -2917,7 +2988,7 @@ impl<A: ChunkAllocator + Clone> PresenceWork<A> {
             None
         };
         let mut replay = Vec::new();
-        let mut requests = Vec::new();
+        let mut requests = None;
         if change.became_available
             && let Some(audience) = audience.as_mut()
         {
@@ -2929,11 +3000,11 @@ impl<A: ChunkAllocator + Clone> PresenceWork<A> {
                     .map_err(|_| CloseOutcome::InternalError)?;
                 replay.extend(presence);
             }
-            requests = mem::take(&mut audience.pending);
+            requests = audience.pending.take();
             tracing::info!(
                 contact_count = audience.contacts.len(),
                 replay_count = replay.len(),
-                pending_count = requests.len(),
+                pending_page_count = requests.as_ref().map_or(0, PendingPage::len),
                 subscriber_count = audience.subscribers.len(),
                 owner_jid = ?account.as_str(),
                 "initial presence prepared"

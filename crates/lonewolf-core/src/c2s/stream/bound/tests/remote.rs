@@ -617,7 +617,7 @@ fn initial_remote_probes_follow_broadcast_fifo_and_original_policy_snapshot() ->
                         } else {
                             Vec::new()
                         },
-                        pending: Vec::new(),
+                        pending: None,
                         probes: if initial {
                             ["bob@remote.test", "carol@remote.test", "bob@example.com"]
                                 .into_iter()
@@ -1053,7 +1053,7 @@ fn stopped_initial_broadcast_or_probe_releases_ticket_and_completion() -> TestRe
                 audience: Some(PresenceAudience {
                     subscribers,
                     contacts: Vec::new(),
-                    pending: Vec::new(),
+                    pending: None,
                     probes: vec![target],
                 }),
                 backlog: None,
@@ -1359,5 +1359,253 @@ fn remote_subscription_commits_pending_out_and_pushes_after_queue_admission() ->
             fixture.finish().await?;
         }
         Ok(())
+    }))?
+}
+
+const PENDING_REQUEST: &[u8] =
+    b"<presence xmlns='jabber:client' from='alice@localhost' to='bob@localhost' type='subscribe' id='pending'/>";
+
+async fn pending_replay_fixture(stored: Option<&[u8]>, blocked: bool) -> TestResult<Fixture> {
+    use lonewolf_extension::roster::Roster;
+    use lonewolf_storage::roster::{PendingSubscription, RosterWrites};
+
+    let mut fixture = Fixture::new(&[]).await?;
+    if let Some(stanza) = stored {
+        let mut arena = Arena::try_new(Default::default())?;
+        let sender = Jid::parse_in("alice@localhost", &mut arena)?;
+        let mut transaction = fixture.storage.begin_write().await?;
+        transaction
+            .put_pending_request(
+                fixture.registration.account(),
+                PendingSubscription {
+                    sender: RosterJid::from(sender.resolve(&arena)?),
+                    stanza: Box::from(stanza),
+                },
+                NonZeroUsize::MAX,
+            )
+            .await?;
+        transaction.commit().await?;
+    }
+    let mut extensions = Extensions::default();
+    extensions.register(Arc::new(Roster::default()))?;
+    let mut enabled = vec!["roster"];
+    if blocked {
+        extensions.register(Arc::new(Policy {
+            verdict: Verdict::Drop,
+            fail: false,
+            checks: PlMutex::new(Vec::new()),
+        }))?;
+        enabled.push("remote-policy");
+    }
+    fixture.router = fixture.router.with_extensions(BTreeMap::from([(
+        "localhost".into(),
+        extensions.enable_host("localhost", enabled)?,
+    )]));
+    Ok(fixture)
+}
+
+async fn pending_replay_session<'a>(
+    fixture: &'a Fixture,
+    metrics: &crate::c2s::metrics::C2sMetrics,
+) -> TestResult<BoundSession<'a, GlobalChunkAllocator, ControlledWriter>> {
+    let router = fixture.router.handle();
+    let registration = router
+        .register(
+            fixture.registration.account(),
+            Some("desk"),
+            NonZeroUsize::new(2).ok_or("mailbox capacity")?,
+        )
+        .await?;
+    let (_sender, incoming) = async_channel::bounded(1);
+    let mut session =
+        fixture.bound_session(GlobalChunkAllocator, registration, router, incoming)?;
+    session.outbox.metrics = metrics.worker(0, 0);
+    Ok(session)
+}
+
+fn assert_pending_replay_counters(
+    metrics: &Arc<crate::c2s::metrics::C2sMetrics>,
+    bytes: usize,
+    blocked: usize,
+    delivered: usize,
+) -> TestResult {
+    let body = metrics.render()?;
+    for sample in [
+        r#"lonewolf_c2s_replay_pages_total{listener="0",kind="subscription_request"} 1"#.to_owned(),
+        format!(
+            r#"lonewolf_c2s_replay_bytes_total{{listener="0",kind="subscription_request"}} {bytes}"#
+        ),
+        format!(
+            r#"lonewolf_c2s_replay_records_total{{listener="0",kind="subscription_request",outcome="delivered"}} {delivered}"#
+        ),
+        format!(
+            r#"lonewolf_c2s_replay_records_total{{listener="0",kind="subscription_request",outcome="blocked"}} {blocked}"#
+        ),
+    ] {
+        assert!(body.lines().any(|line| line == sample), "{body}");
+    }
+    Ok(())
+}
+
+#[test]
+fn initial_empty_pending_page_counts_once_and_presence_update_does_not_read() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let fixture = pending_replay_fixture(None, false).await?;
+        let metrics = crate::c2s::metrics::C2sMetrics::detached();
+        let mut session = pending_replay_session(&fixture, &metrics).await?;
+
+        for xml in ["<presence id='initial'/>", "<presence id='update'/>"] {
+            session
+                .handle_availability(parsed(xml).await?, true)
+                .await
+                .map_err(|error| format!("{error:?}"))?;
+            session
+                .outbox
+                .flush()
+                .await
+                .map_err(|error| format!("{error:?}"))?;
+            assert_pending_replay_counters(&metrics, 0, 0, 0)?;
+        }
+        assert_eq!(session.outbox.writer.written.len(), 2);
+        for (xml, id) in session
+            .outbox
+            .writer
+            .written
+            .iter()
+            .zip(["initial", "update"])
+        {
+            let stanza = parsed(xml).await?;
+            assert_eq!(stanza.value().resolve(stanza.arena())?.id()?, Some(id));
+        }
+        drop(session);
+        fixture.finish().await
+    })
+}
+
+#[test]
+fn completely_blocked_pending_page_counts_its_bytes_and_blocked_records() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let fixture = pending_replay_fixture(Some(PENDING_REQUEST), true).await?;
+        let metrics = crate::c2s::metrics::C2sMetrics::detached();
+        let mut session = pending_replay_session(&fixture, &metrics).await?;
+
+        session
+            .handle_availability(parsed("<presence id='echo'/>").await?, true)
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+        session
+            .outbox
+            .flush()
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+        assert_eq!(session.outbox.writer.written.len(), 1);
+        let echo = parsed(&session.outbox.writer.written[0]).await?;
+        assert_eq!(echo.value().resolve(echo.arena())?.id()?, Some("echo"));
+        assert_pending_replay_counters(&metrics, PENDING_REQUEST.len(), 1, 0)?;
+        drop(session);
+        fixture.finish().await
+    })
+}
+
+#[test]
+fn first_pending_page_is_counted_when_the_presence_echo_write_fails() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let fixture = pending_replay_fixture(Some(PENDING_REQUEST), false).await?;
+        let metrics = crate::c2s::metrics::C2sMetrics::detached();
+        let mut session = pending_replay_session(&fixture, &metrics).await?;
+        session.outbox.writer.fail_write = true;
+
+        session
+            .handle_availability(parsed("<presence id='echo'/>").await?, true)
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+        assert_eq!(
+            session.outbox.flush().await,
+            Err(CloseOutcome::TransportError)
+        );
+        assert!(session.outbox.writer.written.is_empty());
+        assert_pending_replay_counters(&metrics, PENDING_REQUEST.len(), 0, 0)?;
+        drop(session);
+        fixture.finish().await
+    })
+}
+
+#[test]
+fn retired_session_stops_pending_replay_before_the_next_page() -> TestResult {
+    use lonewolf_storage::roster::{PendingSubscription, RosterReads, RosterWrites};
+
+    Runtime::new()?.block_on(compio::time::timeout(Duration::from_secs(5), async {
+        let close = b"</status></presence>";
+        let mut first = b"<presence xmlns='jabber:client' from='alice@localhost' to='bob@localhost' type='subscribe' id='pending'><status>".to_vec();
+        first.resize(REPLAY_PAGE_BYTES.get() - close.len(), b'x');
+        first.extend_from_slice(close);
+
+        let fixture = pending_replay_fixture(Some(&first), false).await?;
+        let account = fixture.registration.account();
+        let mut arena = Arena::try_new(Default::default())?;
+        let charlie = Jid::parse_in("charlie@localhost", &mut arena)?;
+        let zoe = Jid::parse_in("zoe@localhost", &mut arena)?;
+        let charlie = RosterJid::from(charlie.resolve(&arena)?);
+        let zoe = RosterJid::from(zoe.resolve(&arena)?);
+        let mut transaction = fixture.storage.begin_write().await?;
+        transaction.put_pending_request(
+            account,
+            PendingSubscription {
+                sender: charlie,
+                stanza: Box::from(b"<presence xmlns='jabber:client' from='charlie@localhost' to='bob@localhost' type='subscribe' id='second'/>".as_slice()),
+            },
+            NonZeroUsize::MAX,
+        ).await?;
+        transaction.commit().await?;
+
+        let metrics = crate::c2s::metrics::C2sMetrics::detached();
+        let mut session = pending_replay_session(&fixture, &metrics).await?;
+        session.handle_availability(parsed("<presence id='echo'/>").await?, true).await
+            .map_err(|error| format!("{error:?}"))?;
+        let (entered, writing) = oneshot::channel();
+        let (release, paused) = oneshot::channel();
+        session.outbox.writer.partial_after = 1;
+        session.outbox.writer.partial_entered = Some(entered);
+        session.outbox.writer.partial_release = Some(paused);
+        let liveness = session.registration.liveness();
+        let recreated = PendingSubscription {
+            sender: zoe,
+            stanza: Box::from(b"<presence xmlns='jabber:client' from='zoe@localhost' to='bob@localhost' type='subscribe' id='recreated'/>".as_slice()),
+        };
+
+        let recreate = async {
+            writing.await?;
+            let mut transaction = fixture.storage.begin_write().await?;
+            transaction.clear_roster(account).await?;
+            transaction.delete_account(account).await?;
+            transaction.commit().await?;
+            fixture.router.handle().retire_account(account).await?;
+            assert!(!liveness.is_alive());
+
+            let mut transaction = fixture.storage.begin_write().await?;
+            transaction.create_account(NewAccount {
+                key: account.clone(),
+                credentials: credentials(),
+            }).await?;
+            transaction.put_pending_request(account, recreated.clone(), NonZeroUsize::MAX).await?;
+            transaction.commit().await?;
+            release.send(()).map_err(|_| "first page write ended before release")?;
+            Ok::<_, Box<dyn Error>>(())
+        };
+        let (replay, recreation) = join(session.outbox.flush(), recreate).await;
+        recreation?;
+        replay.map_err(|error| format!("{error:?}"))?;
+        let written = &session.outbox.writer.written;
+        assert_eq!(written.len(), 2);
+        assert!(written[0].contains(r#"id="echo""#));
+        assert!(written[1].contains(r#"id="pending""#));
+        assert_pending_replay_counters(&metrics, first.len(), 0, 1)?;
+        assert_eq!(
+            fixture.storage.begin_read().await?.pending_requests(account).await?,
+            [recreated],
+        );
+
+        drop(session);
+        fixture.finish().await
     }))?
 }

@@ -836,7 +836,7 @@ fn filter_audience_without_policies_does_not_allocate_an_arena() -> TestResult {
     Runtime::new()?.block_on(async {
         use lonewolf_extension::presence::PresenceAudience;
         use lonewolf_storage::Storage;
-        use lonewolf_storage::roster::{PendingSubscription, RosterJid};
+        use lonewolf_storage::roster::{PendingPage, RosterJid};
         use lonewolf_xmpp::stanza::{PresenceType, StanzaType};
 
         let directory = tempfile::tempdir()?;
@@ -850,10 +850,11 @@ fn filter_audience_without_policies_does_not_allocate_an_arena() -> TestResult {
         let owner = account("alice@localhost")?;
         let subscriber = account("bob@localhost")?;
         let contact = account("carol@other.localhost")?;
-        let pending = PendingSubscription {
-            sender: RosterJid::from(&subscriber),
-            stanza: Box::from([]),
-        };
+        let pending_sender = RosterJid::from(&subscriber);
+        let mut pending = PendingPage::new();
+        pending.start_read();
+        pending.push(pending_sender.clone(), b"");
+        pending.finish_read(true);
         let mut audience = PresenceAudience {
             probes: vec![
                 RosterJid::from(&subscriber),
@@ -861,7 +862,7 @@ fn filter_audience_without_policies_does_not_allocate_an_arena() -> TestResult {
             ],
             subscribers: vec![RosterJid::from(&subscriber)],
             contacts: vec![contact.clone()],
-            pending: vec![pending.clone()],
+            pending: Some(pending),
         };
         let mut arena = Arena::try_new(Default::default())?;
         let sender = Jid::parse_in("alice@localhost/res", &mut arena)?;
@@ -886,7 +887,11 @@ fn filter_audience_without_policies_does_not_allocate_an_arena() -> TestResult {
             ]
         );
         assert_eq!(audience.contacts, [contact]);
-        assert_eq!(audience.pending, [pending]);
+        let page = audience.pending.ok_or("missing pending page")?;
+        assert_eq!(
+            page.iter().collect::<Vec<_>>(),
+            [(&pending_sender, b"".as_slice())]
+        );
         router.shutdown().await?;
         Ok(())
     })
@@ -948,7 +953,7 @@ fn filter_audience_blocks_probes_to_component_contacts_without_federation() -> T
                 RosterJid::from(server.resolve(&arena)?),
             ],
             subscribers: Vec::new(),
-            pending: Vec::new(),
+            pending: None,
             contacts: Vec::new(),
         };
         let owner = account("alice@localhost")?;
@@ -1210,4 +1215,95 @@ fn remote_message_admission_preserves_error_and_headline_rules() -> TestResult {
         }
         Ok(())
     }))?
+}
+
+#[test]
+fn filter_pending_keeps_the_cursor_and_drops_refused_senders() -> TestResult {
+    use lonewolf_extension::policy::{
+        Direction, PolicyFuture, PolicyHandler, PolicyRequest, Verdict,
+    };
+    use lonewolf_storage::Storage;
+    use lonewolf_storage::roster::{PendingPage, RosterJid};
+    use lonewolf_xmpp::stanza::{PresenceType, StanzaType};
+
+    struct PendingPolicy;
+    impl lonewolf_extension::Extension<GlobalChunkAllocator, RedbStorage> for PendingPolicy {
+        fn name(&self) -> &'static str {
+            "pending-test-policy"
+        }
+
+        fn register(
+            self: Arc<Self>,
+            _: &str,
+            slots: &mut lonewolf_extension::Slots<'_, GlobalChunkAllocator, RedbStorage>,
+        ) -> Result<(), lonewolf_extension::RegistrationError> {
+            slots.policy(self);
+            Ok(())
+        }
+    }
+    impl PolicyHandler<RedbStorage> for PendingPolicy {
+        fn check<'a>(
+            &'a self,
+            request: PolicyRequest<'a>,
+            _: &'a lonewolf_storage::RedbRead,
+        ) -> PolicyFuture<'a> {
+            Box::pin(async move {
+                assert_eq!(request.direction, Direction::Inbound);
+                assert_eq!(request.account.as_str(), "alice@localhost");
+                assert_eq!(request.kind, StanzaType::Presence(PresenceType::Available));
+                Ok(match request.peer.as_str() {
+                    "bob@localhost" => Verdict::Allow,
+                    "spammer@localhost" => Verdict::Drop,
+                    peer => panic!("unexpected policy check for {peer}"),
+                })
+            })
+        }
+    }
+
+    Runtime::new()?.block_on(async {
+        let fixture = Fixture::new()?;
+        let mut extensions = Extensions::default();
+        extensions.register(Arc::new(PendingPolicy))?;
+        let router = fixture.router.with_extensions(BTreeMap::from([(
+            "localhost".into(),
+            extensions.enable_host("localhost", ["pending-test-policy"])?,
+        )]));
+        let owner = account("alice@localhost")?;
+        let allowed = RosterJid::from(&account("bob@localhost")?);
+        let refused = RosterJid::from(&account("spammer@localhost")?);
+        let owner_jid = RosterJid::from(&owner);
+        let mut page = PendingPage::new();
+        page.start_read();
+        for sender in [&owner_jid, &allowed, &refused] {
+            page.push(sender.clone(), sender.as_str().as_bytes());
+        }
+        page.finish_read(false);
+        let bytes = page.byte_len();
+
+        let transaction = fixture.storage.begin_read().await?;
+        crate::stages::policy::filter_pending(
+            &router.handle(),
+            &transaction,
+            &GlobalChunkAllocator,
+            &owner,
+            StanzaType::Presence(PresenceType::Available),
+            &mut page,
+        )
+        .await
+        .map_err(|_| "pending policy filter failed")?;
+
+        assert_eq!(
+            page.iter().collect::<Vec<_>>(),
+            [
+                (&owner_jid, owner_jid.as_str().as_bytes()),
+                (&allowed, allowed.as_str().as_bytes())
+            ],
+        );
+        assert_eq!(page.resume_after(), Some(&refused));
+        assert_eq!(page.read_len(), 3);
+        assert_eq!(page.byte_len(), bytes);
+        assert!(!page.is_complete());
+        router.shutdown().await?;
+        Ok(())
+    })
 }

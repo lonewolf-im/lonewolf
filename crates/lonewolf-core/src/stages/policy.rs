@@ -3,6 +3,7 @@
 use lonewolf_extension::policy::{Direction, PolicyRequest, Verdict};
 use lonewolf_extension::presence::PresenceAudience;
 use lonewolf_storage::account::AccountKey;
+use lonewolf_storage::roster::PendingPage;
 use lonewolf_storage::{RedbRead, RedbStorage, Storage};
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::{Jid, JidRef};
@@ -131,8 +132,8 @@ pub(crate) async fn filter_audience<A: ChunkAllocator + Clone>(
             .any(|account| has_policy(account.as_str()))
         && !audience
             .pending
-            .iter()
-            .any(|request| has_policy(request.sender.as_str()))
+            .as_ref()
+            .is_some_and(|page| page.iter().any(|(sender, _)| has_policy(sender.as_str())))
     {
         return Ok(());
     }
@@ -189,22 +190,6 @@ pub(crate) async fn filter_audience<A: ChunkAllocator + Clone>(
         allowed.push(evaluate_in(router, transaction, kind, &checks).await? == Verdict::Allow);
     }
     retain_allowed(&mut audience.contacts, allowed);
-    let mut allowed = Vec::with_capacity(audience.pending.len());
-    for request in &audience.pending {
-        let jid = Jid::parse_in(request.sender.as_str(), &mut scratch)?;
-        let peer = jid.resolve(&scratch)?;
-        if peer.bare().as_str() == owner.as_str() {
-            allowed.push(true);
-            continue;
-        }
-        let checks = [Check {
-            account: owner,
-            direction: Direction::Inbound,
-            peer,
-        }];
-        allowed.push(evaluate_in(router, transaction, kind, &checks).await? == Verdict::Allow);
-    }
-    retain_allowed(&mut audience.pending, allowed);
     let federated = router.federation_enabled();
     if owner_has_policy
         && (federated
@@ -240,6 +225,42 @@ pub(crate) async fn filter_audience<A: ChunkAllocator + Clone>(
         }
         retain_allowed(&mut audience.probes, allowed);
     }
+    if let Some(page) = audience.pending.as_mut() {
+        filter_pending(router, transaction, allocator, owner, kind, page).await?;
+    }
+    Ok(())
+}
+
+/// Drops refused requests using the same snapshot that supplied the page.
+pub(crate) async fn filter_pending<A: ChunkAllocator + Clone>(
+    router: &RouterHandle<A>,
+    transaction: &RedbRead,
+    allocator: &A,
+    owner: &AccountKey,
+    kind: StanzaType,
+    page: &mut PendingPage,
+) -> Result<(), StageFailure> {
+    if page.is_empty() || router.policies(owner.domain()).is_empty() {
+        return Ok(());
+    }
+    let mut scratch = Arena::try_new_in(Default::default(), allocator.clone())?;
+    let mut allowed = Vec::with_capacity(page.len());
+    for (sender, _) in page.iter() {
+        let jid = Jid::parse_in(sender.as_str(), &mut scratch)?;
+        let peer = jid.resolve(&scratch)?;
+        if peer.bare().as_str() == owner.as_str() {
+            allowed.push(true);
+            continue;
+        }
+        let checks = [Check {
+            account: owner,
+            direction: Direction::Inbound,
+            peer,
+        }];
+        allowed.push(evaluate_in(router, transaction, kind, &checks).await? == Verdict::Allow);
+    }
+    let mut allowed = allowed.into_iter();
+    page.retain(|_, _| allowed.next() == Some(true));
     Ok(())
 }
 

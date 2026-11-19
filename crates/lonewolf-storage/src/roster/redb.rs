@@ -2,13 +2,15 @@
 
 use std::future::Future;
 use std::num::NonZeroUsize;
+use std::ops::Bound;
 
 use ::redb::{ReadableTable, TableDefinition, WriteTransaction};
 use lonewolf_xmpp::jid::MAX_JID_LEN;
 
 use super::{
-    MAX_GROUPS_PER_ITEM, PendingSubscription, RosterError, RosterItem, RosterJid, RosterMutation,
-    RosterQuota, RosterReads, RosterSnapshot, RosterSubscription, RosterVersion, RosterWrites,
+    MAX_GROUPS_PER_ITEM, PendingPage, PendingSubscription, RosterError, RosterItem, RosterJid,
+    RosterMutation, RosterQuota, RosterReads, RosterSnapshot, RosterSubscription, RosterVersion,
+    RosterWrites,
 };
 use crate::account::AccountKey;
 use crate::account::redb::account_exists;
@@ -108,6 +110,21 @@ macro_rules! roster_reads {
                 self.run(move |transaction| {
                     let table=transaction.open_table(PENDING).map_err(storage_error)?;
                     Ok(table.get(key.as_ref()).map_err(storage_error)?.is_some())
+                })
+            }
+
+            fn pending_page(
+                &self,
+                owner: &AccountKey,
+                after: Option<&RosterJid>,
+                max_bytes: NonZeroUsize,
+                page: PendingPage,
+            ) -> impl Future<Output = Result<PendingPage, RosterError>> + Send {
+                let owner = Box::<str>::from(owner.as_str());
+                let after = after.map(|jid| item_key_text(&owner, jid));
+                self.run(move |transaction| {
+                    let table = transaction.open_table(PENDING).map_err(storage_error)?;
+                    read_pending_page(&table, &owner, after.as_deref(), max_bytes, page)
                 })
             }
 
@@ -363,6 +380,33 @@ fn read_item<T: ReadableTable<&'static str, &'static [u8]>>(
             decode_item(jid, record.value()).map_err(Into::into)
         })
         .transpose()
+}
+
+fn read_pending_page<T: ReadableTable<&'static str, &'static [u8]>>(
+    table: &T,
+    owner: &str,
+    after: Option<&str>,
+    max_bytes: NonZeroUsize,
+    mut page: PendingPage,
+) -> Result<PendingPage, RosterError> {
+    page.start_read();
+    let (start, end) = owner_range(owner);
+    let lower = after.map_or(Bound::Included(start.as_ref()), Bound::Excluded);
+    for entry in table
+        .range::<&str>((lower, Bound::Excluded(end.as_ref())))
+        .map_err(storage_error)?
+    {
+        let (key, stanza) = entry.map_err(storage_error)?;
+        let sender = decode_key(owner, key.value())?;
+        let stanza = stanza.value();
+        if !page.admits(stanza.len(), max_bytes) {
+            page.finish_read(false);
+            return Ok(page);
+        }
+        page.push(sender, stanza);
+    }
+    page.finish_read(true);
+    Ok(page)
 }
 
 fn read_pending_requests<T: ReadableTable<&'static str, &'static [u8]>>(

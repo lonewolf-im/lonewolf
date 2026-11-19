@@ -6,6 +6,7 @@ mod options;
 mod state;
 
 use std::cell::{Cell, RefCell};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use futures_executor::block_on;
@@ -14,8 +15,8 @@ use lonewolf_auth::scram::{
 };
 use lonewolf_storage::account::{AccountKey, AccountReads, AccountWrites, NewAccount};
 use lonewolf_storage::roster::{
-    PendingSubscription, RosterError, RosterItem, RosterJid, RosterReads, RosterSnapshot,
-    RosterSubscription, RosterVersion, RosterWrites, SubscriptionState,
+    PendingPage, PendingSubscription, RosterError, RosterItem, RosterJid, RosterReads,
+    RosterSnapshot, RosterSubscription, RosterVersion, RosterWrites, SubscriptionState,
 };
 use lonewolf_storage::{RedbStorage, Storage, WriteTransaction};
 use lonewolf_util::arena::{Arena, ArenaConfig, GlobalChunkAllocator};
@@ -1240,6 +1241,16 @@ impl RosterReads for FailingReads {
     ) -> Result<Vec<PendingSubscription>, RosterError> {
         Err(read_failure(self.0).into())
     }
+    async fn pending_page(
+        &self,
+        _: &AccountKey,
+        _: Option<&RosterJid>,
+        _: NonZeroUsize,
+        _: PendingPage,
+    ) -> Result<PendingPage, RosterError> {
+        Err(read_failure(self.0).into())
+    }
+
     async fn pending_request(
         &self,
         _owner: &AccountKey,
@@ -3248,8 +3259,14 @@ fn inbound_subscription_table(
                         "alice@example.com/desk",
                         PresenceTransition::Initial
                     )
-                    .pending,
+                    .pending
+                    .expect("initial audience reads pending requests")
+                    .iter()
+                    .collect::<Vec<_>>(),
                     requests
+                        .iter()
+                        .map(|request| (&request.sender, request.stanza.as_ref()))
+                        .collect::<Vec<_>>()
                 );
             }
             let mut events = Vec::new();
@@ -3498,6 +3515,7 @@ fn inbound_pending_request_limit(
                 PresenceTransition::Initial
             )
             .pending
+            .expect("initial audience reads pending requests")
             .len(),
             1,
             "{index}"
@@ -3720,4 +3738,97 @@ fn domain_only_federated_subscription_target_is_rejected() -> Result<(), Box<dyn
     assert!(pending(&fixture, &owner).is_empty());
     assert!(delivery.events.borrow().is_empty());
     Ok(())
+}
+
+fn seed_pending_replay(
+    roster: &TestRoster,
+    owner: &AccountKey,
+) -> Result<[RosterJid; 3], RosterError> {
+    let senders = ["a@example.com", "b@example.com", "c@example.com"]
+        .map(|sender| RosterJid::from(&account(sender)));
+    block_on(async {
+        let mut transaction = roster.storage.begin_write().await?;
+        for sender in &senders {
+            transaction
+                .put_pending_request(
+                    owner,
+                    PendingSubscription {
+                        sender: sender.clone(),
+                        stanza: vec![b'x'; crate::REPLAY_PAGE_BYTES.get() / 2].into_boxed_slice(),
+                    },
+                    NonZeroUsize::MAX,
+                )
+                .await?;
+        }
+        transaction.commit().await?;
+        Ok(senders)
+    })
+}
+
+#[test]
+fn initial_audience_reads_the_first_pending_page() -> Result<(), RosterError> {
+    let (_directory, roster) = roster();
+    let owner = account("alice@example.com");
+    create_account(&roster, &owner);
+    let [first, second, _] = seed_pending_replay(&roster, &owner)?;
+    let page = audience(
+        &roster,
+        "alice@example.com/desk",
+        PresenceTransition::Initial,
+    )
+    .pending
+    .expect("initial audience reads pending requests");
+    assert_eq!(
+        page.iter().map(|(sender, _)| sender).collect::<Vec<_>>(),
+        [&first, &second]
+    );
+    assert_eq!(page.resume_after(), Some(&second));
+    assert_eq!(page.byte_len(), crate::REPLAY_PAGE_BYTES.get());
+    assert!(!page.is_complete());
+    assert!(
+        audience(
+            &roster,
+            "alice@example.com/desk",
+            PresenceTransition::Update
+        )
+        .pending
+        .is_none()
+    );
+    Ok(())
+}
+
+#[test]
+fn pending_page_continues_after_the_cursor() -> Result<(), Box<dyn std::error::Error>> {
+    let (_directory, roster) = roster();
+    let owner = account("alice@example.com");
+    create_account(&roster, &owner);
+    let [_, _, third] = seed_pending_replay(&roster, &owner)?;
+    let page = audience(
+        &roster,
+        "alice@example.com/desk",
+        PresenceTransition::Initial,
+    )
+    .pending
+    .ok_or("missing pending page")?;
+    let cursor = page.resume_after().cloned().ok_or("missing cursor")?;
+    block_on(async {
+        let transaction = roster.storage.begin_read().await?;
+        let page = TestPresenceHandler::pending_page(
+            &Roster::default(),
+            &owner,
+            &cursor,
+            &transaction,
+            page,
+        )
+        .await
+        .map_err(|error| format!("{error:?}"))?;
+        assert_eq!(
+            page.iter().map(|(sender, _)| sender).collect::<Vec<_>>(),
+            [&third]
+        );
+        assert_eq!(page.resume_after(), Some(&third));
+        assert_eq!(page.byte_len(), crate::REPLAY_PAGE_BYTES.get() / 2);
+        assert!(page.is_complete());
+        Ok(())
+    })
 }

@@ -2,6 +2,7 @@
 
 use crate::roster::RosterQuota;
 
+use std::num::NonZeroUsize;
 use std::slice;
 
 use futures_executor::block_on;
@@ -11,7 +12,8 @@ use super::{
 };
 use crate::account::{AccountReads, AccountWrites};
 use crate::roster::{
-    RosterError, RosterReads, RosterSubscription, RosterVersion, RosterWrites, SubscriptionState,
+    PendingPage, RosterError, RosterReads, RosterSubscription, RosterVersion, RosterWrites,
+    SubscriptionState,
 };
 use crate::{Storage, WriteTransaction};
 
@@ -791,6 +793,191 @@ pub(crate) fn aborted_pending_changes_preserve_payload_and_capacity<S: Storage>(
             storage.begin_read().await?.pending_requests(&alice).await?,
             [pending("bob@example.com", b"original")?]
         );
+        Ok(())
+    })
+}
+
+pub(crate) fn pending_pages_follow_sender_order_and_resume_after_the_cursor<S: Storage>(
+    storage: S,
+) -> TestResult {
+    block_on(async {
+        let owner = key("alice@example.com")?;
+        create_owners(&storage, &[owner.as_str()]).await?;
+        let mut writer = storage.begin_write().await?;
+        for (sender, bytes) in [
+            ("c@example.com", b"c"),
+            ("a@example.com", b"a"),
+            ("b@example.com", b"b"),
+        ] {
+            writer
+                .put_pending_request(&owner, pending(sender, bytes)?, NonZeroUsize::MAX)
+                .await?;
+        }
+        writer.commit().await?;
+        let reader = storage.begin_read().await?;
+        let page = reader
+            .pending_page(
+                &owner,
+                Some(&jid("a@example.com")?),
+                NonZeroUsize::MAX,
+                PendingPage::new(),
+            )
+            .await?;
+        assert_eq!(
+            page.iter()
+                .map(|(sender, bytes)| (sender.as_str(), bytes))
+                .collect::<Vec<_>>(),
+            [
+                ("b@example.com", b"b".as_slice()),
+                ("c@example.com", b"c".as_slice())
+            ],
+        );
+        assert_eq!(page.resume_after(), Some(&jid("c@example.com")?));
+        assert!(page.is_complete());
+        Ok(())
+    })
+}
+
+pub(crate) fn pending_pages_stop_before_the_request_that_exceeds_the_byte_limit<S: Storage>(
+    storage: S,
+) -> TestResult {
+    block_on(async {
+        let owner = key("alice@example.com")?;
+        create_owners(&storage, &[owner.as_str()]).await?;
+        let mut writer = storage.begin_write().await?;
+        for sender in ["a@example.com", "b@example.com", "c@example.com"] {
+            writer
+                .put_pending_request(&owner, pending(sender, b"0123456789")?, NonZeroUsize::MAX)
+                .await?;
+        }
+
+        let limit = NonZeroUsize::new(20).ok_or("invalid byte limit")?;
+        let page = writer
+            .pending_page(&owner, None, limit, PendingPage::new())
+            .await?;
+        assert_eq!(
+            page.iter()
+                .map(|(sender, _)| sender.as_str())
+                .collect::<Vec<_>>(),
+            ["a@example.com", "b@example.com"]
+        );
+        assert_eq!(page.byte_len(), 20);
+        assert!(!page.is_complete());
+        let cursor = page.resume_after().cloned().ok_or("missing cursor")?;
+        let page = writer
+            .pending_page(&owner, Some(&cursor), limit, page)
+            .await?;
+        assert_eq!(
+            page.iter()
+                .map(|(sender, _)| sender.as_str())
+                .collect::<Vec<_>>(),
+            ["c@example.com"]
+        );
+        assert_eq!(page.byte_len(), 10);
+        assert!(page.is_complete());
+
+        let page = writer
+            .pending_page(&owner, None, NonZeroUsize::MIN, page)
+            .await?;
+        assert_eq!(
+            page.iter()
+                .map(|(sender, _)| sender.as_str())
+                .collect::<Vec<_>>(),
+            ["a@example.com"]
+        );
+        assert_eq!(page.byte_len(), 10);
+        assert!(!page.is_complete());
+        writer.commit().await?;
+        Ok(())
+    })
+}
+
+pub(crate) fn pending_pages_isolate_owners_with_shared_prefixes<S: Storage>(
+    storage: S,
+) -> TestResult {
+    block_on(async {
+        let owner = key("alice@example.com")?;
+        let other = key("alice@example.com.au")?;
+        create_owners(&storage, &[owner.as_str(), other.as_str()]).await?;
+        let mut writer = storage.begin_write().await?;
+        writer
+            .put_pending_request(
+                &owner,
+                pending("b@example.com", b"owner")?,
+                NonZeroUsize::MAX,
+            )
+            .await?;
+        writer
+            .put_pending_request(
+                &other,
+                pending("c@example.com", b"other")?,
+                NonZeroUsize::MAX,
+            )
+            .await?;
+        writer.commit().await?;
+        let reader = storage.begin_read().await?;
+        let page = reader
+            .pending_page(
+                &owner,
+                Some(&jid("a@example.com")?),
+                NonZeroUsize::MAX,
+                PendingPage::new(),
+            )
+            .await?;
+        assert_eq!(
+            page.iter()
+                .map(|(sender, bytes)| (sender.as_str(), bytes))
+                .collect::<Vec<_>>(),
+            [("b@example.com", b"owner".as_slice())]
+        );
+        assert!(page.is_complete());
+        let page = reader
+            .pending_page(
+                &other,
+                Some(&jid("a@example.com")?),
+                NonZeroUsize::MAX,
+                page,
+            )
+            .await?;
+        assert_eq!(
+            page.iter()
+                .map(|(sender, bytes)| (sender.as_str(), bytes))
+                .collect::<Vec<_>>(),
+            [("c@example.com", b"other".as_slice())]
+        );
+        assert!(page.is_complete());
+        Ok(())
+    })
+}
+
+pub(crate) fn pending_pages_read_their_transaction_snapshot<S: Storage>(storage: S) -> TestResult {
+    block_on(async {
+        let owner = key("alice@example.com")?;
+        create_owners(&storage, &[owner.as_str()]).await?;
+        let reader = storage.begin_read().await?;
+        let mut writer = storage.begin_write().await?;
+        writer
+            .put_pending_request(&owner, pending("b@example.com", b"new")?, NonZeroUsize::MAX)
+            .await?;
+        writer.commit().await?;
+
+        let page = reader
+            .pending_page(&owner, None, NonZeroUsize::MAX, PendingPage::new())
+            .await?;
+        assert!(page.is_empty());
+        assert!(page.is_complete());
+        let page = storage
+            .begin_read()
+            .await?
+            .pending_page(&owner, None, NonZeroUsize::MAX, page)
+            .await?;
+        assert_eq!(
+            page.iter()
+                .map(|(sender, bytes)| (sender.as_str(), bytes))
+                .collect::<Vec<_>>(),
+            [("b@example.com", b"new".as_slice())]
+        );
+        assert!(page.is_complete());
         Ok(())
     })
 }

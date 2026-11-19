@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use lonewolf_storage::Storage;
 use lonewolf_storage::account::AccountKey;
-use lonewolf_storage::roster::{PendingSubscription, RosterJid};
+use lonewolf_storage::roster::{PendingPage, RosterJid};
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::JidRef;
 use lonewolf_xmpp::stanza::{Element, PresenceType, RoutedStanza, StanzaErrorCondition};
@@ -73,8 +73,8 @@ pub struct PresenceRequest<'a, A: ChunkAllocator> {
 pub struct PresenceAudience {
     /// Bare JIDs that receive the resource's availability.
     pub subscribers: Vec<RosterJid>,
-    /// Stored subscription requests to replay once the resource becomes available.
-    pub pending: Vec<PendingSubscription>,
+    /// The first page, if read. An empty page means storage was read.
+    pub pending: Option<PendingPage>,
     /// Accounts whose current presence a newly available resource receives.
     pub contacts: Vec<AccountKey>,
     /// Core probes these contacts at component domains and other non-local domains with federation.
@@ -118,6 +118,17 @@ pub trait PresenceHandler<A: ChunkAllocator, S: Storage>: Send + Sync {
         _transaction: &'a S::Read,
     ) -> PresenceFuture<'a, Option<PresenceAudience>> {
         Box::pin(async { Ok(None) })
+    }
+
+    /// Refills `page` with stored subscription requests after the sender `after`.
+    fn pending_page<'a>(
+        &'a self,
+        _owner: &'a AccountKey,
+        _after: &'a RosterJid,
+        _transaction: &'a S::Read,
+        _page: PendingPage,
+    ) -> PresenceFuture<'a, PendingPage> {
+        Box::pin(async { Ok(PendingPage::new()) })
     }
 
     /// Authorizes a subscription presence on the sender's host before it is routed.
@@ -175,6 +186,10 @@ impl<A: ChunkAllocator, S: Storage> PresenceRegistry<A, S> {
 
     pub fn find(&self, kind: PresenceRequestType) -> Option<&dyn PresenceHandler<A, S>> {
         self.handlers[kind as usize].as_deref()
+    }
+
+    pub fn find_shared(&self, kind: PresenceRequestType) -> Option<Arc<dyn PresenceHandler<A, S>>> {
+        self.handlers[kind as usize].clone()
     }
 }
 

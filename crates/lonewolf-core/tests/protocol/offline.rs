@@ -888,3 +888,67 @@ fn offline_backlog_larger_than_one_page_replays_in_order_and_reports_pages() -> 
     suite.wait_for_metric(r#"lonewolf_c2s_replay_records_total{listener="0",kind="offline_message",outcome="invalid"} 0"#)?;
     bob.close()
 }
+
+#[test]
+fn pending_requests_larger_than_one_page_replay_in_sender_order_and_drop_refused_senders()
+-> TestResult {
+    use lonewolf_extension::REPLAY_PAGE_BYTES;
+
+    let record_len = REPLAY_PAGE_BYTES.get() / 2;
+    let requests = ["p1", "p2", "p3", "spammer"].map(|localpart| {
+        let sender = format!("{localpart}@localhost");
+        let mut xml = format!(
+            "<presence xmlns='jabber:client' from='{sender}' to='bob@localhost' type='subscribe' id='pending-{localpart}'><status>"
+        );
+        let suffix = "</status></presence>";
+        xml.extend(std::iter::repeat_n('x', record_len - xml.len() - suffix.len()));
+        xml.push_str(suffix);
+        (sender, xml)
+    });
+    let suite = C2sSuite::with_extensions_and_setup("'roster', 'test-policy'", |directory| {
+        seed_replay_roster(directory)?;
+        let storage = RedbStorage::open(directory.join("data/lonewolf.dat"))?;
+        let mut arena = Arena::try_new(ArenaConfig::default())?;
+        let bob =
+            AccountKey::try_from(Jid::parse_in("bob@localhost", &mut arena)?.resolve(&arena)?)?;
+        Runtime::new()?.block_on(async {
+            let mut transaction = storage.begin_write().await?;
+            for (sender, xml) in &requests {
+                let sender = RosterJid::from(Jid::parse_in(sender, &mut arena)?.resolve(&arena)?);
+                transaction
+                    .put_pending_request(
+                        &bob,
+                        PendingSubscription {
+                            sender,
+                            stanza: Box::from(xml.as_bytes()),
+                        },
+                        std::num::NonZeroUsize::MAX,
+                    )
+                    .await?;
+            }
+            transaction.commit().await?;
+            Ok(())
+        })
+    })?;
+    let mut bob = suite.connect("bob", OTHER_PASSWORD, "phone")?;
+    bob.send("<presence/>")?;
+    bob.expect_xml(
+        "<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'/>",
+    )?;
+    let charlie = "<presence xmlns='jabber:client' from='charlie@localhost' to='bob@localhost' type='subscribe' id='pending'/>";
+    bob.expect_xml(charlie)?;
+    for (_, xml) in &requests[..3] {
+        bob.expect_xml(xml)?;
+    }
+    barrier(&mut bob, "bob@localhost/phone")?;
+    suite.wait_for_metric(
+        r#"lonewolf_c2s_replay_pages_total{listener="0",kind="subscription_request"} 3"#,
+    )?;
+    suite.wait_for_metric(&format!(
+        r#"lonewolf_c2s_replay_bytes_total{{listener="0",kind="subscription_request"}} {}"#,
+        charlie.len() + requests.len() * record_len
+    ))?;
+    suite.wait_for_metric(r#"lonewolf_c2s_replay_records_total{listener="0",kind="subscription_request",outcome="delivered"} 4"#)?;
+    suite.wait_for_metric(r#"lonewolf_c2s_replay_records_total{listener="0",kind="subscription_request",outcome="blocked"} 1"#)?;
+    bob.close()
+}

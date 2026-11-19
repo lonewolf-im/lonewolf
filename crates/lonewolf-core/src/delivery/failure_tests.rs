@@ -254,6 +254,10 @@ impl BlockingWrites for FailedCommit {
     ) -> Result<BlockDelta, BlockError> {
         unreachable!("commit test cannot use storage operations")
     }
+
+    async fn delete_blocklist(&mut self, _: &AccountKey) -> Result<(), StorageError> {
+        unreachable!("commit test cannot use storage operations")
+    }
 }
 
 impl OfflineReads for FailedCommit {

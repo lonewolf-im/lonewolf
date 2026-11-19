@@ -955,6 +955,10 @@ mod tests {
         ) -> Result<BlockDelta, BlockError> {
             unreachable!()
         }
+
+        async fn delete_blocklist(&mut self, _: &AccountKey) -> Result<(), StorageError> {
+            unreachable!()
+        }
     }
 
     impl OfflineReads for MemoryTransaction {

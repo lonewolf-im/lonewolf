@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::BTreeSet;
+
 use ::redb::{ReadableTable, TableDefinition, WriteTransaction};
 use lonewolf_xmpp::jid::{JidRef, MAX_JID_LEN};
 
@@ -100,23 +102,48 @@ impl BlockingWrites for RedbWrite {
         owner: &AccountKey,
         change: BlockChange<'_>,
     ) -> Result<BlockDelta, BlockError> {
-        let owner = owner.clone();
         let change = match change {
-            BlockChange::Block(items) => OwnedChange::Block(items.to_vec()),
+            BlockChange::Block(items) => OwnedChange::Block(distinct_block_items(items)?),
             BlockChange::Unblock(items) => OwnedChange::Unblock(items.to_vec()),
             BlockChange::Clear => OwnedChange::Clear,
         };
+        let owner = owner.clone();
         self.run(move |transaction| update(transaction, owner.as_str(), change))
             .await
     }
+
+    async fn delete_blocklist(&mut self, owner: &AccountKey) -> Result<(), StorageError> {
+        let owner = owner.clone();
+        self.run(move |transaction| {
+            let owner = owner.as_str();
+            let end = owner_end(owner);
+            transaction
+                .open_table(ITEMS)
+                .map_err(storage_error)?
+                .retain_in((owner, "")..(end.as_str(), ""), |_, _| false)
+                .map_err(storage_error)?;
+            Ok(())
+        })
+        .await
+    }
+}
+
+fn distinct_block_items(items: &[RosterJid]) -> Result<Vec<RosterJid>, BlockError> {
+    let mut unique = BTreeSet::new();
+    for item in items {
+        unique.insert(item);
+        if unique.len() > MAX_BLOCKLIST_ITEMS {
+            return Err(BlockError::QuotaExceeded);
+        }
+    }
+    Ok(unique.into_iter().cloned().collect())
 }
 
 fn load_rules(
     table: &impl ReadableTable<(&'static str, &'static str), ()>,
     owner: &str,
 ) -> Result<Vec<RosterJid>, StorageError> {
-    // Canonical JIDs cannot contain NUL, so this range includes only this owner.
-    let end = format!("{owner}\0");
+    let end = owner_end(owner);
     table
         .range((owner, "")..(end.as_str(), ""))
         .map_err(storage_error)?
@@ -126,6 +153,11 @@ fn load_rules(
             with_canonical_jid(text, MAX_JID_LEN, |jid| Ok(RosterJid::from(jid)))
         })
         .collect()
+}
+
+// Appending NUL gives the exclusive upper bound for a canonical owner.
+fn owner_end(owner: &str) -> String {
+    format!("{owner}\0")
 }
 
 fn update(
@@ -141,8 +173,6 @@ fn update(
     let mut delta = BlockDelta::default();
     match change {
         OwnedChange::Block(mut items) => {
-            items.sort_unstable();
-            items.dedup();
             items.retain(|item| unchanged.binary_search(item).is_err());
             let count = unchanged.len() + items.len();
             if !items.is_empty()

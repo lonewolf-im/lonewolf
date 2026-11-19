@@ -85,12 +85,17 @@ pub trait BlockingReads {
 }
 
 pub trait BlockingWrites {
-    /// Clear can remove an owner's entries after account deletion within the same transaction.
     fn change_blocklist(
         &mut self,
         owner: &AccountKey,
         change: BlockChange<'_>,
     ) -> impl Future<Output = Result<BlockDelta, BlockError>> + Send;
+
+    /// Erases the rules without decoding them, even if the account is absent.
+    fn delete_blocklist(
+        &mut self,
+        owner: &AccountKey,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send;
 }
 
 #[cfg(test)]

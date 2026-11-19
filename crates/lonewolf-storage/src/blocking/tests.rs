@@ -7,11 +7,12 @@ use lonewolf_util::arena::Arena;
 use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::stanza::{Element, IqType, Stanza, StanzaNamespace, StanzaType};
 
+use super::redb::ITEMS;
 use super::{BlockChange, BlockError, BlockingReads, BlockingWrites};
 use crate::account::{AccountKey, AccountWrites};
 use crate::roster::RosterJid;
 use crate::tests::{TestResult, jid, key, new_account, poll, write};
-use crate::{RedbStorage, Storage, WriteTransaction};
+use crate::{RedbStorage, Storage, StorageErrorKind, WriteTransaction};
 
 const ALICE: &str = "alice@example.test";
 const BOB: &str = "bob@example.test";
@@ -177,6 +178,44 @@ fn batch_is_atomic_persistent_and_owner_scoped() -> TestResult {
 }
 
 #[test]
+fn deleting_a_blocklist_also_erases_rules_that_cannot_be_decoded() -> TestResult {
+    let storage = crate::redb::tests::storage()?;
+    let owner = key(BOB)?;
+    let adjacent = key(BOB_ADJACENT)?;
+    let adjacent_rule = jid(ALICE)?;
+    let raw = storage.as_ref().begin_write()?;
+    {
+        let mut items = raw.open_table(ITEMS)?;
+        items.insert((owner.as_str(), "invalid domain"), ())?;
+        items.insert((adjacent.as_str(), adjacent_rule.as_str()), ())?;
+    }
+    raw.commit()?;
+
+    block_on(async {
+        let before = storage.begin_read().await?;
+        assert!(matches!(
+            before.blocklist(&owner).await,
+            Err(BlockError::Storage(error)) if error.kind() == StorageErrorKind::CorruptData
+        ));
+        let mut writer = storage.begin_write().await?;
+        writer.delete_blocklist(&owner).await?;
+        writer.delete_blocklist(&owner).await?;
+        assert!(writer.blocklist(&owner).await?.is_empty());
+        assert_eq!(writer.blocklist(&adjacent).await?, [adjacent_rule]);
+        writer.commit().await?;
+        assert!(
+            storage
+                .begin_read()
+                .await?
+                .blocklist(&owner)
+                .await?
+                .is_empty()
+        );
+        Ok(())
+    })
+}
+
+#[test]
 fn blocklist_count_limit_accepts_exactly_1024_distinct_rules() -> TestResult {
     let storage = crate::redb::tests::storage()?;
     let owner = key(ALICE)?;
@@ -198,8 +237,10 @@ fn blocklist_count_limit_accepts_exactly_1024_distinct_rules() -> TestResult {
             Err(BlockError::QuotaExceeded)
         ));
         assert_eq!(writer.blocklist(&owner).await?, first);
+        let mut repeated = allowed.to_vec();
+        repeated.resize(4096, allowed[1023].clone());
         let delta = writer
-            .change_blocklist(&owner, BlockChange::Block(allowed))
+            .change_blocklist(&owner, BlockChange::Block(&repeated))
             .await?;
         assert_eq!(delta.inserted, &allowed[1023..]);
         let duplicate = writer

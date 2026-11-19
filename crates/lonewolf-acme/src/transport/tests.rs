@@ -263,14 +263,6 @@ fn redirects_compression_and_oversized_headers_and_bodies_fail() {
             AcmeErrorKind::Other,
             Some(200),
         ),
-        (
-            format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {MAX_BODY}\r\n\r\n{}",
-                "a".repeat(MAX_BODY)
-            ),
-            AcmeErrorKind::Other,
-            Some(200),
-        ),
     ];
     for (response, expected, status) in cases {
         let (url, worker) = serve(
@@ -309,24 +301,26 @@ fn permitted_headers_are_preserved() {
 }
 
 #[test]
-fn a_body_one_byte_below_the_exclusive_read_limit_is_preserved() {
+fn bodies_just_below_and_at_the_read_limit_are_preserved() {
     let (certificate, key) = certificate("127.0.0.1", false);
     let client = client_with_root(&certificate, GLOBAL_TIMEOUT);
-    let length = MAX_BODY - 1;
-    let (url, worker) = serve(server_config(certificate, key), move |stream| {
-        write!(
-            stream,
-            "HTTP/1.1 200 OK\r\nContent-Length: {length}\r\n\r\n"
-        )
-        .unwrap();
-        stream.write_all(&vec![b'a'; length]).unwrap();
-    });
-    let mut response = block_on(client.request(request(&url))).unwrap();
-    assert_eq!(response.parts.status, http::StatusCode::OK);
-    let body = block_on(response.body.into_bytes()).unwrap();
-    assert_eq!(body.len(), MAX_BODY - 1);
-    assert!(body.iter().all(|byte| *byte == b'a'));
-    worker.join().unwrap();
+    let config = server_config(certificate, key);
+    for length in [MAX_BODY - 1, MAX_BODY] {
+        let (url, worker) = serve(Arc::clone(&config), move |stream| {
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {length}\r\n\r\n"
+            )
+            .unwrap();
+            stream.write_all(&vec![b'a'; length]).unwrap();
+        });
+        let mut response = block_on(client.request(request(&url))).unwrap();
+        assert_eq!(response.parts.status, http::StatusCode::OK);
+        let body = block_on(response.body.into_bytes()).unwrap();
+        assert_eq!(body.len(), length);
+        assert!(body.iter().all(|byte| *byte == b'a'));
+        worker.join().unwrap();
+    }
 }
 
 #[test]

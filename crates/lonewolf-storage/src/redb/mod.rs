@@ -29,8 +29,8 @@ pub(crate) use jid::with_canonical_jid;
 
 /// A redb database as one transaction domain.
 ///
-/// Clones share the database, its admission limits of 32 submitted reads and one
-/// open write transaction, and the SCRAM decoy secret.
+/// Clones share the database, its admission limits of 32 submitted read operations,
+/// 32 snapshot openings and one open write transaction, and the SCRAM decoy secret.
 #[derive(Clone)]
 pub struct RedbStorage {
     inner: Arc<Inner>,
@@ -38,6 +38,9 @@ pub struct RedbStorage {
 
 struct Inner {
     database: Database,
+    /// Callers may open a snapshot while holding an ordering lock, so opening one
+    /// must not queue behind long read operations.
+    openings: BlockingExecutor,
     reads: BlockingExecutor,
     writes: BlockingExecutor,
     /// Admits one write transaction at a time ahead of the writer thread, so that
@@ -81,6 +84,7 @@ impl RedbStorage {
         Ok(Self {
             inner: Arc::new(Inner {
                 database,
+                openings: BlockingExecutor::new(const { NonZeroUsize::new(32).unwrap() }),
                 reads: BlockingExecutor::new(const { NonZeroUsize::new(32).unwrap() }),
                 writes: BlockingExecutor::new(NonZeroUsize::MIN),
                 writer: Arc::new(Mutex::new(())),
@@ -144,7 +148,7 @@ impl Storage for RedbStorage {
         let inner = Arc::clone(&self.inner);
         let transaction = self
             .inner
-            .reads
+            .openings
             .run(move || inner.database.begin_read().map_err(storage_error))
             .await
             .inspect_err(|error| {

@@ -10,8 +10,10 @@ use lonewolf_metrics::PerWorker;
 use prometheus_client::collector::Collector;
 use prometheus_client::encoding::{DescriptorEncoder, EncodeLabelSet, EncodeMetric};
 use prometheus_client::metrics::{MetricType, counter::ConstCounter, gauge::ConstGauge};
+use prometheus_client::registry::Unit;
 
 use super::{DetachedWork, MAX_DETACHED};
+use crate::order::Order;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MessageOutcome {
@@ -81,11 +83,20 @@ impl RouterMetrics {
 pub(in crate::router) struct RouterCollector {
     metrics: Arc<RouterMetrics>,
     detached: DetachedWork,
+    order: Arc<Order>,
 }
 
 impl RouterCollector {
-    pub(in crate::router) fn new(metrics: Arc<RouterMetrics>, detached: DetachedWork) -> Self {
-        Self { metrics, detached }
+    pub(in crate::router) fn new(
+        metrics: Arc<RouterMetrics>,
+        detached: DetachedWork,
+        order: Arc<Order>,
+    ) -> Self {
+        Self {
+            metrics,
+            detached,
+            order,
+        }
     }
 }
 
@@ -136,6 +147,20 @@ impl Collector for RouterCollector {
             "Detached delivery tasks allowed before new work is refused.",
             None,
             MetricType::Gauge,
+        )?)?;
+        self.order
+            .wait_duration()
+            .encode(encoder.encode_descriptor(
+                "router_order_lock_wait_duration",
+                "Time ordered commits and snapshots wait for the server-wide ordering lock.",
+                Some(&Unit::Seconds),
+                MetricType::Histogram,
+            )?)?;
+        self.order.hold_duration().encode(encoder.encode_descriptor(
+            "router_order_lock_hold_duration",
+            "Time ordered commits and snapshots hold the server-wide ordering lock.",
+            Some(&Unit::Seconds),
+            MetricType::Histogram,
         )?)
     }
 }
@@ -148,7 +173,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn router_collector_encodes_sessions_messages_and_detached_work()
+    fn router_collector_encodes_sessions_messages_detached_work_and_order_lock()
     -> Result<(), Box<dyn std::error::Error>> {
         let metrics = Arc::new(RouterMetrics::new(4, NonZeroUsize::MIN));
         metrics.message(MessageOutcome::Routed);
@@ -158,10 +183,13 @@ mod tests {
         metrics.publish_sessions(3, 1);
         let detached = DetachedWork::default();
         let guard = detached.try_start().ok_or("available detached slot")?;
+        let order = Order::new();
+        order.wait_duration().observe(0.002);
+        order.hold_duration().observe(0.003);
         let mut registry = Registry::default();
         registry
             .sub_registry_with_prefix("lonewolf")
-            .register_collector(Box::new(RouterCollector::new(metrics, detached)));
+            .register_collector(Box::new(RouterCollector::new(metrics, detached, order)));
         let mut output = String::new();
         encode(&mut output, &registry)?;
         for sample in [
@@ -173,6 +201,10 @@ mod tests {
             "lonewolf_router_messages_total{outcome=\"failed\"} 1",
             "lonewolf_router_detached_tasks 1",
             "lonewolf_router_detached_tasks_limit 4096",
+            "lonewolf_router_order_lock_wait_duration_seconds_count 1",
+            "lonewolf_router_order_lock_wait_duration_seconds_bucket{le=\"0.0025\"} 1",
+            "lonewolf_router_order_lock_hold_duration_seconds_count 1",
+            "lonewolf_router_order_lock_hold_duration_seconds_bucket{le=\"0.0025\"} 0",
         ] {
             assert!(output.lines().any(|line| line == sample), "{output}");
         }

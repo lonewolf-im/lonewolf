@@ -608,6 +608,38 @@ fn full_read_capacity_does_not_block_a_writer() -> TestResult {
 }
 
 #[test]
+fn full_read_capacity_does_not_block_opening_a_snapshot() -> TestResult {
+    let storage = storage()?;
+    let alice = key("alice@example.com")?;
+    let account = new_account("alice@example.com", 10)?;
+    block_on(async {
+        let busy = storage.begin_read().await?;
+        let mut blocked = Vec::with_capacity(32);
+        for _ in 0..32 {
+            let (entered, started) = mpsc::channel();
+            let (release, gate) = mpsc::channel();
+            let mut operation = Box::pin(busy.run(move |_| {
+                let _ = entered.send(());
+                gate.recv_timeout(TIMEOUT)
+            }));
+            assert!(poll(operation.as_mut()).is_pending());
+            started.recv_timeout(TIMEOUT)?;
+            blocked.push((operation, release));
+        }
+
+        let snapshot = storage.begin_read().await?;
+        write(&storage, async |tx| tx.create_account(account).await).await?;
+
+        for (operation, release) in blocked {
+            release.send(())?;
+            operation.await?;
+        }
+        assert!(snapshot.account(&alice).await?.is_none());
+        Ok(())
+    })
+}
+
+#[test]
 fn a_committing_writer_and_queued_writers_do_not_block_reads() -> TestResult {
     let backend = ObservedBackend::default();
     let storage = RedbStorage::new(database(backend.clone(), 1024 * 1024)?)?;

@@ -3,16 +3,21 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Instant;
 
 use futures_channel::oneshot;
 use lonewolf_storage::account::AccountKey;
+use lonewolf_storage::metrics::DURATION_BUCKETS;
 use parking_lot::Mutex as PlMutex;
+use prometheus_client::metrics::histogram::Histogram;
 
 /// Orders deliveries by fixed storage view; deletion barriers also order unrelated accounts.
 pub(crate) struct Order {
     lines: PlMutex<Lines>,
     /// Prevents a later commit from taking an earlier delivery ticket.
     fixing: async_lock::Mutex<()>,
+    wait_duration: Histogram,
+    hold_duration: Histogram,
 }
 
 #[derive(Default)]
@@ -40,7 +45,17 @@ impl Order {
         Arc::new(Self {
             lines: PlMutex::new(Lines::default()),
             fixing: async_lock::Mutex::new(()),
+            wait_duration: Histogram::new(DURATION_BUCKETS),
+            hold_duration: Histogram::new(DURATION_BUCKETS),
         })
+    }
+
+    pub(crate) fn wait_duration(&self) -> &Histogram {
+        &self.wait_duration
+    }
+
+    pub(crate) fn hold_duration(&self) -> &Histogram {
+        &self.hold_duration
     }
 
     /// Fixes a storage view and its account ticket under one ordering lock.
@@ -49,9 +64,7 @@ impl Order {
         accounts: Vec<AccountKey>,
         fix: impl Future<Output = Result<T, E>>,
     ) -> Result<(T, Ticket), E> {
-        let _fixing = self.fixing.lock().await;
-        let value = fix.await?;
-        Ok((value, self.admit(accounts, false)))
+        self.fixed(fix, |order| order.admit(accounts, false)).await
     }
 
     /// A deletion barrier waits for all older tickets and blocks all later deliveries.
@@ -59,9 +72,26 @@ impl Order {
         self: &Arc<Self>,
         fix: impl Future<Output = Result<T, E>>,
     ) -> Result<(T, Ticket), E> {
-        let _fixing = self.fixing.lock().await;
-        let value = fix.await?;
-        Ok((value, self.admit(Vec::new(), true)))
+        self.fixed(fix, |order| order.admit(Vec::new(), true)).await
+    }
+
+    /// A fix cancelled before it releases the lock records no durations.
+    async fn fixed<T, E>(
+        self: &Arc<Self>,
+        fix: impl Future<Output = Result<T, E>>,
+        admit: impl FnOnce(&Arc<Self>) -> Ticket,
+    ) -> Result<(T, Ticket), E> {
+        let started = Instant::now();
+        let fixing = self.fixing.lock().await;
+        let acquired = Instant::now();
+        let fixed = fix.await.map(|value| (value, admit(self)));
+        drop(fixing);
+        let released = Instant::now();
+        self.wait_duration
+            .observe(acquired.duration_since(started).as_secs_f64());
+        self.hold_duration
+            .observe(released.duration_since(acquired).as_secs_f64());
+        fixed
     }
 
     fn admit(self: &Arc<Self>, accounts: Vec<AccountKey>, global: bool) -> Ticket {

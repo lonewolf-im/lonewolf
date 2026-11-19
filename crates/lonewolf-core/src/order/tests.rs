@@ -11,6 +11,9 @@ use futures_channel::oneshot;
 use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::{Arena, ArenaConfig};
 use lonewolf_xmpp::jid::Jid;
+use prometheus_client::encoding::text::encode;
+use prometheus_client::metrics::histogram::Histogram;
+use prometheus_client::registry::Registry;
 
 use super::{Order, Ticket};
 
@@ -39,6 +42,16 @@ fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
 
 fn is_ready(ticket: &mut Ticket) -> bool {
     poll_once(pin!(ticket.turn())).is_ready()
+}
+
+fn assert_count(histogram: &Histogram, count: u64) -> TestResult {
+    let mut registry = Registry::default();
+    registry.register("duration", "Test duration.", histogram.clone());
+    let mut output = String::new();
+    encode(&mut output, &registry)?;
+    let expected = format!("duration_count {count}");
+    assert!(output.lines().any(|line| line == expected), "{output}");
+    Ok(())
 }
 
 #[test]
@@ -234,5 +247,17 @@ fn dropped_waiting_global_ticket_releases_successors_and_failed_fix_admits_nothi
     assert!(block_on(order.fix_all(async { Err::<(), _>("failed") }))?.is_err());
     assert_eq!(order.lines.lock().waiting.len(), 2);
     drop(older);
+    Ok(())
+}
+
+#[test]
+fn every_completed_fix_records_lock_wait_and_hold_even_when_it_fails() -> TestResult {
+    let order = Order::new();
+    let alice = account("alice@example.com")?;
+    let ((), ticket) = block_on(order.fix(vec![alice], async { Ok::<_, &str>(()) }))??;
+    drop(ticket);
+    assert!(block_on(order.fix_all(async { Err::<(), _>("failed") }))?.is_err());
+    assert_count(order.wait_duration(), 2)?;
+    assert_count(order.hold_duration(), 2)?;
     Ok(())
 }

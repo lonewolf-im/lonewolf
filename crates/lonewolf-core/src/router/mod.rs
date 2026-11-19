@@ -267,6 +267,7 @@ impl<A: ChunkAllocator + Clone> Router<A> {
         registry.register_collector(Box::new(RouterCollector::new(
             Arc::clone(self.handle.local.metrics()),
             self.handle.detached_work.clone(),
+            Arc::clone(&self.handle.order),
         )));
     }
 

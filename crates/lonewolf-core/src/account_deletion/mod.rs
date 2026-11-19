@@ -8,6 +8,7 @@ use async_channel::{Receiver, Sender};
 use futures_channel::oneshot;
 use lonewolf_admin::{AccountDeleter, DeleterError};
 use lonewolf_storage::account::{AccountError, AccountKey, AccountWrites};
+use lonewolf_storage::blocking::BlockingWrites;
 use lonewolf_storage::offline::{OfflineError, OfflineWrites};
 use lonewolf_storage::private::{PrivateXmlError, PrivateXmlWrites};
 use lonewolf_storage::vcard::{VCardError, VCardWrites};
@@ -124,6 +125,7 @@ async fn delete<A: ChunkAllocator + Clone>(
             PrivateXmlError::Storage(error) => DeleterError::from(error),
             error => DeleterError::Other(Box::new(error)),
         })?;
+    transaction.delete_blocklist(account).await?;
     let ((), mut ticket) = router.order().fix_all(transaction.commit()).await?;
     tracing::info!(
         operation = "cleanup",
@@ -143,7 +145,7 @@ async fn delete<A: ChunkAllocator + Clone>(
             );
         }
     }
-    // Sessions end after the commit so their disconnect broadcasts to an empty audience.
+    // Retire sessions after commit so disconnect finds no remaining audience.
     if let Err(error) = router.retire_account(account).await {
         tracing::error!(error = ?error, "account session termination failed");
     }

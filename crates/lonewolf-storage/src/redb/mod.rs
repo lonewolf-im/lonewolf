@@ -19,7 +19,7 @@ use lonewolf_util::blocking::BlockingExecutor;
 
 use crate::metrics::{StoreMetrics, StoreOperation};
 use crate::storage::{ReadTransaction, Storage, WriteTransaction};
-use crate::{StorageError, StorageErrorKind, account, offline, private, roster, vcard};
+use crate::{StorageError, StorageErrorKind, account, blocking, offline, private, roster, vcard};
 
 mod error;
 mod jid;
@@ -27,10 +27,7 @@ mod jid;
 pub(crate) use error::{commit_error, storage_error};
 pub(crate) use jid::with_canonical_jid;
 
-/// A redb database as one transaction domain.
-///
-/// Clones share the database, its admission limits of 32 submitted read operations,
-/// 32 snapshot openings and one open write transaction, and the SCRAM decoy secret.
+/// Clones share the database, admission limits, and SCRAM decoy secret.
 #[derive(Clone)]
 pub struct RedbStorage {
     inner: Arc<Inner>,
@@ -38,26 +35,21 @@ pub struct RedbStorage {
 
 struct Inner {
     database: Database,
-    /// Callers may open a snapshot while holding an ordering lock, so opening one
-    /// must not queue behind long read operations.
+    /// Snapshot openings bypass the read operation limit to avoid stalling callers that hold an ordering lock.
     openings: BlockingExecutor,
     reads: BlockingExecutor,
     writes: BlockingExecutor,
-    /// Admits one write transaction at a time ahead of the writer thread, so that
-    /// thread never blocks inside redb's own writer lock while a handle is open.
+    /// Limits admission so the writer thread can run existing transactions without waiting on redb's writer lock.
     writer: Arc<Mutex<()>>,
     decoy: ScramDecoy,
     metrics: Arc<StoreMetrics>,
 }
 
-/// One consistent snapshot; every operation runs on the read executor.
 pub struct RedbRead {
     transaction: Arc<RedbReadTransaction>,
     reads: BlockingExecutor,
 }
 
-/// The store's open write transaction; operations and the commit run on the writer thread.
-/// Being the only one open keeps everything it reads stable until it commits.
 pub struct RedbWrite {
     inner: Arc<Inner>,
     transaction: Arc<RedbWriteTransaction>,
@@ -136,6 +128,7 @@ fn initialize(database: &Database) -> Result<ScramDecoy, StorageError> {
     offline::redb::initialize(&transaction)?;
     vcard::redb::initialize(&transaction)?;
     private::redb::initialize(&transaction)?;
+    blocking::redb::initialize(&transaction)?;
     transaction.commit().map_err(commit_error)?;
     Ok(decoy)
 }
@@ -239,8 +232,7 @@ impl WriteTransaction for RedbWrite {
             metrics,
             inner: _,
         } = self;
-        // An operation future dropped before it finished may still hold the
-        // transaction on the writer thread; committing around it is unsafe.
+        // A canceled operation can still hold the transaction on the writer thread.
         let transaction = Arc::into_inner(transaction).ok_or_else(|| {
             metrics.record_failure(StoreOperation::Commit, StorageErrorKind::Other);
             StorageError::new(StorageErrorKind::Other)

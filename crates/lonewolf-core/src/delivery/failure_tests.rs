@@ -9,6 +9,9 @@ use compio::runtime::Runtime;
 use futures_channel::oneshot;
 use lonewolf_auth::scram::{ScramCredentials, ScramHash, ScramVerifier};
 use lonewolf_storage::account::*;
+use lonewolf_storage::blocking::{
+    BlockChange, BlockDelta, BlockError, BlockingReads, BlockingWrites,
+};
 use lonewolf_storage::offline::*;
 use lonewolf_storage::private::{
     PrivateXmlChange, PrivateXmlError, PrivateXmlQuota, PrivateXmlReads, PrivateXmlWrites,
@@ -18,6 +21,7 @@ use lonewolf_storage::roster::*;
 use lonewolf_storage::vcard::{StoredVCard, VCardError, VCardQuota, VCardReads, VCardWrites};
 use lonewolf_storage::{ReadTransaction, StorageError, StorageErrorKind, WriteTransaction};
 use lonewolf_util::arena::GlobalChunkAllocator;
+use lonewolf_xmpp::jid::JidRef;
 use parking_lot::Mutex as PlMutex;
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id, Record};
@@ -228,6 +232,30 @@ impl PrivateXmlWrites for FailedCommit {
     }
 
     async fn clear_private_xml(&mut self, _: &AccountKey) -> Result<(), PrivateXmlError> {
+        unreachable!("commit test cannot use storage operations")
+    }
+}
+
+impl BlockingReads for FailedCommit {
+    async fn blocklist(&self, _: &AccountKey) -> Result<Vec<RosterJid>, BlockError> {
+        unreachable!("commit test cannot use storage operations")
+    }
+
+    async fn is_blocked(&self, _: &AccountKey, _: JidRef<'_>) -> Result<bool, BlockError> {
+        unreachable!("commit test cannot use storage operations")
+    }
+}
+
+impl BlockingWrites for FailedCommit {
+    async fn change_blocklist(
+        &mut self,
+        _: &AccountKey,
+        _: BlockChange<'_>,
+    ) -> Result<BlockDelta, BlockError> {
+        unreachable!("commit test cannot use storage operations")
+    }
+
+    async fn delete_blocklist(&mut self, _: &AccountKey) -> Result<(), StorageError> {
         unreachable!("commit test cannot use storage operations")
     }
 }

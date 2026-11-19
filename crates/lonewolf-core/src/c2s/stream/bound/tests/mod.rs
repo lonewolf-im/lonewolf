@@ -3181,10 +3181,16 @@ fn retired_session_stops_offline_replay_before_the_next_page() -> TestResult {
                     credentials: credentials(),
                 })
                 .await?;
-            let sequence = transaction
-                .push_offline_message(account, 1, b"<message id='recreated'/>")
-                .await?;
-            assert_eq!(sequence.get(), 1);
+            for expected in 1..=3 {
+                let sequence = transaction
+                    .push_offline_message(
+                        account,
+                        1,
+                        b"<message xmlns='jabber:client' to='bob@localhost' type='chat' id='recreated'/>",
+                    )
+                    .await?;
+                assert_eq!(sequence.get(), expected);
+            }
             transaction.commit().await?;
             release.send(()).map_err(|_| "flush ended before release")?;
             Ok::<_, Box<dyn Error>>(())
@@ -3194,7 +3200,7 @@ fn retired_session_stops_offline_replay_before_the_next_page() -> TestResult {
         replay.map_err(|error| format!("{error:?}"))?;
         assert_written_pages(&outbox.writer, &[0, 1]);
         drop(outbox);
-        assert_eq!(fixture.count().await?, 1);
+        assert_eq!(stored_sequences(&fixture).await?, [1, 2, 3]);
         fixture.finish().await
     })
 }

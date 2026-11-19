@@ -1478,15 +1478,17 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             .router
             .presence_decorations(self.registration.account().domain());
         let decorate = available && !decorations.is_empty();
+        let backlog_reader = message_handler
+            .as_deref()
+            .filter(|_| candidate)
+            .map(|handler| (handler, self.outbox.metrics.clone()));
         let registration = &self.registration;
         let router = &self.router;
         let storage = &self.storage;
         let work_group = self.outbox.work;
+        let needs_snapshot = presence_handler.is_some() || backlog_reader.is_some() || decorate;
         let prepare = async {
-            let (result, ticket) = if presence_handler.is_some()
-                || (candidate && message_handler.is_some())
-                || decorate
-            {
+            let (result, ticket) = if needs_snapshot {
                 let owner = registration.account();
                 let (transaction, ticket) = Arc::clone(router.order())
                     .fix(vec![owner.clone()], storage.begin_read())
@@ -1504,8 +1506,16 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                         }
                         None => None,
                     };
-                    let backlog = match message_handler.as_ref().filter(|_| candidate) {
-                        Some(handler) => handler.backlog(owner, &transaction).await?,
+                    let backlog = match &backlog_reader {
+                        Some((handler, metrics)) => handler
+                            .backlog(owner, &transaction)
+                            .await?
+                            .inspect(|backlog| {
+                                metrics.replay_page_read(
+                                    ReplayKind::OfflineMessage,
+                                    backlog.page.byte_len(),
+                                );
+                            }),
                         None => None,
                     };
                     Ok((audience, backlog))
@@ -2236,9 +2246,8 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> Outbox<'_, A, W> {
                 Output::Offline { backlog, handler } => {
                     offline_replay = true;
                     let Backlog { through, mut page } = backlog;
+                    let kind = ReplayKind::OfflineMessage;
                     loop {
-                        let kind = ReplayKind::OfflineMessage;
-                        self.metrics.replay_page_read(kind, page.byte_len());
                         for (entry, bytes) in page.iter() {
                             match self.parse_stored(bytes, StoredKind::Message).await {
                                 Ok(stanza) => {
@@ -2309,6 +2318,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> Outbox<'_, A, W> {
                                 CloseOutcome::InternalError
                             })?;
                         drop(transaction);
+                        self.metrics.replay_page_read(kind, page.byte_len());
                     }
                 }
             }

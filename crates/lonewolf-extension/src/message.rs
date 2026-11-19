@@ -4,7 +4,7 @@ use std::time::SystemTime;
 
 use lonewolf_storage::Storage;
 use lonewolf_storage::account::AccountKey;
-use lonewolf_storage::offline::{OfflineSequence, StoredMessage};
+use lonewolf_storage::offline::{OfflinePage, OfflineSequence};
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::stanza::{RoutedStanza, StanzaErrorCondition};
 
@@ -30,10 +30,10 @@ pub enum StoreOutcome {
 }
 
 pub struct Backlog {
-    /// Messages are in sequence order.
-    pub messages: Vec<StoredMessage>,
-    /// The highest sequence in `messages`.
+    /// The highest stored sequence in the availability snapshot.
     pub through: OfflineSequence,
+    /// The first page; later pages come from [`MessageHandler::backlog_page`].
+    pub page: OfflinePage,
 }
 
 pub type StoreFuture<'a> = ExtensionFuture<'a, Result<StoreOutcome, HandlerError>>;
@@ -50,13 +50,25 @@ pub trait MessageHandler<A: ChunkAllocator, S: Storage>: Send + Sync {
         Box::pin(async { Err(StanzaErrorCondition::ServiceUnavailable.into()) })
     }
 
-    /// Reads messages from the availability snapshot for a newly eligible resource.
+    /// Reads the first backlog page from the availability snapshot for a newly eligible resource.
     fn backlog<'a>(
         &'a self,
         _account: &'a AccountKey,
         _transaction: &'a S::Read,
     ) -> PresenceFuture<'a, Option<Backlog>> {
         Box::pin(async { Ok(None) })
+    }
+
+    /// Refills `page` with stored messages after `after` and up to `through`.
+    fn backlog_page<'a>(
+        &'a self,
+        _account: &'a AccountKey,
+        _transaction: &'a S::Read,
+        _after: OfflineSequence,
+        _through: OfflineSequence,
+        _page: OfflinePage,
+    ) -> PresenceFuture<'a, OfflinePage> {
+        Box::pin(async { Ok(OfflinePage::new()) })
     }
 
     /// Removes messages through `through` after a session delivers the replayed copies.

@@ -365,7 +365,7 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
                 Instant::now(),
                 settings.metrics.clone(),
             );
-            Ok(bound_stream(bound, &mut work, recipients).await)
+            Ok(bound_stream(bound, &mut work, recipients, settings.metrics.clone()).await)
         };
         let outcome = finish_phases(phases, &close_control, &settings.metrics).await;
         work.drain().await;

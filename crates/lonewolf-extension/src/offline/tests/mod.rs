@@ -12,7 +12,7 @@ use lonewolf_auth::scram::{
     SCRAM_POLICY_ITERATIONS, ScramCredentials, ScramSha1Verifier, ScramVerifier,
 };
 use lonewolf_storage::account::{AccountKey, AccountWrites, NewAccount};
-use lonewolf_storage::offline::{OfflineReads, OfflineSequence};
+use lonewolf_storage::offline::{OfflineReads, OfflineSequence, OfflineWrites};
 use lonewolf_storage::{RedbStorage, Storage, WriteTransaction};
 use lonewolf_util::arena::{Arena, ArenaConfig, GlobalChunkAllocator};
 use lonewolf_xmpp::jid::Jid;
@@ -20,6 +20,7 @@ use lonewolf_xmpp::parser::{ParserConfig, StreamEvent, XmppParser};
 use lonewolf_xmpp::stanza::{RoutedStanza, StanzaErrorCondition};
 
 use super::{Offline, OfflineLimits};
+use crate::REPLAY_PAGE_BYTES;
 use crate::account::AccountHandler;
 use crate::delivery::{HandlerError, HostLookup};
 use crate::message::{Backlog, MessageHandler, StoreOutcome, UndeliverableMessage};
@@ -167,12 +168,12 @@ fn normal_untyped_and_chat_messages_are_stored_in_order() -> TestResult {
             assert_eq!(test.store(&owner, xml).await?.get(), index as u64 + 1);
         }
         let backlog = test.backlog(&owner).await?.ok_or("missing backlog")?;
-        assert_eq!(backlog.messages.len(), 3);
+        assert_eq!(backlog.page.len(), 3);
         assert_eq!(backlog.through.get(), 3);
-        for (index, stored) in backlog.messages.iter().enumerate() {
+        for (index, (stored, bytes)) in backlog.page.iter().enumerate() {
             assert_eq!(stored.sequence.get(), index as u64 + 1);
             assert_eq!(stored.stored_at, RECEIVED_SECONDS);
-            assert!(std::str::from_utf8(&stored.stanza)?.contains("<body>"));
+            assert!(std::str::from_utf8(bytes)?.contains("<body>"));
         }
         Ok(())
     })
@@ -222,7 +223,7 @@ fn chat_states_with_message_payloads_are_stored() -> TestResult {
             test.backlog(&owner)
                 .await?
                 .ok_or("missing backlog")?
-                .messages
+                .page
                 .len(),
             5
         );
@@ -247,7 +248,7 @@ fn receipts_other_payloads_empty_messages_and_thread_only_messages_are_stored() 
             test.backlog(&owner)
                 .await?
                 .ok_or("missing backlog")?
-                .messages
+                .page
                 .len(),
             4
         );
@@ -262,9 +263,9 @@ fn delay_stamp_uses_recipient_domain_and_utc_receive_time_without_fractions() ->
         let owner = key("bob@example.com")?;
         test.store(&owner, MESSAGE).await?;
         let backlog = test.backlog(&owner).await?.ok_or("missing backlog")?;
-        let stored = &backlog.messages[0];
+        let (stored, bytes) = backlog.page.iter().next().ok_or("missing message")?;
         assert_eq!(stored.stored_at, RECEIVED_SECONDS);
-        let parsed = stanza(std::str::from_utf8(&stored.stanza)?).await?;
+        let parsed = stanza(std::str::from_utf8(bytes)?).await?;
         let view = parsed.resolve()?;
         let delay = view
             .child("delay", "urn:xmpp:delay")?
@@ -286,7 +287,8 @@ fn forged_local_delays_are_removed_and_other_children_keep_their_order() -> Test
         let owner = key("bob@example.com")?;
         test.store(&owner, "<message from='alice@example.org/desk' to='bob@example.com' id='client-id' xml:lang='en' flag='value'><delay xmlns='urn:xmpp:delay' from='example.com' stamp='forged'/><body>Hello &amp; goodbye</body><delay xmlns='urn:xmpp:delay' from='example.org' stamp='foreign'/><delay xmlns='urn:xmpp:delay' stamp='no-from'/><delay xmlns='urn:other' from='example.com'/><delay xmlns='urn:xmpp:delay' from='example.com' stamp='forged-too'/><received xmlns='urn:xmpp:receipts' id='receipt'/></message>").await?;
         let backlog = test.backlog(&owner).await?.ok_or("missing backlog")?;
-        let parsed = stanza(std::str::from_utf8(&backlog.messages[0].stanza)?).await?;
+        let (_, bytes) = backlog.page.iter().next().ok_or("missing message")?;
+        let parsed = stanza(std::str::from_utf8(bytes)?).await?;
         let view = parsed.resolve()?;
         assert_eq!(view.id()?, Some("client-id"));
         assert_eq!(view.lang()?, Some("en"));
@@ -340,7 +342,7 @@ fn per_host_quota_accepts_the_limit_then_rejects_the_next_message() -> TestResul
             test.backlog(&owner)
                 .await?
                 .ok_or("missing backlog")?
-                .messages
+                .page
                 .len(),
             2
         );
@@ -362,7 +364,7 @@ fn per_host_quota_accepts_the_limit_then_rejects_the_next_message() -> TestResul
             test.backlog(&other)
                 .await?
                 .ok_or("missing backlog")?
-                .messages
+                .page
                 .len(),
             3
         );
@@ -445,6 +447,7 @@ fn acknowledging_backlog_preserves_messages_added_after_the_snapshot() -> TestRe
         test.store(&owner, MESSAGE).await?;
         test.store(&owner, MESSAGE).await?;
         let backlog = test.backlog(&owner).await?.ok_or("missing backlog")?;
+        assert!(backlog.page.is_complete());
         let later = test.store(&owner, MESSAGE).await?;
         let handler: &TestHandler = &test.offline;
         let mut transaction = test.storage.begin_write().await?;
@@ -454,7 +457,7 @@ fn acknowledging_backlog_preserves_messages_added_after_the_snapshot() -> TestRe
             .map_err(|error| format!("{error:?}"))?;
         transaction.commit().await?;
         let remaining = test.backlog(&owner).await?.ok_or("missing later message")?;
-        assert_eq!(remaining.messages.len(), 1);
+        assert_eq!(remaining.page.len(), 1);
         assert_eq!(remaining.through, later);
         assert_eq!(test.store(&owner, MESSAGE).await?.get(), 4);
         Ok(())
@@ -476,7 +479,7 @@ fn acknowledging_one_message_keeps_the_other_sequences() -> TestResult {
             .map_err(|error| format!("{error:?}"))?;
         transaction.commit().await?;
         let remaining = test.backlog(&owner).await?.ok_or("missing first message")?;
-        assert_eq!(remaining.messages.len(), 1);
+        assert_eq!(remaining.page.len(), 1);
         assert_eq!(remaining.through, first);
         assert_eq!(test.store(&owner, MESSAGE).await?.get(), 3);
         Ok(())
@@ -512,7 +515,7 @@ fn forgetting_account_clears_messages_and_the_sequence_in_the_deletion_transacti
             test.backlog(&other)
                 .await?
                 .ok_or("missing other backlog")?
-                .messages
+                .page
                 .len(),
             1
         );
@@ -557,7 +560,7 @@ fn hosts_without_configured_limits_enforce_the_default_quota() -> TestResult {
             test.backlog(&owner)
                 .await?
                 .ok_or("missing backlog")?
-                .messages
+                .page
                 .len(),
             100
         );
@@ -664,4 +667,63 @@ fn offline_storage_failure_categories_and_policy_conditions_remain_separate() ->
         assert_eq!(error.failure(), None);
     }
     Ok(())
+}
+
+async fn seed_multiple_pages(
+    test: &TestOffline,
+    owner: &AccountKey,
+) -> TestResult<OfflineSequence> {
+    let mut transaction = test.storage.begin_write().await?;
+    let bytes = vec![b'x'; REPLAY_PAGE_BYTES.get() / 2];
+    transaction.push_offline_message(owner, 1, &bytes).await?;
+    transaction.push_offline_message(owner, 2, &bytes).await?;
+    let last = transaction.push_offline_message(owner, 3, &bytes).await?;
+    transaction.commit().await?;
+    Ok(last)
+}
+
+#[test]
+fn backlog_reads_the_first_page_and_the_snapshot_watermark() -> TestResult {
+    block_on(async {
+        let test = TestOffline::new(BTreeMap::new(), &["bob@example.com"]).await?;
+        let owner = key("bob@example.com")?;
+        let last = seed_multiple_pages(&test, &owner).await?;
+        let Backlog { through, page } = test.backlog(&owner).await?.ok_or("missing backlog")?;
+        assert_eq!(through, last);
+        assert_eq!(page.len(), 2);
+        assert_eq!(page.byte_len(), REPLAY_PAGE_BYTES.get());
+        assert!(!page.is_complete());
+        assert_eq!(
+            page.resume_after().ok_or("missing cursor")?.sequence.get(),
+            2
+        );
+        Ok(())
+    })
+}
+
+#[test]
+fn backlog_pages_continue_after_the_cursor_and_exclude_later_messages() -> TestResult {
+    block_on(async {
+        let test = TestOffline::new(BTreeMap::new(), &["bob@example.com"]).await?;
+        let owner = key("bob@example.com")?;
+        let last = seed_multiple_pages(&test, &owner).await?;
+        let Backlog { through, page } = test.backlog(&owner).await?.ok_or("missing backlog")?;
+        let after = page.resume_after().ok_or("missing cursor")?.sequence;
+        let later = test.store(&owner, MESSAGE).await?;
+        assert!(later > through);
+
+        let transaction = test.storage.begin_read().await?;
+        let handler: &TestHandler = &test.offline;
+        let next = handler
+            .backlog_page(&owner, &transaction, after, through, page)
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+        assert_eq!(next.len(), 1);
+        assert!(next.is_complete());
+        assert_eq!(
+            next.resume_after().ok_or("missing final cursor")?.sequence,
+            last
+        );
+        Ok(())
+    })
 }

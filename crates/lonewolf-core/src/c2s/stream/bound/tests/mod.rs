@@ -16,10 +16,11 @@ use futures_util::{FutureExt, poll};
 use lonewolf_auth::scram::{
     SCRAM_POLICY_ITERATIONS, ScramCredentials, ScramSha1Verifier, ScramVerifier,
 };
+use lonewolf_extension::REPLAY_PAGE_BYTES;
 use lonewolf_extension::message::MessageHandler;
 use lonewolf_extension::offline::Offline;
 use lonewolf_storage::account::{AccountWrites, NewAccount};
-use lonewolf_storage::offline::{OfflineReads, OfflineWrites};
+use lonewolf_storage::offline::{OfflinePage, OfflineReads, OfflineWrites};
 use lonewolf_util::arena::{AllocationError, Chunk, GlobalChunkAllocator};
 use lonewolf_util::pool::{PoolConfig, PooledChunkAllocator};
 use parking_lot::Mutex as PlMutex;
@@ -52,6 +53,7 @@ pub(super) struct ControlledWriter {
     pub(super) partial_release: Option<oneshot::Receiver<()>>,
     pub(super) fail_write: bool,
     fail_flush: bool,
+    fail_flush_at: Option<usize>,
     pub(super) flush_entered: Option<oneshot::Sender<()>>,
     pub(super) flush_release: Option<oneshot::Receiver<()>>,
     pool: Option<Arc<PooledChunkAllocator>>,
@@ -114,7 +116,7 @@ impl<A: ChunkAllocator> OutboxWriter<A> for ControlledWriter {
         if let Some(release) = self.flush_release.take() {
             release.await.map_err(|_| CloseOutcome::TransportError)?;
         }
-        if self.fail_flush {
+        if self.fail_flush || self.fail_flush_at == Some(self.flushed.len()) {
             Err(CloseOutcome::TransportError)
         } else {
             self.flushed.push(through);
@@ -228,6 +230,7 @@ impl Fixture {
             liveness: self.registration.liveness(),
             acknowledgement: None,
             messages: None,
+            metrics: C2sWorkerMetrics::detached(),
             work: &self.work,
         }
     }
@@ -264,11 +267,21 @@ impl Fixture {
 
     async fn backlog(&self) -> TestResult<Backlog> {
         let snapshot = self.storage.begin_read().await?;
-        let messages = snapshot
-            .offline_messages(self.registration.account())
+        let account = self.registration.account();
+        let through = snapshot
+            .last_offline_sequence(account)
+            .await?
+            .ok_or("missing backlog")?;
+        let page = snapshot
+            .offline_page(
+                account,
+                None,
+                through,
+                REPLAY_PAGE_BYTES,
+                OfflinePage::new(),
+            )
             .await?;
-        let through = messages.last().ok_or("missing backlog")?.sequence;
-        Ok(Backlog { messages, through })
+        Ok(Backlog { through, page })
     }
 
     pub(super) async fn count(&self) -> TestResult<usize> {
@@ -573,16 +586,17 @@ fn repeated_live_flushes_coalesce_into_one_worker_and_release_each_sequence() ->
         let handler = Arc::new(Offline::new(Default::default()));
         let mut outbox = fixture.outbox(GlobalChunkAllocator, ControlledWriter::default());
         let mut identity = None;
-        for message in fixture.backlog().await?.messages {
+        let backlog = fixture.backlog().await?;
+        for (entry, bytes) in backlog.page.iter() {
             let stanza = outbox
-                .parse_stored(&message.stanza, StoredKind::Message)
+                .parse_stored(bytes, StoredKind::Message)
                 .await
                 .map_err(|_| "invalid stored message")?;
             outbox.push(Output::Delivered(MailboxEntry {
                 stanza,
                 release: Some(StoredRelease {
                     handler: handler.clone(),
-                    sequence: message.sequence,
+                    sequence: entry.sequence,
                 }),
             }));
             outbox.flush().await.map_err(|error| format!("{error:?}"))?;
@@ -930,11 +944,15 @@ fn repeated_successful_flushes_coalesce_into_one_worker_and_the_highest_watermar
         let handler = Arc::new(AckNotice(PlMutex::new(Some(done))));
         let mut outbox = fixture.outbox(GlobalChunkAllocator, ControlledWriter::default());
         let mut identity = None;
-        for message in fixture.backlog().await?.messages {
+        let backlog = fixture.backlog().await?;
+        for (entry, stanza) in backlog.page.iter() {
+            let mut page = OfflinePage::new();
+            page.push(*entry, stanza);
+            page.finish_read(true);
             outbox.push(Output::Offline {
                 backlog: Backlog {
-                    through: message.sequence,
-                    messages: vec![message],
+                    through: entry.sequence,
+                    page,
                 },
                 handler: handler.clone(),
             });
@@ -1062,8 +1080,17 @@ fn acknowledgement_preserves_a_message_stored_after_the_replay_snapshot() -> Tes
         acknowledged.await?;
         drop(fixture.storage.begin_write().await?);
         let remaining = fixture.backlog().await?;
-        assert_eq!(remaining.messages.len(), 1);
-        assert_eq!(remaining.messages[0].sequence, fresh);
+        assert_eq!(remaining.page.len(), 1);
+        assert_eq!(
+            remaining
+                .page
+                .iter()
+                .next()
+                .ok_or("missing message")?
+                .0
+                .sequence,
+            fresh
+        );
         drop(outbox);
         fixture.finish().await
     })
@@ -2954,6 +2981,226 @@ fn iq_context_reaches_get_set_and_missing_account_handlers() -> TestResult {
             }
         }
         drop(session);
+        fixture.finish().await
+    })
+}
+
+fn page_message(index: usize, length: usize) -> Vec<u8> {
+    let mut bytes = format!(
+        "<message xmlns='jabber:client' to='bob@localhost' type='chat' id='page-{index}'><body>"
+    )
+    .into_bytes();
+    let suffix = b"</body></message>";
+    assert!(length >= bytes.len() + suffix.len());
+    bytes.resize(length - suffix.len(), b'x');
+    bytes.extend_from_slice(suffix);
+    bytes
+}
+
+async fn paged_fixture() -> TestResult<Fixture> {
+    let messages: [Vec<u8>; 5] =
+        std::array::from_fn(|index| page_message(index, REPLAY_PAGE_BYTES.get() / 2));
+    Fixture::new(&messages.each_ref().map(Vec::as_slice)).await
+}
+
+fn assert_written_pages(writer: &ControlledWriter, indices: &[usize]) {
+    assert_eq!(writer.written.len(), indices.len());
+    for (xml, index) in writer.written.iter().zip(indices) {
+        assert!(xml.contains(&format!(r#"id="page-{index}""#)));
+    }
+}
+
+async fn stored_sequences(fixture: &Fixture) -> TestResult<Vec<u64>> {
+    let reader = fixture.storage.begin_read().await?;
+    Ok(reader
+        .offline_messages(fixture.registration.account())
+        .await?
+        .into_iter()
+        .map(|record| record.sequence.get())
+        .collect())
+}
+
+#[test]
+fn offline_replay_writes_every_page_in_order_and_flushes_before_each_later_page() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let fixture = paged_fixture().await?;
+        let mut outbox = fixture.outbox(GlobalChunkAllocator, ControlledWriter::default());
+        outbox.push(Output::Offline {
+            backlog: fixture.backlog().await?,
+            handler: Arc::new(Offline::new(Default::default())),
+        });
+
+        outbox.flush().await.map_err(|error| format!("{error:?}"))?;
+        assert_written_pages(&outbox.writer, &[0, 1, 2, 3, 4]);
+        let second = OutputSequence::default().next().next();
+        let fourth = second.next().next();
+        assert_eq!(outbox.writer.flushed, [second, fourth, fourth.next()]);
+        (&mut outbox
+            .acknowledgement
+            .as_mut()
+            .ok_or("missing final acknowledgement")?
+            .task)
+            .await?;
+        assert_eq!(fixture.count().await?, 0);
+        drop(outbox);
+        fixture.finish().await
+    })
+}
+
+#[test]
+fn failed_later_flush_keeps_only_unflushed_pages_stored() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let fixture = paged_fixture().await?;
+        let mut outbox = fixture.outbox(
+            GlobalChunkAllocator,
+            ControlledWriter {
+                fail_flush_at: Some(1),
+                ..Default::default()
+            },
+        );
+        outbox.push(Output::Offline {
+            backlog: fixture.backlog().await?,
+            handler: Arc::new(Offline::new(Default::default())),
+        });
+
+        assert_eq!(outbox.flush().await, Err(CloseOutcome::TransportError));
+        assert_written_pages(&outbox.writer, &[0, 1, 2, 3]);
+        assert_eq!(stored_sequences(&fixture).await?, [3, 4, 5]);
+        drop(outbox);
+        fixture.finish().await
+    })
+}
+
+struct FailingAcknowledgement;
+
+impl MessageHandler<GlobalChunkAllocator, RedbStorage> for FailingAcknowledgement {
+    fn acknowledge<'a>(
+        &'a self,
+        _: &'a AccountKey,
+        _: OfflineSequence,
+        _: &'a mut RedbWrite,
+    ) -> lonewolf_extension::ExtensionFuture<'a, Result<(), HandlerError>> {
+        Box::pin(async { Err(StanzaErrorCondition::InternalServerError.into()) })
+    }
+}
+
+#[test]
+fn failed_intermediate_acknowledgement_stops_before_the_next_page() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let fixture = paged_fixture().await?;
+        let mut outbox = fixture.outbox(GlobalChunkAllocator, ControlledWriter::default());
+        outbox.push(Output::Offline {
+            backlog: fixture.backlog().await?,
+            handler: Arc::new(FailingAcknowledgement),
+        });
+
+        assert_eq!(outbox.flush().await, Err(CloseOutcome::InternalError));
+        assert_written_pages(&outbox.writer, &[0, 1]);
+        assert_eq!(outbox.writer.flushed.len(), 1);
+        assert_eq!(stored_sequences(&fixture).await?, [1, 2, 3, 4, 5]);
+        drop(outbox);
+        fixture.finish().await
+    })
+}
+
+#[test]
+fn offline_replay_skips_messages_removed_between_pages() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let fixture = paged_fixture().await?;
+        let (entered, flushing) = oneshot::channel();
+        let (release, paused) = oneshot::channel();
+        let mut outbox = fixture.outbox(
+            GlobalChunkAllocator,
+            ControlledWriter {
+                flush_entered: Some(entered),
+                flush_release: Some(paused),
+                ..Default::default()
+            },
+        );
+        outbox.push(Output::Offline {
+            backlog: fixture.backlog().await?,
+            handler: Arc::new(Offline::new(Default::default())),
+        });
+        let modify_queue = async {
+            flushing.await?;
+            let mut transaction = fixture.storage.begin_write().await?;
+            assert_eq!(
+                transaction
+                    .remove_offline_messages_through(
+                        fixture.registration.account(),
+                        OfflineSequence::new(3),
+                    )
+                    .await?,
+                3
+            );
+            transaction.commit().await?;
+            release.send(()).map_err(|_| "flush ended before release")?;
+            Ok::<_, Box<dyn Error>>(())
+        };
+        let (replay, modified) = join(outbox.flush(), modify_queue).await;
+        modified?;
+        replay.map_err(|error| format!("{error:?}"))?;
+        assert_written_pages(&outbox.writer, &[0, 1, 3, 4]);
+        drop(outbox);
+        fixture.finish().await
+    })
+}
+
+#[test]
+fn retired_session_stops_offline_replay_before_the_next_page() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let fixture = paged_fixture().await?;
+        let (entered, flushing) = oneshot::channel();
+        let (release, paused) = oneshot::channel();
+        let mut outbox = fixture.outbox(
+            GlobalChunkAllocator,
+            ControlledWriter {
+                flush_entered: Some(entered),
+                flush_release: Some(paused),
+                ..Default::default()
+            },
+        );
+        outbox.push(Output::Offline {
+            backlog: fixture.backlog().await?,
+            handler: Arc::new(Offline::new(Default::default())),
+        });
+        let recreate = async {
+            flushing.await?;
+            let account = fixture.registration.account();
+            let mut transaction = fixture.storage.begin_write().await?;
+            transaction.clear_offline_messages(account).await?;
+            transaction.delete_account(account).await?;
+            transaction.commit().await?;
+            fixture.router.handle().retire_account(account).await?;
+            assert!(!fixture.registration.liveness().is_alive());
+
+            let mut transaction = fixture.storage.begin_write().await?;
+            transaction
+                .create_account(NewAccount {
+                    key: account.clone(),
+                    credentials: credentials(),
+                })
+                .await?;
+            for expected in 1..=3 {
+                let sequence = transaction
+                    .push_offline_message(
+                        account,
+                        1,
+                        b"<message xmlns='jabber:client' to='bob@localhost' type='chat' id='recreated'/>",
+                    )
+                    .await?;
+                assert_eq!(sequence.get(), expected);
+            }
+            transaction.commit().await?;
+            release.send(()).map_err(|_| "flush ended before release")?;
+            Ok::<_, Box<dyn Error>>(())
+        };
+        let (replay, recreated) = join(outbox.flush(), recreate).await;
+        recreated?;
+        replay.map_err(|error| format!("{error:?}"))?;
+        assert_written_pages(&outbox.writer, &[0, 1]);
+        drop(outbox);
+        assert_eq!(stored_sequences(&fixture).await?, [1, 2, 3]);
         fixture.finish().await
     })
 }

@@ -56,6 +56,7 @@ use super::outcome::CloseOutcome;
 use super::recipient_rate::RecipientLimiter;
 use super::session::{Session, Writer};
 use crate::c2s::iq;
+use crate::c2s::metrics::{C2sWorkerMetrics, ReplayKind, ReplayOutcome};
 use crate::delivery::{
     EffectsDiagnostics, Pending, RouterDelivery, WorkGroup, WorkHandle, after_turn,
     commit_and_deliver, report_failure, report_handler_failure, storage_failure,
@@ -114,6 +115,7 @@ struct Outbox<'w, A: ChunkAllocator, W = Writer> {
     liveness: SessionLiveness,
     acknowledgement: Option<ReplayAcknowledgement>,
     messages: Option<MessageRelease>,
+    metrics: C2sWorkerMetrics,
     work: &'w WorkGroup,
 }
 
@@ -219,6 +221,7 @@ pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(
     bound: Bound<A>,
     work: &mut WorkGroup,
     recipients: RecipientLimiter,
+    metrics: C2sWorkerMetrics,
 ) -> CloseOutcome {
     let Bound {
         session:
@@ -260,6 +263,7 @@ pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(
                 liveness: registration.liveness(),
                 acknowledgement: None,
                 messages: None,
+                metrics,
                 work: &*work,
             };
             let mut session = BoundSession {
@@ -1474,15 +1478,17 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             .router
             .presence_decorations(self.registration.account().domain());
         let decorate = available && !decorations.is_empty();
+        let backlog_reader = message_handler
+            .as_deref()
+            .filter(|_| candidate)
+            .map(|handler| (handler, self.outbox.metrics.clone()));
         let registration = &self.registration;
         let router = &self.router;
         let storage = &self.storage;
         let work_group = self.outbox.work;
+        let needs_snapshot = presence_handler.is_some() || backlog_reader.is_some() || decorate;
         let prepare = async {
-            let (result, ticket) = if presence_handler.is_some()
-                || (candidate && message_handler.is_some())
-                || decorate
-            {
+            let (result, ticket) = if needs_snapshot {
                 let owner = registration.account();
                 let (transaction, ticket) = Arc::clone(router.order())
                     .fix(vec![owner.clone()], storage.begin_read())
@@ -1500,8 +1506,16 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                         }
                         None => None,
                     };
-                    let backlog = match message_handler.as_ref().filter(|_| candidate) {
-                        Some(handler) => handler.backlog(owner, &transaction).await?,
+                    let backlog = match &backlog_reader {
+                        Some((handler, metrics)) => handler
+                            .backlog(owner, &transaction)
+                            .await?
+                            .inspect(|backlog| {
+                                metrics.replay_page_read(
+                                    ReplayKind::OfflineMessage,
+                                    backlog.page.byte_len(),
+                                );
+                            }),
                         None => None,
                     };
                     Ok((audience, backlog))
@@ -2231,35 +2245,81 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> Outbox<'_, A, W> {
                 }
                 Output::Offline { backlog, handler } => {
                     offline_replay = true;
-                    for message in backlog.messages {
-                        match self
-                            .parse_stored(&message.stanza, StoredKind::Message)
-                            .await
-                        {
-                            Ok(stanza) => {
-                                self.written = self.written.next();
-                                self.writer.write(Outgoing::Routed(stanza)).await?;
-                                messages_written += 1;
-                            }
-                            Err(StoredRecordError::InvalidContent) => {
-                                messages_skipped += 1;
-                                tracing::error!(
-                                    sequence = message.sequence.get(),
-                                    "stored offline message rejected"
-                                );
-                            }
-                            Err(StoredRecordError::ReplayFailure) => {
-                                return Err(CloseOutcome::InternalError);
+                    let Backlog { through, mut page } = backlog;
+                    let kind = ReplayKind::OfflineMessage;
+                    loop {
+                        for (entry, bytes) in page.iter() {
+                            match self.parse_stored(bytes, StoredKind::Message).await {
+                                Ok(stanza) => {
+                                    self.written = self.written.next();
+                                    self.writer.write(Outgoing::Routed(stanza)).await?;
+                                    self.metrics
+                                        .replay_records(kind, ReplayOutcome::Delivered, 1);
+                                    messages_written += 1;
+                                }
+                                Err(StoredRecordError::InvalidContent) => {
+                                    self.metrics.replay_records(kind, ReplayOutcome::Invalid, 1);
+                                    messages_skipped += 1;
+                                    tracing::error!(
+                                        sequence = entry.sequence.get(),
+                                        "stored offline message rejected"
+                                    );
+                                }
+                                Err(StoredRecordError::ReplayFailure) => {
+                                    return Err(CloseOutcome::InternalError);
+                                }
                             }
                         }
+                        let Some(last) = page.resume_after().map(|entry| entry.sequence) else {
+                            break;
+                        };
+                        if page.is_complete() {
+                            self.releases.push_back((
+                                self.written,
+                                Release::Backlog {
+                                    handler,
+                                    through: last,
+                                },
+                            ));
+                            break;
+                        }
+                        self.writer.flush(self.written).await?;
+                        self.release_through(self.written);
+                        // Commit this page before a later transport failure can retire the session.
+                        acknowledge_backlog(
+                            &self.storage,
+                            &self.account,
+                            &self.liveness,
+                            &*handler,
+                            &Cell::new(last),
+                        )
+                        .await
+                        .map_err(|error| {
+                            report_handler_failure(&error, &self.account);
+                            CloseOutcome::InternalError
+                        })?;
+                        let transaction = self.storage.begin_read().await.map_err(|error| {
+                            close_storage_failure(error, "offline_replay_begin_read", &self.account)
+                        })?;
+                        if !self.liveness.is_alive() {
+                            tracing::debug!(
+                                operation = "replay",
+                                outcome = "stale_session",
+                                owner_jid = ?self.account.as_str(),
+                                "offline replay stopped"
+                            );
+                            break;
+                        }
+                        page = handler
+                            .backlog_page(&self.account, &transaction, last, through, page)
+                            .await
+                            .map_err(|error| {
+                                report_handler_failure(&error, &self.account);
+                                CloseOutcome::InternalError
+                            })?;
+                        drop(transaction);
+                        self.metrics.replay_page_read(kind, page.byte_len());
                     }
-                    self.releases.push_back((
-                        self.written,
-                        Release::Backlog {
-                            handler,
-                            through: backlog.through,
-                        },
-                    ));
                 }
             }
         }

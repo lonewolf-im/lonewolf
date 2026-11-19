@@ -39,7 +39,7 @@ use lonewolf_extension::{
     Effects, Extension, ExtensionFuture, Extensions, RegistrationError, Slots,
 };
 use lonewolf_storage::account::AccountKey;
-use lonewolf_storage::offline::{OfflineReads, OfflineWrites};
+use lonewolf_storage::offline::{OfflinePage, OfflineReads, OfflineSequence, OfflineWrites};
 use lonewolf_storage::roster::{RosterJid, RosterReads, RosterWrites};
 use lonewolf_storage::{RedbRead, RedbStorage, RedbWrite};
 use lonewolf_util::arena::{Arena, ChunkAllocator};
@@ -1122,6 +1122,24 @@ impl<A: ChunkAllocator> MessageHandler<A, RedbStorage> for SlowOffline {
     ) -> PresenceFuture<'a, Option<lonewolf_extension::message::Backlog>> {
         <Offline as MessageHandler<A, RedbStorage>>::backlog(&self.offline, account, transaction)
     }
+    fn backlog_page<'a>(
+        &'a self,
+        account: &'a AccountKey,
+        transaction: &'a RedbRead,
+        after: OfflineSequence,
+        through: OfflineSequence,
+        page: OfflinePage,
+    ) -> PresenceFuture<'a, OfflinePage> {
+        <Offline as MessageHandler<A, RedbStorage>>::backlog_page(
+            &self.offline,
+            account,
+            transaction,
+            after,
+            through,
+            page,
+        )
+    }
+
     fn acknowledge<'a>(
         &'a self,
         account: &'a AccountKey,

@@ -8,7 +8,9 @@ use std::sync::Arc;
 
 use lonewolf_storage::Storage;
 use lonewolf_storage::account::AccountKey;
-use lonewolf_storage::offline::{OfflineError, OfflineReads, OfflineSequence, OfflineWrites};
+use lonewolf_storage::offline::{
+    OfflineError, OfflinePage, OfflineReads, OfflineSequence, OfflineWrites,
+};
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::stanza::{MessageType, StanzaErrorCondition, StanzaType};
 use serde::Deserialize;
@@ -19,7 +21,7 @@ use crate::message::{Backlog, MessageHandler, StoreFuture, StoreOutcome, Undeliv
 use crate::presence::PresenceFuture;
 use crate::{
     Effects, Extension, ExtensionFactory, ExtensionFuture, HostOptions, OptionsError,
-    RegistrationError, Slots,
+    REPLAY_PAGE_BYTES, RegistrationError, Slots,
 };
 
 pub const NAME: &str = "offline";
@@ -209,26 +211,54 @@ impl<A: ChunkAllocator, S: Storage> MessageHandler<A, S> for Offline {
         transaction: &'a S::Read,
     ) -> PresenceFuture<'a, Option<Backlog>> {
         Box::pin(async move {
-            let messages = transaction
-                .offline_messages(account)
+            let through = transaction
+                .last_offline_sequence(account)
+                .await
+                .map_err(|error| offline_error(error, "offline_backlog"))?;
+            let Some(through) = through else {
+                tracing::info!(
+                    operation = "backlog",
+                    outcome = "empty",
+                    owner_jid = ?account.as_str(),
+                    "offline backlog snapshot read"
+                );
+                return Ok(None);
+            };
+            let page = transaction
+                .offline_page(
+                    account,
+                    None,
+                    through,
+                    REPLAY_PAGE_BYTES,
+                    OfflinePage::new(),
+                )
                 .await
                 .map_err(|error| offline_error(error, "offline_backlog"))?;
             tracing::info!(
                 operation = "backlog",
-                outcome = if messages.is_empty() {
-                    "empty"
-                } else {
-                    "available"
-                },
-                message_count = messages.len(),
+                outcome = "available",
+                page_count = page.len(),
+                complete = page.is_complete(),
                 owner_jid = ?account.as_str(),
                 "offline backlog snapshot read"
             );
-            let Some(last) = messages.last() else {
-                return Ok(None);
-            };
-            let through = last.sequence;
-            Ok(Some(Backlog { messages, through }))
+            Ok(Some(Backlog { through, page }))
+        })
+    }
+
+    fn backlog_page<'a>(
+        &'a self,
+        account: &'a AccountKey,
+        transaction: &'a S::Read,
+        after: OfflineSequence,
+        through: OfflineSequence,
+        page: OfflinePage,
+    ) -> PresenceFuture<'a, OfflinePage> {
+        Box::pin(async move {
+            transaction
+                .offline_page(account, Some(after), through, REPLAY_PAGE_BYTES, page)
+                .await
+                .map_err(|error| offline_error(error, "offline_backlog"))
         })
     }
 

@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::future::Future;
+use std::num::NonZeroUsize;
 
 use ::redb::{ReadableTable, TableDefinition, WriteTransaction};
 
-use super::{OfflineError, OfflineReads, OfflineSequence, OfflineWrites, StoredMessage};
+use super::{
+    OfflineEntry, OfflineError, OfflinePage, OfflineReads, OfflineSequence, OfflineWrites,
+    StoredMessage,
+};
 use crate::account::AccountKey;
 use crate::account::redb::account_exists;
 use crate::redb::{RedbRead, RedbWrite, storage_error};
@@ -32,6 +36,64 @@ macro_rules! offline_reads {
                 self.run(move |transaction| {
                     let table = transaction.open_table(MESSAGES).map_err(storage_error)?;
                     read_messages(&table, &owner)
+                })
+            }
+
+            fn last_offline_sequence(
+                &self,
+                owner: &AccountKey,
+            ) -> impl Future<Output = Result<Option<OfflineSequence>, OfflineError>> + Send {
+                let owner = Box::<str>::from(owner.as_str());
+                self.run(move |transaction| {
+                    let table = transaction.open_table(MESSAGES).map_err(storage_error)?;
+                    let last = table
+                        .range((owner.as_ref(), 0)..=(owner.as_ref(), u64::MAX))
+                        .map_err(storage_error)?
+                        .next_back()
+                        .transpose()
+                        .map_err(storage_error)?;
+                    Ok(last.map(|(key, _)| OfflineSequence::new(key.value().1)))
+                })
+            }
+
+            fn offline_page(
+                &self,
+                owner: &AccountKey,
+                after: Option<OfflineSequence>,
+                through: OfflineSequence,
+                max_bytes: NonZeroUsize,
+                mut page: OfflinePage,
+            ) -> impl Future<Output = Result<OfflinePage, OfflineError>> + Send {
+                let owner = Box::<str>::from(owner.as_str());
+                self.run(move |transaction| {
+                    page.start_read();
+                    let first = after.map_or(Some(0), |sequence| sequence.get().checked_add(1));
+                    let Some(first) = first.filter(|first| *first <= through.get()) else {
+                        page.finish_read(true);
+                        return Ok(page);
+                    };
+                    let table = transaction.open_table(MESSAGES).map_err(storage_error)?;
+                    let mut complete = true;
+                    for entry in table
+                        .range((owner.as_ref(), first)..=(owner.as_ref(), through.get()))
+                        .map_err(storage_error)?
+                    {
+                        let (key, record) = entry.map_err(storage_error)?;
+                        let (stored_at, stanza) = split_message(record.value())?;
+                        if !page.admits(stanza.len(), max_bytes) {
+                            complete = false;
+                            break;
+                        }
+                        page.push(
+                            OfflineEntry {
+                                sequence: OfflineSequence::new(key.value().1),
+                                stored_at,
+                            },
+                            stanza,
+                        );
+                    }
+                    page.finish_read(complete);
+                    Ok(page)
                 })
             }
 
@@ -171,17 +233,21 @@ fn read_messages<T: ReadableTable<(&'static str, u64), &'static [u8]>>(
         .map_err(storage_error)?
     {
         let (key, record) = entry.map_err(storage_error)?;
-        let (stored_at, stanza) = record
-            .value()
-            .split_first_chunk::<{ size_of::<u64>() }>()
-            .ok_or_else(|| StorageError::new(StorageErrorKind::CorruptData))?;
+        let (stored_at, stanza) = split_message(record.value())?;
         messages.push(StoredMessage {
             sequence: OfflineSequence::new(key.value().1),
-            stored_at: u64::from_be_bytes(*stored_at),
+            stored_at,
             stanza: Box::from(stanza),
         });
     }
     Ok(messages)
+}
+
+fn split_message(record: &[u8]) -> Result<(u64, &[u8]), StorageError> {
+    let (stored_at, stanza) = record
+        .split_first_chunk::<{ size_of::<u64>() }>()
+        .ok_or_else(|| StorageError::new(StorageErrorKind::CorruptData))?;
+    Ok((u64::from_be_bytes(*stored_at), stanza))
 }
 
 fn offline_storage_error(error: ::redb::StorageError) -> OfflineError {

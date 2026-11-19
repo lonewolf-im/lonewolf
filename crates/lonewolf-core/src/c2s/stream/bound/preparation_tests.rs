@@ -12,9 +12,11 @@ use lonewolf_extension::delivery::{FailureKind, HostLookup};
 use lonewolf_extension::iq::IqFuture;
 use lonewolf_extension::message::StoreFuture;
 use lonewolf_extension::presence::{PresenceFuture, PresenceHandler};
-use lonewolf_extension::{Effects, Extension, Extensions, RegistrationError, Slots};
+use lonewolf_extension::{
+    Effects, Extension, Extensions, REPLAY_PAGE_BYTES, RegistrationError, Slots,
+};
 use lonewolf_storage::account::AccountWrites;
-use lonewolf_storage::offline::{OfflineReads, OfflineWrites};
+use lonewolf_storage::offline::{OfflinePage, OfflineReads, OfflineWrites};
 use lonewolf_util::arena::GlobalChunkAllocator;
 use parking_lot::Mutex as PlMutex;
 
@@ -178,14 +180,43 @@ impl MessageHandler<GlobalChunkAllocator, RedbStorage> for Gate {
         transaction: &'a RedbRead,
     ) -> PresenceFuture<'a, Option<Backlog>> {
         Box::pin(async move {
-            let messages = transaction
-                .offline_messages(account)
+            let through = transaction
+                .last_offline_sequence(account)
                 .await
                 .map_err(|_| Self::error("offline_backlog"))?;
-            let through = messages.last().map(|last| last.sequence);
-            Ok(through.map(|through| Backlog { through, messages }))
+            let Some(through) = through else {
+                return Ok(None);
+            };
+            let page = transaction
+                .offline_page(
+                    account,
+                    None,
+                    through,
+                    REPLAY_PAGE_BYTES,
+                    OfflinePage::new(),
+                )
+                .await
+                .map_err(|_| Self::error("offline_backlog"))?;
+            Ok(Some(Backlog { through, page }))
         })
     }
+
+    fn backlog_page<'a>(
+        &'a self,
+        account: &'a AccountKey,
+        transaction: &'a RedbRead,
+        after: OfflineSequence,
+        through: OfflineSequence,
+        page: OfflinePage,
+    ) -> PresenceFuture<'a, OfflinePage> {
+        Box::pin(async move {
+            transaction
+                .offline_page(account, Some(after), through, REPLAY_PAGE_BYTES, page)
+                .await
+                .map_err(|_| Self::error("offline_backlog"))
+        })
+    }
+
     fn acknowledge<'a>(
         &'a self,
         account: &'a AccountKey,
@@ -673,6 +704,47 @@ fn vcard_waiting_writer_is_cancelled_by_retirement_before_deleted_account_recrea
         recreation.commit().await?;
         assert!(fixture.storage.begin_read().await?.vcard(owner).await?.is_none());
         assert!(session.outbox.queue.is_empty());
+        drop(session);
+        fixture.finish().await
+    })
+}
+
+#[test]
+fn first_offline_page_is_counted_when_the_presence_echo_write_fails() -> TestResult {
+    use crate::c2s::metrics::C2sMetrics;
+
+    Runtime::new()?.block_on(async {
+        let stored = b"<message xmlns='jabber:client' to='bob@localhost' type='chat' id='replay'/>";
+        let fixture = Fixture::new(&[stored]).await?;
+        let (gate, _entered, release) = Gate::new(Outcome::Commit);
+        release.send(()).map_err(|_| "preparation cancelled")?;
+        let fixture = enable(fixture, &gate)?;
+        let (mut session, _output_entered, _output_release) = session(&fixture, true).await?;
+        let metrics = C2sMetrics::detached();
+        session.outbox.metrics = metrics.worker(0, 0);
+        session.outbox.writer.fail_write = true;
+
+        session
+            .handle_availability(parsed("<presence id='echo'/>").await?, true)
+            .await
+            .map_err(|error| format!("{error:?}"))?;
+        assert_eq!(session.outbox.flush().await, Err(CloseOutcome::TransportError));
+        assert!(session.outbox.writer.written.is_empty());
+        assert_eq!(fixture.count().await?, 1);
+
+        let body = metrics.render()?;
+        let bytes = format!(
+            r#"lonewolf_c2s_replay_bytes_total{{listener="0",kind="offline_message"}} {}"#,
+            stored.len()
+        );
+        for sample in [
+            r#"lonewolf_c2s_replay_pages_total{listener="0",kind="offline_message"} 1"#,
+            &bytes,
+            r#"lonewolf_c2s_replay_records_total{listener="0",kind="offline_message",outcome="delivered"} 0"#,
+            r#"lonewolf_c2s_replay_records_total{listener="0",kind="offline_message",outcome="invalid"} 0"#,
+        ] {
+            assert!(body.lines().any(|line| line == sample), "{body}");
+        }
         drop(session);
         fixture.finish().await
     })

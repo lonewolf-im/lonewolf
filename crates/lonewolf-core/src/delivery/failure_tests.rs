@@ -239,6 +239,24 @@ impl OfflineReads for FailedCommit {
     ) -> Result<Vec<StoredMessage>, OfflineError> {
         unreachable!("commit test cannot use storage operations")
     }
+    async fn last_offline_sequence(
+        &self,
+        _: &AccountKey,
+    ) -> Result<Option<OfflineSequence>, OfflineError> {
+        unreachable!("commit test cannot use storage operations")
+    }
+
+    async fn offline_page(
+        &self,
+        _: &AccountKey,
+        _: Option<OfflineSequence>,
+        _: OfflineSequence,
+        _: NonZeroUsize,
+        _: OfflinePage,
+    ) -> Result<OfflinePage, OfflineError> {
+        unreachable!("commit test cannot use storage operations")
+    }
+
     async fn offline_count(&self, _owner: &AccountKey) -> Result<usize, OfflineError> {
         unreachable!("commit test cannot use storage operations")
     }

@@ -49,6 +49,7 @@ pub(super) struct ControlledWriter {
     pub(super) written: Vec<String>,
     pub(super) flushed: Vec<OutputSequence>,
     pub(super) bytes: String,
+    partial_after: usize,
     pub(super) partial_entered: Option<oneshot::Sender<()>>,
     pub(super) partial_release: Option<oneshot::Receiver<()>>,
     pub(super) fail_write: bool,
@@ -82,7 +83,9 @@ impl ControlledWriter {
         stanza
             .write_xml(&mut xml)
             .map_err(|_| CloseOutcome::InternalError)?;
-        if let Some(release) = self.partial_release.take() {
+        if self.written.len() == self.partial_after
+            && let Some(release) = self.partial_release.take()
+        {
             let split = xml.len() / 2;
             self.bytes.push_str(&xml[..split]);
             if let Some(entered) = self.partial_entered.take() {

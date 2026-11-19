@@ -22,6 +22,7 @@ use self::backend::{FailingSyncBackend, ObservedBackend};
 use super::initialize;
 use crate::account::redb::{ACCOUNTS, DECOY_SECRET, DECOY_SECRET_KEY};
 use crate::account::{AccountReads, AccountWrites};
+use crate::blocking::redb::ITEMS as BLOCKLIST_ITEMS;
 use crate::offline::redb::{MESSAGES, SEQUENCES};
 use crate::offline::{OfflineReads, OfflineWrites};
 use crate::private::redb::ELEMENTS;
@@ -72,7 +73,7 @@ fn fresh_database_initializes_all_tables() -> TestResult {
     let storage = RedbStorage::new(database)?;
     let transaction = storage.as_ref().begin_read()?;
     let tables: Vec<_> = transaction.list_tables()?.collect();
-    assert_eq!(tables.len(), 9);
+    assert_eq!(tables.len(), 10);
     for expected in [
         ACCOUNTS.name(),
         DECOY_SECRET.name(),
@@ -83,6 +84,7 @@ fn fresh_database_initializes_all_tables() -> TestResult {
         SEQUENCES.name(),
         VCARDS.name(),
         ELEMENTS.name(),
+        BLOCKLIST_ITEMS.name(),
     ] {
         assert!(
             tables.iter().any(|table| table.name() == expected),
@@ -167,7 +169,7 @@ fn unknown_tables_are_left_untouched() -> TestResult {
     let reinitialized = initialize(storage.as_ref())?;
     assert_eq!(decoy_salt(&reinitialized)?, before);
     let transaction = storage.as_ref().begin_read()?;
-    assert_eq!(transaction.list_tables()?.count(), 10);
+    assert_eq!(transaction.list_tables()?.count(), 11);
     assert_eq!(
         transaction
             .open_table(METADATA)?
@@ -206,7 +208,7 @@ fn existing_database_gains_offline_tables_without_changing_accounts() -> TestRes
         Ok::<_, Box<dyn Error>>(())
     })?;
     let reader = storage.as_ref().begin_read()?;
-    assert_eq!(reader.list_tables()?.count(), 9);
+    assert_eq!(reader.list_tables()?.count(), 10);
     reader.open_table(MESSAGES)?;
     reader.open_table(SEQUENCES)?;
     Ok(())
@@ -988,7 +990,7 @@ fn existing_database_gains_only_an_empty_vcard_table_without_rewriting_other_row
     transaction.open_table(METADATA)?.insert("unknown", 42)?;
     transaction.commit()?;
     let before = storage.as_ref().begin_read()?;
-    assert_eq!(before.list_tables()?.count(), 8);
+    assert_eq!(before.list_tables()?.count(), 9);
     let snapshot = |transaction: &::redb::ReadTransaction| -> TestResult<_> {
         let account = transaction
             .open_table(ACCOUNTS)?
@@ -1046,7 +1048,7 @@ fn existing_database_gains_only_an_empty_vcard_table_without_rewriting_other_row
     let expected = snapshot(&before)?;
     initialize(storage.as_ref())?;
     let after = storage.as_ref().begin_read()?;
-    assert_eq!(after.list_tables()?.count(), 10);
+    assert_eq!(after.list_tables()?.count(), 11);
     assert!(after.open_table(VCARDS)?.is_empty()?);
     assert!(after.open_table(ELEMENTS)?.is_empty()?);
     assert_eq!(snapshot(&after)?, expected);

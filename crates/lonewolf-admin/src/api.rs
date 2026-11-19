@@ -183,8 +183,7 @@ struct Api<S> {
     storage: S,
     deleter: Arc<dyn AccountDeleter>,
     passwords: BlockingExecutor,
-    /// Serializes creation and deletion of one account on this node, so no account can
-    /// bind sessions until a deleted account's sessions are gone.
+    /// New sessions must wait until account deletion retires the old sessions.
     lifecycle: [Mutex<()>; LIFECYCLE_SHARDS],
     hash_state: RandomState,
 }
@@ -543,6 +542,9 @@ mod tests {
     use lonewolf_auth::server::ScramDecoy;
     use lonewolf_storage::ReadTransaction;
     use lonewolf_storage::account::Account;
+    use lonewolf_storage::blocking::{
+        BlockChange, BlockDelta, BlockError, BlockingReads, BlockingWrites,
+    };
     use lonewolf_storage::offline::{
         OfflineError, OfflinePage, OfflineReads, OfflineSequence, OfflineWrites, StoredMessage,
     };
@@ -550,8 +552,9 @@ mod tests {
         PrivateXmlChange, PrivateXmlError, PrivateXmlQuota, PrivateXmlReads, PrivateXmlWrites,
         StoredPrivateXml,
     };
-    use lonewolf_storage::roster::{self, RosterReads, RosterWrites};
+    use lonewolf_storage::roster::{self, RosterJid, RosterReads, RosterWrites};
     use lonewolf_storage::vcard::{StoredVCard, VCardError, VCardQuota, VCardReads, VCardWrites};
+    use lonewolf_xmpp::jid::JidRef;
     use parking_lot::{Mutex as PlMutex, MutexGuard as PlMutexGuard};
     use serde_json::{Value, json};
 
@@ -930,6 +933,26 @@ mod tests {
         }
 
         async fn clear_private_xml(&mut self, _: &AccountKey) -> Result<(), PrivateXmlError> {
+            unreachable!()
+        }
+    }
+
+    impl BlockingReads for MemoryTransaction {
+        async fn blocklist(&self, _: &AccountKey) -> Result<Vec<RosterJid>, BlockError> {
+            unreachable!()
+        }
+
+        async fn is_blocked(&self, _: &AccountKey, _: JidRef<'_>) -> Result<bool, BlockError> {
+            unreachable!()
+        }
+    }
+
+    impl BlockingWrites for MemoryTransaction {
+        async fn change_blocklist(
+            &mut self,
+            _: &AccountKey,
+            _: BlockChange<'_>,
+        ) -> Result<BlockDelta, BlockError> {
             unreachable!()
         }
     }

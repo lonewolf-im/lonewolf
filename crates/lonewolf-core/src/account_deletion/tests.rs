@@ -17,10 +17,12 @@ use lonewolf_auth::scram::{
     SCRAM_POLICY_ITERATIONS, ScramCredentials, ScramSha1Verifier, ScramVerifier,
 };
 use lonewolf_storage::account::{AccountKey, AccountReads, AccountWrites, NewAccount};
+use lonewolf_storage::blocking::{BlockChange, BlockingReads, BlockingWrites};
 use lonewolf_storage::offline::{OfflineReads, OfflineWrites};
 use lonewolf_storage::private::{
     PrivateXmlChange, PrivateXmlQuota, PrivateXmlReads, PrivateXmlWrites,
 };
+use lonewolf_storage::roster::RosterJid;
 use lonewolf_storage::vcard::{MAX_VCARD_BYTES, VCardQuota, VCardReads, VCardWrites};
 use lonewolf_storage::{RedbStorage, Storage, StorageErrorKind, WriteTransaction};
 use lonewolf_util::arena::{Arena, ArenaConfig, GlobalChunkAllocator};
@@ -366,7 +368,7 @@ fn deletion_waits_for_older_effects_before_session_retirement_and_completion() -
         assert!(storage.begin_read().await?.vcard(&alice).await?.is_none());
         assert!(session.liveness().is_alive());
         let carol = key("carol@localhost")?;
-        // The commit is visible before the deletion is polled to admit its barrier and release the ordering lock.
+        // A visible commit can precede barrier admission and release of the ordering lock.
         let (_, mut later) = select_biased! {
             result = deletion.as_mut().fuse() => { result?; return Err("deletion completed ahead of older effects".into()); },
             later = handle.order().fix(vec![carol], async { TestResult::Ok(()) }).fuse() => later?,
@@ -532,6 +534,57 @@ fn disabled_extension_cleanup_removes_only_the_deleted_owners_private_xml() -> T
                 .await?
                 .is_none()
         );
+        router.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn delete_with_blocking_disabled_clears_only_owner_rules() -> TestResult {
+    run_test(async {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("storage.redb");
+        let storage = RedbStorage::open(&path)?;
+        let router = router()?;
+        let handle = router.handle();
+        let alice = key("Alice@LOCALHOST")?;
+        let bob = key("bob@localhost")?;
+        let alice_rules = [RosterJid::from(&bob)];
+        let bob_rules = [RosterJid::from(&alice)];
+        assert!(handle.account_handlers(alice.domain()).is_empty());
+
+        let mut writer = storage.begin_write().await?;
+        writer.create_account(new_account(&alice)).await?;
+        writer.create_account(new_account(&bob)).await?;
+        writer
+            .change_blocklist(&alice, BlockChange::Block(&alice_rules))
+            .await?;
+        writer
+            .change_blocklist(&bob, BlockChange::Block(&bob_rules))
+            .await?;
+        writer.commit().await?;
+
+        let before = storage.begin_read().await?;
+        assert!(delete(&alice, &storage, &handle, &GlobalChunkAllocator).await?);
+        assert!(before.account(&alice).await?.is_some());
+        assert_eq!(before.blocklist(&alice).await?, alice_rules);
+        let after = storage.begin_read().await?;
+        assert!(after.account(&alice).await?.is_none());
+        assert!(after.blocklist(&alice).await?.is_empty());
+        assert_eq!(after.blocklist(&bob).await?, bob_rules);
+
+        let mut writer = storage.begin_write().await?;
+        writer.create_account(new_account(&alice)).await?;
+        writer.commit().await?;
+        drop(after);
+        drop(before);
+        drop(storage);
+
+        let reopened = RedbStorage::open(&path)?;
+        let current = reopened.begin_read().await?;
+        assert!(current.account(&alice).await?.is_some());
+        assert!(current.blocklist(&alice).await?.is_empty());
+        assert_eq!(current.blocklist(&bob).await?, bob_rules);
         router.shutdown().await?;
         Ok(())
     })

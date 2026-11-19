@@ -6,25 +6,20 @@ use lonewolf_auth::server::ScramDecoy;
 
 use crate::StorageError;
 use crate::account::{AccountReads, AccountWrites};
+use crate::blocking::{BlockingReads, BlockingWrites};
 use crate::offline::{OfflineReads, OfflineWrites};
 use crate::private::{PrivateXmlReads, PrivateXmlWrites};
 use crate::roster::{RosterReads, RosterWrites};
 use crate::vcard::{VCardReads, VCardWrites};
 
-/// One store, which is one transaction domain.
-///
-/// Every operation runs on a transaction obtained from [`Self::begin_read`] or
-/// [`Self::begin_write`]. A transaction must hold storage work only: awaiting
-/// anything else while one is open can stall every other write on the store.
+/// Await only storage work while a transaction is open to avoid stalling other writes.
 pub trait Storage: Clone + Send + Sync + 'static {
     type Read: ReadTransaction + 'static;
     type Write: WriteTransaction + RosterWrites<Snapshot = Self::Read>;
 
-    /// Opens a read transaction over one consistent snapshot.
+    /// Reads use one consistent snapshot.
     fn begin_read(&self) -> impl Future<Output = Result<Self::Read, StorageError>> + Send;
 
-    /// Opens a write transaction. A store admits one at a time unless it can keep the
-    /// reads of concurrent write transactions stable, as [`WriteTransaction`] requires.
     fn begin_write(&self) -> impl Future<Output = Result<Self::Write, StorageError>> + Send;
 
     /// The per-store secret that keeps authentication timing equal for absent accounts.
@@ -32,19 +27,28 @@ pub trait Storage: Clone + Send + Sync + 'static {
 }
 
 pub trait ReadTransaction:
-    AccountReads + OfflineReads + PrivateXmlReads + RosterReads + VCardReads + Send + Sync
+    AccountReads
+    + BlockingReads
+    + OfflineReads
+    + PrivateXmlReads
+    + RosterReads
+    + VCardReads
+    + Send
+    + Sync
 {
 }
 
-/// Writes commit atomically, and values read stay stable until commit or abort.
-/// The store must serialize writers or lock all values read; read-committed isolation is insufficient.
-///
-/// Dropping the transaction without committing aborts every write in it.
+/// Writes commit atomically and reads stay stable until commit or abort.
+/// Dropping an uncommitted transaction discards all its writes.
 pub trait WriteTransaction:
-    ReadTransaction + AccountWrites + OfflineWrites + PrivateXmlWrites + RosterWrites + VCardWrites
+    ReadTransaction
+    + AccountWrites
+    + BlockingWrites
+    + OfflineWrites
+    + PrivateXmlWrites
+    + RosterWrites
+    + VCardWrites
 {
-    /// Persists every write made through this transaction.
-    ///
     /// # Errors
     ///
     /// [`crate::StorageErrorKind::CommitUnknown`] means the writes may have landed.

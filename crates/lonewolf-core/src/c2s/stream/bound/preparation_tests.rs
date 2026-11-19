@@ -12,9 +12,11 @@ use lonewolf_extension::delivery::{FailureKind, HostLookup};
 use lonewolf_extension::iq::IqFuture;
 use lonewolf_extension::message::StoreFuture;
 use lonewolf_extension::presence::{PresenceFuture, PresenceHandler};
-use lonewolf_extension::{Effects, Extension, Extensions, RegistrationError, Slots};
+use lonewolf_extension::{
+    Effects, Extension, Extensions, REPLAY_PAGE_BYTES, RegistrationError, Slots,
+};
 use lonewolf_storage::account::AccountWrites;
-use lonewolf_storage::offline::{OfflineReads, OfflineWrites};
+use lonewolf_storage::offline::{OfflinePage, OfflineReads, OfflineWrites};
 use lonewolf_util::arena::GlobalChunkAllocator;
 use parking_lot::Mutex as PlMutex;
 
@@ -178,14 +180,43 @@ impl MessageHandler<GlobalChunkAllocator, RedbStorage> for Gate {
         transaction: &'a RedbRead,
     ) -> PresenceFuture<'a, Option<Backlog>> {
         Box::pin(async move {
-            let messages = transaction
-                .offline_messages(account)
+            let through = transaction
+                .last_offline_sequence(account)
                 .await
                 .map_err(|_| Self::error("offline_backlog"))?;
-            let through = messages.last().map(|last| last.sequence);
-            Ok(through.map(|through| Backlog { through, messages }))
+            let Some(through) = through else {
+                return Ok(None);
+            };
+            let page = transaction
+                .offline_page(
+                    account,
+                    None,
+                    through,
+                    REPLAY_PAGE_BYTES,
+                    OfflinePage::new(),
+                )
+                .await
+                .map_err(|_| Self::error("offline_backlog"))?;
+            Ok(Some(Backlog { through, page }))
         })
     }
+
+    fn backlog_page<'a>(
+        &'a self,
+        account: &'a AccountKey,
+        transaction: &'a RedbRead,
+        after: OfflineSequence,
+        through: OfflineSequence,
+        page: OfflinePage,
+    ) -> PresenceFuture<'a, OfflinePage> {
+        Box::pin(async move {
+            transaction
+                .offline_page(account, Some(after), through, REPLAY_PAGE_BYTES, page)
+                .await
+                .map_err(|_| Self::error("offline_backlog"))
+        })
+    }
+
     fn acknowledge<'a>(
         &'a self,
         account: &'a AccountKey,

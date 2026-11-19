@@ -848,7 +848,9 @@ fn unknown_message_type_round_trips_through_offline_storage_with_inherited_langu
 
 #[test]
 fn offline_backlog_larger_than_one_page_replays_in_order_and_reports_pages() -> TestResult {
-    let record_len = 262_144 / 2;
+    use lonewolf_extension::REPLAY_PAGE_BYTES;
+
+    let record_len = REPLAY_PAGE_BYTES.get() / 2;
     let messages: [String; 5] = std::array::from_fn(|index| {
         let mut xml = format!(
             "<message xmlns='jabber:client' to='bob@localhost' type='chat' id='page-{index}'><body>"

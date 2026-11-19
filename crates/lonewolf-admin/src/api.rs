@@ -544,7 +544,7 @@ mod tests {
     use lonewolf_storage::ReadTransaction;
     use lonewolf_storage::account::Account;
     use lonewolf_storage::offline::{
-        OfflineError, OfflineReads, OfflineSequence, OfflineWrites, StoredMessage,
+        OfflineError, OfflinePage, OfflineReads, OfflineSequence, OfflineWrites, StoredMessage,
     };
     use lonewolf_storage::private::{
         PrivateXmlChange, PrivateXmlError, PrivateXmlQuota, PrivateXmlReads, PrivateXmlWrites,
@@ -929,6 +929,24 @@ mod tests {
             &self,
             _: &AccountKey,
         ) -> Result<Vec<StoredMessage>, OfflineError> {
+            unreachable!()
+        }
+
+        async fn last_offline_sequence(
+            &self,
+            _: &AccountKey,
+        ) -> Result<Option<OfflineSequence>, OfflineError> {
+            unreachable!()
+        }
+
+        async fn offline_page(
+            &self,
+            _: &AccountKey,
+            _: Option<OfflineSequence>,
+            _: OfflineSequence,
+            _: NonZeroUsize,
+            _: OfflinePage,
+        ) -> Result<OfflinePage, OfflineError> {
             unreachable!()
         }
 

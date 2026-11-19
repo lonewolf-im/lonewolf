@@ -121,6 +121,41 @@ impl RejectReason {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ReplayKind {
+    OfflineMessage,
+}
+
+impl ReplayKind {
+    const ALL: [Self; 1] = [Self::OfflineMessage];
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::OfflineMessage => "offline_message",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ReplayOutcome {
+    Delivered,
+    Invalid,
+}
+
+impl ReplayOutcome {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Delivered => "delivered",
+            Self::Invalid => "invalid",
+        }
+    }
+}
+
+const REPLAY_RECORDS: [(ReplayKind, ReplayOutcome); 2] = [
+    (ReplayKind::OfflineMessage, ReplayOutcome::Delivered),
+    (ReplayKind::OfflineMessage, ReplayOutcome::Invalid),
+];
+
 struct C2sCounters {
     connections: AtomicU64,
     accepted: AtomicU64,
@@ -135,6 +170,9 @@ struct C2sCounters {
     received_bytes: AtomicU64,
     sent_bytes: AtomicU64,
     rate_limited: [AtomicU64; RateLimit::ALL.len()],
+    replay_pages: [AtomicU64; ReplayKind::ALL.len()],
+    replay_bytes: [AtomicU64; ReplayKind::ALL.len()],
+    replay_records: [AtomicU64; REPLAY_RECORDS.len()],
 }
 
 impl Default for C2sCounters {
@@ -152,6 +190,9 @@ impl Default for C2sCounters {
             received_bytes: AtomicU64::new(0),
             sent_bytes: AtomicU64::new(0),
             rate_limited: std::array::from_fn(|_| AtomicU64::new(0)),
+            replay_pages: std::array::from_fn(|_| AtomicU64::new(0)),
+            replay_bytes: std::array::from_fn(|_| AtomicU64::new(0)),
+            replay_records: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 }
@@ -246,6 +287,24 @@ impl C2sWorkerMetrics {
 
     pub(super) fn rate_limited(&self, limit: RateLimit) {
         self.0.counters.rate_limited[limit as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn replay_page_read(&self, kind: ReplayKind, bytes: usize) {
+        let counters = &self.0.counters;
+        counters.replay_pages[kind as usize].fetch_add(1, Ordering::Relaxed);
+        counters.replay_bytes[kind as usize]
+            .fetch_add(u64::try_from(bytes).unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+
+    pub(super) fn replay_records(&self, kind: ReplayKind, outcome: ReplayOutcome, count: usize) {
+        let index = REPLAY_RECORDS
+            .iter()
+            .position(|pair| *pair == (kind, outcome));
+        debug_assert!(index.is_some());
+        if let Some(index) = index {
+            self.0.counters.replay_records[index]
+                .fetch_add(u64::try_from(count).unwrap_or(u64::MAX), Ordering::Relaxed);
+        }
     }
 
     /// Ignores `StreamPhase::Bound`, which has no negotiation duration.
@@ -656,6 +715,55 @@ impl Collector for C2sCollector {
             }
         }
         let mut family = encoder.encode_descriptor(
+            "c2s_replay_pages",
+            "Stored-record pages read for client replay, by listener and record kind.",
+            None,
+            MetricType::Counter,
+        )?;
+        for (listener, workers) in metrics.listeners.iter().enumerate() {
+            for kind in ReplayKind::ALL {
+                ConstCounter::new(sum(workers, |c| &c.replay_pages[kind as usize])).encode(
+                    family.encode_family(&ReplayLabels {
+                        listener,
+                        kind: kind.as_str(),
+                    })?,
+                )?;
+            }
+        }
+        let mut family = encoder.encode_descriptor(
+            "c2s_replay",
+            "Stored stanza bytes copied into client replay pages, by listener and record kind.",
+            Some(&Unit::Bytes),
+            MetricType::Counter,
+        )?;
+        for (listener, workers) in metrics.listeners.iter().enumerate() {
+            for kind in ReplayKind::ALL {
+                ConstCounter::new(sum(workers, |c| &c.replay_bytes[kind as usize])).encode(
+                    family.encode_family(&ReplayLabels {
+                        listener,
+                        kind: kind.as_str(),
+                    })?,
+                )?;
+            }
+        }
+        let mut family = encoder.encode_descriptor(
+            "c2s_replay_records",
+            "Stored records written or dropped during client replay, by listener, record kind and outcome.",
+            None,
+            MetricType::Counter,
+        )?;
+        for (listener, workers) in metrics.listeners.iter().enumerate() {
+            for (index, (kind, outcome)) in REPLAY_RECORDS.into_iter().enumerate() {
+                ConstCounter::new(sum(workers, |c| &c.replay_records[index])).encode(
+                    family.encode_family(&ReplayRecordLabels {
+                        listener,
+                        kind: kind.as_str(),
+                        outcome: outcome.as_str(),
+                    })?,
+                )?;
+            }
+        }
+        let mut family = encoder.encode_descriptor(
             "c2s_phase_duration",
             "Time to complete each stream negotiation phase.",
             Some(&Unit::Seconds),
@@ -718,6 +826,17 @@ struct LimitLabels {
     limit: &'static str,
 }
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct ReplayLabels {
+    listener: usize,
+    kind: &'static str,
+}
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct ReplayRecordLabels {
+    listener: usize,
+    kind: &'static str,
+    outcome: &'static str,
+}
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct PhaseLabels {
     phase: &'static str,
 }
@@ -725,6 +844,41 @@ struct PhaseLabels {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_counters_export_all_valid_series_at_zero() -> Result<(), fmt::Error> {
+        let body = C2sMetrics::detached().render()?;
+        for sample in [
+            r#"lonewolf_c2s_replay_pages_total{listener="0",kind="offline_message"} 0"#,
+            r#"lonewolf_c2s_replay_bytes_total{listener="0",kind="offline_message"} 0"#,
+            r#"lonewolf_c2s_replay_records_total{listener="0",kind="offline_message",outcome="delivered"} 0"#,
+            r#"lonewolf_c2s_replay_records_total{listener="0",kind="offline_message",outcome="invalid"} 0"#,
+        ] {
+            assert!(body.lines().any(|line| line == sample), "{body}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn replay_counters_sum_pages_bytes_and_records() -> Result<(), fmt::Error> {
+        let metrics = C2sMetrics::detached();
+        let worker = metrics.worker(0, 0);
+        let kind = ReplayKind::OfflineMessage;
+        worker.replay_page_read(kind, 10);
+        worker.replay_page_read(kind, 5);
+        worker.replay_records(kind, ReplayOutcome::Delivered, 3);
+        worker.replay_records(kind, ReplayOutcome::Invalid, 1);
+        let body = metrics.render()?;
+        for sample in [
+            r#"lonewolf_c2s_replay_pages_total{listener="0",kind="offline_message"} 2"#,
+            r#"lonewolf_c2s_replay_bytes_total{listener="0",kind="offline_message"} 15"#,
+            r#"lonewolf_c2s_replay_records_total{listener="0",kind="offline_message",outcome="delivered"} 3"#,
+            r#"lonewolf_c2s_replay_records_total{listener="0",kind="offline_message",outcome="invalid"} 1"#,
+        ] {
+            assert!(body.lines().any(|line| line == sample), "{body}");
+        }
+        Ok(())
+    }
 
     #[test]
     fn kind_and_limit_indexes_follow_their_order() {

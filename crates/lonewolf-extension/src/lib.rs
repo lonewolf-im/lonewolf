@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -35,6 +36,9 @@ pub mod vcard;
 pub mod version;
 
 pub use slots::Slots;
+
+/// Stored stanza bytes one replay page may hold; a larger single record fills a page alone.
+pub const REPLAY_PAGE_BYTES: NonZeroUsize = NonZeroUsize::new(262_144).unwrap();
 
 pub type ExtensionFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 

@@ -5,9 +5,11 @@ pub mod redb;
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
+use std::num::NonZeroUsize;
 
 use crate::StorageError;
 use crate::account::AccountKey;
+use crate::page::StoredPage;
 
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub struct OfflineSequence(u64);
@@ -21,6 +23,15 @@ impl OfflineSequence {
         self.0
     }
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OfflineEntry {
+    pub sequence: OfflineSequence,
+    /// Seconds since the Unix epoch.
+    pub stored_at: u64,
+}
+
+pub type OfflinePage = StoredPage<OfflineEntry>;
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct StoredMessage {
@@ -50,11 +61,30 @@ pub enum OfflineError {
 }
 
 pub trait OfflineReads {
-    /// Returns all stored messages in sequence order.
+    /// Copies every stored message in sequence order; delivery paths read pages instead.
     fn offline_messages(
         &self,
         owner: &AccountKey,
     ) -> impl Future<Output = Result<Vec<StoredMessage>, OfflineError>> + Send;
+
+    /// Returns the highest stored sequence, or `None` when no message is stored.
+    fn last_offline_sequence(
+        &self,
+        owner: &AccountKey,
+    ) -> impl Future<Output = Result<Option<OfflineSequence>, OfflineError>> + Send;
+
+    /// Refills `page` with messages after `after` and up to `through`, in sequence order.
+    ///
+    /// The page holds at least one message when any remain, and stops before a message
+    /// that would take its stanza bytes over `max_bytes`.
+    fn offline_page(
+        &self,
+        owner: &AccountKey,
+        after: Option<OfflineSequence>,
+        through: OfflineSequence,
+        max_bytes: NonZeroUsize,
+        page: OfflinePage,
+    ) -> impl Future<Output = Result<OfflinePage, OfflineError>> + Send;
 
     fn offline_count(
         &self,

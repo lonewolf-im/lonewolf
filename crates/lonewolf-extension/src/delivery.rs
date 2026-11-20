@@ -33,6 +33,8 @@ pub enum SessionTag {
     Interested,
     /// The resource enabled Message Carbons and receives forwarded copies.
     Carbons,
+    /// The resource fetched its account's blocklist and receives blocklist pushes.
+    Blocklist,
 }
 
 impl SessionTag {
@@ -295,27 +297,24 @@ mod tests {
 
     #[test]
     fn session_tags_insert_and_remove_each_tag_independently() {
-        for (tag, other) in [
-            (SessionTag::Interested, SessionTag::Carbons),
-            (SessionTag::Carbons, SessionTag::Interested),
-        ] {
+        let all = [
+            SessionTag::Interested,
+            SessionTag::Carbons,
+            SessionTag::Blocklist,
+        ];
+        for tag in all {
             let mut tags = SessionTags::default();
             tags.remove(tag);
             assert_eq!(tags, SessionTags::default());
-            tags.insert(other);
-            tags.remove(tag);
-            assert!(tags.contains(other));
-            assert!(!tags.contains(tag));
-            tags.insert(tag);
-            assert!(tags.contains(tag));
-            assert!(tags.contains(other));
-            for _ in 0..2 {
-                tags.remove(tag);
-                assert!(!tags.contains(tag));
-                assert!(tags.contains(other));
+            for candidate in all {
+                tags.insert(candidate);
             }
-            tags.remove(other);
-            assert_eq!(tags, SessionTags::default());
+            assert!(all.into_iter().all(|candidate| tags.contains(candidate)));
+            tags.remove(tag);
+            tags.remove(tag);
+            for candidate in all {
+                assert_eq!(tags.contains(candidate), candidate != tag);
+            }
         }
     }
 }

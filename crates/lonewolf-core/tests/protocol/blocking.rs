@@ -2,7 +2,9 @@
 
 use compio::runtime::Runtime;
 use lonewolf_storage::account::AccountKey;
-use lonewolf_storage::blocking::{BlockChange, BlockingWrites};
+use lonewolf_storage::blocking::{
+    BlockChange, BlockingWrites, MAX_BLOCKLIST_ITEM_BYTES, MAX_BLOCKLIST_ITEMS,
+};
 use lonewolf_storage::roster::RosterJid;
 use lonewolf_storage::{RedbStorage, Storage, WriteTransaction};
 use lonewolf_util::arena::Arena;
@@ -108,6 +110,53 @@ fn blocklist_get_rejects_invalid_content_and_non_owner_destinations() -> TestRes
         let error = reply.child("jabber:client", "error")?;
         assert_eq!(error.attribute("type"), Some("auth"), "{error:?}");
         error.child("urn:ietf:params:xml:ns:xmpp-stanzas", "forbidden")?;
+    }
+    alice.close()?;
+    suite.stop()
+}
+
+#[test]
+fn full_blocklist_fits_in_one_client_reply() -> TestResult {
+    let mut suite = C2sSuite::with_extensions("'blocking'")?;
+    suite.create_account("alice", PASSWORD)?;
+    suite.stop()?;
+    let items = {
+        let store = RedbStorage::open(suite.fixture_path().join("data/lonewolf.dat"))?;
+        let mut arena = Arena::try_new(Default::default())?;
+        let owner =
+            AccountKey::try_from(Jid::parse_in("alice@localhost", &mut arena)?.resolve(&arena)?)?;
+        let item_bytes = MAX_BLOCKLIST_ITEM_BYTES / MAX_BLOCKLIST_ITEMS;
+        let mut items = Vec::with_capacity(MAX_BLOCKLIST_ITEMS);
+        for index in 0..MAX_BLOCKLIST_ITEMS {
+            let prefix = format!("contact{index:04}@example.org/Desk&");
+            let padding =
+                item_bytes - (prefix.len() - 1 + "&amp;".len() + "<item jid=\"\"/>".len());
+            let jid = Jid::parse_in(&format!("{prefix}{}", "x".repeat(padding)), &mut arena)?;
+            items.push(RosterJid::from(jid.resolve(&arena)?));
+        }
+        Runtime::new()?.block_on(async {
+            let mut tx = store.begin_write().await?;
+            tx.change_blocklist(&owner, BlockChange::Block(&items))
+                .await?;
+            tx.commit().await?;
+            TestResult::Ok(())
+        })?;
+        items
+    };
+    suite.restart()?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    alice.send("<iq type='get' id='full'><blocklist xmlns='urn:xmpp:blocking'/></iq>")?;
+    let reply = alice.receive()?;
+    reply.assert_name("jabber:client", "iq");
+    assert_eq!(reply.attribute("type"), Some("result"));
+    assert_eq!(reply.attribute("id"), Some("full"));
+    assert_eq!(reply.children.len(), 1);
+    let blocklist = reply.child("urn:xmpp:blocking", "blocklist")?;
+    assert_eq!(blocklist.children.len(), items.len());
+    for (item, jid) in blocklist.children.iter().zip(&items) {
+        item.assert_name("urn:xmpp:blocking", "item");
+        assert_eq!(item.attribute("jid"), Some(jid.as_str()));
+        assert!(item.children.is_empty());
     }
     alice.close()?;
     suite.stop()

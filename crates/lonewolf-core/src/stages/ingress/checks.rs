@@ -46,7 +46,11 @@ pub(crate) fn parties_for<A: ChunkAllocator + Clone>(
     let recipient_needed = local_recipient
         && ((!same_account && !router.policies(to.domainpart()).is_empty())
             || (kind == StanzaKind::Message
-                && (router.archive_handler(to.domainpart()).is_some()
+                && ((!same_account
+                    && sender.is_some_and(|sender| {
+                        policy::Selection::Explicit.configured(router, sender.domain())
+                    }))
+                    || router.archive_handler(to.domainpart()).is_some()
                     || !router.message_observers(to.domainpart()).is_empty())));
     Ok(Parties {
         local_recipient,
@@ -229,7 +233,7 @@ pub(crate) async fn observe_message<A: ChunkAllocator + Clone>(
     origin: &Origin<'_, A>,
     parties: &Parties,
     stanza: &RoutedStanza<A>,
-    outcome: &DeliveryOutcome<A>,
+    outcome: &mut DeliveryOutcome<A>,
     archived: (Option<ArchiveId>, Option<ArchiveId>),
     rejection: Option<&RoutedStanza<A>>,
 ) {
@@ -251,18 +255,18 @@ pub(crate) async fn observe_from<A: ChunkAllocator + Clone>(
     session: Option<&SessionHandle<A>>,
     parties: &Parties,
     stanza: &RoutedStanza<A>,
-    outcome: &DeliveryOutcome<A>,
+    delivery_outcome: &mut DeliveryOutcome<A>,
     archived: (Option<ArchiveId>, Option<ArchiveId>),
     rejection: Option<&RoutedStanza<A>>,
 ) {
-    let admitted = match outcome {
-        DeliveryOutcome::Routed { admitted } | DeliveryOutcome::Stored { admitted } => {
-            admitted.as_slice()
-        }
+    let outcome = MessageOutcome::from(&*delivery_outcome);
+    let (admitted, copies) = match delivery_outcome {
+        DeliveryOutcome::Routed { admitted, copies }
+        | DeliveryOutcome::Stored { admitted, copies } => (admitted.as_slice(), copies.take()),
         DeliveryOutcome::Retired
         | DeliveryOutcome::Policy { .. }
         | DeliveryOutcome::Discarded
-        | DeliveryOutcome::Rejected { .. } => &[],
+        | DeliveryOutcome::Rejected { .. } => ([].as_slice(), None),
     };
     let sender = session.map(SessionHandle::session_id);
     let combined = if parties.same_account {
@@ -273,8 +277,8 @@ pub(crate) async fn observe_from<A: ChunkAllocator + Clone>(
     } else {
         Vec::new()
     };
-    let delivery = RouterDelivery::with_session(stage.router, stage.allocator, session.cloned());
-    let outcome = MessageOutcome::from(outcome);
+    let mut delivery =
+        RouterDelivery::with_session(stage.router, stage.allocator, session.cloned());
     if let Some(session) = session {
         observe::message(
             stage,
@@ -298,6 +302,9 @@ pub(crate) async fn observe_from<A: ChunkAllocator + Clone>(
     if matches!(outcome, MessageOutcome::Routed | MessageOutcome::Stored)
         && let Some(recipient) = parties.recipient.as_ref()
     {
+        if let Some(copies) = copies {
+            delivery.restrict_received_copies(recipient, copies);
+        }
         observe::message(
             stage,
             &delivery,

@@ -529,6 +529,65 @@ fn component_domain_lookup_distinguishes_components_from_services_and_hosts() ->
 }
 
 #[test]
+fn filtered_delivery_cannot_inherit_a_retired_session_admission() -> TestResult {
+    run_test(async {
+        let router = setup()?;
+        let handle = router.handle();
+        let owner = account("alice@localhost")?;
+        let old = handle
+            .register(&owner, Some("desk"), NonZeroUsize::MIN)
+            .await?;
+        old.handle()
+            .set_presence(Some(0), presence("desk").await?, None)
+            .await?;
+        let candidates = handle
+            .message_targets(&owner, None, lonewolf_xmpp::stanza::MessageType::Chat)
+            .await?;
+        assert_eq!(candidates.len(), 1);
+        let approved = [candidates[0].session];
+
+        handle.retire_account(&owner).await?;
+        old.wait_retired().await?;
+        let replacement = handle
+            .register(&owner, Some("desk"), NonZeroUsize::MIN)
+            .await?;
+        replacement
+            .handle()
+            .set_presence(Some(0), presence("desk").await?, None)
+            .await?;
+        replacement.handle().tag(SessionTag::Carbons).await?;
+        assert_eq!(old.full_jid(), replacement.full_jid());
+        assert_ne!(approved[0], replacement.session_id());
+        for (target, expected) in [
+            ("alice@localhost", RouterError::NotFound),
+            ("alice@localhost/desk", RouterError::Offline),
+        ] {
+            let stanza = parse_stanza(&format!("<message to='{target}' type='chat'/>")).await?;
+            assert_eq!(
+                handle
+                    .route_addressed_message(stanza, None, Some(&approved))
+                    .await,
+                Err(expected)
+            );
+        }
+        handle
+            .copy_to_tagged_for(
+                &owner,
+                SessionTag::Carbons,
+                &[],
+                Some(&approved),
+                Box::new(|_| panic!("copy builder ran without a checked session")),
+            )
+            .await?;
+        assert!(old.take_queued().is_empty());
+        assert!(replacement.take_queued().is_empty());
+        drop((old, replacement));
+        router.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
 fn bare_chat_reports_the_highest_priority_session() -> TestResult {
     run_test(async {
         let router = setup()?;

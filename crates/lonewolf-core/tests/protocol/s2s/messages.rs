@@ -5,6 +5,39 @@ use crate::support::federation::FederatedPair;
 use crate::support::{PASSWORD, TestResult};
 
 #[test]
+fn resource_rule_for_remote_account_preserves_bare_federated_address() -> TestResult {
+    let mut options = workflow_options();
+    options.a_extensions.push_str(", 'blocking'");
+    let mut pair = FederatedPair::start("a.test", "b.test", options)?;
+    pair.a.create_account("alice", PASSWORD)?;
+    pair.b.create_account("bob", PASSWORD)?;
+    let mut alice = pair.a.connect("alice", PASSWORD, "desk")?;
+    let mut bob = pair.b.connect("bob", PASSWORD, "phone")?;
+    available(&mut bob, "bob@b.test", "phone")?;
+    alice.send("<iq type='set' id='set'><block xmlns='urn:xmpp:blocking'><item jid='bob@b.test/tablet'/></block></iq>")?;
+    let set = alice.receive()?;
+    set.assert_name("jabber:client", "iq");
+    assert_eq!(set.attribute("id"), Some("set"));
+    assert_eq!(set.attribute("type"), Some("result"));
+    alice.send("<message type='chat' to='bob@b.test' id='bare'/>")?;
+    let message = bob.receive()?;
+    message.assert_name("jabber:client", "message");
+    assert_eq!(message.attribute("from"), Some("alice@a.test/desk"));
+    assert_eq!(message.attribute("to"), Some("bob@b.test"));
+    assert_eq!(message.attribute("id"), Some("bare"));
+    assert_eq!(message.attribute("type"), Some("chat"));
+    traffic(
+        &pair,
+        "resource_rule_for_remote_account_preserves_bare_federated_address",
+        [1, 0, 0],
+        [0, 0, 0],
+    )?;
+    alice.close()?;
+    bob.close()?;
+    pair.stop()
+}
+
+#[test]
 fn chat_to_bare_jid_reaches_available_resource() -> TestResult {
     for (ad, an, bd, bn) in DIRECTIONS {
         let mut pair = FederatedPair::start(ad, bd, workflow_options())?;

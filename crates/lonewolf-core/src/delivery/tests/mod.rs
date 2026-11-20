@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::cell::Cell;
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::num::NonZeroUsize;
 use std::rc::Rc;
@@ -12,13 +13,16 @@ use futures_util::FutureExt;
 use lonewolf_auth::scram::{
     SCRAM_POLICY_ITERATIONS, ScramCredentials, ScramSha1Verifier, ScramVerifier,
 };
-use lonewolf_extension::Effects;
+use lonewolf_extension::blocking::Blocking;
 use lonewolf_extension::delivery::{
     Delivery, DeliveryError, DeliveryFuture, HostLookup, SessionTag, StanzaFactory,
 };
 use lonewolf_extension::offline::Offline;
+use lonewolf_extension::{Effects, Extensions};
 use lonewolf_storage::account::{AccountKey, AccountWrites, NewAccount};
+use lonewolf_storage::blocking::{BlockChange, BlockingWrites};
 use lonewolf_storage::offline::{OfflineReads, OfflineWrites};
+use lonewolf_storage::roster::RosterJid;
 use lonewolf_storage::{RedbStorage, Storage, WriteTransaction};
 use lonewolf_util::arena::{Arena, ArenaConfig, GlobalChunkAllocator};
 use lonewolf_xmpp::jid::Jid;
@@ -214,6 +218,7 @@ fn stored_messages_report_the_rerouted_session() -> TestResult {
                     stanza: parsed("<message to='bob@localhost' type='chat' id='reported'/>")
                         .await?,
                     bytes: 0,
+                    policy: None,
                 },
             );
             let committed = storage.begin_write().await?;
@@ -235,7 +240,8 @@ fn stored_messages_report_the_rerouted_session() -> TestResult {
                 .finished()
                 .await
                 .ok_or("missing store completion")?
-                .map_err(|_| "offline store failed")?;
+                .map_err(|_| "offline store failed")?
+                .admitted;
             if reroute {
                 assert!(matches!(admitted, Admitted::One(_)));
                 assert_eq!(admitted.as_slice(), [registration.session_id()]);
@@ -257,6 +263,125 @@ fn stored_messages_report_the_rerouted_session() -> TestResult {
             drop(registration);
             router.shutdown().await?;
         }
+        Ok(())
+    }))?
+}
+
+#[test]
+fn a_stored_message_reroutes_to_an_allowed_concrete_resource() -> TestResult {
+    Runtime::new()?.block_on(compio::time::timeout(Duration::from_secs(5), async {
+        let directory = tempfile::tempdir()?;
+        let storage = RedbStorage::open(directory.path().join("lonewolf.dat"))?;
+        let mut extensions = Extensions::default();
+        extensions.register(Arc::new(Blocking))?;
+        let router = Router::new(
+            Hosts::new(&Config::default().hosts, None)?,
+            LocalRouter::new(GlobalChunkAllocator),
+        )
+        .with_extensions(BTreeMap::from([(
+            "localhost".into(),
+            extensions.enable_host("localhost", Some("blocking"))?,
+        )]));
+        let handle = router.handle();
+        let source = account("alice@localhost")?;
+        let recipient = account("bob@localhost")?;
+        let mut transaction = storage.begin_write().await?;
+        for key in [&source, &recipient] {
+            transaction
+                .create_account(NewAccount {
+                    key: key.clone(),
+                    credentials: ScramCredentials::new(ScramVerifier::Sha1(
+                        ScramSha1Verifier::new(
+                            [11; 16],
+                            SCRAM_POLICY_ITERATIONS,
+                            [12; 20],
+                            [13; 20],
+                        ),
+                    )),
+                })
+                .await?;
+        }
+        let mut arena = Arena::try_new(ArenaConfig::default())?;
+        let blocked = Jid::parse_in("bob@localhost/phone", &mut arena)?;
+        transaction
+            .change_blocklist(
+                &source,
+                BlockChange::Block(&[RosterJid::from(blocked.resolve(&arena)?)]),
+            )
+            .await?;
+        transaction.commit().await?;
+        let limit = NonZeroUsize::new(2).ok_or("invalid resource limit")?;
+        let phone = handle.register(&recipient, Some("phone"), limit).await?;
+        let desk = handle.register(&recipient, Some("desk"), limit).await?;
+        let ((), ahead) = handle
+            .order()
+            .fix(vec![recipient.clone()], async {
+                Ok::<_, DeliveryError>(())
+            })
+            .await?;
+        let mut transaction = storage.begin_write().await?;
+        let snapshot = storage.begin_read().await?;
+        let sequence = transaction
+            .push_offline_message(&recipient, 0, b"<message to='bob@localhost'/>")
+            .await?;
+        let pending = commit_and_store(
+            WorkGroup::new().start(),
+            handle,
+            transaction,
+            Arc::new(Offline::new(Default::default())),
+            StoredDelivery {
+                source: Some(source),
+                recipient: recipient.clone(),
+                sequence,
+                stanza: parsed(
+                    "<message from='alice@localhost/desk' to='bob@localhost' type='chat'/>",
+                )
+                .await?,
+                bytes: 0,
+                policy: Some((GlobalChunkAllocator, snapshot)),
+            },
+        );
+        let committed = storage.begin_write().await?;
+        assert_eq!(committed.offline_count(&recipient).await?, 1);
+        drop(committed);
+        for (registration, resource, priority) in [(&phone, "phone", 5), (&desk, "desk", 1)] {
+            registration
+                .handle()
+                .set_presence(
+                    Some(priority),
+                    parsed(&format!("<presence from='bob@localhost/{resource}'/>")).await?,
+                    None,
+                )
+                .await?;
+        }
+        for registration in [&phone, &desk] {
+            for entry in registration.take_queued() {
+                assert!(matches!(
+                    entry.stanza.resolve()?.stanza_type(),
+                    lonewolf_xmpp::stanza::StanzaType::Presence(_)
+                ));
+            }
+        }
+        drop(ahead);
+        let result = pending
+            .finished()
+            .await
+            .ok_or("missing completion")?
+            .map_err(|_| "store failed")?;
+        assert_eq!(result.admitted.as_slice(), [desk.session_id()]);
+        assert_eq!(
+            result.copies.as_deref(),
+            Some([desk.session_id()].as_slice())
+        );
+        assert!(phone.take_queued().is_empty());
+        let copies = desk.take_queued();
+        assert_eq!(copies.len(), 1);
+        assert_eq!(
+            copies[0].release.as_ref().map(|release| release.sequence),
+            Some(sequence)
+        );
+        drop((desk, phone));
+        router.shutdown().await?;
         Ok(())
     }))?
 }
@@ -314,6 +439,7 @@ fn stored_message_commits_and_reroutes_after_its_requester_drops_before_the_tick
                 sequence,
                 stanza,
                 bytes: 0,
+                policy: None,
             },
         );
         drop(pending);

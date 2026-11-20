@@ -355,12 +355,14 @@ fn observe_message_holders_follow_origin_and_account() -> TestResult {
                     StanzaKind::Message,
                 )
                 .map_err(|_| "parties failed")?;
-                for outcome in [
+                for mut outcome in [
                     DeliveryOutcome::Routed {
                         admitted: Admitted::One(recipient.session_id()),
+                        copies: None,
                     },
                     DeliveryOutcome::Stored {
                         admitted: Admitted::One(recipient.session_id()),
+                        copies: None,
                     },
                     DeliveryOutcome::Discarded,
                     DeliveryOutcome::Rejected {
@@ -375,7 +377,7 @@ fn observe_message_holders_follow_origin_and_account() -> TestResult {
                         &origin,
                         &parties,
                         &routed,
-                        &outcome,
+                        &mut outcome,
                         (None, None),
                         None,
                     )

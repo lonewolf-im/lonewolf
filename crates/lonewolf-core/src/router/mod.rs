@@ -24,7 +24,9 @@ use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::roster::RosterJid;
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::{Jid, JidRef};
-use lonewolf_xmpp::stanza::{Element, PresenceType, Stanza, StanzaNamespace, StanzaType};
+use lonewolf_xmpp::stanza::{
+    Element, MessageType, PresenceType, Stanza, StanzaNamespace, StanzaType,
+};
 use lonewolf_xmpp::stanza::{StanzaErrorCondition, StanzaErrorText};
 use prometheus_client::registry::Registry;
 
@@ -50,6 +52,13 @@ pub(crate) enum Admitted {
     None,
     One(SessionId),
     Many(Vec<SessionId>),
+}
+
+pub(crate) struct MessageTarget {
+    pub(crate) resource: Box<str>,
+    pub(crate) session: SessionId,
+    pub(crate) direct: bool,
+    pub(crate) bare: bool,
 }
 
 impl Admitted {
@@ -722,7 +731,7 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         &self,
         stanza: RoutedStanza<A>,
     ) -> Result<Admitted, RouterError> {
-        self.route_addressed_message(stanza, None)
+        self.route_addressed_message(stanza, None, None)
             .await
             .map(|result| result.unwrap_or(Admitted::None))
     }
@@ -731,16 +740,36 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         &self,
         stanza: RoutedStanza<A>,
         source: Option<SessionLiveness>,
+        allowed: Option<&[SessionId]>,
     ) -> Result<Option<Admitted>, RouterError> {
-        self.route_message_with(stanza, None, source).await
+        self.route_message_with(stanza, None, source, allowed).await
     }
 
+    pub(crate) async fn message_targets(
+        &self,
+        account: &AccountKey,
+        resource: Option<&str>,
+        kind: MessageType,
+    ) -> Result<Vec<MessageTarget>, RouterError> {
+        self.local.message_targets(account, resource, kind).await
+    }
+
+    #[cfg(test)]
     pub(crate) async fn route_stored_message(
         &self,
         stanza: RoutedStanza<A>,
         release: StoredRelease<A>,
     ) -> Result<Admitted, RouterError> {
-        self.route_message_with(stanza, Some(release), None)
+        self.route_stored_message_to(stanza, release, None).await
+    }
+
+    pub(crate) async fn route_stored_message_to(
+        &self,
+        stanza: RoutedStanza<A>,
+        release: StoredRelease<A>,
+        allowed: Option<&[SessionId]>,
+    ) -> Result<Admitted, RouterError> {
+        self.route_message_with(stanza, Some(release), None, allowed)
             .await
             .map(|result| result.unwrap_or(Admitted::None))
     }
@@ -750,6 +779,7 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         stanza: RoutedStanza<A>,
         release: Option<StoredRelease<A>>,
         source: Option<SessionLiveness>,
+        allowed: Option<&[SessionId]>,
     ) -> Result<Option<Admitted>, RouterError> {
         if source.as_ref().is_some_and(|session| !session.is_alive()) {
             return Ok(None);
@@ -770,10 +800,14 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
             }
             Destination::Service | Destination::Remote => Err(RouterError::RemoteUnsupported),
             Destination::Server | Destination::ServerResource => Err(RouterError::NotFound),
-            Destination::Resource => self.local.deliver_message(stanza, release, source).await,
+            Destination::Resource => {
+                self.local
+                    .deliver_message(stanza, release, source, allowed)
+                    .await
+            }
             Destination::Account => {
                 self.local
-                    .deliver_bare_message(stanza, release, source)
+                    .deliver_bare_message(stanza, release, source, allowed)
                     .await
             }
         }
@@ -1190,6 +1224,7 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         self.local.retire_tagged(account, tag).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn copy_to_tagged(
         &self,
         account: &AccountKey,
@@ -1197,10 +1232,25 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         holders: &[SessionId],
         build: CopyFactory<'_, A>,
     ) -> Result<(), RouterError> {
+        self.copy_to_tagged_for(account, tag, holders, None, build)
+            .await
+    }
+
+    pub(crate) async fn copy_to_tagged_for(
+        &self,
+        account: &AccountKey,
+        tag: SessionTag,
+        holders: &[SessionId],
+        allowed: Option<&[SessionId]>,
+        build: CopyFactory<'_, A>,
+    ) -> Result<(), RouterError> {
         if !self.hosts.is_local_host(account.domain()) {
             return Err(RouterError::RemoteUnsupported);
         }
-        let sessions = self.local.tagged_sessions(account, tag, holders).await?;
+        let mut sessions = self.local.tagged_sessions(account, tag, holders).await?;
+        if let Some(allowed) = allowed {
+            sessions.retain(|(_, token)| allowed.contains(&SessionId::new(*token)));
+        }
         if sessions.is_empty() {
             return Ok(());
         }
@@ -1228,7 +1278,7 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
     }
 
     /// The builder must use the supplied full JID and must not block the calling thread.
-    /// Build failures retire all tagged sessions; mailbox failures retire the affected session.
+    /// A build failure retires all tagged sessions. A mailbox failure retires its session.
     pub(crate) async fn route_to_tagged(
         &self,
         account: &AccountKey,

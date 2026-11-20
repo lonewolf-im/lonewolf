@@ -38,6 +38,8 @@ use crate::stages::ingress::message::handle_from;
 use crate::stages::ingress::message::{MessageDisposition, Reply, handle};
 use crate::stages::message::MissingRecipientPolicy;
 
+mod recipients;
+
 type ObserverGate = (oneshot::Sender<()>, oneshot::Receiver<()>);
 
 #[derive(Debug, PartialEq)]
@@ -171,6 +173,24 @@ impl Fixture {
         observer_fails: bool,
         blocking: bool,
     ) -> TestResult<Self> {
+        Self::with_extensions(
+            verdict,
+            archive_rejects,
+            observer_fails,
+            if blocking {
+                &[BLOCKING, "pipeline-recorder"]
+            } else {
+                &["pipeline-recorder"]
+            },
+        )
+    }
+
+    fn with_extensions(
+        verdict: Verdict,
+        archive_rejects: bool,
+        observer_fails: bool,
+        names: &[&str],
+    ) -> TestResult<Self> {
         let directory = tempfile::tempdir()?;
         let storage = RedbStorage::open(directory.path().join("lonewolf.dat"))?;
         let recorder = Arc::new(Recorder {
@@ -184,11 +204,10 @@ impl Fixture {
         let mut extensions = Extensions::default();
         extensions.register(recorder.clone())?;
         extensions.register(Arc::new(Blocking))?;
-        let names = if blocking {
-            &[BLOCKING, "pipeline-recorder"][..]
-        } else {
-            &["pipeline-recorder"][..]
-        };
+        extensions.register(Arc::new(lonewolf_extension::carbons::Carbons))?;
+        extensions.register(Arc::new(lonewolf_extension::offline::Offline::new(
+            BTreeMap::new(),
+        )))?;
         let router = Router::new(
             Hosts::new(&Config::default().hosts, None)?,
             LocalRouter::new(GlobalChunkAllocator),

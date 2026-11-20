@@ -111,6 +111,242 @@ async fn parsed(xml: &str) -> TestResult<RoutedStanza<GlobalChunkAllocator>> {
     }
 }
 
+async fn blocking_message_fixture() -> TestResult<(Fixture, AccountKey, AccountKey)> {
+    use lonewolf_auth::scram::{
+        SCRAM_POLICY_ITERATIONS, ScramCredentials, ScramSha1Verifier, ScramVerifier,
+    };
+    use lonewolf_extension::blocking::{Blocking, NAME};
+    use lonewolf_extension::offline::Offline;
+    use lonewolf_storage::account::{AccountWrites, NewAccount};
+    use lonewolf_storage::{Storage, WriteTransaction};
+
+    let mut fixture = Fixture::new()?;
+    let mut extensions = Extensions::default();
+    extensions.register(Arc::new(Blocking))?;
+    extensions.register(Arc::new(Offline::new(BTreeMap::new())))?;
+    fixture.router = fixture.router.with_extensions(BTreeMap::from([(
+        "localhost".into(),
+        extensions.enable_host("localhost", [NAME, "offline"])?,
+    )]));
+    fixture.handle = fixture.router.handle();
+    let source = account("alice@localhost")?;
+    let recipient = account("bob@localhost")?;
+    let mut write = fixture.storage.begin_write().await?;
+    for key in [&source, &recipient] {
+        write
+            .create_account(NewAccount {
+                key: key.clone(),
+                credentials: ScramCredentials::new(ScramVerifier::Sha1(ScramSha1Verifier::new(
+                    [21; 16],
+                    SCRAM_POLICY_ITERATIONS,
+                    [22; 20],
+                    [23; 20],
+                ))),
+            })
+            .await?;
+    }
+    write.commit().await?;
+    Ok((fixture, source, recipient))
+}
+
+#[test]
+fn late_direct_binding_preserves_checked_chat_fallback() -> TestResult {
+    use lonewolf_storage::Storage;
+    use lonewolf_storage::offline::OfflineReads;
+
+    use super::{DeliveryAdmission, MessageRecipients, concrete_recipients, deliver_addressed};
+
+    Runtime::new()?.block_on(compio::time::timeout(Duration::from_secs(5), async {
+        for sibling in [true, false] {
+            let (fixture, source, recipient) = blocking_message_fixture().await?;
+            let limit = NonZeroUsize::new(2).ok_or("resource limit")?;
+            let desk = if sibling {
+                let desk = fixture.handle.register(&recipient, Some("desk"), limit).await?;
+                desk.handle()
+                    .set_presence(Some(1), parsed("<presence from='bob@localhost/desk'/>").await?, None)
+                    .await?;
+                Some(desk)
+            } else {
+                None
+            };
+            let stanza = parsed(
+                "<message from='alice@localhost/desk' to='bob@localhost/phone' type='chat' id='fallback'/>",
+            ).await?;
+            let (snapshot, mut ticket) = fixture.handle.order()
+                .fix(vec![source.clone(), recipient.clone()], fixture.storage.begin_read())
+                .await?;
+            ticket.turn().await;
+            let MessageRecipients::Allowed(Some(approved)) = concrete_recipients(
+                &fixture.handle,
+                &fixture.allocator,
+                Some(&snapshot),
+                Some(&source),
+                Some(&recipient),
+                &stanza,
+            ).await.map_err(|_| "eligibility failed")? else {
+                return Err("expected checked recipients".into());
+            };
+            assert_eq!(approved, desk.iter().map(|session| session.session_id()).collect::<Vec<_>>());
+
+            let phone = fixture.handle.register(&recipient, Some("phone"), limit).await?;
+            phone.handle()
+                .set_presence(Some(5), parsed("<presence from='bob@localhost/phone'/>").await?, None)
+                .await?;
+            for registration in desk.iter().chain([&phone]) {
+                for entry in registration.take_queued() {
+                    assert!(matches!(entry.stanza.resolve()?.stanza_type(), lonewolf_xmpp::stanza::StanzaType::Presence(_)));
+                }
+            }
+            let outcome = deliver_addressed(
+                &fixture.stage(),
+                stanza,
+                MessageType::Chat,
+                MissingRecipientPolicy::Reject,
+                DeliveryAdmission {
+                    source: Some(&source),
+                    liveness: None,
+                    ticket: Some(ticket),
+                    recipients: Some(approved),
+                },
+            ).await.map_err(|_| "delivery failed")?;
+            let count = fixture.storage.begin_read().await?.offline_count(&recipient).await?;
+            if let Some(desk) = desk {
+                let DeliveryOutcome::Routed { admitted, .. } = outcome else {
+                    return Err("expected the checked sibling to receive the original".into());
+                };
+                assert_eq!(admitted.as_slice(), [desk.session_id()]);
+                let delivered = desk.take_queued();
+                assert_eq!(delivered.len(), 1);
+                assert_eq!(delivered[0].stanza.resolve()?.id()?, Some("fallback"));
+                assert!(delivered[0].release.is_none());
+                assert!(phone.take_queued().is_empty());
+                assert_eq!(count, 0);
+            } else {
+                let DeliveryOutcome::Stored { admitted, .. } = outcome else {
+                    return Err("expected ordinary offline storage".into());
+                };
+                assert_eq!(count, 1);
+                assert_eq!(admitted.as_slice(), [phone.session_id()]);
+                let rerouted = phone.take_queued();
+                assert_eq!(rerouted.len(), 1);
+                assert_eq!(rerouted[0].stanza.resolve()?.id()?, Some("fallback"));
+                assert!(rerouted[0].release.is_some());
+            }
+            drop(phone);
+            fixture.router.shutdown().await?;
+        }
+        Ok(())
+    }))?
+}
+
+#[test]
+fn filtered_headline_reaches_each_approved_nonnegative_resource() -> TestResult {
+    use lonewolf_storage::blocking::{BlockChange, BlockingWrites};
+    use lonewolf_storage::roster::RosterJid;
+    use lonewolf_storage::{Storage, WriteTransaction};
+
+    use super::{DeliveryAdmission, MessageRecipients, concrete_recipients, deliver_addressed};
+
+    Runtime::new()?.block_on(compio::time::timeout(Duration::from_secs(5), async {
+        let (fixture, source, recipient) = blocking_message_fixture().await?;
+        let limit = NonZeroUsize::new(3).ok_or("resource limit")?;
+        let high = fixture
+            .handle
+            .register(&recipient, Some("high"), limit)
+            .await?;
+        let low = fixture
+            .handle
+            .register(&recipient, Some("low"), limit)
+            .await?;
+        let blocked = fixture
+            .handle
+            .register(&recipient, Some("blocked"), limit)
+            .await?;
+        for (session, priority) in [(&high, 5), (&low, 0), (&blocked, 9)] {
+            session
+                .handle()
+                .set_presence(
+                    Some(priority),
+                    parsed(&format!(
+                        "<presence from='bob@localhost/{}'/>",
+                        session.resource()
+                    ))
+                    .await?,
+                    None,
+                )
+                .await?;
+        }
+        for session in [&high, &low, &blocked] {
+            session.take_queued();
+        }
+        let mut arena = Arena::try_new(Default::default())?;
+        let jid = Jid::parse_in("bob@localhost/blocked", &mut arena)?;
+        let mut write = fixture.storage.begin_write().await?;
+        write
+            .change_blocklist(
+                &source,
+                BlockChange::Block(&[RosterJid::from(jid.resolve(&arena)?)]),
+            )
+            .await?;
+        write.commit().await?;
+        let stanza = parsed(
+            "<message from='alice@localhost/desk' to='bob@localhost' type='headline' id='fanout'/>",
+        )
+        .await?;
+        let (snapshot, mut ticket) = fixture
+            .handle
+            .order()
+            .fix(
+                vec![source.clone(), recipient.clone()],
+                fixture.storage.begin_read(),
+            )
+            .await?;
+        ticket.turn().await;
+        let MessageRecipients::Allowed(Some(approved)) = concrete_recipients(
+            &fixture.handle,
+            &fixture.allocator,
+            Some(&snapshot),
+            Some(&source),
+            Some(&recipient),
+            &stanza,
+        )
+        .await
+        .map_err(|_| "eligibility failed")?
+        else {
+            return Err("expected checked recipients".into());
+        };
+        let DeliveryOutcome::Routed { admitted, .. } = deliver_addressed(
+            &fixture.stage(),
+            stanza,
+            MessageType::Headline,
+            MissingRecipientPolicy::Reject,
+            DeliveryAdmission {
+                source: Some(&source),
+                liveness: None,
+                ticket: Some(ticket),
+                recipients: Some(approved),
+            },
+        )
+        .await
+        .map_err(|_| "delivery failed")?
+        else {
+            return Err("expected a fan-out delivery".into());
+        };
+        let mut selected = admitted.as_slice().to_vec();
+        selected.sort_unstable();
+        assert_eq!(selected, [high.session_id(), low.session_id()]);
+        for session in [&high, &low] {
+            let delivered = session.take_queued();
+            assert_eq!(delivered.len(), 1);
+            assert_eq!(delivered[0].stanza.resolve()?.id()?, Some("fanout"));
+        }
+        assert!(blocked.take_queued().is_empty());
+        drop((high, low, blocked));
+        fixture.router.shutdown().await?;
+        Ok(())
+    }))?
+}
+
 #[test]
 fn deliver_routes_a_chat_message_to_a_bound_resource() -> TestResult {
     Runtime::new()?.block_on(compio::time::timeout(Duration::from_secs(5), async {
@@ -1259,7 +1495,7 @@ fn remote_message_admission_preserves_error_and_headline_rules() -> TestResult {
                     }
                     let outcome = deliver(&stage, stanza, kind, MissingRecipientPolicy::Discard).await;
                     if mode == "success" {
-                        assert!(matches!(outcome, Ok(DeliveryOutcome::Routed { admitted: Admitted::None })), "{target} {kind:?} {mode}");
+                        assert!(matches!(outcome, Ok(DeliveryOutcome::Routed { admitted: Admitted::None, .. })), "{target} {kind:?} {mode}");
                         assert_eq!(remote.occupancy(), (1, expected.len()));
                         let snapshot = remote.snapshot();
                         assert_eq!((snapshot.connecting, snapshot.ready, snapshot.queued_stanzas, snapshot.queued_bytes), (1, 0, 1, expected.len() as u64));

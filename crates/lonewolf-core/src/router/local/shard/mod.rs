@@ -25,7 +25,9 @@ use super::registration::{
 use super::shards::LocalRouterHandle;
 #[cfg(test)]
 use crate::config::limits::default_max_directed_presence_recipients_per_resource;
-use crate::router::{Admitted, RoutedStanza, RouterError, RouterState, validate_target};
+use crate::router::{
+    Admitted, MessageTarget, RoutedStanza, RouterError, RouterState, validate_target,
+};
 
 const LAST_UNAVAILABLE_PER_SHARD: usize = 64;
 
@@ -958,6 +960,17 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
         valid: impl Fn() -> bool,
         release: Option<StoredRelease<A>>,
     ) -> Result<Option<Admitted>, RouterError> {
+        self.deliver_full_with_filter(stanza, fallback_chat, valid, release, None)
+    }
+
+    pub(super) fn deliver_full_with_filter(
+        &mut self,
+        stanza: RoutedStanza<A>,
+        fallback_chat: bool,
+        valid: impl Fn() -> bool,
+        release: Option<StoredRelease<A>>,
+        allowed: Option<&[SessionId]>,
+    ) -> Result<Option<Admitted>, RouterError> {
         if !valid() {
             return Ok(None);
         }
@@ -974,7 +987,10 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
         let recipient = self
             .accounts
             .get(account)
-            .and_then(|sessions| sessions.get(resource));
+            .and_then(|sessions| sessions.get(resource))
+            .filter(|session| {
+                allowed.is_none_or(|ids| ids.contains(&SessionId::new(session.token)))
+            });
         let result = recipient.map(|session| {
             let delivery = if !valid() {
                 Ok(None)
@@ -1009,7 +1025,8 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
                     && view.stanza_type() == StanzaType::Message(MessageType::Chat) =>
             {
                 if valid() {
-                    self.deliver_bare(stanza, true, release).map(Some)
+                    self.deliver_bare_with_filter(stanza, true, release, allowed)
+                        .map(Some)
                 } else {
                     Ok(None)
                 }
@@ -1068,11 +1085,22 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
         .map(|_| ())
     }
 
+    #[cfg(test)]
     pub(super) fn deliver_bare(
         &mut self,
         stanza: RoutedStanza<A>,
         allow_full: bool,
         release: Option<StoredRelease<A>>,
+    ) -> Result<Admitted, RouterError> {
+        self.deliver_bare_with_filter(stanza, allow_full, release, None)
+    }
+
+    pub(super) fn deliver_bare_with_filter(
+        &mut self,
+        stanza: RoutedStanza<A>,
+        allow_full: bool,
+        release: Option<StoredRelease<A>>,
+        allowed: Option<&[SessionId]>,
     ) -> Result<Admitted, RouterError> {
         let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
         let to = view
@@ -1091,23 +1119,45 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
         if !allow_full && to.resourcepart().is_some() {
             return Err(RouterError::InvalidTarget);
         }
+        let filter = |session: &&Session<A>| {
+            session.accepts_bare_message()
+                && allowed.is_none_or(|ids| ids.contains(&SessionId::new(session.token)))
+        };
+        let addressed = to
+            .resourcepart()
+            .and_then(|resource| sessions.get(resource))
+            .map(|session| session.token);
+        let offline_or_filtered = || {
+            if allowed.is_some()
+                && sessions.values().any(|session| {
+                    Some(session.token) != addressed && session.accepts_bare_message()
+                })
+            {
+                RouterError::NotFound
+            } else {
+                RouterError::Offline
+            }
+        };
         match view.stanza_type() {
             StanzaType::Message(MessageType::Normal | MessageType::Chat) => {
                 let recipient = sessions
                     .values()
-                    .filter(|session| session.accepts_bare_message())
+                    .filter(filter)
                     .max_by_key(|session| (session.priority, std::cmp::Reverse(session.token)))
-                    .ok_or(RouterError::Offline)?;
-                enqueue_bare_message(sessions, recipient, stanza, release)
+                    .ok_or_else(offline_or_filtered)?;
+                enqueue_bare_message(sessions, recipient, stanza, release).map_err(|error| {
+                    if allowed.is_some() && error == RouterError::NotFound {
+                        offline_or_filtered()
+                    } else {
+                        error
+                    }
+                })
             }
             StanzaType::Message(MessageType::Headline) => {
                 debug_assert!(release.is_none());
                 let mut admitted = Admitted::None;
                 let mut busy = false;
-                for session in sessions
-                    .values()
-                    .filter(|session| session.accepts_bare_message())
-                {
+                for session in sessions.values().filter(filter) {
                     match session.outbound.try_send(MailboxEntry::new(stanza.clone())) {
                         Ok(()) => {
                             let id = SessionId::new(session.token);
@@ -1125,12 +1175,47 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
                 }
                 match admitted {
                     Admitted::None if busy => Err(RouterError::Busy),
-                    Admitted::None => Err(RouterError::Offline),
+                    Admitted::None => Err(offline_or_filtered()),
                     admitted => Ok(admitted),
                 }
             }
             _ => Err(RouterError::InvalidTarget),
         }
+    }
+
+    pub(super) fn message_targets(
+        &self,
+        owner: &AccountKey,
+        addressed: Option<&str>,
+        kind: MessageType,
+    ) -> Vec<MessageTarget> {
+        let can_route_bare = match addressed {
+            None => matches!(
+                kind,
+                MessageType::Normal | MessageType::Chat | MessageType::Headline
+            ),
+            Some(_) => kind == MessageType::Chat,
+        };
+        self.accounts
+            .get(owner.as_str())
+            .into_iter()
+            .flat_map(HashMap::iter)
+            .filter_map(|(resource, session)| {
+                if !session.alive.load(Ordering::Acquire) || session.outbound.is_closed() {
+                    return None;
+                }
+                let direct = addressed == Some(resource.as_ref());
+                let bare = can_route_bare && session.accepts_bare_message();
+                (direct || bare || session.tags.contains(SessionTag::Carbons)).then(|| {
+                    MessageTarget {
+                        resource: resource.clone(),
+                        session: SessionId::new(session.token),
+                        direct,
+                        bare,
+                    }
+                })
+            })
+            .collect()
     }
 
     pub(super) fn deliver_presence(

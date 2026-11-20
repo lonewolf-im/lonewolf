@@ -5,6 +5,8 @@ mod support;
 
 mod carbons;
 
+mod blocking;
+
 mod component;
 
 mod observers;

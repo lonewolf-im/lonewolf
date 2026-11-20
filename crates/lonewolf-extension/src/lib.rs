@@ -16,6 +16,7 @@ use lonewolf_util::arena::ChunkAllocator;
 
 pub mod account;
 pub mod archive;
+pub mod blocking;
 pub mod carbons;
 pub mod delivery;
 mod detached;

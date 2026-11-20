@@ -32,6 +32,7 @@ use crate::hosts::Hosts;
 use crate::router::local::{LocalRouter, RetireCause};
 use crate::router::{Router, StoredRelease};
 
+mod blocking;
 mod iq_destinations;
 mod iq_errors;
 mod iq_policy;

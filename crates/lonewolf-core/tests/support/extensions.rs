@@ -2048,7 +2048,8 @@ impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for RouterFailureIq {
     ) -> IqFuture<'a, A> {
         Box::pin(async move {
             if request.payload.name() == CONNECTION_FAILURE_SET.name {
-                panic!("seeded-sensitive-connection-payload");
+                // Panic reports print literal messages, so a seeded secret must be built at runtime.
+                panic!("{}", String::from("seeded-sensitive-connection-payload"));
             }
             let account = AccountKey::try_from(request.target.bare())
                 .map_err(|_| StanzaErrorCondition::InternalServerError)?;
@@ -2058,7 +2059,9 @@ impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for RouterFailureIq {
                         .push_to_tagged(
                             &account,
                             SessionTag::Interested,
-                            Box::new(|_, _| panic!("seeded-sensitive-router-payload")),
+                            Box::new(|_, _| {
+                                panic!("{}", String::from("seeded-sensitive-router-payload"))
+                            }),
                         )
                         .await?;
                     Ok(())

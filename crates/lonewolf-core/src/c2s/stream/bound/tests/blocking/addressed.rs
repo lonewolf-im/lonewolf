@@ -3,6 +3,7 @@
 use super::*;
 use crate::stages::ingress::checks::{Snapshot, check_from, parties};
 use lonewolf_extension::policy::{Direction, Verdict};
+use lonewolf_xmpp::stanza::error_element_in;
 
 #[test]
 fn addressed_policy_matrix_uses_authenticated_sender() -> TestResult {
@@ -98,10 +99,28 @@ fn addressed_policy_matrix_uses_authenticated_sender() -> TestResult {
                     StanzaType::Presence(PresenceType::Probe),
                     StanzaType::Presence(PresenceType::Error),
                 ] {
-                    let stanza = Stanza::builder_in(kind, namespace, &mut arena)
+                    let payload = if kind.is_error() {
+                        let condition = StanzaErrorCondition::ServiceUnavailable;
+                        Some(error_element_in(
+                            namespace,
+                            condition,
+                            None,
+                            condition.default_text(),
+                            &mut arena,
+                        )?)
+                    } else if matches!(kind, StanzaType::Iq(IqType::Get | IqType::Set)) {
+                        Some(Element::builder_in("query", "urn:test:peer", &mut arena)?.build()?)
+                    } else {
+                        None
+                    };
+                    let mut stanza = Stanza::builder_in(kind, namespace, &mut arena)
                         .id(Some("addressed"))?
-                        .to(Some(to))?
-                        .build()?;
+                        .from((namespace != StanzaNamespace::Client).then_some(from))?
+                        .to(Some(to))?;
+                    if let Some(payload) = payload {
+                        stanza = stanza.child(payload)?;
+                    }
+                    let stanza = stanza.build()?;
                     let view = stanza.resolve(&arena)?;
                     let endpoints = parties(&handle, origin, to.resolve(&arena)?, kind.kind())
                         .map_err(|_| "party lookup failed")?;

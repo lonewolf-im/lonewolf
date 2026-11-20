@@ -79,10 +79,12 @@ use crate::stages::{Stage, archive, ingress, observe, policy};
 
 mod link;
 mod output;
+mod replay;
 mod transport;
 
 use link::{Incoming, LinkWriter};
 use output::{Outgoing, OutputSequence, Release};
+use replay::ReplayPolicy;
 use transport::Transport;
 
 const STORED_STANZA_STREAM_HEADER: &[u8] =
@@ -113,6 +115,7 @@ struct Outbox<'w, A: ChunkAllocator, W = Writer> {
     storage: RedbStorage,
     liveness: SessionLiveness,
     acknowledgement: Option<ReplayAcknowledgement>,
+    selective_acknowledgement: Option<compio::runtime::JoinHandle<()>>,
     messages: Option<MessageRelease>,
     metrics: C2sWorkerMetrics,
     work: &'w WorkGroup,
@@ -148,6 +151,7 @@ enum Output<A: ChunkAllocator> {
     Offline {
         backlog: Backlog,
         handler: Arc<dyn MessageHandler<A, RedbStorage>>,
+        policy: Option<ReplayPolicy<A>>,
     },
 }
 
@@ -280,6 +284,7 @@ pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(
                 storage: storage.clone(),
                 liveness: registration.liveness(),
                 acknowledgement: None,
+                selective_acknowledgement: None,
                 messages: None,
                 metrics,
                 work: &*work,
@@ -339,11 +344,12 @@ pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(
             let Outbox {
                 writer: link,
                 acknowledgement,
+                selective_acknowledgement,
                 messages,
                 ..
             } = outbox;
             work.drain().await;
-            drop((acknowledgement, messages));
+            drop((acknowledgement, selective_acknowledgement, messages));
             link.close(outcome).await;
         };
         let ((), outcome) = join(serve, transport.run()).await;
@@ -1617,7 +1623,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         let router = &self.router;
         let storage = &self.storage;
         let work_group = self.outbox.work;
-        let explicit = router.has_explicit_presence_policy();
+        let explicit = router.has_explicit_policy();
         let needs_snapshot = presence_handler.is_some()
             || backlog_reader.is_some()
             || decorate
@@ -1823,7 +1829,15 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         if let Some(backlog) = outcome.backlog
             && let Some(handler) = message_handler
         {
-            self.outbox.push(Output::Offline { backlog, handler });
+            let policy = self.router.has_explicit_policy().then(|| ReplayPolicy {
+                router: self.router.clone(),
+                resource: self.registration.resource().into(),
+            });
+            self.outbox.push(Output::Offline {
+                backlog,
+                handler,
+                policy,
+            });
         }
         if let Some(echo) = echo {
             let account = self.registration.account();
@@ -2559,83 +2573,15 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> Outbox<'_, A, W> {
                         );
                     }
                 }
-                Output::Offline { backlog, handler } => {
+                Output::Offline {
+                    backlog,
+                    handler,
+                    policy,
+                } => {
                     offline_replay = true;
-                    let Backlog { through, mut page } = backlog;
-                    let kind = ReplayKind::OfflineMessage;
-                    loop {
-                        for (entry, bytes) in page.iter() {
-                            match self.parse_stored(bytes, StoredKind::Message).await {
-                                Ok(stanza) => {
-                                    self.written = self.written.next();
-                                    self.writer.write(Outgoing::Routed(stanza)).await?;
-                                    self.metrics
-                                        .replay_records(kind, ReplayOutcome::Delivered, 1);
-                                    messages_written += 1;
-                                }
-                                Err(StoredRecordError::InvalidContent) => {
-                                    self.metrics.replay_records(kind, ReplayOutcome::Invalid, 1);
-                                    messages_skipped += 1;
-                                    tracing::error!(
-                                        sequence = entry.sequence.get(),
-                                        "stored offline message rejected"
-                                    );
-                                }
-                                Err(StoredRecordError::ReplayFailure) => {
-                                    return Err(CloseOutcome::InternalError);
-                                }
-                            }
-                        }
-                        let Some(last) = page.resume_after().map(|entry| entry.sequence) else {
-                            break;
-                        };
-                        if page.is_complete() {
-                            self.releases.push_back((
-                                self.written,
-                                Release::Backlog {
-                                    handler,
-                                    through: last,
-                                },
-                            ));
-                            break;
-                        }
-                        self.writer.flush(self.written).await?;
-                        self.release_through(self.written);
-                        // Commit this page before a later transport failure can retire the session.
-                        acknowledge_backlog(
-                            &self.storage,
-                            &self.account,
-                            &self.liveness,
-                            &*handler,
-                            &Cell::new(last),
-                        )
-                        .await
-                        .map_err(|error| {
-                            report_handler_failure(&error, &self.account);
-                            CloseOutcome::InternalError
-                        })?;
-                        let transaction = self.storage.begin_read().await.map_err(|error| {
-                            close_storage_failure(error, "offline_replay_begin_read", &self.account)
-                        })?;
-                        if !self.liveness.is_alive() {
-                            tracing::debug!(
-                                operation = "replay",
-                                outcome = "stale_session",
-                                owner_jid = ?self.account.as_str(),
-                                "offline replay stopped"
-                            );
-                            break;
-                        }
-                        page = handler
-                            .backlog_page(&self.account, &transaction, last, through, page)
-                            .await
-                            .map_err(|error| {
-                                report_handler_failure(&error, &self.account);
-                                CloseOutcome::InternalError
-                            })?;
-                        drop(transaction);
-                        self.metrics.replay_page_read(kind, page.byte_len());
-                    }
+                    let counts = self.write_offline(backlog, handler, policy).await?;
+                    messages_written += counts.written;
+                    messages_skipped += counts.skipped;
                 }
             }
         }
@@ -2678,6 +2624,9 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> Outbox<'_, A, W> {
                 Release::Message { handler, sequence } => {
                     messages.push(sequence);
                     message_handler = Some(handler);
+                }
+                Release::BacklogMessages { handler, sequences } => {
+                    self.release_replay_sequences(handler, sequences);
                 }
                 Release::Backlog { handler, through } => {
                     let through = backlog
@@ -2845,19 +2794,19 @@ async fn acknowledge_messages<A: ChunkAllocator>(
     handler: &dyn MessageHandler<A, RedbStorage>,
     pending: &RefCell<Vec<OfflineSequence>>,
 ) -> Result<(), HandlerError> {
-    loop {
+    while !pending.borrow().is_empty() {
         let mut transaction =
             storage
                 .begin_write()
                 .await
                 .map_err(|error| HandlerError::Internal {
                     condition: StanzaErrorCondition::InternalServerError,
-                    failure: storage_failure(error, "offline_acknowledge_live_begin_write"),
+                    failure: storage_failure(error, "offline_acknowledge_one_begin_write"),
                 })?;
         // Check after writer admission so account recreation cannot reset these sequences.
         if !liveness.is_alive() {
             tracing::info!(
-                operation = "acknowledge_live",
+                operation = "acknowledge_one",
                 outcome = "skipped_stale_session",
                 recipient_jid = ?account.as_str(),
                 "offline message acknowledgement handled"
@@ -2865,9 +2814,6 @@ async fn acknowledge_messages<A: ChunkAllocator>(
             return Ok(());
         }
         let batch = mem::take(&mut *pending.borrow_mut());
-        if batch.is_empty() {
-            return Ok(());
-        }
         for sequence in batch {
             handler
                 .acknowledge_one(account, sequence, &mut transaction)
@@ -2878,15 +2824,16 @@ async fn acknowledge_messages<A: ChunkAllocator>(
             .await
             .map_err(|error| HandlerError::Internal {
                 condition: StanzaErrorCondition::InternalServerError,
-                failure: storage_failure(error, "offline_acknowledge_live_commit"),
+                failure: storage_failure(error, "offline_acknowledge_one_commit"),
             })?;
         tracing::info!(
-            operation = "acknowledge_live",
+            operation = "acknowledge_one",
             outcome = "committed",
             recipient_jid = ?account.as_str(),
             "offline message acknowledgement handled"
         );
     }
+    Ok(())
 }
 
 async fn acknowledge_backlog<A: ChunkAllocator>(
@@ -3131,7 +3078,7 @@ impl<A: ChunkAllocator + Clone> TerminalPresenceWork<A> {
         let mut covered = Vec::new();
         let mut ticket = None;
         let mut snapshot = None;
-        let explicit = self.router.has_explicit_presence_policy();
+        let explicit = self.router.has_explicit_policy();
         let needs_directed_policy = explicit && !withdrawal.directed.recipients.is_empty();
         let broadcast = if withdrawal.unavailable.is_some() || needs_directed_policy {
             async {

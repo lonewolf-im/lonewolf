@@ -103,6 +103,17 @@ pub(crate) async fn evaluate_selected_in<A: ChunkAllocator + Clone>(
     checks: &[Check<'_>],
     selection: Selection,
 ) -> Result<Verdict, StageFailure> {
+    evaluate_checks(router, transaction, kind, checks, selection, false).await
+}
+
+async fn evaluate_checks<A: ChunkAllocator + Clone>(
+    router: &RouterHandle<A>,
+    transaction: &RedbRead,
+    kind: StanzaType,
+    checks: &[Check<'_>],
+    selection: Selection,
+    fail_on_error: bool,
+) -> Result<Verdict, StageFailure> {
     let mut verdict = Verdict::Allow;
     let mut decided_by = None;
     'checks: for check in checks {
@@ -125,6 +136,9 @@ pub(crate) async fn evaluate_selected_in<A: ChunkAllocator + Clone>(
                 Ok(verdict) => verdict,
                 Err(error) => {
                     report_handler_failure(&error, check.account);
+                    if fail_on_error {
+                        return Err(StageFailure);
+                    }
                     Verdict::Reject {
                         condition: error.condition(),
                         application: None,
@@ -158,6 +172,58 @@ pub(crate) async fn evaluate_selected_in<A: ChunkAllocator + Clone>(
         );
     }
     Ok(verdict)
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ReplayDisposition {
+    Deliver,
+    Discard,
+    DeferForOtherResource,
+}
+
+pub(crate) async fn check_offline_replay<A: ChunkAllocator + Clone>(
+    router: &RouterHandle<A>,
+    snapshot: &RedbRead,
+    owner: &AccountKey,
+    sender: Option<&AccountKey>,
+    from: JidRef<'_>,
+    to: JidRef<'_>,
+    kind: StanzaType,
+) -> Result<ReplayDisposition, StageFailure> {
+    use ReplayDisposition::{DeferForOtherResource, Deliver, Discard};
+
+    if from.bare() == to.bare() {
+        return Ok(Deliver);
+    }
+    let selection = Selection::Explicit;
+    let check =
+        async |check| evaluate_checks(router, snapshot, kind, &[check], selection, true).await;
+    if selection.configured(router, owner.domain())
+        && check(Check {
+            account: owner,
+            direction: Direction::Inbound,
+            peer: from,
+        })
+        .await?
+            != Verdict::Allow
+    {
+        return Ok(Discard);
+    }
+    if let Some(sender) = sender {
+        let outbound = |peer| Check {
+            account: sender,
+            direction: Direction::Outbound,
+            peer,
+        };
+        if check(outbound(to)).await? != Verdict::Allow {
+            return Ok(if check(outbound(to.bare())).await? == Verdict::Allow {
+                DeferForOtherResource
+            } else {
+                Discard
+            });
+        }
+    }
+    Ok(Deliver)
 }
 
 pub(crate) struct PresencePolicy<'a, A: ChunkAllocator> {
@@ -384,7 +450,7 @@ pub(crate) async fn filter_pending<A: ChunkAllocator + Clone>(
     page: &mut PendingPage,
 ) -> Result<(), StageFailure> {
     let has_sender_policy = || {
-        router.has_explicit_presence_policy()
+        router.has_explicit_policy()
             && page
                 .iter()
                 .any(|(sender, _)| Selection::Explicit.configured(router, sender.domain()))

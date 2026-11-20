@@ -71,7 +71,43 @@ pub trait MessageHandler<A: ChunkAllocator, S: Storage>: Send + Sync {
         Box::pin(async { Ok(OfflinePage::new()) })
     }
 
-    /// Removes messages through `through` after a session delivers the replayed copies.
+    /// Checks whether a preloaded message still exists in the current replay snapshot.
+    fn replay_contains<'a>(
+        &'a self,
+        account: &'a AccountKey,
+        sequence: OfflineSequence,
+        transaction: &'a S::Read,
+    ) -> PresenceFuture<'a, bool> {
+        Box::pin(async move {
+            if let Some(after) = sequence.get().checked_sub(1) {
+                let page = self
+                    .backlog_page(
+                        account,
+                        transaction,
+                        OfflineSequence::new(after),
+                        sequence,
+                        OfflinePage::new(),
+                    )
+                    .await?;
+                if page.iter().any(|(entry, _)| entry.sequence == sequence) {
+                    return Ok(true);
+                }
+            }
+            // Single-page handlers can rely on the default empty range reader.
+            Ok(self
+                .backlog(account, transaction)
+                .await?
+                .is_some_and(|backlog| {
+                    backlog
+                        .page
+                        .iter()
+                        .any(|(entry, _)| entry.sequence == sequence)
+                }))
+        })
+    }
+
+    /// Removes records through `through` inclusive.
+    /// Each record must have a flushed replay copy or a permanent discard decision.
     fn acknowledge<'a>(
         &'a self,
         _account: &'a AccountKey,
@@ -81,7 +117,8 @@ pub trait MessageHandler<A: ChunkAllocator, S: Storage>: Send + Sync {
         Box::pin(async { Ok(()) })
     }
 
-    /// Removes a stored message after a session delivers its live copy; the row may already be gone.
+    /// Removes only `sequence` after its copy flushes or replay permanently discards it.
+    /// Succeeds if the record is already absent.
     fn acknowledge_one<'a>(
         &'a self,
         _account: &'a AccountKey,

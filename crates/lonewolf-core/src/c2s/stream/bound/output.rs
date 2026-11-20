@@ -30,7 +30,7 @@ pub(super) enum Outgoing<A: ChunkAllocator> {
     Owned { stanza: Stanza, arena: Arena<A> },
 }
 
-/// A stored copy that output releases once its last stanza reaches the release stage.
+/// The writer must flush the corresponding output sequence before storage can release the copy.
 pub(super) enum Release<A: ChunkAllocator> {
     Message {
         handler: Arc<dyn MessageHandler<A, RedbStorage>>,
@@ -39,5 +39,9 @@ pub(super) enum Release<A: ChunkAllocator> {
     Backlog {
         handler: Arc<dyn MessageHandler<A, RedbStorage>>,
         through: OfflineSequence,
+    },
+    BacklogMessages {
+        handler: Arc<dyn MessageHandler<A, RedbStorage>>,
+        sequences: Vec<OfflineSequence>,
     },
 }

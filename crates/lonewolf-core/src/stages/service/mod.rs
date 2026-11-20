@@ -193,7 +193,7 @@ impl<A: ChunkAllocator + Clone + 'static> ServiceOutbound<A> for Outbound<'_, A>
                     .map_err(|_| DeliveryError)?
                 {
                     Verdict::Allow => {}
-                    Verdict::Drop => return Ok(()),
+                    Verdict::Drop | Verdict::OutboundBlocked => return Ok(()),
                     Verdict::Reject { .. } => return Err(DeliveryError),
                 }
             }

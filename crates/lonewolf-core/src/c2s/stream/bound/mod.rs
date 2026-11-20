@@ -73,6 +73,7 @@ use crate::stages::ingress::iq::{AnswerStanzas, IqAnswer, IqDisposition, IqInput
 #[cfg(test)]
 use crate::stages::ingress::iq::{Diagnostics, GetWork, ResourceAuthorization, ResourceIqWork};
 use crate::stages::ingress::message::{MessageDisposition, Reply};
+use crate::stages::ingress::presence::ProbeAuthorization;
 #[cfg(test)]
 use crate::stages::iq::require_iq_account;
 use crate::stages::service::{self, ServiceOutcome, ServicePresenceLease};
@@ -592,6 +593,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         };
         match verdict {
             Verdict::Allow => {}
+            Verdict::OutboundBlocked => return self.reply_outbound_blocked(&routed),
             Verdict::Reject {
                 condition,
                 application,
@@ -853,6 +855,18 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
     async fn complete_iq(&mut self, disposition: IqDisposition<A>) -> Result<(), CloseOutcome> {
         match disposition {
             IqDisposition::Done => Ok(()),
+            IqDisposition::OutboundBlocked(IqInput::Owned {
+                request,
+                mut arena,
+                sender,
+            }) => {
+                let stanza = iq::outbound_blocked_reply(&request, &mut arena, sender)?;
+                self.outbox.push(Output::Owned { stanza, arena });
+                Ok(())
+            }
+            IqDisposition::OutboundBlocked(IqInput::Routed(stanza)) => {
+                self.reply_outbound_blocked(&stanza)
+            }
             IqDisposition::PolicyRejected {
                 input: IqInput::Owned {
                     request, mut arena, ..
@@ -1200,77 +1214,61 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             let view = routed.resolve()?;
             let to = view.to()?.ok_or(CloseOutcome::InternalError)?;
             match self.router.destination(to) {
-                Destination::Account | Destination::Resource => {}
+                Destination::Account | Destination::Resource => {
+                    Some(AccountKey::try_from(to.bare()).map_err(|_| CloseOutcome::InternalError)?)
+                }
+                Destination::Remote if self.router.federation_enabled() => None,
                 Destination::Remote => {
-                    if !self.router.federation_enabled() {
-                        return self
-                            .reply_error(&routed, StanzaErrorCondition::RemoteServerNotFound);
-                    }
-                    return self.handle_remote_probe(routed).await;
+                    return self.reply_error(&routed, StanzaErrorCondition::RemoteServerNotFound);
                 }
                 _ => return Ok(()),
             }
-            AccountKey::try_from(to.bare()).map_err(|_| CloseOutcome::InternalError)?
         };
         let session = self.registration.handle();
         let router = self.router.clone();
         let storage = self.storage.clone();
         let account = self.registration.account().clone();
         let pending = Pending::spawn(self.outbox.work.start(), async move {
-            let Some(grant) = ingress::presence::authorize_probe(
+            let local = target.is_some();
+            let grant = match ingress::presence::authorize_probe(
                 router.clone(),
                 storage,
                 Some(account),
-                Some(target),
+                target,
                 &routed,
                 false,
             )
             .await?
-            else {
-                return Ok::<_, CloseOutcome>(());
+            {
+                ProbeAuthorization::Granted(grant) => grant,
+                ProbeAuthorization::OutboundBlocked => return Ok::<_, CloseOutcome>(Some(routed)),
+                ProbeAuthorization::Denied => return Ok(None),
             };
-            let result = router
-                .probe_presence(&session, &routed, grant.subscribed)
-                .await;
-            drop(grant.ticket);
-            result.map_err(|_| CloseOutcome::InternalError)
-        });
-        self.outbox
-            .drain_until(&self.registration, pending.finished())
-            .await?
-            .ok_or(CloseOutcome::InternalError)?
-            .map_err(|_| CloseOutcome::InternalError)
-    }
-
-    async fn handle_remote_probe(&mut self, routed: RoutedStanza<A>) -> Result<(), CloseOutcome> {
-        let router = self.router.clone();
-        let storage = self.storage.clone();
-        let account = self.registration.account().clone();
-        let pending = Pending::spawn(self.outbox.work.start(), async move {
-            let Some(grant) = ingress::presence::authorize_probe(
-                router.clone(),
-                storage,
-                Some(account),
-                None,
-                &routed,
-                false,
-            )
-            .await?
-            else {
-                return Ok::<_, CloseOutcome>(());
-            };
-            let result = match router.route_remote_or_bounce(routed) {
-                Err(RouterError::Stopped) => Err(CloseOutcome::InternalError),
-                _ => Ok(()),
+            let result = if local {
+                router
+                    .probe_presence(&session, &routed, grant.subscribed)
+                    .await
+            } else {
+                match router.route_remote_or_bounce(routed) {
+                    Err(RouterError::Stopped) => Err(RouterError::Stopped),
+                    _ => Ok(()),
+                }
             };
             drop(grant.ticket);
             result
+                .map(|()| None)
+                .map_err(|_| CloseOutcome::InternalError)
         });
-        self.outbox
+        let blocked = self
+            .outbox
             .drain_until(&self.registration, pending.finished())
             .await?
             .ok_or(CloseOutcome::InternalError)?
-            .map_err(|_| CloseOutcome::InternalError)
+            .map_err(|_| CloseOutcome::InternalError)?;
+        if let Some(routed) = blocked {
+            self.reply_outbound_blocked(&routed)?;
+        }
+        Ok(())
     }
 
     async fn handle_directed(
@@ -1300,7 +1298,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             let view = routed.resolve()?;
             view.to()?.ok_or(CloseOutcome::InternalError)?;
             view.from()?.ok_or(CloseOutcome::InternalError)?;
-            if self
+            let verdict = self
                 .outbox
                 .drain_until(
                     &self.registration,
@@ -1314,10 +1312,11 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                         ingress::checks::Snapshot::Fresh,
                     ),
                 )
-                .await??
-                != Verdict::Allow
-            {
-                return Ok(());
+                .await??;
+            match verdict {
+                Verdict::Allow => {}
+                Verdict::OutboundBlocked => return self.reply_outbound_blocked(&routed),
+                Verdict::Drop | Verdict::Reject { .. } => return Ok(()),
             }
         }
         let session = self.registration.handle();
@@ -1787,7 +1786,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                 direction: Direction::Outbound,
                 peer: policy_target,
             }];
-            if self
+            let verdict = self
                 .outbox
                 .drain_until(
                     &self.registration,
@@ -1798,10 +1797,11 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                         &checks,
                     ),
                 )
-                .await??
-                != Verdict::Allow
-            {
-                return Ok(());
+                .await??;
+            match verdict {
+                Verdict::Allow => {}
+                Verdict::OutboundBlocked => return self.reply_outbound_blocked(&source),
+                Verdict::Drop | Verdict::Reject { .. } => return Ok(()),
             }
         }
         if let Some(sender_host) = sender_host {
@@ -2048,6 +2048,12 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             application,
             text,
         )?));
+        Ok(())
+    }
+
+    fn reply_outbound_blocked(&mut self, source: &RoutedStanza<A>) -> Result<(), CloseOutcome> {
+        let reply = ingress::outbound_blocked_reply(&self.allocator, source)?;
+        self.outbox.push(Output::Routed(reply));
         Ok(())
     }
 

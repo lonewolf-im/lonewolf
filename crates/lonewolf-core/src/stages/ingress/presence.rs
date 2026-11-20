@@ -23,6 +23,12 @@ pub(crate) struct ProbeGrant {
     pub(crate) ticket: Ticket,
 }
 
+pub(crate) enum ProbeAuthorization {
+    Granted(ProbeGrant),
+    OutboundBlocked,
+    Denied,
+}
+
 pub(crate) async fn authorize_probe<A: ChunkAllocator + Clone + 'static>(
     router: RouterHandle<A>,
     storage: RedbStorage,
@@ -30,7 +36,7 @@ pub(crate) async fn authorize_probe<A: ChunkAllocator + Clone + 'static>(
     target: Option<AccountKey>,
     routed: &RoutedStanza<A>,
     check_account_exists: bool,
-) -> Result<Option<ProbeGrant>, StageFailure> {
+) -> Result<ProbeAuthorization, StageFailure> {
     let local = sender.is_some() && target.is_some();
     let (accounts, sender) = match (sender, target.as_ref()) {
         (Some(sender), Some(target)) => {
@@ -130,11 +136,17 @@ pub(crate) async fn authorize_probe<A: ChunkAllocator + Clone + 'static>(
         (false, verdict)
     };
     drop(transaction);
-    if verdict != Verdict::Allow {
-        return Ok(None);
+    match verdict {
+        Verdict::Allow => {
+            ticket.turn().await;
+            Ok(ProbeAuthorization::Granted(ProbeGrant {
+                subscribed,
+                ticket,
+            }))
+        }
+        Verdict::OutboundBlocked => Ok(ProbeAuthorization::OutboundBlocked),
+        Verdict::Drop | Verdict::Reject { .. } => Ok(ProbeAuthorization::Denied),
     }
-    ticket.turn().await;
-    Ok(Some(ProbeGrant { subscribed, ticket }))
 }
 
 pub(crate) enum SubscriptionIngress {

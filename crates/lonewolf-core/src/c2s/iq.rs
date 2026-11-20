@@ -71,3 +71,15 @@ pub(super) fn error_reply_with<A: ChunkAllocator>(
         .to(to)?
         .build()?)
 }
+
+pub(super) fn outbound_blocked_reply<A: ChunkAllocator>(
+    request: &Stanza,
+    arena: &mut Arena<A>,
+    sender: Jid,
+) -> Result<Stanza, ReplyError> {
+    Ok(
+        crate::stages::ingress::outbound_blocked_reply_in(request, arena)?
+            .to(Some(sender))?
+            .build()?,
+    )
+}

@@ -358,6 +358,7 @@ fn policy_rejections_keep_application_and_text_and_drop_stops_later_stages() -> 
             (Verdict::Reject { condition: StanzaErrorCondition::Forbidden, application: Some(ApplicationCondition { name: "blocked", namespace: "urn:test:policy" }), text: Some(StanzaErrorText::Static("Policy rejected request.")) }, false),
             (Verdict::Reject { condition: StanzaErrorCondition::Forbidden, application: None, text: None }, false),
             (Verdict::Drop, false),
+            (Verdict::OutboundBlocked, false),
             (Verdict::Allow, true),
         ] {
             for kind in ["chat", "headline", "error"] {
@@ -843,7 +844,11 @@ fn inbound_iq_builtin_handlers_keep_remote_non_owner_rules() -> TestResult {
 #[test]
 fn inbound_iq_normalizes_one_recipient_policy_for_every_type_and_target() -> TestResult {
     compio::runtime::Runtime::new()?.block_on(compio::time::timeout(Duration::from_secs(10), async {
-        for verdict in [Verdict::Drop, Verdict::Reject { condition: StanzaErrorCondition::Forbidden, application: Some(ApplicationCondition { name: "blocked", namespace: "urn:test:policy" }), text: Some(StanzaErrorText::Static("Blocked IQ.")) }] {
+        for (verdict, condition, text, application) in [
+            (Verdict::Drop, StanzaErrorCondition::ServiceUnavailable, default_text(StanzaErrorCondition::ServiceUnavailable), false),
+            (Verdict::OutboundBlocked, StanzaErrorCondition::ServiceUnavailable, default_text(StanzaErrorCondition::ServiceUnavailable), false),
+            (Verdict::Reject { condition: StanzaErrorCondition::Forbidden, application: Some(ApplicationCondition { name: "blocked", namespace: "urn:test:policy" }), text: Some(StanzaErrorText::Static("Blocked IQ.")) }, StanzaErrorCondition::Forbidden, "Blocked IQ.", true),
+        ] {
             let handler = Arc::new(Iqs::new(verdict, true));
             let mut extensions = Extensions::default(); extensions.register(handler.clone())?;
             let fixture = Fixture::new(extensions, &["iqs"])?;
@@ -857,9 +862,10 @@ fn inbound_iq_normalizes_one_recipient_policy_for_every_type_and_target() -> Tes
                     assert!(handler.visibility.lock().is_empty());
                     assert_eq!(handler.calls.load(Ordering::SeqCst), 0);
                     if matches!(typed, IqType::Get | IqType::Set) {
-                        let condition = if verdict == Verdict::Drop { StanzaErrorCondition::ServiceUnavailable } else { StanzaErrorCondition::Forbidden };
-                        let reply = error_reply(&fixture, target, "iq", if verdict == Verdict::Drop { "service-unavailable" } else { "forbidden" }, if verdict == Verdict::Drop { default_text(condition) } else { "Blocked IQ." })?;
-                        if verdict != Verdict::Drop { assert!(reply.resolve()?.child("error", "jabber:client")?.ok_or("error")?.child("blocked", "urn:test:policy")?.is_some()); }
+                        let reply = error_reply(&fixture, target, "iq", condition.as_str(), text)?;
+                        let error = reply.resolve()?.child("error", "jabber:client")?.ok_or("error")?;
+                        assert_eq!(error.child("blocked", "urn:test:policy")?.is_some(), application);
+                        assert!(error.child("blocked", "urn:xmpp:blocking:errors")?.is_none());
                     } else { assert!(fixture.remote.receive()?.is_none()); }
                 }
             }

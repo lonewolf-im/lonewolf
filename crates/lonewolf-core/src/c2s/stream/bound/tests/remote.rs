@@ -134,6 +134,273 @@ fn rejection(application: bool, text: bool) -> Verdict {
     }
 }
 
+const BLOCKING_ERRORS: &str = "urn:xmpp:blocking:errors";
+
+fn assert_blocked<E: ArenaRead>(view: &StanzaRef<'_, E>) -> TestResult {
+    let error = view
+        .child("error", CLIENT_NAMESPACE)?
+        .ok_or("missing error")?;
+    assert_eq!(error.attribute("type", "")?, Some("cancel"));
+    assert!(
+        error
+            .child("not-acceptable", "urn:ietf:params:xml:ns:xmpp-stanzas")?
+            .is_some()
+    );
+    let blocked = error
+        .child("blocked", BLOCKING_ERRORS)?
+        .ok_or("missing blocked")?;
+    assert_eq!(blocked.children()?.count(), 0);
+    assert_eq!(blocked.attributes()?.count(), 0);
+    Ok(())
+}
+
+#[test]
+fn outbound_block_uses_cancel_without_changing_generic_not_acceptable() -> TestResult {
+    Runtime::new()?.block_on(compio::time::timeout(Duration::from_secs(5), async {
+        let fixture = Fixture::new(&[]).await?;
+        for verdict in [
+            Verdict::Reject {
+                condition: StanzaErrorCondition::NotAcceptable,
+                application: None,
+                text: None,
+            },
+            Verdict::OutboundBlocked,
+        ] {
+            let mut remote = RemoteFixture::new(AdmissionState::Link)?;
+            let policy = Arc::new(Policy { verdict, fail: false, checks: PlMutex::new(Vec::new()) });
+            let (router, mut session) = session(&fixture, &remote, true, Some(policy)).await?;
+            let source = parsed("<message type='chat' from='ignored@example.com' to='bob@remote.test/phone' id='example-9' xml:lang='es'><body>Hola &amp; adiós</body></message>").await?;
+            session.handle_stanza(source).await.map_err(|error| format!("{error:?}"))?;
+            session.outbox.flush().await.map_err(|error| format!("{error:?}"))?;
+            let [serialized] = session.outbox.writer.written.as_slice() else {
+                return Err("expected one reply".into());
+            };
+            let reply = RoutedStanza::from_parsed(parsed(serialized).await?);
+            let view = reply.resolve()?;
+            assert_eq!(view.stanza_type(), StanzaType::Message(MessageType::Error));
+            assert_eq!(view.from()?.ok_or("from")?.as_str(), "bob@remote.test/phone");
+            assert_eq!(view.to()?.ok_or("to")?.as_str(), "alice@example.com/desk");
+            assert_eq!(view.id()?, Some("example-9"));
+            assert_eq!(view.lang()?, Some("es"));
+            assert_eq!(view.child("body", CLIENT_NAMESPACE)?.ok_or("body")?.text()?, Some("Hola & adiós"));
+            assert!(serialized.contains("Hola &amp; adiós"), "{serialized}");
+            if verdict == Verdict::OutboundBlocked {
+                assert_blocked(&view)?;
+                assert!(serialized.contains("<blocked xmlns=\"urn:xmpp:blocking:errors\"/>"), "{serialized}");
+            } else {
+                let error = view.child("error", CLIENT_NAMESPACE)?.ok_or("missing error")?;
+                assert_eq!(error.attribute("type", "")?, Some("modify"));
+                assert!(error.child("not-acceptable", "urn:ietf:params:xml:ns:xmpp-stanzas")?.is_some());
+                assert!(error.child("blocked", BLOCKING_ERRORS)?.is_none());
+            }
+            assert_eq!(remote.occupancy(), (0, 0));
+            drop(session);
+            remote.finish(Instant::now() + Duration::from_secs(5)).await?;
+            router.shutdown().await?;
+        }
+        fixture.finish().await
+    }))?
+}
+
+#[test]
+fn outbound_blocked_iq_and_directed_presence_keep_the_requesting_resource() -> TestResult {
+    Runtime::new()?.block_on(compio::time::timeout(Duration::from_secs(5), async {
+        let fixture = Fixture::new(&[]).await?;
+        let mut remote = RemoteFixture::new(AdmissionState::Link)?;
+        let policy = Arc::new(Policy {
+            verdict: Verdict::OutboundBlocked,
+            fail: false,
+            checks: PlMutex::new(Vec::new()),
+        });
+        let (router, mut session) = session(&fixture, &remote, true, Some(policy)).await?;
+        let target = "bob@remote.test/phone";
+        for (kind, answer) in [
+            (StanzaType::Iq(IqType::Get), Some(StanzaType::Iq(IqType::Error))),
+            (StanzaType::Iq(IqType::Set), Some(StanzaType::Iq(IqType::Error))),
+            (StanzaType::Iq(IqType::Result), None),
+            (StanzaType::Iq(IqType::Error), None),
+            (StanzaType::Presence(PresenceType::Available), Some(StanzaType::Presence(PresenceType::Error))),
+            (StanzaType::Presence(PresenceType::Unavailable), Some(StanzaType::Presence(PresenceType::Error))),
+            (StanzaType::Presence(PresenceType::Subscribe), Some(StanzaType::Presence(PresenceType::Error))),
+            (StanzaType::Presence(PresenceType::Subscribed), Some(StanzaType::Presence(PresenceType::Error))),
+            (StanzaType::Presence(PresenceType::Unsubscribe), Some(StanzaType::Presence(PresenceType::Error))),
+            (StanzaType::Presence(PresenceType::Unsubscribed), Some(StanzaType::Presence(PresenceType::Error))),
+            (StanzaType::Presence(PresenceType::Probe), Some(StanzaType::Presence(PresenceType::Error))),
+            (StanzaType::Message(MessageType::Error), None),
+        ] {
+            let name = kind.kind().as_str();
+            let type_attr = kind.as_str().map_or_else(String::new, |value| format!(" type='{value}'"));
+            let payload = match kind {
+                StanzaType::Iq(_) => "<query xmlns='urn:test'/>",
+                StanzaType::Presence(_) => "<status>test</status>",
+                _ => "<body>test</body>",
+            };
+            let original_error = if kind.is_error() {
+                "<error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>"
+            } else { "" };
+            let xml = format!("<{name}{type_attr} from='ignored@example.com' to='{target}' id='blocked' xml:lang='es'>{payload}{original_error}</{name}>");
+            session.handle_stanza(parsed(&xml).await?).await.map_err(|error| format!("{kind:?}: {error:?}"))?;
+            session.outbox.flush().await.map_err(|error| format!("{error:?}"))?;
+            let replies = std::mem::take(&mut session.outbox.writer.written);
+            if let Some(expected) = answer {
+                let [serialized] = replies.as_slice() else { return Err(format!("expected one reply for {kind:?}").into()); };
+                let reply = RoutedStanza::from_parsed(parsed(serialized).await?);
+                let view = reply.resolve()?;
+                assert_eq!(view.stanza_type(), expected, "{kind:?}");
+                assert_eq!(view.id()?, Some("blocked"));
+                assert_eq!(view.lang()?, Some("es"));
+                assert_eq!(view.to()?.ok_or("to")?.as_str(), "alice@example.com/desk");
+                assert_eq!(view.from()?.ok_or("from")?.as_str(), target);
+                assert_blocked(&view)?;
+            } else {
+                assert!(replies.is_empty(), "{kind:?}");
+            }
+            assert!(remote.receive()?.is_none(), "{kind:?}");
+        }
+        drop(session);
+        remote.finish(Instant::now() + Duration::from_secs(5)).await?;
+        router.shutdown().await?;
+        fixture.finish().await
+    }))?
+}
+
+#[test]
+fn outbound_block_hides_mutual_block() -> TestResult {
+    use lonewolf_storage::blocking::{BlockChange, BlockingReads, BlockingWrites};
+    use lonewolf_storage::roster::RosterJid;
+
+    struct Blocklists;
+
+    impl Extension<GlobalChunkAllocator, RedbStorage> for Blocklists {
+        fn name(&self) -> &'static str {
+            "test-blocklists"
+        }
+
+        fn register(
+            self: Arc<Self>,
+            _: &str,
+            slots: &mut Slots<'_, GlobalChunkAllocator, RedbStorage>,
+        ) -> Result<(), RegistrationError> {
+            slots.policy(self);
+            Ok(())
+        }
+    }
+
+    impl PolicyHandler<RedbStorage> for Blocklists {
+        fn check<'a>(
+            &'a self,
+            request: PolicyRequest<'a>,
+            transaction: &'a RedbRead,
+        ) -> PolicyFuture<'a> {
+            Box::pin(async move {
+                if !transaction
+                    .is_blocked(request.account, request.peer)
+                    .await
+                    .map_err(|_| HandlerError::from(StanzaErrorCondition::InternalServerError))?
+                {
+                    return Ok(Verdict::Allow);
+                }
+                Ok(match request.direction {
+                    Direction::Outbound => Verdict::OutboundBlocked,
+                    Direction::Inbound => Verdict::Reject {
+                        condition: StanzaErrorCondition::ServiceUnavailable,
+                        application: None,
+                        text: None,
+                    },
+                })
+            })
+        }
+    }
+
+    Runtime::new()?.block_on(compio::time::timeout(Duration::from_secs(5), async {
+        let fixture = Fixture::new(&[]).await?;
+        let mut arena = Arena::try_new(Default::default())?;
+        let alice = Jid::parse_in("alice@localhost", &mut arena)?.resolve(&arena)?;
+        let alice = AccountKey::try_from(alice)?;
+        let bob = fixture.registration.account();
+        let mut transaction = fixture.storage.begin_write().await?;
+        transaction
+            .create_account(NewAccount {
+                key: alice.clone(),
+                credentials: credentials(),
+            })
+            .await?;
+        transaction
+            .change_blocklist(&alice, BlockChange::Block(&[RosterJid::from(bob)]))
+            .await?;
+        transaction
+            .change_blocklist(bob, BlockChange::Block(&[RosterJid::from(&alice)]))
+            .await?;
+        transaction.commit().await?;
+
+        let mut extensions = Extensions::default();
+        extensions.register(Arc::new(Blocklists))?;
+        let router = Router::new(
+            Hosts::new(&Config::default().hosts, None)?,
+            LocalRouter::new(GlobalChunkAllocator),
+        )
+        .with_extensions(BTreeMap::from([(
+            "localhost".into(),
+            extensions.enable_host("localhost", ["test-blocklists"])?,
+        )]));
+        let handle = router.handle();
+        let registration = handle
+            .register(&alice, Some("desk"), NonZeroUsize::MIN)
+            .await?;
+        let recipient = handle
+            .register(bob, Some("phone"), NonZeroUsize::MIN)
+            .await?;
+        let (_, incoming) = async_channel::bounded(1);
+        let mut session =
+            fixture.bound_session(GlobalChunkAllocator, registration, handle, incoming)?;
+        session.outbox.account = alice.clone();
+        let chat =
+            "<message type='chat' to='bob@localhost/phone' id='chat'><body>Hello</body></message>";
+        for owner_block in [true, false] {
+            if !owner_block {
+                let mut transaction = fixture.storage.begin_write().await?;
+                transaction
+                    .change_blocklist(&alice, BlockChange::Unblock(&[RosterJid::from(bob)]))
+                    .await?;
+                transaction.commit().await?;
+            }
+            session
+                .handle_stanza(parsed(chat).await?)
+                .await
+                .map_err(|error| format!("{error:?}"))?;
+            session
+                .outbox
+                .flush()
+                .await
+                .map_err(|error| format!("{error:?}"))?;
+            let serialized = std::mem::take(&mut session.outbox.writer.written);
+            let [serialized] = serialized.as_slice() else {
+                return Err("expected one reply".into());
+            };
+            let reply = RoutedStanza::from_parsed(parsed(serialized).await?);
+            let view = reply.resolve()?;
+            assert_eq!(view.to()?.ok_or("to")?.as_str(), "alice@localhost/desk");
+            let error = view
+                .child("error", CLIENT_NAMESPACE)?
+                .ok_or("missing error")?;
+            let unavailable =
+                error.child("service-unavailable", "urn:ietf:params:xml:ns:xmpp-stanzas")?;
+            if owner_block {
+                assert_blocked(&view)?;
+                assert!(unavailable.is_none());
+            } else {
+                assert!(unavailable.is_some());
+                assert!(error.child("blocked", BLOCKING_ERRORS)?.is_none());
+            }
+            assert!(recipient.take_queued().is_empty());
+        }
+        drop(recipient);
+        drop(session);
+        router.shutdown().await?;
+        fixture.finish().await
+    }))?
+}
+
 #[test]
 fn remote_iq_policy_matrix_uses_authenticated_outbound_identity() -> TestResult {
     Runtime::new()?.block_on(compio::time::timeout(Duration::from_secs(5), async {

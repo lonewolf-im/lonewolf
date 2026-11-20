@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Builds immutable stanza trees with all retained data in one arena.
-//!
-//! Builders validate XML structure; protocol handlers validate payload schemas.
+//! Stanza trees retain their data in one arena. Builders leave payload schema validation to protocol handlers.
 
 use std::fmt;
 use std::io;
@@ -22,7 +20,7 @@ mod storage;
 pub(crate) mod xml;
 
 pub use element::{AttributeRef, Element, ElementBuilder, ElementRef, NodeRef};
-pub use error::{StanzaErrorText, error_element_in};
+pub use error::{StanzaErrorClass, StanzaErrorText, error_element_in};
 pub use incoming::{RejectedStanza, StanzaRejection};
 pub use routed::RoutedStanza;
 
@@ -150,16 +148,22 @@ impl StanzaErrorCondition {
     }
 
     pub const fn error_type(self) -> &'static str {
+        self.error_class().as_str()
+    }
+
+    const fn error_class(self) -> StanzaErrorClass {
         match self {
-            Self::BadRequest | Self::JidMalformed | Self::NotAcceptable => "modify",
+            Self::BadRequest | Self::JidMalformed | Self::NotAcceptable => StanzaErrorClass::Modify,
             Self::Conflict
             | Self::ItemNotFound
             | Self::NotAllowed
             | Self::RemoteServerNotFound
-            | Self::ServiceUnavailable => "cancel",
-            Self::Forbidden => "auth",
-            Self::InternalServerError => "cancel",
-            Self::PolicyViolation | Self::RemoteServerTimeout | Self::ResourceConstraint => "wait",
+            | Self::ServiceUnavailable
+            | Self::InternalServerError => StanzaErrorClass::Cancel,
+            Self::Forbidden => StanzaErrorClass::Auth,
+            Self::PolicyViolation | Self::RemoteServerTimeout | Self::ResourceConstraint => {
+                StanzaErrorClass::Wait
+            }
         }
     }
 }
@@ -441,7 +445,6 @@ impl Stanza {
         self.error_reply_with_in(arena, condition, None)
     }
 
-    /// Keeps the error reply contract of [`Self::error_reply_in`] and adds an application condition.
     pub fn error_reply_with_in<'a, A: ChunkAllocator>(
         &self,
         arena: &'a mut Arena<A>,
@@ -458,6 +461,18 @@ impl Stanza {
         application: Option<ApplicationCondition>,
         text: StanzaErrorText,
     ) -> Result<StanzaBuilder<'a, A>, BuildError> {
+        self.error_reply_with_class_in(arena, condition, condition.error_class(), application, text)
+    }
+
+    /// Keeps the reply envelope of [`Self::error_reply_in`] with an explicit error class.
+    pub fn error_reply_with_class_in<'a, A: ChunkAllocator>(
+        &self,
+        arena: &'a mut Arena<A>,
+        condition: StanzaErrorCondition,
+        class: StanzaErrorClass,
+        application: Option<ApplicationCondition>,
+        text: StanzaErrorText,
+    ) -> Result<StanzaBuilder<'a, A>, BuildError> {
         let mut header = arena.get(self.data)?.header;
         header.stanza_type = match header.stanza_type {
             StanzaType::Iq(IqType::Get | IqType::Set) => StanzaType::Iq(IqType::Error),
@@ -471,7 +486,14 @@ impl Stanza {
         };
         header.original_message_type = None;
         let children = arena.get(self.data)?.children;
-        let error = error_element_in(header.namespace, condition, application, text, arena)?;
+        let error = error::error_element_with_class_in(
+            header.namespace,
+            condition,
+            class,
+            application,
+            text,
+            arena,
+        )?;
         std::mem::swap(&mut header.from, &mut header.to);
         StanzaBuilder {
             arena,

@@ -187,11 +187,10 @@ use std::error::Error;
 use std::fs;
 use std::time::Instant;
 
+use aws_lc_rs::rand::SystemRandom;
+use aws_lc_rs::signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, KeyPair};
 use compio::runtime::Runtime;
 use futures_channel::oneshot;
-use graviola::hashing::Sha256;
-use graviola::key_agreement::p256::StaticPrivateKey;
-use graviola::signing::ecdsa::{P256, SigningKey};
 use parking_lot::Mutex as PlMutex;
 use prometheus_client::registry::Registry;
 use rcgen::{
@@ -209,23 +208,18 @@ pub(super) const ROOT_CRL: &str = "http://ca.example/root.crl";
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 struct Signer {
-    key: SigningKey<P256>,
-    public: [u8; 65],
+    key: EcdsaKeyPair,
 }
 impl Signer {
     fn new() -> TestResult<Self> {
-        let key = SigningKey::<P256> {
-            private_key: StaticPrivateKey::new_random()?,
-        };
         Ok(Self {
-            public: key.private_key.public_key_uncompressed(),
-            key,
+            key: EcdsaKeyPair::generate(&ECDSA_P256_SHA256_ASN1_SIGNING)?,
         })
     }
 }
 impl rcgen::PublicKeyData for Signer {
     fn der_bytes(&self) -> &[u8] {
-        &self.public
+        self.key.public_key().as_ref()
     }
     fn algorithm(&self) -> &'static rcgen::SignatureAlgorithm {
         &rcgen::PKCS_ECDSA_P256_SHA256
@@ -233,10 +227,9 @@ impl rcgen::PublicKeyData for Signer {
 }
 impl rcgen::SigningKey for Signer {
     fn sign(&self, bytes: &[u8]) -> Result<Vec<u8>, rcgen::Error> {
-        let mut signature = [0; 80];
         self.key
-            .sign_asn1::<Sha256>(&[bytes], &mut signature)
-            .map(<[u8]>::to_vec)
+            .sign(&SystemRandom::new(), bytes)
+            .map(|signature| signature.as_ref().to_vec())
             .map_err(|_| rcgen::Error::RemoteKeyError)
     }
 }
@@ -298,7 +291,7 @@ impl FetchedFixture {
                 trust_anchors_path: Some(roots),
                 ..Default::default()
             },
-            Arc::new(rustls_graviola::default_provider()),
+            Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
         )?;
         let chain = Arc::from([leaf.der().clone(), issuer.der().clone()]);
         Ok(Self {

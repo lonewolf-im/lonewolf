@@ -1,37 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{BenchResult, failure};
+use aws_lc_rs::rand::SystemRandom;
+use aws_lc_rs::signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, KeyPair};
 use base64::{Engine, engine::general_purpose::STANDARD};
-use graviola::{
-    hashing::Sha256,
-    key_agreement::p256::StaticPrivateKey,
-    signing::ecdsa::{P256, SigningKey},
-};
 use rcgen::{CertificateParams, PublicKeyData};
 use rustls::pki_types::CertificateDer;
 use std::{fs::OpenOptions, io::Write, os::unix::fs::OpenOptionsExt, path::Path};
 use zeroize::Zeroizing;
 
 pub(super) fn configure(directory: &Path) -> BenchResult<CertificateDer<'static>> {
-    let key = SigningKey::<P256> {
-        private_key: StaticPrivateKey::new_random().map_err(|_| failure("fixture_key"))?,
-    };
-    let signer = Signer {
-        public_key: key.private_key.public_key_uncompressed(),
-        key,
-    };
+    let signer = Signer(
+        EcdsaKeyPair::generate(&ECDSA_P256_SHA256_ASN1_SIGNING)
+            .map_err(|_| failure("fixture_key"))?,
+    );
     let mut parameters = CertificateParams::new(vec!["localhost".into()])
         .map_err(|_| failure("fixture_certificate"))?;
     parameters.serial_number = Some(1u64.into());
     let certificate = parameters
         .self_signed(&signer)
         .map_err(|_| failure("fixture_certificate"))?;
-    let mut key_bytes = Zeroizing::new([0; 512]);
-    let key_der = signer
-        .key
-        .to_pkcs8_der(&mut key_bytes[..])
-        .map_err(|_| failure("fixture_key"))?;
-    let key_pem = pem("PRIVATE KEY", key_der)?;
+    let key_der = signer.0.to_pkcs8v1().map_err(|_| failure("fixture_key"))?;
+    let key_pem = pem("PRIVATE KEY", key_der.as_ref())?;
     write_private(&directory.join("key.pem"), key_pem.as_bytes())?;
     write_private(
         &directory.join("certificate.pem"),
@@ -64,13 +54,10 @@ fn pem(label: &str, der: &[u8]) -> BenchResult<Zeroizing<String>> {
     Ok(output)
 }
 
-struct Signer {
-    key: SigningKey<P256>,
-    public_key: [u8; 65],
-}
+struct Signer(EcdsaKeyPair);
 impl PublicKeyData for Signer {
     fn der_bytes(&self) -> &[u8] {
-        &self.public_key
+        self.0.public_key().as_ref()
     }
     fn algorithm(&self) -> &'static rcgen::SignatureAlgorithm {
         &rcgen::PKCS_ECDSA_P256_SHA256
@@ -78,10 +65,9 @@ impl PublicKeyData for Signer {
 }
 impl rcgen::SigningKey for Signer {
     fn sign(&self, message: &[u8]) -> Result<Vec<u8>, rcgen::Error> {
-        let mut signature = [0; 80];
-        self.key
-            .sign_asn1::<Sha256>(&[message], &mut signature)
-            .map(<[u8]>::to_vec)
+        self.0
+            .sign(&SystemRandom::new(), message)
+            .map(|signature| signature.as_ref().to_vec())
             .map_err(|_| rcgen::Error::RemoteKeyError)
     }
 }

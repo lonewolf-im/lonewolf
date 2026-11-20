@@ -682,7 +682,7 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
             Some(resource) if !sessions.contains_key(resource.as_ref()) => resource,
             _ => loop {
                 let mut random = [0; 16];
-                graviola::random::fill(&mut random).map_err(|_| RouterError::Unavailable)?;
+                aws_lc_rs::rand::fill(&mut random).map_err(|_| RouterError::Unavailable)?;
                 let candidate = format!("lw-{:032x}", u128::from_be_bytes(random)).into_boxed_str();
                 if !sessions.contains_key(candidate.as_ref()) {
                     break candidate;

@@ -234,11 +234,13 @@ fn deadline_bridge(
 }
 
 fn build_agent(roots: RootCertStore, timeout: Duration) -> Result<ureq::Agent, AcmeError> {
-    let tls = ClientConfig::builder_with_provider(Arc::new(rustls_graviola::default_provider()))
-        .with_safe_default_protocol_versions()
-        .map_err(|_| AcmeError::new(AcmeErrorKind::Crypto))?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    let tls = ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|_| AcmeError::new(AcmeErrorKind::Crypto))?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
     let config = ureq::Agent::config_builder()
         .https_only(true)
         .proxy(None)

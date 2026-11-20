@@ -4,10 +4,9 @@ use std::collections::VecDeque;
 use std::error::Error;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use aws_lc_rs::rand::SystemRandom;
+use aws_lc_rs::signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, KeyPair};
 use compio::runtime::Runtime;
-use graviola::hashing::Sha256;
-use graviola::key_agreement::p256::StaticPrivateKey;
-use graviola::signing::ecdsa::{P256, SigningKey};
 use prometheus_client::registry::Registry;
 use rcgen::{
     BasicConstraints, CertificateParams, CertificateRevocationListParams, CertifiedIssuer, DnType,
@@ -21,23 +20,18 @@ use super::*;
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 struct Signer {
-    key: SigningKey<P256>,
-    public: [u8; 65],
+    key: EcdsaKeyPair,
 }
 impl Signer {
     fn new() -> TestResult<Self> {
-        let key = SigningKey::<P256> {
-            private_key: StaticPrivateKey::new_random()?,
-        };
         Ok(Self {
-            public: key.private_key.public_key_uncompressed(),
-            key,
+            key: EcdsaKeyPair::generate(&ECDSA_P256_SHA256_ASN1_SIGNING)?,
         })
     }
 }
 impl rcgen::PublicKeyData for Signer {
     fn der_bytes(&self) -> &[u8] {
-        &self.public
+        self.key.public_key().as_ref()
     }
     fn algorithm(&self) -> &'static rcgen::SignatureAlgorithm {
         &rcgen::PKCS_ECDSA_P256_SHA256
@@ -45,10 +39,9 @@ impl rcgen::PublicKeyData for Signer {
 }
 impl rcgen::SigningKey for Signer {
     fn sign(&self, bytes: &[u8]) -> Result<Vec<u8>, rcgen::Error> {
-        let mut signature = [0; 80];
         self.key
-            .sign_asn1::<Sha256>(&[bytes], &mut signature)
-            .map(<[u8]>::to_vec)
+            .sign(&SystemRandom::new(), bytes)
+            .map(|signature| signature.as_ref().to_vec())
             .map_err(|_| rcgen::Error::RemoteKeyError)
     }
 }

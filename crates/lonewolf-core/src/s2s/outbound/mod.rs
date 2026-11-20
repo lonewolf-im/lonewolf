@@ -565,7 +565,7 @@ fn backoff_delay(limits: &S2sLimits, failures: u32, jitter: u16) -> Duration {
 }
 
 fn jitter() -> u16 {
-    draw_jitter(|bytes| graviola::random::fill(bytes).is_ok())
+    draw_jitter(|bytes| aws_lc_rs::rand::fill(bytes).is_ok())
 }
 
 fn draw_jitter(mut fill: impl FnMut(&mut [u8]) -> bool) -> u16 {

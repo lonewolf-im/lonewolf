@@ -92,6 +92,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
+name = "aws-lc-rs"
+version = "1.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "048006790404103c488e6c5616b3e7e702a71292aadda08e8f7698a9e0d2eb53"
+dependencies = [
+ "aws-lc-sys",
+ "zeroize",
+]
+
+[[package]]
+name = "aws-lc-sys"
+version = "0.47.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8bfbe32ac36b3c428696ce315464181bc4029d689fd58e3f2a4e58c252242f52"
+dependencies = [
+ "cc",
+ "cmake",
+ "dunce",
+ "fs_extra",
+ "pkg-config",
+]
+
+[[package]]
 name = "axum"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -218,6 +241,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "509591b7bcd67f4ef775afad7662703b4935daaa6ec0e5605cfb1090b32a2b6d"
 dependencies = [
  "find-msvc-tools",
+ "jobserver",
+ "libc",
  "shlex",
 ]
 
@@ -281,6 +306,15 @@ name = "clap_lex"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
+
+[[package]]
+name = "cmake"
+version = "0.1.58"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0f78a02292a74a88ac736019ab962ece0bc380e3f977bf72e376c5d78ff0678"
+dependencies = [
+ "cc",
+]
 
 [[package]]
 name = "cmov"
@@ -680,6 +714,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4c3cf4824e2d5f025c7b531afcb2325364084a16806f6d47fbc1f5fbd9960590"
 
 [[package]]
+name = "dunce"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
+
+[[package]]
 name = "ecdsa"
 version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -801,6 +841,12 @@ checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
 ]
+
+[[package]]
+name = "fs_extra"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "futures-channel"
@@ -952,16 +998,6 @@ dependencies = [
  "libc",
  "r-efi 6.0.0",
  "rand_core 0.10.1",
-]
-
-[[package]]
-name = "graviola"
-version = "0.4.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc0377ccc5ef095424121430046e475cf06658e23475b1af526655cfad0b86b2"
-dependencies = [
- "cfg-if",
- "getrandom 0.4.3",
 ]
 
 [[package]]
@@ -1329,6 +1365,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "jobserver"
+version = "0.1.35"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c00acbd29eabad4a2392fa0e921c874934dbbf4194312ad20f04a0ed67a3cb3"
+dependencies = [
+ "getrandom 0.4.3",
+ "libc",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1386,10 +1432,10 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 name = "lonewolf"
 version = "0.3.0"
 dependencies = [
+ "aws-lc-rs",
  "base64",
  "clap",
  "futures-executor",
- "graviola",
  "hmac",
  "idna",
  "lonewolf-acme",
@@ -1402,7 +1448,6 @@ dependencies = [
  "quick-xml",
  "rcgen",
  "rustls",
- "rustls-graviola",
  "serde_json",
  "sha1 0.11.0",
  "sha2",
@@ -1418,6 +1463,7 @@ dependencies = [
 name = "lonewolf-acme"
 version = "0.3.0"
 dependencies = [
+ "aws-lc-rs",
  "base64",
  "blocking",
  "bytes",
@@ -1427,7 +1473,6 @@ dependencies = [
  "futures-executor",
  "futures-util",
  "getrandom 0.4.3",
- "graviola",
  "hmac",
  "http",
  "http-body-util",
@@ -1444,7 +1489,6 @@ dependencies = [
  "rcgen",
  "redb",
  "rustls",
- "rustls-graviola",
  "serde",
  "serde_json",
  "sha2",
@@ -1508,13 +1552,13 @@ version = "0.3.0"
 dependencies = [
  "async-channel",
  "async-lock",
+ "aws-lc-rs",
  "base64",
  "compio",
  "crossbeam-utils",
  "futures-channel",
  "futures-rustls",
  "futures-util",
- "graviola",
  "hickory-proto",
  "hmac",
  "http",
@@ -1537,7 +1581,6 @@ dependencies = [
  "rcgen",
  "redb",
  "rustls",
- "rustls-graviola",
  "rustls-webpki",
  "serde",
  "serde_json",
@@ -1657,13 +1700,13 @@ name = "lonewolfbench"
 version = "0.3.0"
 dependencies = [
  "async-lock",
+ "aws-lc-rs",
  "base64",
  "clap",
  "compio",
  "futures-executor",
  "futures-rustls",
  "getrandom 0.4.3",
- "graviola",
  "hdrhistogram",
  "hickory-proto",
  "hmac",
@@ -1687,7 +1730,6 @@ dependencies = [
  "quick-xml",
  "rcgen",
  "rustls",
- "rustls-graviola",
  "serde",
  "serde_json",
  "sha1 0.11.0",
@@ -1968,6 +2010,12 @@ dependencies = [
  "der",
  "spki",
 ]
+
+[[package]]
+name = "pkg-config"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "polling"
@@ -2326,22 +2374,13 @@ version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
+ "aws-lc-rs",
  "log",
  "once_cell",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
  "zeroize",
-]
-
-[[package]]
-name = "rustls-graviola"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf5d0a370be690f7f1aa4e1b912fde3f5f9a5c53285062fd2d6ac1a52ab3e883"
-dependencies = [
- "graviola",
- "rustls",
 ]
 
 [[package]]
@@ -2359,6 +2398,7 @@ version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
+ "aws-lc-rs",
  "ring",
  "rustls-pki-types",
  "untrusted",

@@ -84,7 +84,7 @@ impl Fixture {
     fn trust(&self) -> TestResult<Arc<PeerTrust>> {
         Ok(PeerTrust::load(
             &self.config,
-            Arc::new(rustls_graviola::default_provider()),
+            Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
         )?)
     }
 
@@ -119,9 +119,8 @@ impl Fixture {
             let certificate_chain_path = self.directory.path().join(format!("{domain}.pem"));
             let private_key_path = self.directory.path().join(format!("{domain}.key"));
             fs::write(&certificate_chain_path, pem("CERTIFICATE", cert.der())?)?;
-            let mut buffer = zeroize::Zeroizing::new([0; 512]);
-            let key = signer.key.to_pkcs8_der(&mut buffer[..])?;
-            fs::write(&private_key_path, pem("PRIVATE KEY", key)?)?;
+            let key = signer.key.to_pkcs8v1()?;
+            fs::write(&private_key_path, pem("PRIVATE KEY", key.as_ref())?)?;
             configs.insert(
                 domain.into(),
                 HostConfig {
@@ -400,7 +399,7 @@ fn only_the_verified_path_and_its_anchor_bound_validity() -> TestResult {
 #[test]
 fn trust_loading_uses_exact_configured_roots_or_bundled_roots() -> TestResult {
     let fixture = Fixture::new(30)?;
-    let provider = Arc::new(rustls_graviola::default_provider());
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let bundled = PeerTrust::load(&S2sTlsConfig::default(), Arc::clone(&provider))?;
     assert_eq!(bundled.roots.len(), webpki_roots::TLS_SERVER_ROOTS.len());
     assert!(!bundled.roots.is_empty());
@@ -537,11 +536,10 @@ fn signed_material(
     let signer = TestSigner::new()?;
     let params = leaf_parameters(vec![dns_name(domain)?], fixture.now)?;
     let leaf = params.signed_by(&signer, &fixture.root)?.der().clone();
-    let mut buffer = zeroize::Zeroizing::new([0; 512]);
-    let key = signer.key.to_pkcs8_der(&mut buffer[..])?;
+    let key = signer.key.to_pkcs8v1()?;
     Ok((
         vec![leaf],
-        rustls::pki_types::PrivatePkcs8KeyDer::from(key.to_vec()).into(),
+        rustls::pki_types::PrivatePkcs8KeyDer::from(key.as_ref().to_vec()).into(),
     ))
 }
 
@@ -776,10 +774,9 @@ fn service_hosts(fixture: &Fixture, service_name: GeneralName) -> TestResult<Hos
             .path()
             .join(format!("service-{domain}.key"));
         fs::write(&certificate_chain_path, pem("CERTIFICATE", leaf.der())?)?;
-        let mut buffer = zeroize::Zeroizing::new([0; 512]);
         fs::write(
             &private_key_path,
-            pem("PRIVATE KEY", signer.key.to_pkcs8_der(&mut buffer[..])?)?,
+            pem("PRIVATE KEY", signer.key.to_pkcs8v1()?.as_ref())?,
         )?;
         configs.insert(
             domain.into(),
@@ -811,11 +808,9 @@ fn replace_service_snapshot(
         names.push(dns_name("svc.example.test")?);
     }
     let leaf = leaf_parameters(names, fixture.now)?.signed_by(&signer, &fixture.root)?;
-    let mut buffer = zeroize::Zeroizing::new([0; 512]);
-    let key = rustls::pki_types::PrivatePkcs8KeyDer::from(
-        signer.key.to_pkcs8_der(&mut buffer[..])?.to_vec(),
-    )
-    .into();
+    let key =
+        rustls::pki_types::PrivatePkcs8KeyDer::from(signer.key.to_pkcs8v1()?.as_ref().to_vec())
+            .into();
     let host = hosts.find_host(domain).ok_or("missing host")?;
     let snapshot = Arc::new(crate::hosts::make_snapshot(
         domain,

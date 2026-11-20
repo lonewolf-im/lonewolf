@@ -7,11 +7,10 @@ use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use aws_lc_rs::rand::SystemRandom;
+use aws_lc_rs::signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, KeyPair};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use graviola::hashing::Sha256;
-use graviola::key_agreement::p256::StaticPrivateKey;
-use graviola::signing::ecdsa::{P256, SigningKey};
 use rcgen::{CertificateParams, CertifiedIssuer, PublicKeyData};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
@@ -32,30 +31,24 @@ const EXTERNAL_BIDI_FEATURES: &str = "<stream:features><mechanisms xmlns='urn:ie
 type SendingPeer = XmlStream<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>;
 
 struct Signer {
-    key: SigningKey<P256>,
-    public: [u8; 65],
+    key: EcdsaKeyPair,
 }
 
 impl Signer {
     fn new() -> TestResult<Self> {
-        let key = SigningKey::<P256> {
-            private_key: StaticPrivateKey::new_random()?,
-        };
         Ok(Self {
-            public: key.private_key.public_key_uncompressed(),
-            key,
+            key: EcdsaKeyPair::generate(&ECDSA_P256_SHA256_ASN1_SIGNING)?,
         })
     }
 
     fn private(&self) -> TestResult<PrivateKeyDer<'static>> {
-        let mut bytes = zeroize::Zeroizing::new([0; 512]);
-        Ok(PrivatePkcs8KeyDer::from(self.key.to_pkcs8_der(&mut bytes[..])?.to_vec()).into())
+        Ok(PrivatePkcs8KeyDer::from(self.key.to_pkcs8v1()?.as_ref().to_vec()).into())
     }
 }
 
 impl PublicKeyData for Signer {
     fn der_bytes(&self) -> &[u8] {
-        &self.public
+        self.key.public_key().as_ref()
     }
     fn algorithm(&self) -> &'static rcgen::SignatureAlgorithm {
         &rcgen::PKCS_ECDSA_P256_SHA256
@@ -64,10 +57,9 @@ impl PublicKeyData for Signer {
 
 impl rcgen::SigningKey for Signer {
     fn sign(&self, message: &[u8]) -> Result<Vec<u8>, rcgen::Error> {
-        let mut bytes = [0; 80];
         self.key
-            .sign_asn1::<Sha256>(&[message], &mut bytes)
-            .map(<[u8]>::to_vec)
+            .sign(&SystemRandom::new(), message)
+            .map(|signature| signature.as_ref().to_vec())
             .map_err(|_| rcgen::Error::RemoteKeyError)
     }
 }
@@ -247,7 +239,7 @@ fn hosted_service_authenticates_echoes_rejects_uncovered_domains_and_closes_with
     let (peer_certificate, peer_key) = identity(&issuer, &["peer.test"])?;
     let mut roots = rustls::RootCertStore::empty();
     roots.add(issuer.der().clone())?;
-    let provider = Arc::new(rustls_graviola::default_provider());
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let client = Arc::new(
         rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
             .with_safe_default_protocol_versions()?

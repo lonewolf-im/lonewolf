@@ -5,10 +5,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use aws_lc_rs::rand::SystemRandom;
+use aws_lc_rs::signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, KeyPair};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use graviola::hashing::Sha256;
-use graviola::key_agreement::p256::StaticPrivateKey;
-use graviola::signing::ecdsa::{P256, SigningKey};
 use rcgen::{CertificateParams, CertifiedIssuer, PublicKeyData};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, pem::PemObject};
 use rustls::sign::CertifiedKey;
@@ -175,12 +174,11 @@ impl FederationCa {
             .push(rcgen::KeyUsagePurpose::KeyCertSign);
         let signer = TestSigner::new()?;
         let certificate = parameters.self_signed(&signer)?;
-        let mut bytes = zeroize::Zeroizing::new([0; 512]);
-        let key = signer.key.to_pkcs8_der(&mut bytes[..])?;
-        let provider = rustls_graviola::default_provider();
+        let key = signer.key.to_pkcs8v1()?;
+        let provider = rustls::crypto::aws_lc_rs::default_provider();
         let key = provider
             .key_provider
-            .load_private_key(PrivatePkcs8KeyDer::from(key.to_vec()).into())?;
+            .load_private_key(PrivatePkcs8KeyDer::from(key.as_ref().to_vec()).into())?;
         Ok(Arc::new(CertifiedKey::new(
             vec![certificate.der().clone()],
             key,
@@ -224,11 +222,10 @@ impl FederationCa {
         );
         let signer = TestSigner::new()?;
         let leaf = leaf.signed_by(&signer, &intermediate)?;
-        let mut bytes = zeroize::Zeroizing::new([0; 512]);
-        let key = signer.key.to_pkcs8_der(&mut bytes[..])?;
-        let key = rustls_graviola::default_provider()
+        let key = signer.key.to_pkcs8v1()?;
+        let key = rustls::crypto::aws_lc_rs::default_provider()
             .key_provider
-            .load_private_key(PrivatePkcs8KeyDer::from(key.to_vec()).into())?;
+            .load_private_key(PrivatePkcs8KeyDer::from(key.as_ref().to_vec()).into())?;
         Ok(Arc::new(CertifiedKey::new(
             vec![leaf.der().clone(), intermediate.der().clone()],
             key,
@@ -305,20 +302,19 @@ impl FederationCa {
         );
         let signer = TestSigner::new()?;
         let certificate = parameters.signed_by(&signer, &self.issuer)?;
-        let mut bytes = zeroize::Zeroizing::new([0; 512]);
-        let key = signer.key.to_pkcs8_der(&mut bytes[..])?;
+        let key = signer.key.to_pkcs8v1()?;
         fs::write(
             directory.join(format!("certificate-{name}.pem")),
             pem("CERTIFICATE", certificate.der()),
         )?;
         fs::write(
             directory.join(format!("private-key-{name}.pem")),
-            pem("PRIVATE KEY", key),
+            pem("PRIVATE KEY", key.as_ref()),
         )?;
-        let provider = rustls_graviola::default_provider();
+        let provider = rustls::crypto::aws_lc_rs::default_provider();
         let key = provider
             .key_provider
-            .load_private_key(PrivatePkcs8KeyDer::from(key.to_vec()).into())?;
+            .load_private_key(PrivatePkcs8KeyDer::from(key.as_ref().to_vec()).into())?;
         Ok(Arc::new(CertifiedKey::new(
             vec![certificate.der().clone()],
             key,
@@ -352,23 +348,18 @@ fn pem(label: &str, bytes: &[u8]) -> String {
 }
 
 struct TestSigner {
-    key: SigningKey<P256>,
-    public: [u8; 65],
+    key: EcdsaKeyPair,
 }
 impl TestSigner {
     fn new() -> TestResult<Self> {
-        let key = SigningKey::<P256> {
-            private_key: StaticPrivateKey::new_random()?,
-        };
         Ok(Self {
-            public: key.private_key.public_key_uncompressed(),
-            key,
+            key: EcdsaKeyPair::generate(&ECDSA_P256_SHA256_ASN1_SIGNING)?,
         })
     }
 }
 impl PublicKeyData for TestSigner {
     fn der_bytes(&self) -> &[u8] {
-        &self.public
+        self.key.public_key().as_ref()
     }
     fn algorithm(&self) -> &'static rcgen::SignatureAlgorithm {
         &rcgen::PKCS_ECDSA_P256_SHA256
@@ -376,10 +367,9 @@ impl PublicKeyData for TestSigner {
 }
 impl rcgen::SigningKey for TestSigner {
     fn sign(&self, message: &[u8]) -> Result<Vec<u8>, rcgen::Error> {
-        let mut bytes = [0; 80];
         self.key
-            .sign_asn1::<Sha256>(&[message], &mut bytes)
-            .map(<[u8]>::to_vec)
+            .sign(&SystemRandom::new(), message)
+            .map(|signature| signature.as_ref().to_vec())
             .map_err(|_| rcgen::Error::RemoteKeyError)
     }
 }

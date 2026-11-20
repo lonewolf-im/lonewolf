@@ -431,7 +431,7 @@ impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
             },
         };
         let mut server_nonce = [0_u8; 24];
-        if graviola::random::fill(&mut server_nonce).is_err() {
+        if aws_lc_rs::rand::fill(&mut server_nonce).is_err() {
             return Err(CloseOutcome::InternalError);
         }
         let nonce = STANDARD.encode(server_nonce);
@@ -738,7 +738,7 @@ mod tests {
             roots.add(b.clone())?;
             let config = Arc::new(
                 rustls::ClientConfig::builder_with_provider(Arc::new(
-                    rustls_graviola::default_provider(),
+                    rustls::crypto::aws_lc_rs::default_provider(),
                 ))
                 .with_safe_default_protocol_versions()?
                 .with_root_certificates(roots)

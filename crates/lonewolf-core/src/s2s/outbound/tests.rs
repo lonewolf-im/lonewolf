@@ -268,7 +268,7 @@ fn ca_used_as_peer_leaf_is_an_untrusted_certificate_failure() -> TestResult {
     let (certificate, _) = crate::hosts::test_support::material(parameters)?;
     let trust = PeerTrust::load(
         &crate::config::S2sTlsConfig::default(),
-        Arc::new(rustls_graviola::default_provider()),
+        Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
     )?;
     let error = trust
         .verify_chain(
@@ -344,7 +344,7 @@ fn configured_anchor_expiry_rejects_an_otherwise_valid_peer_at_completion() -> T
             trust_anchors_path: Some(path),
             ..crate::config::S2sTlsConfig::default()
         },
-        Arc::new(rustls_graviola::default_provider()),
+        Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
     )?;
     let expiry = SystemTime::UNIX_EPOCH + Duration::from_secs(epoch as u64 + 10);
     let initial = trust.verify_chain(

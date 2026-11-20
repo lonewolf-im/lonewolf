@@ -10,11 +10,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use aws_lc_rs::digest::{SHA256, digest};
+use aws_lc_rs::rand::SystemRandom;
+use aws_lc_rs::signature::{
+    ECDSA_P256_SHA256_ASN1, ECDSA_P256_SHA256_ASN1_SIGNING, ECDSA_P256_SHA256_FIXED, EcdsaKeyPair,
+    KeyPair, UnparsedPublicKey,
+};
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
-use graviola::hashing::{Hash, Sha256};
-use graviola::key_agreement::p256::StaticPrivateKey;
-use graviola::signing::ecdsa::{P256, SigningKey, VerifyingKey};
 use parking_lot::{Condvar as PlCondvar, Mutex as PlMutex};
 use rcgen::{CertificateParams, PublicKeyData};
 use rustls::pki_types::PrivatePkcs8KeyDer;
@@ -121,16 +124,15 @@ impl FakeAcmeCa {
             CertificateParams::new(vec!["127.0.0.1".into(), "localhost".into()])?;
         https_params.serial_number = Some(2u64.into());
         let https_certificate = https_params.signed_by(&https_key, &issuer)?;
-        let mut key_buf = [0; 512];
-        let key = https_key.key.to_pkcs8_der(&mut key_buf)?;
+        let key = https_key.key.to_pkcs8v1()?;
         let config = rustls::ServerConfig::builder_with_provider(Arc::new(
-            rustls_graviola::default_provider(),
+            rustls::crypto::aws_lc_rs::default_provider(),
         ))
         .with_safe_default_protocol_versions()?
         .with_no_client_auth()
         .with_single_cert(
             vec![https_certificate.der().clone()],
-            PrivatePkcs8KeyDer::from(key.to_vec()).into(),
+            PrivatePkcs8KeyDer::from(key.as_ref().to_vec()).into(),
         )?;
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let base = format!("https://{}", listener.local_addr()?);
@@ -458,10 +460,9 @@ fn signed_payload(
     let mut key = vec![4];
     key.extend(URL_SAFE_NO_PAD.decode(jwk["x"].as_str().ok_or("JWK x")?)?);
     key.extend(URL_SAFE_NO_PAD.decode(jwk["y"].as_str().ok_or("JWK y")?)?);
-    let verifier = VerifyingKey::<P256>::from_x962_uncompressed(&key)?;
     let payload = jws["payload"].as_str().ok_or("JWS payload")?;
-    verifier.verify::<Sha256>(
-        &[format!("{protected}.{payload}").as_bytes()],
+    UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, &key).verify(
+        format!("{protected}.{payload}").as_bytes(),
         &URL_SAFE_NO_PAD.decode(jws["signature"].as_str().ok_or("JWS signature")?)?,
     )?;
     let bytes = URL_SAFE_NO_PAD.decode(payload)?;
@@ -609,7 +610,7 @@ fn respond(
             let authorization = format!(
                 "{}.{}",
                 order.token,
-                URL_SAFE_NO_PAD.encode(Sha256::hash(thumb.as_bytes()).as_ref())
+                URL_SAFE_NO_PAD.encode(digest(&SHA256, thumb.as_bytes()).as_ref())
             );
             let path = format!("/.well-known/acme-challenge/{}", order.token);
             let response = http_get(state.callback, &order.dns, &path)?;
@@ -675,8 +676,8 @@ fn sign_csr(
         .subject_public_key
         .as_bytes()
         .ok_or("CSR key")?;
-    VerifyingKey::<P256>::from_x962_uncompressed(key)?.verify_asn1::<Sha256>(
-        &[&csr.info.to_der()?],
+    UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, key).verify(
+        &csr.info.to_der()?,
         csr.signature.as_bytes().ok_or("CSR signature")?,
     )?;
     let attribute = csr
@@ -740,23 +741,18 @@ impl PublicKeyData for CsrKey<'_> {
     }
 }
 struct Signer {
-    key: SigningKey<P256>,
-    public: [u8; 65],
+    key: EcdsaKeyPair,
 }
 impl Signer {
     fn new() -> TestResult<Self> {
-        let key = SigningKey::<P256> {
-            private_key: StaticPrivateKey::new_random()?,
-        };
         Ok(Self {
-            public: key.private_key.public_key_uncompressed(),
-            key,
+            key: EcdsaKeyPair::generate(&ECDSA_P256_SHA256_ASN1_SIGNING)?,
         })
     }
 }
 impl PublicKeyData for Signer {
     fn der_bytes(&self) -> &[u8] {
-        &self.public
+        self.key.public_key().as_ref()
     }
     fn algorithm(&self) -> &'static rcgen::SignatureAlgorithm {
         &rcgen::PKCS_ECDSA_P256_SHA256
@@ -764,10 +760,9 @@ impl PublicKeyData for Signer {
 }
 impl rcgen::SigningKey for Signer {
     fn sign(&self, message: &[u8]) -> Result<Vec<u8>, rcgen::Error> {
-        let mut signature = [0; 80];
         self.key
-            .sign_asn1::<Sha256>(&[message], &mut signature)
-            .map(<[u8]>::to_vec)
+            .sign(&SystemRandom::new(), message)
+            .map(|signature| signature.as_ref().to_vec())
             .map_err(|_| rcgen::Error::RemoteKeyError)
     }
 }

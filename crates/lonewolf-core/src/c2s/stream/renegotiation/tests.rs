@@ -142,7 +142,7 @@ impl rustls::server::ResolvesServerCert for Certificate {
 }
 
 fn fixture(version: &'static rustls::SupportedProtocolVersion) -> TestResult<Fixture> {
-    let mut provider = rustls_graviola::default_provider();
+    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
     if version.version == ProtocolVersion::TLSv1_2 {
         provider.cipher_suites.retain(|suite| {
             suite.suite() == CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256

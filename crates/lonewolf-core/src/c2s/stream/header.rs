@@ -126,7 +126,7 @@ pub(super) fn response_header_xml(
     version: ResponseVersion<'_>,
 ) -> Result<String, CloseOutcome> {
     let mut id = [0_u8; 16];
-    graviola::random::fill(&mut id).map_err(|_| CloseOutcome::InternalError)?;
+    aws_lc_rs::rand::fill(&mut id).map_err(|_| CloseOutcome::InternalError)?;
     let version_bytes = match version {
         ResponseVersion::ZeroMajor { minor } => minor.len(),
         _ => 0,

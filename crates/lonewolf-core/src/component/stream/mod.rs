@@ -36,7 +36,7 @@ pub(crate) fn response_header_xml(
     domain: Option<&str>,
 ) -> Result<(String, Box<str>), ComponentError> {
     let mut random = [0_u8; 16];
-    graviola::random::fill(&mut random).map_err(|_| ComponentError::Internal)?;
+    aws_lc_rs::rand::fill(&mut random).map_err(|_| ComponentError::Internal)?;
     let id = format!("{:032x}", u128::from_be_bytes(random)).into_boxed_str();
     let mut xml = String::with_capacity(192 + domain.map_or(0, str::len));
     xml.push_str("<?xml version='1.0'?><stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:component:accept' id='");

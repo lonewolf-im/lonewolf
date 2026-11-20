@@ -119,7 +119,7 @@ pub fn client(fixture: &Fixture, address: SocketAddr) -> Result<Peer> {
     peer.write_all(HEADER.as_bytes())?;
     support::until(&mut peer, "</stream:features>")?;
     let mut random = [0; 18];
-    graviola::random::fill(&mut random)?;
+    aws_lc_rs::rand::fill(&mut random)?;
     let nonce = STANDARD.encode(random);
     let first = format!("n=alice,r={nonce}");
     write!(

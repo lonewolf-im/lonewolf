@@ -77,15 +77,14 @@ fn account_keys_roundtrip_and_verify_with_independent_rustcrypto() {
             .load_key(PrivatePkcs8KeyDer::from(vec![0; 64]))
             .is_err()
     );
-    let wrong = SigningKey::<graviola::signing::ecdsa::P384> {
-        private_key: graviola::key_agreement::p384::StaticPrivateKey::new_random().unwrap(),
-    };
-    let mut buffer = Zeroizing::new([0; 512]);
-    let wrong = wrong.to_pkcs8_der(&mut buffer[..]).unwrap();
+    let wrong = EcdsaKeyPair::generate(&aws_lc_rs::signature::ECDSA_P384_SHA384_FIXED_SIGNING)
+        .unwrap()
+        .to_pkcs8v1()
+        .unwrap();
     assert!(
         crypto_provider()
             .key_provider
-            .load_key(PrivatePkcs8KeyDer::from(wrong.to_vec()))
+            .load_key(PrivatePkcs8KeyDer::from(wrong.as_ref().to_vec()))
             .is_err()
     );
     let mut wrong_curve = der.secret_pkcs8_der().to_vec();

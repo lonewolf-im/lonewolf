@@ -66,7 +66,7 @@ accounts. It only takes a few minutes, plus however long your first Rust build
 takes.
 
 You'll need Linux or macOS, Git, a [stable Rust toolchain](https://rust-lang.org/tools/install/),
-a system linker, and an [XMPP client](https://xmpp.org/software/) to chat with.
+a C compiler such as GCC or Clang, and an [XMPP client](https://xmpp.org/software/) to chat with.
 
 ### 1. Build it
 

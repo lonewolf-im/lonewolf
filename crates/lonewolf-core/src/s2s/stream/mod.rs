@@ -107,7 +107,7 @@ pub(crate) fn initial_header_xml(from: &str, to: &str) -> String {
 
 pub(crate) fn response_header_xml(from: &str, to: Option<&str>) -> Result<String, S2sError> {
     let mut id = [0_u8; 16];
-    graviola::random::fill(&mut id).map_err(|_| S2sError::Internal)?;
+    aws_lc_rs::rand::fill(&mut id).map_err(|_| S2sError::Internal)?;
     let mut xml = String::with_capacity(224 + from.len() + to.map_or(0, str::len));
     xml.push_str(HEADER_PREFIX);
     escape_attribute(&mut xml, from);

@@ -322,11 +322,12 @@ fn run_starttls_restart_case_with_timeout(
             .cert[0]
             .clone();
         roots.add(certificate)?;
-        let tls_config =
-            ClientConfig::builder_with_provider(Arc::new(rustls_graviola::default_provider()))
-                .with_safe_default_protocol_versions()?
-                .with_root_certificates(roots)
-                .with_no_client_auth();
+        let tls_config = ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
         let address = listener.local_addr()?;
         let client = std::thread::spawn(
             move || -> Result<(String, String), Box<dyn Error + Send + Sync>> {
@@ -435,11 +436,12 @@ fn blocked_certificate_preparation_cancels_without_losing_completed_tls()
                 .cert[0]
                 .clone(),
         )?;
-        let client_config =
-            ClientConfig::builder_with_provider(Arc::new(rustls_graviola::default_provider()))
-                .with_safe_default_protocol_versions()?
-                .with_root_certificates(roots)
-                .with_no_client_auth();
+        let client_config = ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
         let listener = crate::connection::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
         let address = listener.local_addr()?;
         let client = std::thread::spawn(move || -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -567,11 +569,12 @@ where
                 .cert[0]
                 .clone(),
         )?;
-        let tls_config =
-            ClientConfig::builder_with_provider(Arc::new(rustls_graviola::default_provider()))
-                .with_safe_default_protocol_versions()?
-                .with_root_certificates(roots)
-                .with_no_client_auth();
+        let tls_config = ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
         let listener = crate::connection::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
         let address = listener.local_addr()?;
         let client = std::thread::spawn(move || -> Result<(), Box<dyn Error + Send + Sync>> {

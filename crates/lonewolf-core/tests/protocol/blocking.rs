@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+mod addressed;
 mod mutations;
 
 use compio::runtime::Runtime;

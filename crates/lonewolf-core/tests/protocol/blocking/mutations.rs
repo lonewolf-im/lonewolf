@@ -22,13 +22,13 @@ fn fetch(client: &mut Client, items: &str) -> TestResult {
     )
 }
 
-fn send_change(client: &mut Client, command: &str, items: &str) -> TestResult {
+pub(super) fn send_change(client: &mut Client, command: &str, items: &str) -> TestResult {
     client.send(&format!(
         "<iq type='set' id='change'><{command} xmlns='{BLOCKING}'>{items}</{command}></iq>"
     ))
 }
 
-fn assert_result(reply: &Element) {
+pub(super) fn assert_result(reply: &Element) {
     reply.assert_name("jabber:client", "iq");
     assert_eq!(reply.attribute("type"), Some("result"), "{reply:?}");
     assert_eq!(reply.attribute("id"), Some("change"), "{reply:?}");

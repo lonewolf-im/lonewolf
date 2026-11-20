@@ -82,6 +82,12 @@ fn federated_subscriber_receives_committed_block_presence_transitions() -> TestR
         iq_reply(&mut bob, "local", "result", "b.test", "bob@b.test/phone")?;
     }
     alice.close()?;
+    presence(
+        &mut bob,
+        "alice@a.test/desk",
+        "bob@b.test",
+        Some("unavailable"),
+    )?;
     bob.close()?;
     pair.stop()
 }

@@ -22,7 +22,12 @@ fn install_rule(client: &mut Client) -> TestResult {
     Ok(())
 }
 
-fn subscribe(subscriber: &mut Client, from: &str, publisher: &mut Client, to: &str) -> TestResult {
+pub(super) fn subscribe(
+    subscriber: &mut Client,
+    from: &str,
+    publisher: &mut Client,
+    to: &str,
+) -> TestResult {
     publisher.send(&format!("<presence type='subscribed' to='{from}'/>"))?;
     barrier(publisher)?;
     subscriber.send(&format!("<presence type='subscribe' to='{to}'/>"))?;

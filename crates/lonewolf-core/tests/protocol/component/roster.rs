@@ -697,6 +697,27 @@ fn generated_presence_denial_is_silent() -> TestResult {
     suite.stop()
 }
 
+#[test]
+fn component_subscription_receives_block_transitions_at_its_wire_address() -> TestResult {
+    let (mut suite, mut alice, mut component) = unavailable_setup(&format!(
+        "{CONFIG}\n[hosts.localhost]\nextensions=['blocking','roster','ping']"
+    ))?;
+    grant(&mut alice, &mut component, SERVER, false, false)?;
+    publish(&mut alice, None, "ready")?;
+    expect_audience(&mut component, &[], &[SERVER], None, Some("ready"))?;
+    crate::blocking::change_rule(&mut alice, "block", DOMAIN)?;
+    expect_audience(&mut component, &[], &[SERVER], Some("unavailable"), None)?;
+    crate::blocking::change_rule(&mut alice, "block", SERVER)?;
+    component_barrier(&mut component)?;
+    crate::blocking::change_rule(&mut alice, "unblock", DOMAIN)?;
+    component_barrier(&mut component)?;
+    crate::blocking::change_rule(&mut alice, "unblock", "")?;
+    expect_audience(&mut component, &[], &[SERVER], None, Some("ready"))?;
+    component.close()?;
+    alice.close()?;
+    suite.stop()
+}
+
 fn presence_updates_and_unavailable_reach_component_subscribers(contact: &str) -> TestResult {
     let (mut suite, mut alice, mut component) = online()?;
     roster_audience(&mut alice, &mut component, contact, true)?;

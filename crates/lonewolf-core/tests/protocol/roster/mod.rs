@@ -177,7 +177,7 @@ fn seed_roster(directory: &Path) -> TestResult {
     Ok(())
 }
 
-fn seed_mutual_subscription(directory: &Path) -> TestResult {
+pub(super) fn seed_mutual_subscription(directory: &Path) -> TestResult {
     fs::create_dir(directory.join("data"))?;
     let storage = RedbStorage::open(directory.join("data/lonewolf.dat"))?;
     let mut arena = Arena::try_new(ArenaConfig::default())?;

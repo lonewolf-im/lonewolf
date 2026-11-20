@@ -160,6 +160,86 @@ pub(crate) async fn evaluate_selected_in<A: ChunkAllocator + Clone>(
     Ok(verdict)
 }
 
+pub(crate) struct PresencePolicy<'a, A: ChunkAllocator> {
+    pub(crate) router: &'a RouterHandle<A>,
+    pub(crate) snapshot: &'a RedbRead,
+}
+
+impl<A: ChunkAllocator + Clone> PresencePolicy<'_, A> {
+    pub(crate) fn applies(&self, from: JidRef<'_>, to: JidRef<'_>) -> bool {
+        from.bare() != to.bare()
+            && [from, to].into_iter().any(|jid| {
+                self.router.is_local_host(jid.domainpart())
+                    && jid.localpart().is_some()
+                    && Selection::Explicit.configured(self.router, jid.domainpart())
+            })
+    }
+
+    pub(crate) async fn allows_outbound(
+        &self,
+        sender: &AccountKey,
+        recipient: JidRef<'_>,
+        kind: StanzaType,
+    ) -> Result<bool, StageFailure> {
+        let checks = [Check {
+            account: sender,
+            direction: Direction::Outbound,
+            peer: recipient,
+        }];
+        Ok(evaluate_selected_in(
+            self.router,
+            self.snapshot,
+            kind,
+            &checks,
+            Selection::Explicit,
+        )
+        .await?
+            == Verdict::Allow)
+    }
+
+    pub(crate) async fn allows(
+        &self,
+        from: JidRef<'_>,
+        to: JidRef<'_>,
+        kind: StanzaType,
+    ) -> Result<bool, StageFailure> {
+        if !self.applies(from, to) {
+            return Ok(true);
+        }
+        let local = |jid: JidRef<'_>| {
+            (self.router.is_local_host(jid.domainpart()) && jid.localpart().is_some())
+                .then(|| AccountKey::try_from(jid.bare()))
+                .transpose()
+        };
+        let sender = local(from)?;
+        let recipient = local(to)?;
+        let account = sender.as_ref().or(recipient.as_ref()).ok_or(StageFailure)?;
+        let checks = [
+            Check {
+                account: sender.as_ref().unwrap_or(account),
+                direction: Direction::Outbound,
+                peer: to,
+            },
+            Check {
+                account: recipient.as_ref().unwrap_or(account),
+                direction: Direction::Inbound,
+                peer: from,
+            },
+        ];
+        let checks =
+            &checks[usize::from(sender.is_none())..if recipient.is_some() { 2 } else { 1 }];
+        Ok(evaluate_selected_in(
+            self.router,
+            self.snapshot,
+            kind,
+            checks,
+            Selection::Explicit,
+        )
+        .await?
+            == Verdict::Allow)
+    }
+}
+
 /// Uses the audience snapshot so policy checks keep its ordering guarantees.
 pub(crate) async fn filter_audience<A: ChunkAllocator + Clone>(
     router: &RouterHandle<A>,
@@ -281,7 +361,15 @@ pub(crate) async fn filter_audience<A: ChunkAllocator + Clone>(
         retain_allowed(&mut audience.probes, allowed);
     }
     if let Some(page) = audience.pending.as_mut() {
-        filter_pending(router, transaction, allocator, owner, kind, page).await?;
+        filter_pending(
+            router,
+            transaction,
+            allocator,
+            (owner, sender.resourcepart()),
+            kind,
+            page,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -291,14 +379,30 @@ pub(crate) async fn filter_pending<A: ChunkAllocator + Clone>(
     router: &RouterHandle<A>,
     transaction: &RedbRead,
     allocator: &A,
-    owner: &AccountKey,
+    (owner, resource): (&AccountKey, Option<&str>),
     kind: StanzaType,
     page: &mut PendingPage,
 ) -> Result<(), StageFailure> {
-    if page.is_empty() || router.policies(owner.domain()).is_empty() {
+    let has_sender_policy = || {
+        router.has_explicit_presence_policy()
+            && page
+                .iter()
+                .any(|(sender, _)| Selection::Explicit.configured(router, sender.domain()))
+    };
+    if page.is_empty() || (router.policies(owner.domain()).is_empty() && !has_sender_policy()) {
         return Ok(());
     }
     let mut scratch = Arena::try_new_in(Default::default(), allocator.clone())?;
+    let to = Jid::from_trusted_parts_in(
+        Some(owner.username()),
+        owner.domain(),
+        resource,
+        &mut scratch,
+    )?;
+    let policy = PresencePolicy {
+        router,
+        snapshot: transaction,
+    };
     let mut allowed = Vec::with_capacity(page.len());
     for (sender, _) in page.iter() {
         let jid = Jid::parse_in(sender.as_str(), &mut scratch)?;
@@ -307,12 +411,26 @@ pub(crate) async fn filter_pending<A: ChunkAllocator + Clone>(
             allowed.push(true);
             continue;
         }
+        if !policy
+            .allows(
+                peer,
+                to.resolve(&scratch)?,
+                StanzaType::Presence(PresenceType::Subscribe),
+            )
+            .await?
+        {
+            allowed.push(false);
+            continue;
+        }
         let checks = [Check {
             account: owner,
             direction: Direction::Inbound,
             peer,
         }];
-        allowed.push(evaluate_in(router, transaction, kind, &checks).await? == Verdict::Allow);
+        allowed.push(
+            evaluate_selected_in(router, transaction, kind, &checks, Selection::Standard).await?
+                == Verdict::Allow,
+        );
     }
     let mut allowed = allowed.into_iter();
     page.retain(|_, _| allowed.next() == Some(true));

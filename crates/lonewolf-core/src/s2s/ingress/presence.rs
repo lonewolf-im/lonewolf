@@ -55,13 +55,13 @@ pub(crate) async fn handle<A: ChunkAllocator + Clone + 'static>(
         };
         let replies = context
             .router
-            .probe_remote(&routed, grant.subscribed)
+            .probe_remote(&routed, grant.subscribed, grant.snapshot.as_ref())
             .await
             .map_err(|_| IngressFailure)?;
-        for reply in replies {
+        for reply in replies.into_iter().filter(|reply| reply.is_current()) {
             context
                 .router
-                .route_remote_or_bounce(reply)
+                .route_remote_or_bounce(reply.stanza)
                 .map_err(|_| IngressFailure)?;
         }
         drop(grant.ticket);

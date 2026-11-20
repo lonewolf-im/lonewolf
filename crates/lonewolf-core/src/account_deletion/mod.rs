@@ -134,6 +134,8 @@ async fn delete<A: ChunkAllocator + Clone>(
         "offline account state cleared"
     );
     ticket.turn().await;
+    let delivery =
+        delivery.with_presence_snapshot(router.has_explicit_presence_policy().then_some(before));
     for (_extension, deliver) in deliveries {
         if deliver(&delivery).await.is_err() {
             report_failure(

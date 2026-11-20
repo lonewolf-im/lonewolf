@@ -29,7 +29,8 @@ use super::shard::Shard;
 use crate::config::limits::default_max_directed_presence_recipients_per_resource;
 use crate::router::metrics::RouterMetrics;
 use crate::router::{
-    Admitted, MessageTarget, RoutedStanza, RouterError, RouterFailure, RouterState,
+    Admitted, MessageTarget, PresenceDelivery, RoutedStanza, RouterError, RouterFailure,
+    RouterState,
 };
 
 const SHARD_COUNT: usize = 256;
@@ -363,6 +364,35 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
         .await
     }
 
+    pub(crate) async fn presence_targets(
+        &self,
+        account: &AccountKey,
+    ) -> Result<Vec<(Box<str>, SessionId)>, RouterError> {
+        self.with_shard(self.shard_index(account.as_str()), |shard| {
+            shard.presence_targets(account)
+        })
+        .await
+    }
+
+    pub(crate) async fn deliver_filtered_presence(
+        &self,
+        stanza: RoutedStanza<A>,
+        tag: Option<SessionTag>,
+        allowed: Option<&[SessionId]>,
+        source: Option<&SessionLiveness>,
+    ) -> Result<(), RouterError> {
+        let shard = {
+            let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
+            self.bare_target_shard(&view)?
+        };
+        self.with_shard(shard, |shard| {
+            shard.deliver_filtered_presence(stanza, tag, allowed, || {
+                source.is_none_or(SessionLiveness::is_alive)
+            })
+        })
+        .await?
+    }
+
     pub(crate) async fn deliver_presence(
         &self,
         stanza: RoutedStanza<A>,
@@ -392,6 +422,7 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
             .await?
     }
 
+    #[cfg(test)]
     pub(crate) async fn deliver_presence_guarded(
         &self,
         stanza: RoutedStanza<A>,
@@ -410,13 +441,15 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
         &self,
         stanza: RoutedStanza<A>,
     ) -> Result<(), RouterError> {
-        self.deliver_presence_error_guarded(stanza, None).await
+        self.deliver_presence_error_guarded(stanza, None, None)
+            .await
     }
 
     pub(crate) async fn deliver_presence_error_guarded(
         &self,
         stanza: RoutedStanza<A>,
         source: Option<SessionLiveness>,
+        allowed: Option<&[SessionId]>,
     ) -> Result<(), RouterError> {
         let shard = {
             let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
@@ -429,7 +462,9 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
             if source.as_ref().is_some_and(|session| !session.is_alive()) {
                 return Ok(());
             }
-            shard.deliver_presence_where(stanza, |session| session.priority.is_some())
+            shard.deliver_filtered_presence(stanza, None, allowed, || {
+                source.as_ref().is_none_or(SessionLiveness::is_alive)
+            })
         })
         .await?
     }
@@ -450,7 +485,7 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
     pub(crate) async fn presence_snapshot(
         &self,
         account: &AccountKey,
-    ) -> Result<Vec<RoutedStanza<A>>, RouterError> {
+    ) -> Result<Vec<PresenceDelivery<A>>, RouterError> {
         self.with_shard(self.shard_index(account.as_str()), |shard| {
             shard.presence_snapshot(account)
         })
@@ -528,24 +563,12 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
         .await
     }
 
-    pub(crate) async fn probe(
+    pub(crate) async fn deliver_probe(
         &self,
         requester: &SessionHandle<A>,
-        request: &RoutedStanza<A>,
-        subscribed: bool,
+        deliveries: Vec<PresenceDelivery<A>>,
     ) -> Result<(), RouterError> {
-        let source = request
-            .resolve()
-            .map_err(|_| RouterError::InvalidTarget)?
-            .to()
-            .map_err(|_| RouterError::InvalidTarget)?
-            .ok_or(RouterError::InvalidTarget)?;
-        if let Some(unavailable) = self
-            .with_shard(self.shard_index(source.bare().as_str()), |shard| {
-                shard.probe(requester, request, subscribed)
-            })
-            .await??
-        {
+        if let Some(unavailable) = requester.enqueue_probe(deliveries) {
             self.with_shard(requester.shard, |shard| {
                 shard.prune_directed(&unavailable, Some(requester.token))
             })
@@ -554,11 +577,11 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
         Ok(())
     }
 
-    pub(crate) async fn probe_remote(
+    pub(crate) async fn probe_candidates(
         &self,
         request: &RoutedStanza<A>,
         subscribed: bool,
-    ) -> Result<Vec<RoutedStanza<A>>, RouterError> {
+    ) -> Result<Vec<PresenceDelivery<A>>, RouterError> {
         let view = request.resolve().map_err(|_| RouterError::InvalidTarget)?;
         let observer = view
             .from()
@@ -569,7 +592,7 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
             .map_err(|_| RouterError::InvalidTarget)?
             .ok_or(RouterError::InvalidTarget)?;
         self.with_shard(self.shard_index(target.bare().as_str()), |shard| {
-            shard.probe_for(observer, request, subscribed, &self.allocator())
+            shard.probe_candidates(observer, request, subscribed, &self.allocator())
         })
         .await?
     }

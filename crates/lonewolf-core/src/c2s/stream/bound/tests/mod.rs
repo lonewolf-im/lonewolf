@@ -1561,6 +1561,7 @@ fn cancelled_global_unavailable_keeps_directed_delivery_inside_ticket_owner() ->
             unavailable: None,
             audience: None,
             backlog: None,
+            snapshot: None,
         };
         drop(after_turn(
             fixture.work.start(),
@@ -1658,6 +1659,7 @@ fn terminal_claim_prevents_pending_global_unavailable_from_withdrawing_twice() -
             unavailable: None,
             audience: None,
             backlog: None,
+            snapshot: None,
         };
         drop(after_turn(
             fixture.work.start(),

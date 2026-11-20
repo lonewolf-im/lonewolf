@@ -25,7 +25,7 @@ use lonewolf_storage::offline::OfflineSequence;
 use lonewolf_storage::{RedbRead, RedbStorage, RedbWrite, StorageError, WriteTransaction};
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::Jid;
-use lonewolf_xmpp::stanza::{IqType, StanzaType};
+use lonewolf_xmpp::stanza::{IqType, StanzaKind, StanzaType};
 
 use crate::order::{Order, Ticket};
 use crate::router::iq_requests::{ID_PREFIX, MAX_TIMEOUT};
@@ -125,6 +125,7 @@ pub(crate) struct RouterDelivery<A: ChunkAllocator> {
     /// Server-initiated work has no session to tag.
     session: Option<SessionHandle<A>>,
     received_copies: Option<(AccountKey, Vec<SessionId>)>,
+    presence_snapshot: Option<Arc<RedbRead>>,
 }
 
 impl<A: ChunkAllocator + Clone> RouterDelivery<A> {
@@ -151,11 +152,17 @@ impl<A: ChunkAllocator + Clone> RouterDelivery<A> {
             scope: DeliveryScope::ComponentAware,
             session,
             received_copies: None,
+            presence_snapshot: None,
         }
     }
 
     pub(crate) fn with_scope(mut self, scope: DeliveryScope) -> Self {
         self.scope = scope;
+        self
+    }
+
+    pub(crate) fn with_presence_snapshot(mut self, snapshot: Option<Arc<RedbRead>>) -> Self {
+        self.presence_snapshot = snapshot;
         self
     }
 
@@ -561,6 +568,7 @@ impl<A: ChunkAllocator + Clone + 'static> Delivery<A> for RouterDelivery<A> {
             scope: self.scope,
             session: None,
             received_copies: None,
+            presence_snapshot: None,
         };
         compio::runtime::spawn(async move {
             if work(&delivery).await.is_err() {
@@ -587,15 +595,25 @@ impl<A: ChunkAllocator + Clone + 'static> Delivery<A> for RouterDelivery<A> {
 
     fn to_available<'a>(&'a self, stanza: RoutedStanza<A>) -> DeliveryFuture<'a> {
         Box::pin(async move {
-            match self.router.route_presence(stanza).await {
-                Ok(()) | Err(RouterError::NotFound | RouterError::Busy) => Ok(()),
-                Err(_) => Err(DeliveryError),
-            }
+            self.router
+                .route_generated_presence(self.presence_snapshot.as_deref(), stanza, None, None)
+                .await
+                .map_err(|_| DeliveryError)
         })
     }
 
     fn to_remote<'a>(&'a self, stanza: RoutedStanza<A>) -> DeliveryFuture<'a> {
         Box::pin(async move {
+            if let Some(snapshot) = self.presence_snapshot.as_deref()
+                && stanza.resolve()?.kind() == StanzaKind::Presence
+                && !self
+                    .router
+                    .presence_allowed(Some(snapshot), &stanza)
+                    .await
+                    .map_err(|_| DeliveryError)?
+            {
+                return Ok(());
+            }
             let component = self.scope.allows_components()
                 && stanza
                     .resolve()
@@ -617,10 +635,14 @@ impl<A: ChunkAllocator + Clone + 'static> Delivery<A> for RouterDelivery<A> {
 
     fn to_tagged<'a>(&'a self, tag: SessionTag, stanza: RoutedStanza<A>) -> DeliveryFuture<'a> {
         Box::pin(async move {
-            self.router
-                .route_presence_to_tagged(tag, stanza)
-                .await
-                .map_err(|_| DeliveryError)
+            if let Some(snapshot) = self.presence_snapshot.as_deref() {
+                self.router
+                    .route_generated_presence(Some(snapshot), stanza, Some(tag), None)
+                    .await
+            } else {
+                self.router.route_presence_to_tagged(tag, stanza).await
+            }
+            .map_err(|_| DeliveryError)
         })
     }
 
@@ -676,7 +698,7 @@ impl<A: ChunkAllocator + Clone + 'static> Delivery<A> for RouterDelivery<A> {
     fn current_presence<'a>(&'a self, from: &'a AccountKey, to: &'a str) -> DeliveryFuture<'a> {
         Box::pin(async move {
             self.router
-                .route_current_presence(from, to, self.scope)
+                .route_current_presence(from, to, self.scope, self.presence_snapshot.as_deref())
                 .await
                 .map_err(|_| DeliveryError)
         })
@@ -685,7 +707,7 @@ impl<A: ChunkAllocator + Clone + 'static> Delivery<A> for RouterDelivery<A> {
     fn unavailable_presence<'a>(&'a self, from: &'a AccountKey, to: &'a str) -> DeliveryFuture<'a> {
         Box::pin(async move {
             self.router
-                .route_unavailable_presence(from, to, self.scope)
+                .route_unavailable_presence(from, to, self.scope, self.presence_snapshot.as_deref())
                 .await
                 .map_err(|_| DeliveryError)
         })

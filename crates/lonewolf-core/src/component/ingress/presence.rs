@@ -75,11 +75,13 @@ pub(super) async fn handle<A: ChunkAllocator + Clone + 'static>(
         };
         let replies = context
             .router
-            .probe_remote(&routed, grant.subscribed)
+            .probe_remote(&routed, grant.subscribed, grant.snapshot.as_ref())
             .await
             .map_err(|_| IngressFailure)?;
-        for reply in replies {
-            let _ = context.registry.reply(domain, context.connection_id, reply);
+        for reply in replies.into_iter().filter(|reply| reply.is_current()) {
+            let _ = context
+                .registry
+                .reply(domain, context.connection_id, reply.stanza);
         }
         drop(grant.ticket);
         return Ok(());

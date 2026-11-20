@@ -36,12 +36,10 @@ use lonewolf_extension::presence::{
     PresenceAudience, PresenceHandler, PresenceRequest, PresenceRequestType, PresenceSend,
     PresenceTransition, PresenceUpdate,
 };
-#[cfg(test)]
-use lonewolf_storage::RedbRead;
 use lonewolf_storage::account::{AccountError, AccountKey, AccountReads};
 use lonewolf_storage::offline::OfflineSequence;
 use lonewolf_storage::roster::{PendingPage, RosterJid};
-use lonewolf_storage::{RedbStorage, RedbWrite, Storage, StorageError, WriteTransaction};
+use lonewolf_storage::{RedbRead, RedbStorage, RedbWrite, Storage, StorageError, WriteTransaction};
 use lonewolf_util::arena::{Arena, ArenaConfig, ArenaRead, ChunkAllocator, HandleError};
 use lonewolf_xmpp::jid::{Jid, JidError, JidRef};
 use lonewolf_xmpp::parser::{ParseError, Parsed, ParserConfig, StreamEvent, XmppParser};
@@ -135,6 +133,7 @@ struct MessageRelease {
 enum Output<A: ChunkAllocator> {
     Delivered(MailboxEntry<A>),
     Routed(RoutedStanza<A>),
+    Presence(crate::router::PresenceDelivery<A>),
     Owned {
         stanza: Stanza,
         arena: Arena<A>,
@@ -142,6 +141,7 @@ enum Output<A: ChunkAllocator> {
     /// Each page stays unparsed until it is written, which bounds replay memory.
     Requests {
         page: PendingPage,
+        resource: Box<str>,
         handler: Arc<dyn PresenceHandler<A, RedbStorage>>,
         router: RouterHandle<A>,
     },
@@ -1181,7 +1181,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                     let routed = self.stamp(parsed)?;
                     self.outbox
                         .drain_until(&self.registration, async {
-                            let (verdict, _admission) = Self::explicit_presence_policy(
+                            let (verdict, admission) = Self::explicit_presence_policy(
                                 &self.router,
                                 &self.storage,
                                 &self.registration,
@@ -1202,7 +1202,11 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                             }
                             match self
                                 .router
-                                .route_addressed_presence_error(routed, Some(liveness))
+                                .route_addressed_presence_error(
+                                    routed,
+                                    Some(liveness),
+                                    admission.as_ref().map(|(snapshot, _)| snapshot),
+                                )
                                 .await
                             {
                                 Ok(())
@@ -1234,7 +1238,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         storage: &RedbStorage,
         registration: &Registration<A>,
         stanza: &RoutedStanza<A>,
-    ) -> Result<(Verdict, Option<Ticket>), CloseOutcome> {
+    ) -> Result<(Verdict, Option<(RedbRead, Ticket)>), CloseOutcome> {
         let view = stanza.resolve()?;
         let to = view.to()?.ok_or(CloseOutcome::InternalError)?;
         let sender = Some(registration.account());
@@ -1259,12 +1263,11 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             policy::Selection::Explicit,
         )
         .await?;
-        drop(snapshot);
         if verdict != Verdict::Allow {
             return Ok((verdict, None));
         }
         ticket.turn().await;
-        Ok((verdict, Some(ticket)))
+        Ok((verdict, Some((snapshot, ticket))))
     }
 
     async fn directed_presence_fallback(
@@ -1336,7 +1339,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             }
             let result = if local {
                 router
-                    .probe_presence(&session, &routed, grant.subscribed)
+                    .probe_presence(&session, &routed, grant.subscribed, grant.snapshot.as_ref())
                     .await
             } else {
                 match router.route_remote_or_bounce(routed) {
@@ -1413,7 +1416,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                     }
                 })
                 .await?;
-            if let Some(snapshot) = snapshot {
+            if let Some(snapshot) = snapshot.as_ref() {
                 let view = directed.resolve().map_err(|_| RouterError::InvalidTarget)?;
                 let verdict = ingress::checks::check_from(
                     &router,
@@ -1422,7 +1425,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                     target.as_ref(),
                     &view,
                     None,
-                    ingress::checks::Snapshot::Ordered(&snapshot),
+                    ingress::checks::Snapshot::Ordered(snapshot),
                 )
                 .await
                 .map_err(|_| RouterError::Unavailable)?;
@@ -1435,7 +1438,12 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                 return Ok(Verdict::Drop);
             }
             if !remote {
-                session.directed_presence(directed, available).await?;
+                let allowed = router
+                    .presence_recipient_filter(snapshot.as_ref(), &directed)
+                    .await?;
+                session
+                    .directed_presence_filtered(directed, available, allowed.as_deref())
+                    .await?;
             } else {
                 let to = directed
                     .resolve()
@@ -1609,9 +1617,13 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         let router = &self.router;
         let storage = &self.storage;
         let work_group = self.outbox.work;
-        let needs_snapshot = presence_handler.is_some() || backlog_reader.is_some() || decorate;
+        let explicit = router.has_explicit_presence_policy();
+        let needs_snapshot = presence_handler.is_some()
+            || backlog_reader.is_some()
+            || decorate
+            || (!available && explicit);
         let prepare = async {
-            let (result, ticket) = if needs_snapshot {
+            let (result, ticket, snapshot) = if needs_snapshot {
                 let owner = registration.account();
                 let (transaction, ticket) = Arc::clone(router.order())
                     .fix(vec![owner.clone()], storage.begin_read())
@@ -1706,8 +1718,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                         stamped = builder.build()?;
                     }
                 }
-                drop(transaction);
-                (result, ticket)
+                (result, ticket, explicit.then_some(transaction))
             } else {
                 let ((), ticket) = router
                     .order()
@@ -1715,7 +1726,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                         Ok::<_, CloseOutcome>(())
                     })
                     .await?;
-                (Ok((None, None)), ticket)
+                (Ok((None, None)), ticket, None)
             };
             let (audience, backlog) = match result {
                 Ok(result) => result,
@@ -1751,6 +1762,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                 unavailable,
                 audience,
                 backlog,
+                snapshot,
             };
             Ok(Ok(after_turn(
                 work_group.start(),
@@ -1795,12 +1807,15 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             .is_empty())
         .then(|| outcome.echo.clone());
         self.outbox.push(Output::Routed(outcome.echo));
-        self.outbox.routed(outcome.replay);
+        self.outbox
+            .queue
+            .extend(outcome.replay.into_iter().map(Output::Presence));
         if let (Some(page), Some(handler)) = (outcome.requests, presence_handler)
             && (!page.is_empty() || !page.is_complete())
         {
             self.outbox.push(Output::Requests {
                 page,
+                resource: self.registration.resource().into(),
                 handler,
                 router: self.router.clone(),
             });
@@ -2011,14 +2026,21 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                     registration.account(),
                 )
             })?;
-            if explicit_policy {
-                let snapshot = storage.begin_read().await.map_err(|error| {
+            let read_policy = || async {
+                storage.begin_read().await.map_err(|error| {
                     close_storage_failure(
                         error,
                         "presence_subscription_policy_begin_read",
                         registration.account(),
                     )
-                })?;
+                })
+            };
+            let mut presence_snapshot = if explicit_policy {
+                Some(read_policy().await?)
+            } else {
+                None
+            };
+            if explicit_policy && let Some(snapshot) = presence_snapshot.as_ref() {
                 let view = source.resolve()?;
                 let recipient = inbound_domain
                     .map(|_| AccountKey::try_from(policy_target))
@@ -2029,7 +2051,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                     recipient.as_ref(),
                     &view,
                     None,
-                    ingress::checks::Snapshot::Ordered(&snapshot),
+                    ingress::checks::Snapshot::Ordered(snapshot),
                     policy::Selection::Explicit,
                 )
                 .await?;
@@ -2157,21 +2179,31 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                 return Ok(SubscriptionPreparation::Done);
             }
             Ok::<_, CloseOutcome>(match effects {
-                Ok(effects) => SubscriptionPreparation::Commit(commit_and_deliver(
-                    work.start(),
-                    Arc::clone(router.order()),
-                    transaction,
-                    effects,
-                    delivery,
-                    Some(registration.mailbox()),
-                    EffectsDiagnostics {
-                        identity: crate::delivery::EffectsIdentity::Account(
-                            registration.account().clone(),
-                        ),
-                        commit_operation: "presence_subscription_commit",
-                        delivery_operation: "presence_subscription_effects",
-                    },
-                )),
+                Ok(effects) => {
+                    if presence_snapshot.is_none()
+                        && router.presence_effects_need_snapshot(&effects.accounts)
+                    {
+                        presence_snapshot = Some(read_policy().await?);
+                        if !registration.liveness().is_alive() {
+                            return Ok(SubscriptionPreparation::Done);
+                        }
+                    }
+                    SubscriptionPreparation::Commit(commit_and_deliver(
+                        work.start(),
+                        Arc::clone(router.order()),
+                        transaction,
+                        effects,
+                        delivery.with_presence_snapshot(presence_snapshot.map(Arc::new)),
+                        Some(registration.mailbox()),
+                        EffectsDiagnostics {
+                            identity: crate::delivery::EffectsIdentity::Account(
+                                registration.account().clone(),
+                            ),
+                            commit_operation: "presence_subscription_commit",
+                            delivery_operation: "presence_subscription_effects",
+                        },
+                    ))
+                }
                 Err(error) => {
                     drop(transaction);
                     report_handler_failure(&error, registration.account());
@@ -2452,18 +2484,28 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> Outbox<'_, A, W> {
                     self.written = self.written.next();
                     self.writer.write(Outgoing::Routed(stanza)).await?;
                 }
+                Output::Presence(delivery) => {
+                    if self.liveness.is_alive() && delivery.is_current() {
+                        self.written = self.written.next();
+                        self.writer.write(Outgoing::Routed(delivery.stanza)).await?;
+                    }
+                }
                 Output::Owned { stanza, arena } => {
                     self.written = self.written.next();
                     self.writer.write(Outgoing::Owned { stanza, arena }).await?;
                 }
                 Output::Requests {
                     mut page,
+                    resource,
                     handler,
                     router,
                 } => {
                     let kind = ReplayKind::SubscriptionRequest;
-                    loop {
+                    'pages: loop {
                         for (sender, bytes) in page.iter() {
+                            if !self.liveness.is_alive() {
+                                break 'pages;
+                            }
                             let stanza = self
                                 .parse_stored(bytes, StoredKind::Subscription(sender))
                                 .await?;
@@ -2503,7 +2545,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> Outbox<'_, A, W> {
                             &router,
                             &transaction,
                             &self.allocator,
-                            &self.account,
+                            (&self.account, Some(&resource)),
                             StanzaType::Presence(PresenceType::Available),
                             &mut page,
                         )
@@ -3088,30 +3130,36 @@ impl<A: ChunkAllocator + Clone> TerminalPresenceWork<A> {
         let mut broadcast_components = false;
         let mut covered = Vec::new();
         let mut ticket = None;
-        let broadcast = if withdrawal.unavailable.is_some() {
+        let mut snapshot = None;
+        let explicit = self.router.has_explicit_presence_policy();
+        let needs_directed_policy = explicit && !withdrawal.directed.recipients.is_empty();
+        let broadcast = if withdrawal.unavailable.is_some() || needs_directed_policy {
             async {
-                let handler = self
-                    .router
-                    .presence_handlers(self.account.domain())
-                    .and_then(|handlers| handlers.find(PresenceRequestType::Unavailable));
+                let handler = withdrawal.unavailable.as_ref().and_then(|_| {
+                    self.router
+                        .presence_handlers(self.account.domain())
+                        .and_then(|handlers| handlers.find(PresenceRequestType::Unavailable))
+                });
                 let (transaction, admitted) = self
                     .router
                     .order()
                     .fix(vec![self.account.clone()], async {
-                        match handler {
-                            Some(_) => self.storage.begin_read().await.map(Some).map_err(|error| {
+                        if handler.is_some() || needs_directed_policy {
+                            self.storage.begin_read().await.map(Some).map_err(|error| {
                                 close_storage_failure(
                                     error,
                                     "presence_terminal_begin_read",
                                     &self.account,
                                 )
-                            }),
-                            None => Ok(None),
+                            })
+                        } else {
+                            Ok(None)
                         }
                     })
                     .await?;
                 ticket = Some(admitted);
-                let mut audience = match (handler, transaction.as_ref()) {
+                snapshot = transaction;
+                let mut audience = match (handler, snapshot.as_ref()) {
                     (Some(handler), Some(transaction)) => {
                         let view = notice.resolve()?;
                         let sender = view.from()?.ok_or(CloseOutcome::InternalError)?;
@@ -3131,8 +3179,7 @@ impl<A: ChunkAllocator + Clone> TerminalPresenceWork<A> {
                     }
                     _ => None,
                 };
-                if let (Some(audience), Some(transaction)) =
-                    (audience.as_mut(), transaction.as_ref())
+                if let (Some(audience), Some(transaction)) = (audience.as_mut(), snapshot.as_ref())
                 {
                     let view = notice.resolve()?;
                     let sender = view.from()?.ok_or(CloseOutcome::InternalError)?;
@@ -3159,7 +3206,12 @@ impl<A: ChunkAllocator + Clone> TerminalPresenceWork<A> {
                         .map_err(|_| CloseOutcome::InternalError)?
                     {
                         self.router
-                            .broadcast_presence(notice, &audience.subscribers)
+                            .broadcast_presence(
+                                notice,
+                                &audience.subscribers,
+                                snapshot.as_ref(),
+                                None,
+                            )
                             .await
                             .map_err(|_| CloseOutcome::InternalError)?;
                         broadcast_components = true;
@@ -3175,7 +3227,18 @@ impl<A: ChunkAllocator + Clone> TerminalPresenceWork<A> {
         if let Some(ticket) = ticket.as_mut() {
             ticket.turn().await;
         }
-        let local = send_local_withdrawal(&stage, notice, &withdrawal.directed, &covered).await;
+        let local = if needs_directed_policy && snapshot.is_none() {
+            Ok(())
+        } else {
+            send_local_withdrawal(
+                &stage,
+                notice,
+                &withdrawal.directed,
+                &covered,
+                snapshot.as_ref(),
+            )
+            .await
+        };
         let finished = self
             .session
             .finish_presence(withdrawal.directed.source_token)
@@ -3187,14 +3250,23 @@ impl<A: ChunkAllocator + Clone> TerminalPresenceWork<A> {
         }
         let components = if broadcast_components {
             self.router
-                .broadcast_component_presence(notice, &covered)
-                .await
+                .broadcast_component_presence(notice, &covered, None)
                 .map_err(|_| CloseOutcome::InternalError)
         } else {
             Ok(())
         };
-        let services =
-            send_service_withdrawal(&stage, notice, &withdrawal.directed, &covered).await;
+        let services = if needs_directed_policy && snapshot.is_none() {
+            Ok(())
+        } else {
+            send_service_withdrawal(
+                &stage,
+                notice,
+                &withdrawal.directed,
+                &covered,
+                snapshot.as_ref(),
+            )
+            .await
+        };
         drop(self.service_presence);
         broadcast
             .and(local)
@@ -3224,6 +3296,7 @@ async fn send_local_withdrawal<A: ChunkAllocator + Clone>(
     notice: &RoutedStanza<A>,
     withdrawal: &DirectedWithdrawal,
     covered: &[RosterJid],
+    snapshot: Option<&RedbRead>,
 ) -> Result<(), CloseOutcome> {
     stage
         .router
@@ -3231,6 +3304,7 @@ async fn send_local_withdrawal<A: ChunkAllocator + Clone>(
             notice,
             withdrawal_recipients(withdrawal, covered)
                 .filter(|recipient| stage.router.service(domain_of(recipient)).is_none()),
+            snapshot,
         )
         .await
         .map_err(|_| CloseOutcome::InternalError)
@@ -3241,6 +3315,7 @@ async fn send_service_withdrawal<A: ChunkAllocator + Clone>(
     notice: &RoutedStanza<A>,
     withdrawal: &DirectedWithdrawal,
     covered: &[RosterJid],
+    snapshot: Option<&RedbRead>,
 ) -> Result<(), CloseOutcome> {
     for recipient in withdrawal_recipients(withdrawal, covered) {
         if let Some(route) = stage.router.service(domain_of(recipient)) {
@@ -3251,7 +3326,15 @@ async fn send_service_withdrawal<A: ChunkAllocator + Clone>(
                 .to_builder_in(&mut arena)?
                 .to(Some(target))?
                 .build()?;
-            service::dispatch(stage, route, RoutedStanza::from_parts(stanza, arena)).await?;
+            let stanza = RoutedStanza::from_parts(stanza, arena);
+            if stage
+                .router
+                .presence_allowed(snapshot, &stanza)
+                .await
+                .map_err(|_| CloseOutcome::InternalError)?
+            {
+                service::dispatch(stage, route, stanza).await?;
+            }
         }
     }
     Ok(())
@@ -3277,12 +3360,13 @@ struct PresenceWork<A: ChunkAllocator> {
     unavailable: Option<RoutedStanza<A>>,
     audience: Option<PresenceAudience>,
     backlog: Option<Backlog>,
+    snapshot: Option<RedbRead>,
 }
 
 struct PresenceOutcome<A: ChunkAllocator> {
     change: PresenceChange<A>,
     echo: RoutedStanza<A>,
-    replay: Vec<RoutedStanza<A>>,
+    replay: Vec<crate::router::PresenceDelivery<A>>,
     requests: Option<PendingPage>,
     backlog: Option<Backlog>,
 }
@@ -3304,6 +3388,7 @@ impl<A: ChunkAllocator + Clone> PresenceWork<A> {
             unavailable,
             mut audience,
             backlog,
+            snapshot,
         } = self;
         let mut change = session
             .set_presence(priority, routed.clone(), unavailable)
@@ -3320,9 +3405,13 @@ impl<A: ChunkAllocator + Clone> PresenceWork<A> {
             && let Some(audience) = audience.as_mut()
         {
             // The ticket keeps subscription revocation behind these deliveries.
+            let observer = routed
+                .resolve()?
+                .from()?
+                .ok_or(CloseOutcome::InternalError)?;
             for contact in &audience.contacts {
                 let presence = router
-                    .current_presence(contact, account.as_str())
+                    .current_presence(contact, observer, snapshot.as_ref())
                     .await
                     .map_err(|_| CloseOutcome::InternalError)?;
                 replay.extend(presence);
@@ -3352,10 +3441,19 @@ impl<A: ChunkAllocator + Clone> PresenceWork<A> {
         {
             async {
                 router
-                    .broadcast_presence(&routed, &audience.subscribers)
+                    .broadcast_presence(
+                        &routed,
+                        &audience.subscribers,
+                        snapshot.as_ref(),
+                        available.then_some(session.liveness()),
+                    )
                     .await?;
                 covered = audience.subscribers;
-                router.broadcast_component_presence(&routed, &covered).await
+                router.broadcast_component_presence(
+                    &routed,
+                    &covered,
+                    available.then_some(session.liveness()),
+                )
             }
             .await
             .map_err(|_| CloseOutcome::InternalError)
@@ -3366,6 +3464,9 @@ impl<A: ChunkAllocator + Clone> PresenceWork<A> {
             async {
                 let federated = router.federation_enabled();
                 for contact in probes {
+                    if !session.liveness().is_alive() {
+                        break;
+                    }
                     if router.is_local_host(contact.domain()) {
                         continue;
                     }
@@ -3408,13 +3509,27 @@ impl<A: ChunkAllocator + Clone> PresenceWork<A> {
             work: &work,
         };
         let local = if !available {
-            send_local_withdrawal(&stage, &routed, &change.directed, &covered).await
+            send_local_withdrawal(
+                &stage,
+                &routed,
+                &change.directed,
+                &covered,
+                snapshot.as_ref(),
+            )
+            .await
         } else {
             Ok(())
         };
         drop(ticket);
         let services = if !available {
-            send_service_withdrawal(&stage, &routed, &change.directed, &covered).await
+            send_service_withdrawal(
+                &stage,
+                &routed,
+                &change.directed,
+                &covered,
+                snapshot.as_ref(),
+            )
+            .await
         } else {
             Ok(())
         };

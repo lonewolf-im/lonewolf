@@ -1563,6 +1563,7 @@ name = "lonewolf-extension"
 version = "0.3.0"
 dependencies = [
  "futures-executor",
+ "getrandom 0.4.3",
  "lonewolf-auth",
  "lonewolf-storage",
  "lonewolf-util",

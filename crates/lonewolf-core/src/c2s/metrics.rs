@@ -155,9 +155,10 @@ impl ReplayOutcome {
     }
 }
 
-const REPLAY_RECORDS: [(ReplayKind, ReplayOutcome); 4] = [
+const REPLAY_RECORDS: [(ReplayKind, ReplayOutcome); 5] = [
     (ReplayKind::OfflineMessage, ReplayOutcome::Delivered),
     (ReplayKind::OfflineMessage, ReplayOutcome::Invalid),
+    (ReplayKind::OfflineMessage, ReplayOutcome::Blocked),
     (ReplayKind::SubscriptionRequest, ReplayOutcome::Delivered),
     (ReplayKind::SubscriptionRequest, ReplayOutcome::Blocked),
 ];
@@ -859,6 +860,7 @@ mod tests {
             r#"lonewolf_c2s_replay_bytes_total{listener="0",kind="offline_message"} 0"#,
             r#"lonewolf_c2s_replay_records_total{listener="0",kind="offline_message",outcome="delivered"} 0"#,
             r#"lonewolf_c2s_replay_records_total{listener="0",kind="offline_message",outcome="invalid"} 0"#,
+            r#"lonewolf_c2s_replay_records_total{listener="0",kind="offline_message",outcome="blocked"} 0"#,
             r#"lonewolf_c2s_replay_pages_total{listener="0",kind="subscription_request"} 0"#,
             r#"lonewolf_c2s_replay_bytes_total{listener="0",kind="subscription_request"} 0"#,
             r#"lonewolf_c2s_replay_records_total{listener="0",kind="subscription_request",outcome="delivered"} 0"#,
@@ -878,6 +880,7 @@ mod tests {
         worker.replay_page_read(kind, 5);
         worker.replay_records(kind, ReplayOutcome::Delivered, 3);
         worker.replay_records(kind, ReplayOutcome::Invalid, 1);
+        worker.replay_records(kind, ReplayOutcome::Blocked, 2);
         let kind = ReplayKind::SubscriptionRequest;
         worker.replay_page_read(kind, 17);
         worker.replay_records(kind, ReplayOutcome::Delivered, 2);
@@ -888,6 +891,7 @@ mod tests {
             r#"lonewolf_c2s_replay_bytes_total{listener="0",kind="offline_message"} 15"#,
             r#"lonewolf_c2s_replay_records_total{listener="0",kind="offline_message",outcome="delivered"} 3"#,
             r#"lonewolf_c2s_replay_records_total{listener="0",kind="offline_message",outcome="invalid"} 1"#,
+            r#"lonewolf_c2s_replay_records_total{listener="0",kind="offline_message",outcome="blocked"} 2"#,
             r#"lonewolf_c2s_replay_pages_total{listener="0",kind="subscription_request"} 1"#,
             r#"lonewolf_c2s_replay_bytes_total{listener="0",kind="subscription_request"} 17"#,
             r#"lonewolf_c2s_replay_records_total{listener="0",kind="subscription_request",outcome="delivered"} 2"#,

@@ -12,8 +12,8 @@ use lonewolf_auth::scram::{
     SCRAM_POLICY_ITERATIONS, ScramCredentials, ScramSha1Verifier, ScramVerifier,
 };
 use lonewolf_storage::account::{AccountKey, AccountWrites, NewAccount};
-use lonewolf_storage::offline::{OfflineReads, OfflineSequence, OfflineWrites};
-use lonewolf_storage::{RedbStorage, Storage, WriteTransaction};
+use lonewolf_storage::offline::{OfflinePage, OfflineReads, OfflineSequence, OfflineWrites};
+use lonewolf_storage::{RedbRead, RedbStorage, Storage, WriteTransaction};
 use lonewolf_util::arena::{Arena, ArenaConfig, GlobalChunkAllocator};
 use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::parser::{ParserConfig, StreamEvent, XmppParser};
@@ -24,7 +24,7 @@ use crate::REPLAY_PAGE_BYTES;
 use crate::account::AccountHandler;
 use crate::delivery::{HandlerError, HostLookup};
 use crate::message::{Backlog, MessageHandler, StoreOutcome, UndeliverableMessage};
-use crate::presence::PresenceRequestType;
+use crate::presence::{PresenceFuture, PresenceRequestType};
 use crate::{Extension, Extensions};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -680,6 +680,85 @@ async fn seed_multiple_pages(
     let last = transaction.push_offline_message(owner, 3, &bytes).await?;
     transaction.commit().await?;
     Ok(last)
+}
+
+#[test]
+fn replay_membership_works_with_existing_backlog_handlers() -> TestResult {
+    struct LegacyHandler<'a> {
+        offline: &'a TestHandler,
+        paged: bool,
+    }
+
+    impl MessageHandler<GlobalChunkAllocator, RedbStorage> for LegacyHandler<'_> {
+        fn backlog<'a>(
+            &'a self,
+            account: &'a AccountKey,
+            transaction: &'a RedbRead,
+        ) -> PresenceFuture<'a, Option<Backlog>> {
+            self.offline.backlog(account, transaction)
+        }
+
+        fn backlog_page<'a>(
+            &'a self,
+            account: &'a AccountKey,
+            transaction: &'a RedbRead,
+            after: OfflineSequence,
+            through: OfflineSequence,
+            page: OfflinePage,
+        ) -> PresenceFuture<'a, OfflinePage> {
+            if self.paged {
+                self.offline
+                    .backlog_page(account, transaction, after, through, page)
+            } else {
+                Box::pin(async { Ok(OfflinePage::new()) })
+            }
+        }
+    }
+
+    async fn contains(
+        handler: &dyn MessageHandler<GlobalChunkAllocator, RedbStorage>,
+        account: &AccountKey,
+        sequence: OfflineSequence,
+        snapshot: &RedbRead,
+    ) -> TestResult<bool> {
+        handler
+            .replay_contains(account, sequence, snapshot)
+            .await
+            .map_err(|error| format!("{error:?}").into())
+    }
+
+    block_on(async {
+        let fixture = TestOffline::new(BTreeMap::new(), &["bob@example.com"]).await?;
+        let account = key("bob@example.com")?;
+        let mut transaction = fixture.storage.begin_write().await?;
+        let first = transaction
+            .push_offline_message(&account, 100, &vec![b'x'; REPLAY_PAGE_BYTES.get()])
+            .await?;
+        let second = transaction
+            .push_offline_message(&account, 101, MESSAGE.as_bytes())
+            .await?;
+        transaction.commit().await?;
+        let reader = fixture.storage.begin_read().await?;
+        let first_page_only = LegacyHandler {
+            offline: &fixture.offline,
+            paged: false,
+        };
+        assert!(contains(&first_page_only, &account, first, &reader).await?);
+        let paged = LegacyHandler {
+            offline: &fixture.offline,
+            paged: true,
+        };
+        assert!(contains(&paged, &account, second, &reader).await?);
+
+        let mut transaction = fixture.storage.begin_write().await?;
+        assert!(transaction.remove_offline_message(&account, first).await?);
+        transaction.commit().await?;
+        let current = fixture.storage.begin_read().await?;
+        assert!(!contains(&first_page_only, &account, first, &current).await?);
+        assert!(!contains(&paged, &account, first, &current).await?);
+        assert!(contains(&paged, &account, first, &reader).await?);
+        Ok(())
+    })
 }
 
 #[test]

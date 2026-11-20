@@ -164,6 +164,7 @@ async fn flush_and_ack<A: ChunkAllocator + Clone>(
     outbox.push(Output::Offline {
         backlog: fixture.backlog().await?,
         handler: Arc::new(AckNotice(PlMutex::new(Some(done)))),
+        policy: None,
     });
     outbox.flush().await.map_err(|error| format!("{error:?}"))?;
     acknowledged.await?;
@@ -235,6 +236,7 @@ impl Fixture {
             storage: self.storage.clone(),
             liveness: self.registration.liveness(),
             acknowledgement: None,
+            selective_acknowledgement: None,
             messages: None,
             metrics: C2sWorkerMetrics::detached(),
             work: &self.work,
@@ -427,6 +429,7 @@ fn failed_write_or_flush_keeps_backlog_for_a_successful_retry() -> TestResult {
             outbox.push(Output::Offline {
                 backlog: fixture.backlog().await?,
                 handler: Arc::new(Offline::new(Default::default())),
+                policy: None,
             });
             assert_eq!(outbox.flush().await, Err(CloseOutcome::TransportError));
             assert!(outbox.releases.is_empty());
@@ -738,6 +741,7 @@ fn flush_reports_the_sequence_of_the_last_written_stanza() -> TestResult {
         outbox.push(Output::Offline {
             backlog: fixture.backlog().await?,
             handler: Arc::new(Offline::new(Default::default())),
+            policy: None,
         });
         outbox.flush().await.map_err(|error| format!("{error:?}"))?;
         assert_eq!(
@@ -802,6 +806,7 @@ fn invalid_backlogs_wait_for_transport_flush_before_releasing_stored_rows() -> T
             outbox.push(Output::Offline {
                 backlog: fixture.backlog().await?,
                 handler: Arc::new(AckNotice(PlMutex::new(Some(done)))),
+                policy: None,
             });
             {
                 let mut running = pin!(transport.write(&mut controlled, None));
@@ -894,6 +899,7 @@ fn valid_message_allocation_failure_keeps_the_stored_copy() -> TestResult {
         outbox.push(Output::Offline {
             backlog: fixture.backlog().await?,
             handler: Arc::new(Offline::new(Default::default())),
+            policy: None,
         });
         assert!(outbox.flush().await.is_err());
         assert_eq!(fixture.count().await?, 2);
@@ -961,6 +967,7 @@ fn repeated_successful_flushes_coalesce_into_one_worker_and_the_highest_watermar
                     page,
                 },
                 handler: handler.clone(),
+                policy: None,
             });
             outbox.flush().await.map_err(|error| format!("{error:?}"))?;
             let worker = outbox
@@ -1002,6 +1009,7 @@ fn dropping_the_outbox_cancels_its_pending_acknowledgement_and_replay_can_retry(
         outbox.push(Output::Offline {
             backlog: fixture.backlog().await?,
             handler: Arc::new(AckNotice(PlMutex::new(Some(done)))),
+            policy: None,
         });
         outbox.flush().await.map_err(|error| format!("{error:?}"))?;
         (&mut outbox
@@ -1033,6 +1041,7 @@ fn writer_waiting_acknowledgement_does_not_stop_a_healthy_resource_from_draining
         outbox.push(Output::Offline {
             backlog: fixture.backlog().await?,
             handler: Arc::new(AckNotice(PlMutex::new(Some(done)))),
+            policy: None,
         });
         outbox.flush().await.map_err(|error| format!("{error:?}"))?;
         for _ in 0..80 {
@@ -1080,6 +1089,7 @@ fn acknowledgement_preserves_a_message_stored_after_the_replay_snapshot() -> Tes
         outbox.push(Output::Offline {
             backlog,
             handler: Arc::new(AckNotice(PlMutex::new(Some(done)))),
+            policy: None,
         });
         outbox.flush().await.map_err(|error| format!("{error:?}"))?;
         writer.commit().await?;
@@ -1153,6 +1163,7 @@ fn failed_acknowledgement_logs_once_and_restarts_for_the_same_watermark_after_a_
         outbox.push(Output::Offline {
             backlog: fixture.backlog().await?,
             handler: handler.clone(),
+            policy: None,
         });
         outbox.flush().await.map_err(|error| format!("{error:?}"))?;
         (&mut outbox
@@ -1178,6 +1189,7 @@ fn failed_acknowledgement_logs_once_and_restarts_for_the_same_watermark_after_a_
         outbox.push(Output::Offline {
             backlog: fixture.backlog().await?,
             handler: handler.clone(),
+            policy: None,
         });
         outbox.flush().await.map_err(|error| format!("{error:?}"))?;
         (&mut outbox
@@ -1225,6 +1237,7 @@ fn certificate_revalidation_keeps_the_outbox_draining() -> TestResult {
                             .await
                             .map_err(|_| CloseOutcome::InternalError)?,
                         handler: Arc::new(Offline::new(Default::default())),
+                        policy: None,
                     });
                     outbox.flush().await
                 },
@@ -1259,6 +1272,7 @@ fn certificate_expiry_interrupts_a_blocked_outbox_write() -> TestResult {
         outbox.push(Output::Offline {
             backlog: fixture.backlog().await?,
             handler: Arc::new(Offline::new(Default::default())),
+            policy: None,
         });
         let monitor = certificate_monitor();
         let mut validity = monitor.validity.get();
@@ -1361,6 +1375,7 @@ fn late_certificate_revalidation_cannot_retire_a_replacement_resource() -> TestR
         replacement_outbox.push(Output::Offline {
             backlog: fixture.backlog().await?,
             handler: Arc::new(Offline::new(Default::default())),
+            policy: None,
         });
         replacement_outbox
             .flush()
@@ -3058,6 +3073,7 @@ fn offline_replay_writes_every_page_in_order_and_flushes_before_each_later_page(
         outbox.push(Output::Offline {
             backlog: fixture.backlog().await?,
             handler: Arc::new(Offline::new(Default::default())),
+            policy: None,
         });
 
         outbox.flush().await.map_err(|error| format!("{error:?}"))?;
@@ -3091,6 +3107,7 @@ fn failed_later_flush_keeps_only_unflushed_pages_stored() -> TestResult {
         outbox.push(Output::Offline {
             backlog: fixture.backlog().await?,
             handler: Arc::new(Offline::new(Default::default())),
+            policy: None,
         });
 
         assert_eq!(outbox.flush().await, Err(CloseOutcome::TransportError));
@@ -3122,6 +3139,7 @@ fn failed_intermediate_acknowledgement_stops_before_the_next_page() -> TestResul
         outbox.push(Output::Offline {
             backlog: fixture.backlog().await?,
             handler: Arc::new(FailingAcknowledgement),
+            policy: None,
         });
 
         assert_eq!(outbox.flush().await, Err(CloseOutcome::InternalError));
@@ -3150,6 +3168,7 @@ fn offline_replay_skips_messages_removed_between_pages() -> TestResult {
         outbox.push(Output::Offline {
             backlog: fixture.backlog().await?,
             handler: Arc::new(Offline::new(Default::default())),
+            policy: None,
         });
         let modify_queue = async {
             flushing.await?;
@@ -3193,6 +3212,7 @@ fn retired_session_stops_offline_replay_before_the_next_page() -> TestResult {
         outbox.push(Output::Offline {
             backlog: fixture.backlog().await?,
             handler: Arc::new(Offline::new(Default::default())),
+            policy: None,
         });
         let recreate = async {
             flushing.await?;

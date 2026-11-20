@@ -262,6 +262,20 @@ impl<A: ChunkAllocator, S: Storage> MessageHandler<A, S> for Offline {
         })
     }
 
+    fn replay_contains<'a>(
+        &'a self,
+        account: &'a AccountKey,
+        sequence: OfflineSequence,
+        transaction: &'a S::Read,
+    ) -> PresenceFuture<'a, bool> {
+        Box::pin(async move {
+            transaction
+                .contains_offline_message(account, sequence)
+                .await
+                .map_err(|error| offline_error(error, "offline_replay_contains"))
+        })
+    }
+
     fn acknowledge<'a>(
         &'a self,
         account: &'a AccountKey,

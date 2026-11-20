@@ -155,7 +155,7 @@ pub(crate) struct RouterHandle<A: ChunkAllocator> {
     remote: Option<crate::s2s::outbound::RemoteRouter<A>>,
     local: LocalRouterHandle<A>,
     extensions: Arc<BTreeMap<String, ExtensionRegistry<A, RedbStorage>>>,
-    explicit_presence_policy: bool,
+    explicit_policy: bool,
     services: Arc<BTreeMap<String, ServiceRoute<A>>>,
     service_presence: Option<Arc<ServicePresenceGates>>,
     order: Arc<Order>,
@@ -267,7 +267,7 @@ impl<A: ChunkAllocator + Clone> Router<A> {
             remote: None,
             local: local.handle(),
             extensions: Arc::default(),
-            explicit_presence_policy: false,
+            explicit_policy: false,
             services: Arc::default(),
             service_presence: None,
             order: Order::new(),
@@ -298,7 +298,7 @@ impl<A: ChunkAllocator + Clone> Router<A> {
         mut self,
         extensions: BTreeMap<String, ExtensionRegistry<A, RedbStorage>>,
     ) -> Self {
-        self.handle.explicit_presence_policy = extensions.values().any(|registry| {
+        self.handle.explicit_policy = extensions.values().any(|registry| {
             registry
                 .policies()
                 .iter()
@@ -338,7 +338,7 @@ impl<A: ChunkAllocator + Clone> Clone for RouterHandle<A> {
             remote: self.remote.clone(),
             local: self.local.clone(),
             extensions: Arc::clone(&self.extensions),
-            explicit_presence_policy: self.explicit_presence_policy,
+            explicit_policy: self.explicit_policy,
             services: Arc::clone(&self.services),
             service_presence: self.service_presence.clone(),
             order: Arc::clone(&self.order),
@@ -944,12 +944,12 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         self.local.deliver_presence_to_tagged(tag, stanza).await
     }
 
-    pub(crate) fn has_explicit_presence_policy(&self) -> bool {
-        self.explicit_presence_policy
+    pub(crate) fn has_explicit_policy(&self) -> bool {
+        self.explicit_policy
     }
 
     pub(crate) fn presence_effects_need_snapshot(&self, accounts: &[AccountKey]) -> bool {
-        self.explicit_presence_policy
+        self.explicit_policy
             && accounts
                 .iter()
                 .any(|account| Selection::Explicit.configured(self, account.domain()))

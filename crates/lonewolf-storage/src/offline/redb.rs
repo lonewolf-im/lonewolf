@@ -115,6 +115,21 @@ macro_rules! offline_reads {
                     Ok(count)
                 })
             }
+
+            fn contains_offline_message(
+                &self,
+                owner: &AccountKey,
+                sequence: OfflineSequence,
+            ) -> impl Future<Output = Result<bool, OfflineError>> + Send {
+                let owner = owner.clone();
+                self.run(move |transaction| {
+                    let table = transaction.open_table(MESSAGES).map_err(storage_error)?;
+                    let record = table
+                        .get((owner.as_str(), sequence.get()))
+                        .map_err(storage_error)?;
+                    Ok(record.is_some())
+                })
+            }
         }
     };
 }

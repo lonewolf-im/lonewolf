@@ -86,6 +86,22 @@ pub trait OfflineReads {
         page: OfflinePage,
     ) -> impl Future<Output = Result<OfflinePage, OfflineError>> + Send;
 
+    fn contains_offline_message(
+        &self,
+        owner: &AccountKey,
+        sequence: OfflineSequence,
+    ) -> impl Future<Output = Result<bool, OfflineError>> + Send {
+        let after = sequence.get().checked_sub(1).map(OfflineSequence::new);
+        let page = self.offline_page(
+            owner,
+            after,
+            sequence,
+            NonZeroUsize::MIN,
+            OfflinePage::new(),
+        );
+        async move { Ok(!page.await?.is_empty()) }
+    }
+
     fn offline_count(
         &self,
         owner: &AccountKey,

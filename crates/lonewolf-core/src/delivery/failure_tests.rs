@@ -144,11 +144,28 @@ impl Capture {
 struct FailedCommit {
     kind: StorageErrorKind,
     release: oneshot::Receiver<()>,
+    transaction: Option<lonewolf_storage::RedbWrite>,
 }
+
+pub(crate) fn fail_commit(
+    transaction: lonewolf_storage::RedbWrite,
+) -> (impl WriteTransaction, oneshot::Sender<()>) {
+    let (release, blocked) = oneshot::channel();
+    (
+        FailedCommit {
+            kind: StorageErrorKind::Unavailable,
+            release: blocked,
+            transaction: Some(transaction),
+        },
+        release,
+    )
+}
+
 impl ReadTransaction for FailedCommit {}
 impl WriteTransaction for FailedCommit {
     async fn commit(self) -> Result<(), StorageError> {
         let _ = self.release.await;
+        drop(self.transaction);
         Err(seeded_error(self.kind))
     }
 }
@@ -495,6 +512,7 @@ fn detached_commit_failures_keep_categories_and_log_after_requester_cancellation
                 FailedCommit {
                     kind,
                     release: blocked,
+                    transaction: None,
                 },
                 effects,
                 NoDelivery,

@@ -7,11 +7,13 @@ use std::time::Duration;
 
 use compio::runtime::Runtime;
 use futures_util::poll;
+use lonewolf_extension::blocking::Blocking;
 use lonewolf_extension::delivery::DeliveryError;
 use lonewolf_extension::offline::Offline;
 use lonewolf_extension::roster::Roster;
 use lonewolf_extension::service::{ServiceContext, ServiceHandler};
 use lonewolf_extension::{ExtensionFuture, Extensions};
+use lonewolf_storage::blocking::{BlockChange, BlockingWrites};
 use lonewolf_storage::roster::{
     RosterItem, RosterJid, RosterReads, RosterSubscription, RosterWrites, SubscriptionState,
 };
@@ -36,6 +38,7 @@ struct TestService {
     barrier: PlMutex<Option<Barrier>>,
     events: PlMutex<Vec<PresenceType>>,
     subscriptions: PlMutex<Vec<RoutedStanza<GlobalChunkAllocator>>>,
+    withdrawn: PlMutex<Vec<RosterJid>>,
     joined: AtomicBool,
     offline: bool,
 }
@@ -97,6 +100,11 @@ impl ServiceHandler<GlobalChunkAllocator, RedbStorage> for TestService {
                         .outbound
                         .route(RoutedStanza::from_parts(message, arena))
                         .await?;
+                }
+                if kind == PresenceType::Unavailable
+                    && let Some(target) = view.to()?
+                {
+                    self.withdrawn.lock().push(RosterJid::from(target));
                 }
                 self.events.lock().push(kind);
                 self.joined
@@ -262,6 +270,59 @@ fn service_withdrawal_releases_account_ticket_before_offline_reply() -> TestResu
         }
         Ok(())
     }))?
+}
+
+#[test]
+fn service_withdrawal_checks_the_directed_recipient_policy() -> TestResult {
+    Runtime::new()?.block_on(async {
+        for terminal in [false, true] {
+            let service = Arc::new(TestService::default());
+            let mut fixture = fixture(service.clone()).await?;
+            let mut catalog = Extensions::default();
+            catalog.register(Arc::new(Blocking))?;
+            fixture.router = fixture.router.with_extensions(BTreeMap::from([(
+                "localhost".into(),
+                catalog.enable_host("localhost", ["blocking"])?,
+            )]));
+            let mut client = session(&fixture).await?;
+            handle(&mut client, "<presence to='room@echo.localhost/blocked'/>").await?;
+            handle(&mut client, "<presence to='room@echo.localhost/allowed'/>").await?;
+            assert_eq!(*service.events.lock(), [PresenceType::Available; 2]);
+
+            let mut arena = Arena::try_new(Default::default())?;
+            let target = Jid::parse_in("room@echo.localhost/blocked", &mut arena)?;
+            let mut write = fixture.storage.begin_write().await?;
+            write
+                .change_blocklist(
+                    client.registration.account(),
+                    BlockChange::Block(&[RosterJid::from(target.resolve(&arena)?)]),
+                )
+                .await?;
+            write.commit().await?;
+
+            if !terminal {
+                handle(&mut client, "<presence type='unavailable'/>").await?;
+            }
+            client.end().await.map_err(|error| format!("{error:?}"))?;
+            assert_eq!(
+                *service.events.lock(),
+                [
+                    PresenceType::Available,
+                    PresenceType::Available,
+                    PresenceType::Unavailable
+                ],
+            );
+            {
+                let recipients = service.withdrawn.lock();
+                assert_eq!(recipients.len(), 1);
+                assert_eq!(recipients[0].as_str(), "room@echo.localhost/allowed");
+            }
+            drop(client);
+            fixture.work.drain().await;
+            fixture.finish().await?;
+        }
+        Ok(())
+    })
 }
 
 async fn canceled_unavailable(directed: bool) -> TestResult {

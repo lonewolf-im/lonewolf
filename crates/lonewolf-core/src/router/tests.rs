@@ -371,7 +371,12 @@ fn current_and_unavailable_presence_reach_component_contacts_without_federation(
                 match kind {
                     PresenceType::Available => {
                         handle
-                            .route_current_presence(&owner, contact, DeliveryScope::ComponentAware)
+                            .route_current_presence(
+                                &owner,
+                                contact,
+                                DeliveryScope::ComponentAware,
+                                None,
+                            )
                             .await?
                     }
                     _ => {
@@ -380,6 +385,7 @@ fn current_and_unavailable_presence_reach_component_contacts_without_federation(
                                 &owner,
                                 contact,
                                 DeliveryScope::ComponentAware,
+                                None,
                             )
                             .await?
                     }
@@ -428,9 +434,7 @@ fn broadcast_component_presence_reaches_only_component_subscribers() -> TestResu
             (PresenceType::Unavailable, "type='unavailable'"),
         ] {
             let source = parse_stanza(&format!("<presence from='alice@localhost/desk' id='notice' {attribute}><status>At the desk</status></presence>")).await?;
-            handle
-                .broadcast_component_presence(&source, &subscribers)
-                .await?;
+            handle.broadcast_component_presence(&source, &subscribers, None)?;
             for contact in [gateway, server] {
                 let stanza = link.try_next().ok_or("component broadcast")?;
                 let view = stanza.resolve()?;
@@ -457,9 +461,7 @@ fn broadcast_component_presence_reaches_only_component_subscribers() -> TestResu
         ] {
             let source = parse_stanza(xml).await?;
             assert_eq!(
-                handle
-                    .broadcast_component_presence(&source, &subscribers)
-                    .await,
+                handle.broadcast_component_presence(&source, &subscribers, None),
                 Err(RouterError::InvalidTarget)
             );
         }
@@ -487,7 +489,9 @@ fn broadcast_presence_skips_component_subscribers() -> TestResult {
         let [gateway, server] = COMPONENT_CONTACTS;
         let subscribers = [roster_jid(gateway)?, roster_jid(server)?];
         let source = parse_stanza("<presence from='alice@localhost/desk'/>").await?;
-        handle.broadcast_presence(&source, &subscribers).await?;
+        handle
+            .broadcast_presence(&source, &subscribers, None, None)
+            .await?;
         assert!(link.try_next().is_none());
         assert!(remote.receive()?.is_none());
         let mut root = prometheus_client::registry::Registry::default();
@@ -826,7 +830,10 @@ fn presence_errors_keep_exact_and_available_audiences_and_presence_state() -> Te
         }
         let snapshots = handle.local.presence_snapshot(&alice).await?;
         assert_eq!(snapshots.len(), 2);
-        let mut ids = [snapshots[0].resolve()?.id()?, snapshots[1].resolve()?.id()?];
+        let mut ids = [
+            snapshots[0].stanza.resolve()?.id()?,
+            snapshots[1].stanza.resolve()?.id()?,
+        ];
         ids.sort();
         assert_eq!(ids, [Some("phone"), Some("tablet")]);
         for resource in [&desk, &phone, &tablet] {
@@ -843,6 +850,61 @@ fn presence_errors_keep_exact_and_available_audiences_and_presence_state() -> Te
             Err(RouterError::Offline)
         );
         drop((desk, phone));
+        router.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn addressed_presence_error_admits_the_selected_available_sessions() -> TestResult {
+    run_test(async {
+        let router = setup()?;
+        let handle = router.handle();
+        let alice = account("alice@localhost")?;
+        let bob = account("bob@localhost")?;
+        let limit = NonZeroUsize::new(4).ok_or("zero limit")?;
+        let source = handle.register(&bob, Some("home"), limit).await?;
+        let desk = handle.register(&alice, Some("desk"), limit).await?;
+        let phone = handle.register(&alice, Some("phone"), limit).await?;
+        let tablet = handle.register(&alice, Some("tablet"), limit).await?;
+        let quiet = handle.register(&alice, Some("quiet"), limit).await?;
+        let selected = [
+            desk.handle().session_id(),
+            phone.handle().session_id(),
+            quiet.handle().session_id(),
+        ];
+        drop(desk);
+        let replacement = handle.register(&alice, Some("desk"), limit).await?;
+        for resource in [&phone, &tablet, &replacement] {
+            resource
+                .handle()
+                .set_presence(Some(-1), presence(resource.resource()).await?, None)
+                .await?;
+        }
+        for resource in [&phone, &tablet, &replacement] {
+            resource.take_queued();
+        }
+        let notice = parse_stanza(
+            "<presence from='bob@localhost/home' to='alice@localhost' type='error' id='status'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>",
+        ).await?;
+        handle
+            .local
+            .deliver_presence_error_guarded(notice, Some(source.liveness()), Some(&selected))
+            .await?;
+
+        let queued = phone.take_queued();
+        assert_eq!(queued.len(), 1);
+        let view = queued[0].stanza.resolve()?;
+        assert_eq!(
+            view.stanza_type(),
+            StanzaType::Presence(PresenceType::Error)
+        );
+        assert_eq!(view.id()?, Some("status"));
+        assert_eq!(view.to()?.map(|to| to.as_str()), Some("alice@localhost"));
+        for resource in [&tablet, &quiet, &replacement] {
+            assert!(resource.take_queued().is_empty());
+        }
+        drop((source, phone, tablet, quiet, replacement));
         router.shutdown().await?;
         Ok(())
     })
@@ -2516,7 +2578,12 @@ fn withdrawal_sees_disconnecting_presence_until_terminal_delivery_finishes() -> 
         assert!(alice_desk.end_presence().await?.unavailable.is_some());
         assert!(handle.local.presence_snapshot(&alice).await?.is_empty());
         handle
-            .route_unavailable_presence(&alice, bob_account.as_str(), DeliveryScope::ComponentAware)
+            .route_unavailable_presence(
+                &alice,
+                bob_account.as_str(),
+                DeliveryScope::ComponentAware,
+                None,
+            )
             .await?;
         let unavailable = receive_routed(&bob).await?;
         let view = unavailable.resolve()?;
@@ -2808,7 +2875,7 @@ fn incoming_unavailable_prunes_connected_only_grants_by_sender_scope() -> TestRe
                 directed_grant(source, target, true).await?;
             }
         }
-        handle.route_directed_presence(parse_stanza("<presence from='bob@localhost/desk' to='alice@localhost/desk' type='unavailable'/>").await?).await?;
+        handle.route_directed_presence(parse_stanza("<presence from='bob@localhost/desk' to='alice@localhost/desk' type='unavailable'/>").await?, None).await?;
         assert!(has_grant(&handle, &alice, "desk", "bob@localhost/desk").await?);
         directed_grant(&desk, "bob@localhost", false).await?;
         assert!(!has_grant(&handle, &alice, "desk", "bob@localhost/desk").await?);
@@ -2820,6 +2887,7 @@ fn incoming_unavailable_prunes_connected_only_grants_by_sender_scope() -> TestRe
                     "<presence from='bob@localhost' to='alice@localhost' type='unavailable'/>",
                 )
                 .await?,
+                None,
             )
             .await?;
         for resource in ["desk", "phone"] {
@@ -2949,7 +3017,9 @@ fn unavailable_probe_reply_prunes_the_requester_grant() -> TestResult {
         let probe =
             parse_stanza("<presence from='bob@localhost/desk' to='alice@localhost' type='probe'/>")
                 .await?;
-        handle.probe_presence(&bob.handle(), &probe, true).await?;
+        handle
+            .probe_presence(&bob.handle(), &probe, true, None)
+            .await?;
         let replies = bob.take_queued();
         assert_eq!(replies.len(), 1);
         assert_eq!(
@@ -2972,7 +3042,9 @@ fn unavailable_probe_reply_prunes_the_requester_grant() -> TestResult {
         }
         assert!(count > 0);
         assert!(has_grant(&handle, &bob_account, "desk", "alice@localhost").await?);
-        handle.probe_presence(&bob.handle(), &probe, true).await?;
+        handle
+            .probe_presence(&bob.handle(), &probe, true, None)
+            .await?;
         assert!(!has_grant(&handle, &bob_account, "desk", "alice@localhost").await?);
         assert!(bob.liveness().is_alive());
         let replies = bob.take_queued();

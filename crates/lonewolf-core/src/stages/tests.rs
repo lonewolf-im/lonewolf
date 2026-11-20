@@ -1605,7 +1605,7 @@ fn filter_pending_keeps_the_cursor_and_drops_refused_senders() -> TestResult {
             &router.handle(),
             &transaction,
             &GlobalChunkAllocator,
-            &owner,
+            (&owner, None),
             StanzaType::Presence(PresenceType::Available),
             &mut page,
         )

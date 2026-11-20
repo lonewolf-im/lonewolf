@@ -2204,3 +2204,84 @@ fn probe_for_matches_local_mailbox_replies() -> Result<(), Box<dyn Error>> {
         Ok(())
     })
 }
+
+#[test]
+fn filtered_presence_admits_only_the_selected_session_tokens() -> Result<(), Box<dyn Error>> {
+    Runtime::new()?.block_on(async {
+        let owner = account()?;
+        let router = test_router();
+        let mut shard = Shard::new();
+        let desk = register_probe_session(&mut shard, &router, &owner, "desk")?;
+        let phone = register_probe_session(&mut shard, &router, &owner, "phone")?;
+        shard
+            .accounts
+            .get_mut(owner.as_str())
+            .and_then(|sessions| sessions.get_mut("desk"))
+            .ok_or("missing desk")?
+            .priority = Some(0);
+        shard
+            .accounts
+            .get_mut(owner.as_str())
+            .and_then(|sessions| sessions.get_mut("phone"))
+            .ok_or("missing phone")?
+            .priority = Some(0);
+        let approved = shard
+            .presence_targets(&owner)
+            .into_iter()
+            .map(|(_, token)| token)
+            .collect::<Vec<_>>();
+
+        shard.cleanup(&owner, "desk", desk.token);
+        let replacement = register_probe_session(&mut shard, &router, &owner, "desk")?;
+        shard
+            .accounts
+            .get_mut(owner.as_str())
+            .and_then(|sessions| sessions.get_mut("desk"))
+            .ok_or("missing desk")?
+            .priority = Some(0);
+        let presence = routed("<presence from='bob@localhost/desk' to='alice@localhost'/>").await?;
+        shard.deliver_filtered_presence(presence, None, Some(&approved), || true)?;
+        assert_eq!(phone.take_queued().len(), 1);
+        assert!(replacement.take_queued().is_empty());
+        assert!(desk.take_queued().is_empty());
+        Ok(())
+    })
+}
+
+#[test]
+fn prepared_probe_replies_follow_the_original_sources() -> Result<(), Box<dyn Error>> {
+    Runtime::new()?.block_on(async {
+        let alice = account()?;
+        let mut arena = Arena::try_new(Default::default())?;
+        let bob =
+            AccountKey::try_from(Jid::parse_in("bob@localhost", &mut arena)?.resolve(&arena)?)?;
+        let router = test_router();
+        let mut shard = Shard::new();
+        let desk = register_probe_session(&mut shard, &router, &alice, "desk")?;
+        let phone = register_probe_session(&mut shard, &router, &alice, "phone")?;
+        let observer = register_probe_session(&mut shard, &router, &bob, "desk")?;
+        for (resource, token) in [("desk", desk.token), ("phone", phone.token)] {
+            let stanza = routed(&format!(
+                "<presence from='alice@localhost/{resource}' id='{resource}'/>"
+            ))
+            .await?;
+            shard.presence(&alice, resource, token, Some(0), stanza, None)?;
+        }
+        let probe =
+            routed("<presence from='bob@localhost/desk' to='alice@localhost' type='probe'/>")
+                .await?;
+        let requester = probe.resolve()?.from()?.ok_or("missing requester")?;
+        let replies = shard.probe_candidates(requester, &probe, true, &GlobalChunkAllocator)?;
+        assert_eq!(replies.len(), 2);
+
+        shard.cleanup(&alice, "desk", desk.token);
+        let replacement = register_probe_session(&mut shard, &router, &alice, "desk")?;
+        let stanza = routed("<presence from='alice@localhost/desk' id='new'/>").await?;
+        shard.presence(&alice, "desk", replacement.token, Some(0), stanza, None)?;
+        assert!(observer.handle().enqueue_probe(replies).is_none());
+        let replies = observer.take_queued();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].stanza.resolve()?.id()?, Some("phone"));
+        Ok(())
+    })
+}

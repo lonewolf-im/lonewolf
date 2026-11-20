@@ -2,6 +2,7 @@
 
 mod addressed;
 mod mutations;
+mod presence;
 
 use compio::runtime::Runtime;
 use lonewolf_storage::account::AccountKey;

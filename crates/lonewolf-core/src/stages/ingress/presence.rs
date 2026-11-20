@@ -5,11 +5,11 @@ use std::sync::Arc;
 use lonewolf_extension::policy::Verdict;
 use lonewolf_extension::presence::{PresenceRequest, PresenceRequestType};
 use lonewolf_storage::account::{AccountKey, AccountReads};
-use lonewolf_storage::{RedbStorage, Storage};
+use lonewolf_storage::{RedbRead, RedbStorage, Storage};
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::stanza::{StanzaErrorCondition, StanzaErrorText};
 
-use super::checks::{Snapshot, check_selected};
+use super::checks::{Snapshot, check_selected, explicit_applies};
 use crate::delivery::{
     EffectsDiagnostics, EffectsError, EffectsIdentity, RouterDelivery, commit_and_deliver,
     report_failure, report_handler_failure, storage_failure,
@@ -22,6 +22,7 @@ use crate::stages::{Stage, StageFailure};
 pub(crate) struct ProbeGrant {
     pub(crate) subscribed: bool,
     pub(crate) ticket: Ticket,
+    pub(crate) snapshot: Option<RedbRead>,
 }
 
 pub(crate) enum ProbeAuthorization {
@@ -39,6 +40,7 @@ pub(crate) async fn authorize_probe<A: ChunkAllocator + Clone + 'static>(
     check_account_exists: bool,
 ) -> Result<ProbeAuthorization, StageFailure> {
     let identity = target.as_ref().or(sender.as_ref()).ok_or(StageFailure)?;
+    let explicit = explicit_applies(&router, sender.as_ref(), target.as_ref());
     let accounts = sender
         .iter()
         .chain(
@@ -113,13 +115,13 @@ pub(crate) async fn authorize_probe<A: ChunkAllocator + Clone + 'static>(
         Selection::Standard,
     )
     .await?;
-    drop(transaction);
     match verdict {
         Verdict::Allow => {
             ticket.turn().await;
             Ok(ProbeAuthorization::Granted(ProbeGrant {
                 subscribed,
                 ticket,
+                snapshot: explicit.then_some(transaction),
             }))
         }
         Verdict::OutboundBlocked => Ok(ProbeAuthorization::OutboundBlocked),
@@ -233,28 +235,35 @@ pub(crate) async fn receive_subscription<A: ChunkAllocator + Clone + 'static>(
             });
         }
     };
-    if explicit_policy {
-        let snapshot = stage.storage.begin_read().await.map_err(|error| {
+    let read_policy = || async {
+        stage.storage.begin_read().await.map_err(|error| {
             report_failure(
                 storage_failure(error, "presence_subscription_policy_begin_read"),
                 &owner,
             );
             StageFailure
-        })?;
-        if check_selected(
+        })
+    };
+    let mut presence_snapshot = if explicit_policy {
+        Some(read_policy().await?)
+    } else {
+        None
+    };
+    if explicit_policy
+        && let Some(snapshot) = presence_snapshot.as_ref()
+        && check_selected(
             (stage.router, stage.storage),
             None,
             Some(&owner),
             &addressed.resolve()?,
             None,
-            Snapshot::Ordered(&snapshot),
+            Snapshot::Ordered(snapshot),
             Selection::Explicit,
         )
         .await?
             != Verdict::Allow
-        {
-            return Ok(SubscriptionReceipt::Done);
-        }
+    {
+        return Ok(SubscriptionReceipt::Done);
     }
     let scope = match ingress {
         SubscriptionIngress::Federated => DeliveryScope::FederationOnly,
@@ -285,12 +294,19 @@ pub(crate) async fn receive_subscription<A: ChunkAllocator + Clone + 'static>(
             });
         }
     };
+    if presence_snapshot.is_none()
+        && stage
+            .router
+            .presence_effects_need_snapshot(&effects.accounts)
+    {
+        presence_snapshot = Some(read_policy().await?);
+    }
     let pending = commit_and_deliver(
         stage.work.start(),
         Arc::clone(stage.router.order()),
         transaction,
         effects,
-        delivery,
+        delivery.with_presence_snapshot(presence_snapshot.map(Arc::new)),
         None,
         EffectsDiagnostics {
             identity: EffectsIdentity::Account(owner),

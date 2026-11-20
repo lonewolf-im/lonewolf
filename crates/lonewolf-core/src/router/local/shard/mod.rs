@@ -17,16 +17,19 @@ use lonewolf_xmpp::jid::JidRef;
 use lonewolf_xmpp::stanza::{IqType, MessageType, PresenceType, StanzaType};
 use parking_lot::Mutex as PlMutex;
 
+#[cfg(test)]
+use super::registration::SessionHandle;
 use super::registration::{
     DirectedWithdrawal, Links, MailboxEntry, PresenceChange, Registration, ResourceMatch,
-    RetireCause, Retired, SessionHandle, SessionLiveness, SharedDirectedWithdrawal, StoredRelease,
-    Withdrawal, take_queued,
+    RetireCause, Retired, SessionLiveness, SharedDirectedWithdrawal, StoredRelease, Withdrawal,
+    take_queued,
 };
 use super::shards::LocalRouterHandle;
 #[cfg(test)]
 use crate::config::limits::default_max_directed_presence_recipients_per_resource;
 use crate::router::{
-    Admitted, MessageTarget, RoutedStanza, RouterError, RouterState, validate_target,
+    Admitted, MessageTarget, PresenceDelivery, RoutedStanza, RouterError, RouterState,
+    validate_target,
 };
 
 const LAST_UNAVAILABLE_PER_SHARD: usize = 64;
@@ -729,7 +732,7 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
         build: &mut impl for<'a> FnMut(
             PresenceSource<'a, A>,
         ) -> Result<Option<RoutedStanza<A>>, RouterError>,
-    ) -> Result<Vec<RoutedStanza<A>>, RouterError> {
+    ) -> Result<Vec<PresenceDelivery<A>>, RouterError> {
         let mut deliveries = Vec::new();
         let Some(sessions) = self.accounts.get(account.as_str()) else {
             return Ok(deliveries);
@@ -768,52 +771,39 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
             if to.as_str() != observer.as_str() {
                 return Err(RouterError::InvalidTarget);
             }
-            deliveries.push(stanza);
+            deliveries.push(PresenceDelivery {
+                stanza,
+                source: Some(SessionLiveness(Arc::clone(&session.alive))),
+            });
         }
         Ok(deliveries)
     }
 
+    #[cfg(test)]
     pub(super) fn probe(
         &self,
         requester: &SessionHandle<A>,
         request: &RoutedStanza<A>,
         subscribed: bool,
     ) -> Result<Option<RoutedStanza<A>>, RouterError> {
-        let view = request.resolve().map_err(|_| RouterError::InvalidTarget)?;
-        let observer = view
+        let observer = request
+            .resolve()
+            .map_err(|_| RouterError::InvalidTarget)?
             .from()
             .map_err(|_| RouterError::InvalidTarget)?
             .ok_or(RouterError::InvalidTarget)?;
-        if !requester.matches(observer)
-            || view.stanza_type() != StanzaType::Presence(PresenceType::Probe)
-        {
+        if !requester.matches(observer) {
             return Err(RouterError::InvalidTarget);
         }
-        let deliveries =
-            self.probe_for(observer, request, subscribed, &requester.router.allocator())?;
-        let unavailable = deliveries
-            .iter()
-            .find(|stanza| {
-                stanza.resolve().is_ok_and(|view| {
-                    view.stanza_type() == StanzaType::Presence(PresenceType::Unavailable)
-                })
-            })
-            .cloned();
-        if !requester.liveness.is_alive() {
-            return Ok(None);
-        }
-        let Some(sender) = requester.mailbox.upgrade() else {
-            return Ok(None);
-        };
-        for stanza in deliveries {
-            match sender.try_send(MailboxEntry::new(stanza)) {
-                Ok(()) | Err(TrySendError::Full(_)) => {}
-                Err(TrySendError::Closed(_)) => return Ok(None),
-            }
-        }
-        Ok(unavailable)
+        Ok(requester.enqueue_probe(self.probe_candidates(
+            observer,
+            request,
+            subscribed,
+            &requester.router.allocator(),
+        )?))
     }
 
+    #[cfg(test)]
     pub(super) fn probe_for(
         &self,
         observer: JidRef<'_>,
@@ -821,6 +811,20 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
         subscribed: bool,
         allocator: &A,
     ) -> Result<Vec<RoutedStanza<A>>, RouterError> {
+        Ok(self
+            .probe_candidates(observer, request, subscribed, allocator)?
+            .into_iter()
+            .map(|delivery| delivery.stanza)
+            .collect())
+    }
+
+    pub(super) fn probe_candidates(
+        &self,
+        observer: JidRef<'_>,
+        request: &RoutedStanza<A>,
+        subscribed: bool,
+        allocator: &A,
+    ) -> Result<Vec<PresenceDelivery<A>>, RouterError> {
         let view = request.resolve().map_err(|_| RouterError::InvalidTarget)?;
         if view.stanza_type() != StanzaType::Presence(PresenceType::Probe) {
             return Err(RouterError::InvalidTarget);
@@ -898,7 +902,10 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
                 at,
                 allocator.clone(),
             )?;
-            deliveries.push(stanza);
+            deliveries.push(PresenceDelivery {
+                stanza,
+                source: None,
+            });
         }
         Ok(deliveries)
     }
@@ -907,6 +914,16 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
         &mut self,
         stanza: &RoutedStanza<A>,
         token: Option<u64>,
+    ) -> Result<(), RouterError> {
+        self.prune_directed_where(stanza, |session| {
+            token.is_none_or(|token| session.token == token)
+        })
+    }
+
+    fn prune_directed_where(
+        &mut self,
+        stanza: &RoutedStanza<A>,
+        select: impl Fn(&Session<A>) -> bool,
     ) -> Result<(), RouterError> {
         let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
         if view.stanza_type() != StanzaType::Presence(PresenceType::Unavailable) {
@@ -926,7 +943,7 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
             if to
                 .resourcepart()
                 .is_some_and(|target| target != resource.as_ref())
-                || token.is_some_and(|token| session.token != token)
+                || !select(session)
                 || !session.alive.load(Ordering::Acquire)
             {
                 continue;
@@ -1218,6 +1235,38 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
             .collect()
     }
 
+    pub(super) fn presence_targets(&self, account: &AccountKey) -> Vec<(Box<str>, SessionId)> {
+        self.accounts
+            .get(account.as_str())
+            .into_iter()
+            .flat_map(HashMap::iter)
+            .filter(|(_, session)| {
+                session.alive.load(Ordering::Acquire) && !session.outbound.is_closed()
+            })
+            .map(|(resource, session)| (resource.clone(), SessionId::new(session.token)))
+            .collect()
+    }
+
+    pub(super) fn deliver_filtered_presence(
+        &mut self,
+        stanza: RoutedStanza<A>,
+        tag: Option<SessionTag>,
+        allowed: Option<&[SessionId]>,
+        valid: impl Fn() -> bool,
+    ) -> Result<(), RouterError> {
+        self.deliver_presence_where_with_guard(
+            stanza,
+            |session| {
+                tag.map_or_else(
+                    || session.priority.is_some(),
+                    |tag| session.tags.contains(tag),
+                )
+            },
+            valid,
+            allowed,
+        )
+    }
+
     pub(super) fn deliver_presence(
         &mut self,
         stanza: RoutedStanza<A>,
@@ -1247,6 +1296,7 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
             stanza,
             |session| session.priority.is_some(),
             || source.is_none_or(SessionLiveness::is_alive),
+            None,
         )
     }
 
@@ -1299,7 +1349,7 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
         stanza: RoutedStanza<A>,
         select: impl Fn(&Session<A>) -> bool,
     ) -> Result<(), RouterError> {
-        self.deliver_presence_where_with_guard(stanza, select, || true)
+        self.deliver_presence_where_with_guard(stanza, select, || true, None)
     }
 
     fn deliver_presence_where_with_guard(
@@ -1307,8 +1357,14 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
         stanza: RoutedStanza<A>,
         select: impl Fn(&Session<A>) -> bool,
         valid: impl Fn() -> bool,
+        allowed: Option<&[SessionId]>,
     ) -> Result<(), RouterError> {
-        self.prune_directed(&stanza, None)?;
+        if !valid() {
+            return Err(RouterError::NotFound);
+        }
+        self.prune_directed_where(&stanza, |session| {
+            allowed.is_none_or(|tokens| tokens.contains(&SessionId::new(session.token)))
+        })?;
         let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
         let account = view
             .to()
@@ -1321,7 +1377,9 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
         let mut busy = false;
         let mut failed = Vec::new();
         for (resource, session) in sessions {
-            if !select(session) {
+            if !select(session)
+                || allowed.is_some_and(|tokens| !tokens.contains(&SessionId::new(session.token)))
+            {
                 continue;
             }
             if !session.alive.load(Ordering::Acquire) || session.outbound.is_closed() {
@@ -1356,18 +1414,31 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
         }
     }
 
-    pub(super) fn presence_snapshot(&self, account: &AccountKey) -> Vec<RoutedStanza<A>> {
+    fn present_sessions(&self, account: &AccountKey) -> impl Iterator<Item = &Session<A>> {
         self.accounts
             .get(account.as_str())
             .into_iter()
             .flat_map(|sessions| sessions.values())
             .filter(|session| session.alive.load(Ordering::Acquire))
-            .filter_map(|session| session.presence.clone())
+    }
+
+    pub(super) fn presence_snapshot(&self, account: &AccountKey) -> Vec<PresenceDelivery<A>> {
+        self.present_sessions(account)
+            .filter(|session| !session.outbound.is_closed())
+            .filter_map(|session| {
+                Some(PresenceDelivery {
+                    stanza: session.presence.clone()?,
+                    source: Some(SessionLiveness(Arc::clone(&session.alive))),
+                })
+            })
             .collect()
     }
 
     pub(super) fn withdrawal_snapshot(&self, account: &AccountKey) -> Vec<RoutedStanza<A>> {
-        let mut snapshot = self.presence_snapshot(account);
+        let mut snapshot = self
+            .present_sessions(account)
+            .filter_map(|session| session.presence.clone())
+            .collect::<Vec<_>>();
         if let Some(retiring) = self.retiring.get(account.as_str()) {
             for (token, presence) in retiring {
                 let replaced = self

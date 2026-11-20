@@ -944,6 +944,7 @@ fn initial_remote_probes_follow_broadcast_fifo_and_original_policy_snapshot() ->
                         )?),
                         audience: Some(audience),
                         backlog: None,
+                        snapshot: None,
                     }
                     .run(ticket)
                     .await
@@ -957,6 +958,7 @@ fn initial_remote_probes_follow_broadcast_fifo_and_original_policy_snapshot() ->
                     if initial {
                         assert_eq!(
                             outcome.replay[0]
+                                .stanza
                                 .resolve()?
                                 .to()?
                                 .ok_or("replay to")?
@@ -1235,8 +1237,8 @@ fn remote_presence_errors_and_trusted_snapshots_do_not_apply_policy() -> TestRes
         session.registration.handle().set_presence(Some(0), routed_presence("alice@example.com/desk", None, PresenceType::Available)?, Some(routed_presence("alice@example.com/desk", None, PresenceType::Unavailable)?)).await?;
         let mut arena = Arena::try_new(Default::default())?;
         let target = AccountKey::try_from(Jid::parse_in("bob@remote.test", &mut arena)?.resolve(&arena)?)?;
-        router.handle().route_current_presence(session.registration.account(), target.as_str(), crate::router::DeliveryScope::ComponentAware).await?;
-        router.handle().route_unavailable_presence(session.registration.account(), target.as_str(), crate::router::DeliveryScope::ComponentAware).await?;
+        router.handle().route_current_presence(session.registration.account(), target.as_str(), crate::router::DeliveryScope::ComponentAware, None).await?;
+        router.handle().route_unavailable_presence(session.registration.account(), target.as_str(), crate::router::DeliveryScope::ComponentAware, None).await?;
         for kind in [PresenceType::Available, PresenceType::Unavailable] {
             let stanza = remote.receive()?.ok_or("trusted snapshot")?;
             assert_eq!(stanza.resolve()?.stanza_type(), StanzaType::Presence(kind));
@@ -1324,6 +1326,7 @@ fn stopped_initial_broadcast_or_probe_releases_ticket_and_completion() -> TestRe
                     probes: vec![target],
                 }),
                 backlog: None,
+                snapshot: None,
             }
             .run(ticket)
             .await;

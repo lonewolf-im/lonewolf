@@ -1066,21 +1066,28 @@ async fn prepare_checked_set<A: ChunkAllocator + Clone + 'static>(
     if liveness.as_ref().is_some_and(|session| !session.is_alive()) {
         return Ok(IqDisposition::Done);
     }
-    if explicit {
-        let snapshot = stage.storage.begin_read().await.map_err(|error| {
+    let read_policy = || async {
+        stage.storage.begin_read().await.map_err(|error| {
             origin.report(
                 storage_failure(error, "iq_set_policy_begin_read"),
                 diagnostic_account(origin, target_account.as_ref()),
             );
             StageFailure
-        })?;
+        })
+    };
+    let mut presence_snapshot = if explicit {
+        Some(read_policy().await?)
+    } else {
+        None
+    };
+    if explicit && let Some(snapshot) = presence_snapshot.as_ref() {
         let verdict = checks::check_selected(
             (stage.router, stage.storage),
             origin.sender(),
             target_account.as_ref(),
             &answer.request.resolve(&answer.arena)?,
             Some(sender),
-            Snapshot::Ordered(&snapshot),
+            Snapshot::Ordered(snapshot),
             Selection::Explicit,
         )
         .await?;
@@ -1143,6 +1150,16 @@ async fn prepare_checked_set<A: ChunkAllocator + Clone + 'static>(
                     .sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
                 effects.accounts.dedup();
             }
+            if presence_snapshot.is_none()
+                && stage
+                    .router
+                    .presence_effects_need_snapshot(&effects.accounts)
+            {
+                presence_snapshot = Some(read_policy().await?);
+                if liveness.as_ref().is_some_and(|session| !session.is_alive()) {
+                    return Ok(IqDisposition::Done);
+                }
+            }
             let identity = match origin {
                 Origin::Session(session) => EffectsIdentity::Account(session.account().clone()),
                 Origin::Remote { local, .. } => target_account.map_or_else(
@@ -1159,7 +1176,7 @@ async fn prepare_checked_set<A: ChunkAllocator + Clone + 'static>(
                 Arc::clone(stage.router.order()),
                 transaction,
                 effects,
-                delivery,
+                delivery.with_presence_snapshot(presence_snapshot.map(Arc::new)),
                 origin.session().map(|session| session.mailbox()),
                 EffectsDiagnostics {
                     identity,

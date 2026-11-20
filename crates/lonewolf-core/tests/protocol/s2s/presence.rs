@@ -12,6 +12,38 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 #[test]
+fn generated_federated_presence_retains_its_full_source_and_bare_wire_recipient() -> TestResult {
+    let mut options = workflow_options();
+    options.a_extensions.push_str(", 'blocking'");
+    let mut pair = FederatedPair::start("a.test", "b.test", options)?;
+    pair.a.create_account("alice", PASSWORD)?;
+    pair.b.create_account("bob", PASSWORD)?;
+    let mut alice = pair.a.connect("alice", PASSWORD, "desk")?;
+    let mut bob = pair.b.connect("bob", PASSWORD, "phone")?;
+    alice.send("<iq type='set' id='rule'><block xmlns='urn:xmpp:blocking'><item jid='bob@b.test/tablet'/></block></iq>")?;
+    let reply = alice.receive()?;
+    reply.assert_name("jabber:client", "iq");
+    assert_eq!(reply.attribute("id"), Some("rule"));
+    assert_eq!(reply.attribute("type"), Some("result"));
+    subscribe_mutually(&mut alice, "alice@a.test", &mut bob, "bob@b.test")?;
+
+    alice.send("<presence id='update'><show>away</show></presence>")?;
+    presence(&mut alice, "alice@a.test/desk", "alice@a.test", None)?;
+    let update = presence(&mut bob, "alice@a.test/desk", "bob@b.test", None)?;
+    assert_eq!(update.attribute("id"), Some("update"));
+    assert_eq!(update.child("jabber:client", "show")?.text, "away");
+    alice.close()?;
+    presence(
+        &mut bob,
+        "alice@a.test/desk",
+        "bob@b.test",
+        Some("unavailable"),
+    )?;
+    bob.close()?;
+    pair.stop()
+}
+
+#[test]
 fn mutual_subscription_then_initial_presence_probes_remote_contacts() -> TestResult {
     for (ad, an, bd, bn) in DIRECTIONS {
         let mut pair = FederatedPair::start(ad, bd, workflow_options())?;

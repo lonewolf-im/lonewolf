@@ -7,7 +7,7 @@ use std::mem;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use async_channel::{Receiver, WeakSender};
+use async_channel::{Receiver, TrySendError, WeakSender};
 use futures_channel::oneshot;
 use futures_util::future::Shared;
 use lonewolf_extension::delivery::{SessionId, SessionTag, TagChange};
@@ -17,11 +17,12 @@ use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::offline::OfflineSequence;
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::{JidError, JidRef};
+use lonewolf_xmpp::stanza::{PresenceType, StanzaType};
 use parking_lot::Mutex as PlMutex;
 
 use super::shard::DirectedRecipient;
 use super::shards::{LocalRouterHandle, PendingCleanup};
-use crate::router::{RoutedStanza, RouterError};
+use crate::router::{PresenceDelivery, RoutedStanza, RouterError};
 
 type Retirement<A> = Shared<oneshot::Receiver<Retired<A>>>;
 
@@ -177,7 +178,7 @@ impl<A: ChunkAllocator> Registration<A> {
 }
 
 #[derive(Clone)]
-pub(crate) struct SessionLiveness(Arc<AtomicBool>);
+pub(crate) struct SessionLiveness(pub(super) Arc<AtomicBool>);
 
 impl SessionLiveness {
     pub(crate) fn is_alive(&self) -> bool {
@@ -265,6 +266,35 @@ impl<A: ChunkAllocator> SessionHandle<A> {
     pub(crate) fn matches(&self, jid: JidRef<'_>) -> bool {
         jid.bare().as_str() == self.account.as_str()
             && jid.resourcepart() == Some(self.resource.as_ref())
+    }
+
+    pub(super) fn enqueue_probe(
+        &self,
+        deliveries: Vec<PresenceDelivery<A>>,
+    ) -> Option<RoutedStanza<A>> {
+        let sender = self.mailbox.upgrade()?;
+        let mut unavailable = None;
+        for delivery in deliveries {
+            if !self.liveness.is_alive() {
+                return None;
+            }
+            if !delivery.is_current() {
+                continue;
+            }
+            let stanza = delivery.stanza;
+            if unavailable.is_none()
+                && stanza.resolve().is_ok_and(|view| {
+                    view.stanza_type() == StanzaType::Presence(PresenceType::Unavailable)
+                })
+            {
+                unavailable = Some(stanza.clone());
+            }
+            match sender.try_send(MailboxEntry::new(stanza)) {
+                Ok(()) | Err(TrySendError::Full(_)) => {}
+                Err(TrySendError::Closed(_)) => return None,
+            }
+        }
+        unavailable
     }
 
     pub(crate) async fn end_presence(&self) -> Result<Withdrawal<A>, RouterError> {
@@ -380,11 +410,22 @@ impl<A: ChunkAllocator> SessionHandle<A> {
 }
 
 impl<A: ChunkAllocator + Clone> SessionHandle<A> {
+    #[cfg(test)]
     /// The caller holds the source and recipient account ticket through delivery.
     pub(crate) async fn directed_presence(
         &self,
         stanza: RoutedStanza<A>,
         available: bool,
+    ) -> Result<(), RouterError> {
+        self.directed_presence_filtered(stanza, available, None)
+            .await
+    }
+
+    pub(crate) async fn directed_presence_filtered(
+        &self,
+        stanza: RoutedStanza<A>,
+        available: bool,
+        allowed: Option<&[SessionId]>,
     ) -> Result<(), RouterError> {
         let (recipient, full) = {
             let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
@@ -411,12 +452,16 @@ impl<A: ChunkAllocator + Clone> SessionHandle<A> {
                     .await
             }
             (true, false) => self.router.deliver_full(stanza).await,
-            (false, true) => {
+            (false, _) => {
                 self.router
-                    .deliver_presence_guarded(stanza, self.liveness.clone())
+                    .deliver_filtered_presence(
+                        stanza,
+                        None,
+                        allowed,
+                        available.then_some(&self.liveness),
+                    )
                     .await
             }
-            (false, false) => self.router.deliver_presence(stanza).await,
         };
         match delivered {
             Ok(()) | Err(RouterError::NotFound | RouterError::Busy) => Ok(()),

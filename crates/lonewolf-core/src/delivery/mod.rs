@@ -135,11 +135,19 @@ impl<A: ChunkAllocator + Clone> RouterDelivery<A> {
         allocator: &A,
         session: Option<&Registration<A>>,
     ) -> Self {
+        Self::with_session(router, allocator, session.map(Registration::handle))
+    }
+
+    pub(crate) fn with_session(
+        router: &RouterHandle<A>,
+        allocator: &A,
+        session: Option<SessionHandle<A>>,
+    ) -> Self {
         Self {
             router: router.clone(),
             allocator: allocator.clone(),
             scope: DeliveryScope::ComponentAware,
-            session: session.map(Registration::handle),
+            session,
         }
     }
 
@@ -264,6 +272,7 @@ impl EffectsError {
 }
 
 pub(crate) struct StoredDelivery<A: ChunkAllocator> {
+    pub(crate) source: Option<AccountKey>,
     pub(crate) recipient: AccountKey,
     pub(crate) sequence: OfflineSequence,
     pub(crate) stanza: RoutedStanza<A>,
@@ -284,7 +293,15 @@ pub(crate) fn commit_and_store<A: ChunkAllocator + Clone + 'static>(
         let result: Result<Admitted, EffectsError> = async {
             let ((), mut ticket) = router
                 .order()
-                .fix(vec![stored.recipient.clone()], transaction.commit())
+                .fix(
+                    stored
+                        .source
+                        .into_iter()
+                        .filter(|source| source != &stored.recipient)
+                        .chain([stored.recipient.clone()])
+                        .collect(),
+                    transaction.commit(),
+                )
                 .await
                 .map_err(|error| {
                     let failure = storage_failure(error, "offline_store_commit");

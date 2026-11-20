@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+mod addressed;
+
 use std::collections::BTreeMap;
 
 use lonewolf_extension::Extensions;

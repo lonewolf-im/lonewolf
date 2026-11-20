@@ -83,6 +83,11 @@ impl Verdict {
 pub type PolicyFuture<'a> = ExtensionFuture<'a, Result<Verdict, HandlerError>>;
 
 pub trait PolicyHandler<S: Storage>: Send + Sync {
+    /// Also checks terminal presence and server fallbacks, using the original addresses.
+    fn checks_explicit_addresses(&self) -> bool {
+        false
+    }
+
     /// Uses one consistent snapshot and must not write or deliver.
     fn check<'a>(
         &'a self,

@@ -9,13 +9,14 @@ use lonewolf_storage::{RedbStorage, Storage};
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::stanza::{StanzaErrorCondition, StanzaErrorText};
 
-use super::checks::{Snapshot, check_from};
+use super::checks::{Snapshot, check_selected};
 use crate::delivery::{
     EffectsDiagnostics, EffectsError, EffectsIdentity, RouterDelivery, commit_and_deliver,
     report_failure, report_handler_failure, storage_failure,
 };
 use crate::order::Ticket;
 use crate::router::{DeliveryScope, Destination, RoutedStanza, RouterHandle};
+use crate::stages::policy::Selection;
 use crate::stages::{Stage, StageFailure};
 
 pub(crate) struct ProbeGrant {
@@ -37,20 +38,16 @@ pub(crate) async fn authorize_probe<A: ChunkAllocator + Clone + 'static>(
     routed: &RoutedStanza<A>,
     check_account_exists: bool,
 ) -> Result<ProbeAuthorization, StageFailure> {
-    let local = sender.is_some() && target.is_some();
-    let (accounts, sender) = match (sender, target.as_ref()) {
-        (Some(sender), Some(target)) => {
-            let mut accounts = vec![sender];
-            if &accounts[0] != target {
-                accounts.push(target.clone());
-            }
-            (accounts, None)
-        }
-        (Some(sender), None) => (vec![sender.clone()], Some(sender)),
-        (None, Some(target)) => (vec![target.clone()], None),
-        (None, None) => return Err(StageFailure),
-    };
     let identity = target.as_ref().or(sender.as_ref()).ok_or(StageFailure)?;
+    let accounts = sender
+        .iter()
+        .chain(
+            target
+                .iter()
+                .filter(|target| sender.as_ref() != Some(*target)),
+        )
+        .cloned()
+        .collect();
     let (transaction, mut ticket) = router
         .order()
         .fix(accounts, storage.begin_read())
@@ -63,15 +60,30 @@ pub(crate) async fn authorize_probe<A: ChunkAllocator + Clone + 'static>(
             StageFailure
         })?;
     let view = routed.resolve()?;
-    let (subscribed, verdict) = if let Some(target) = target.as_ref() {
-        let observer = view.from()?.ok_or(StageFailure)?;
+    let observer = view.from()?.ok_or(StageFailure)?;
+    match check_selected(
+        (&router, &storage),
+        sender.as_ref(),
+        target.as_ref(),
+        &view,
+        None,
+        Snapshot::Ordered(&transaction),
+        Selection::Explicit,
+    )
+    .await?
+    {
+        Verdict::Allow => {}
+        Verdict::OutboundBlocked => return Ok(ProbeAuthorization::OutboundBlocked),
+        Verdict::Drop | Verdict::Reject { .. } => return Ok(ProbeAuthorization::Denied),
+    }
+    let subscribed = if let Some(target) = target.as_ref() {
         let exists = !check_account_exists
             || transaction
                 .account(target)
                 .await
                 .map_err(|_| StageFailure)?
                 .is_some();
-        let subscribed = if exists {
+        if exists {
             match router
                 .presence_handlers(target.domain())
                 .and_then(|handlers| handlers.find(PresenceRequestType::Probe))
@@ -87,54 +99,20 @@ pub(crate) async fn authorize_probe<A: ChunkAllocator + Clone + 'static>(
             }
         } else {
             false
-        };
-        let verdict = if local {
-            if observer.bare().as_str() != target.as_str()
-                && (!router.policies(observer.domainpart()).is_empty()
-                    || !router.policies(target.domain()).is_empty())
-            {
-                let prober = AccountKey::try_from(observer.bare())?;
-                view.to()?.ok_or(StageFailure)?;
-                check_from(
-                    &router,
-                    &storage,
-                    Some(&prober),
-                    Some(target),
-                    &view,
-                    None,
-                    Snapshot::Ordered(&transaction),
-                )
-                .await?
-            } else {
-                Verdict::Allow
-            }
-        } else {
-            check_from(
-                &router,
-                &storage,
-                None,
-                Some(target),
-                &view,
-                None,
-                Snapshot::Ordered(&transaction),
-            )
-            .await?
-        };
-        (subscribed, verdict)
+        }
     } else {
-        view.to()?.ok_or(StageFailure)?;
-        let verdict = check_from(
-            &router,
-            &storage,
-            sender.as_ref(),
-            None,
-            &view,
-            None,
-            Snapshot::Ordered(&transaction),
-        )
-        .await?;
-        (false, verdict)
+        false
     };
+    let verdict = check_selected(
+        (&router, &storage),
+        sender.as_ref(),
+        target.as_ref(),
+        &view,
+        None,
+        Snapshot::Ordered(&transaction),
+        Selection::Standard,
+    )
+    .await?;
     drop(transaction);
     match verdict {
         Verdict::Allow => {
@@ -172,16 +150,38 @@ pub(crate) enum SubscriptionReceipt<A: ChunkAllocator> {
 
 pub(crate) async fn receive_subscription<A: ChunkAllocator + Clone + 'static>(
     stage: &Stage<'_, A>,
-    routed: RoutedStanza<A>,
+    addressed: RoutedStanza<A>,
     kind: PresenceRequestType,
     ingress: SubscriptionIngress,
 ) -> Result<SubscriptionReceipt<A>, StageFailure> {
-    let view = routed.resolve()?;
+    let view = addressed.resolve()?;
     let target = view.to()?.ok_or(StageFailure)?;
     if !matches!(
         stage.router.destination(target),
         Destination::Account | Destination::Resource
     ) {
+        return Ok(SubscriptionReceipt::Done);
+    }
+    let owner = AccountKey::try_from(target.bare())?;
+    let handler = stage
+        .router
+        .presence_handlers(target.domainpart())
+        .and_then(|handlers| handlers.find(kind));
+    let explicit_policy = Selection::Explicit.configured(stage.router, owner.domain());
+    if handler.is_none()
+        && explicit_policy
+        && check_selected(
+            (stage.router, stage.storage),
+            None,
+            Some(&owner),
+            &view,
+            None,
+            Snapshot::Fresh,
+            Selection::Explicit,
+        )
+        .await?
+            != Verdict::Allow
+    {
         return Ok(SubscriptionReceipt::Done);
     }
     let sender = view.from()?.ok_or(StageFailure)?;
@@ -197,15 +197,14 @@ pub(crate) async fn receive_subscription<A: ChunkAllocator + Clone + 'static>(
     let view = routed.resolve()?;
     let target = view.to()?.ok_or(StageFailure)?;
     let sender = view.from()?.ok_or(StageFailure)?;
-    let owner = AccountKey::try_from(target)?;
-    match check_from(
-        stage.router,
-        stage.storage,
+    match check_selected(
+        (stage.router, stage.storage),
         None,
         Some(&owner),
         &view,
         None,
         Snapshot::Fresh,
+        Selection::Standard,
     )
     .await
     {
@@ -218,11 +217,7 @@ pub(crate) async fn receive_subscription<A: ChunkAllocator + Clone + 'static>(
             });
         }
     }
-    let Some(handler) = stage
-        .router
-        .presence_handlers(target.domainpart())
-        .and_then(|handlers| handlers.find(kind))
-    else {
+    let Some(handler) = handler else {
         return Ok(SubscriptionReceipt::NoHandler { stanza: routed });
     };
     let mut transaction = match stage.storage.begin_write().await {
@@ -238,6 +233,29 @@ pub(crate) async fn receive_subscription<A: ChunkAllocator + Clone + 'static>(
             });
         }
     };
+    if explicit_policy {
+        let snapshot = stage.storage.begin_read().await.map_err(|error| {
+            report_failure(
+                storage_failure(error, "presence_subscription_policy_begin_read"),
+                &owner,
+            );
+            StageFailure
+        })?;
+        if check_selected(
+            (stage.router, stage.storage),
+            None,
+            Some(&owner),
+            &addressed.resolve()?,
+            None,
+            Snapshot::Ordered(&snapshot),
+            Selection::Explicit,
+        )
+        .await?
+            != Verdict::Allow
+        {
+            return Ok(SubscriptionReceipt::Done);
+        }
+    }
     let scope = match ingress {
         SubscriptionIngress::Federated => DeliveryScope::FederationOnly,
         SubscriptionIngress::Component => DeliveryScope::ComponentAware,

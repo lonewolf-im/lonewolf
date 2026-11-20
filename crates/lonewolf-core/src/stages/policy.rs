@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use lonewolf_extension::policy::{Direction, PolicyRequest, Verdict};
+use lonewolf_extension::policy::{Direction, PolicyHandler, PolicyRequest, Verdict};
 use lonewolf_extension::presence::PresenceAudience;
 use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::roster::PendingPage;
@@ -19,6 +19,34 @@ pub(crate) struct Check<'a> {
     pub(crate) peer: JidRef<'a>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum Selection {
+    All,
+    Explicit,
+    Standard,
+}
+
+impl Selection {
+    fn includes(self, handler: &dyn PolicyHandler<RedbStorage>) -> bool {
+        match self {
+            Self::All => true,
+            Self::Explicit => handler.checks_explicit_addresses(),
+            Self::Standard => !handler.checks_explicit_addresses(),
+        }
+    }
+
+    pub(crate) fn configured<A: ChunkAllocator + Clone>(
+        self,
+        router: &RouterHandle<A>,
+        domain: &str,
+    ) -> bool {
+        router
+            .policies(domain)
+            .iter()
+            .any(|(_, handler)| self.includes(handler.as_ref()))
+    }
+}
+
 pub(crate) async fn evaluate<A: ChunkAllocator + Clone>(
     stage: &Stage<'_, A>,
     kind: StanzaType,
@@ -33,9 +61,19 @@ pub(crate) async fn evaluate_with<A: ChunkAllocator + Clone>(
     kind: StanzaType,
     checks: &[Check<'_>],
 ) -> Result<Verdict, StageFailure> {
+    evaluate_selected(router, storage, kind, checks, Selection::All).await
+}
+
+pub(crate) async fn evaluate_selected<A: ChunkAllocator + Clone>(
+    router: &RouterHandle<A>,
+    storage: &RedbStorage,
+    kind: StanzaType,
+    checks: &[Check<'_>],
+    selection: Selection,
+) -> Result<Verdict, StageFailure> {
     if checks
         .iter()
-        .all(|check| router.policies(check.account.domain()).is_empty())
+        .all(|check| !selection.configured(router, check.account.domain()))
     {
         return Ok(Verdict::Allow);
     }
@@ -46,7 +84,7 @@ pub(crate) async fn evaluate_with<A: ChunkAllocator + Clone>(
         );
         StageFailure
     })?;
-    evaluate_in(router, &transaction, kind, checks).await
+    evaluate_selected_in(router, &transaction, kind, checks, selection).await
 }
 
 pub(crate) async fn evaluate_in<A: ChunkAllocator + Clone>(
@@ -55,10 +93,23 @@ pub(crate) async fn evaluate_in<A: ChunkAllocator + Clone>(
     kind: StanzaType,
     checks: &[Check<'_>],
 ) -> Result<Verdict, StageFailure> {
+    evaluate_selected_in(router, transaction, kind, checks, Selection::All).await
+}
+
+pub(crate) async fn evaluate_selected_in<A: ChunkAllocator + Clone>(
+    router: &RouterHandle<A>,
+    transaction: &RedbRead,
+    kind: StanzaType,
+    checks: &[Check<'_>],
+    selection: Selection,
+) -> Result<Verdict, StageFailure> {
     let mut verdict = Verdict::Allow;
     let mut decided_by = None;
     'checks: for check in checks {
         for (name, handler) in router.policies(check.account.domain()) {
+            if !selection.includes(handler.as_ref()) {
+                continue;
+            }
             let next = match handler
                 .check(
                     PolicyRequest {

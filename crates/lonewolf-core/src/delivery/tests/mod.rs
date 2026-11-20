@@ -160,7 +160,7 @@ fn router_delivery_copies_preserve_holders_and_map_failures() -> TestResult {
 #[test]
 fn stored_messages_report_the_rerouted_session() -> TestResult {
     Runtime::new()?.block_on(compio::time::timeout(Duration::from_secs(5), async {
-        for reroute in [false, true] {
+        for (reroute, preceding_source) in [(false, false), (true, false), (true, true)] {
             let directory = tempfile::tempdir()?;
             let storage = RedbStorage::open(directory.path().join("lonewolf.dat"))?;
             let config = Config::default();
@@ -168,6 +168,7 @@ fn stored_messages_report_the_rerouted_session() -> TestResult {
             let router = Router::new(hosts, LocalRouter::new(GlobalChunkAllocator));
             let handle = router.handle();
             let owner = account("bob@localhost")?;
+            let sender = account("alice@localhost")?;
             let mut transaction = storage.begin_write().await?;
             transaction
                 .create_account(NewAccount {
@@ -188,7 +189,14 @@ fn stored_messages_report_the_rerouted_session() -> TestResult {
                 .await?;
             let ((), ahead) = handle
                 .order()
-                .fix(vec![owner.clone()], async { Ok::<_, DeliveryError>(()) })
+                .fix(
+                    vec![if preceding_source {
+                        sender.clone()
+                    } else {
+                        owner.clone()
+                    }],
+                    async { Ok::<_, DeliveryError>(()) },
+                )
                 .await?;
             let mut transaction = storage.begin_write().await?;
             let sequence = transaction
@@ -200,6 +208,7 @@ fn stored_messages_report_the_rerouted_session() -> TestResult {
                 transaction,
                 Arc::new(Offline::new(Default::default())),
                 StoredDelivery {
+                    source: Some(sender),
                     recipient: owner.clone(),
                     sequence,
                     stanza: parsed("<message to='bob@localhost' type='chat' id='reported'/>")
@@ -300,6 +309,7 @@ fn stored_message_commits_and_reroutes_after_its_requester_drops_before_the_tick
             transaction,
             handler,
             StoredDelivery {
+                source: None,
                 recipient: owner.clone(),
                 sequence,
                 stanza,

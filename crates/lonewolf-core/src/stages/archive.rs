@@ -12,6 +12,7 @@ use lonewolf_xmpp::stanza::{Element, MessageType, StanzaErrorCondition, StanzaTy
 use super::{Stage, StageFailure};
 use crate::delivery::{report_failure, report_handler_failure, storage_failure};
 use crate::router::RoutedStanza;
+use crate::router::local::SessionLiveness;
 
 pub(crate) const STANZA_ID_NAMESPACE: &str = "urn:xmpp:sid:0";
 
@@ -31,11 +32,12 @@ pub(crate) enum ArchiveStep<A: ChunkAllocator> {
 }
 
 /// Commits the local sender's and recipient's entries in one transaction before routing.
-pub(crate) async fn archive<A: ChunkAllocator + Clone>(
+pub(crate) async fn archive_addressed<A: ChunkAllocator + Clone>(
     stage: &Stage<'_, A>,
     routed: RoutedStanza<A>,
     sender: Option<&AccountKey>,
     recipient: Option<&AccountKey>,
+    liveness: Option<&SessionLiveness>,
 ) -> Result<ArchiveStep<A>, StageFailure> {
     let view = routed.resolve()?;
     if view.stanza_type() == StanzaType::Message(MessageType::Error) {
@@ -97,6 +99,13 @@ pub(crate) async fn archive<A: ChunkAllocator + Clone>(
             report_failure(storage_failure(error, "archive_begin_write"), owner);
             StageFailure
         })?;
+        if liveness.is_some_and(|session| !session.is_alive()) {
+            return Ok(ArchiveStep::Accepted(Archived {
+                stanza: routed,
+                sent: None,
+                received: None,
+            }));
+        }
         let mut scratch = Arena::try_new_in(ArenaConfig::default(), stage.allocator.clone())?;
         let mut failure = None;
         for (selected, id) in [(sent_request, &mut sent), (received_request, &mut received)] {
@@ -123,6 +132,13 @@ pub(crate) async fn archive<A: ChunkAllocator + Clone>(
                 condition: error.condition(),
                 text: error.text(),
             });
+        }
+        if liveness.is_some_and(|session| !session.is_alive()) {
+            return Ok(ArchiveStep::Accepted(Archived {
+                stanza: routed,
+                sent: None,
+                received: None,
+            }));
         }
         if sent.is_some() || received.is_some() {
             transaction.commit().await.map_err(|error| {
@@ -181,4 +197,14 @@ pub(crate) async fn archive<A: ChunkAllocator + Clone>(
         sent,
         received,
     }))
+}
+
+#[cfg(test)]
+pub(crate) async fn archive<A: ChunkAllocator + Clone>(
+    stage: &Stage<'_, A>,
+    stanza: RoutedStanza<A>,
+    sender: Option<&AccountKey>,
+    recipient: Option<&AccountKey>,
+) -> Result<ArchiveStep<A>, StageFailure> {
+    archive_addressed(stage, stanza, sender, recipient, None).await
 }

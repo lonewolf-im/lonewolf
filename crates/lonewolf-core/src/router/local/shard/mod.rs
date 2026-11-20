@@ -940,6 +940,7 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn deliver(
         &mut self,
         stanza: RoutedStanza<A>,
@@ -947,6 +948,7 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
         release: Option<StoredRelease<A>>,
     ) -> Result<Admitted, RouterError> {
         self.deliver_with_guard(stanza, fallback_chat, || true, release)
+            .map(|result| result.unwrap_or(Admitted::None))
     }
 
     pub(super) fn deliver_with_guard(
@@ -955,7 +957,10 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
         fallback_chat: bool,
         valid: impl Fn() -> bool,
         release: Option<StoredRelease<A>>,
-    ) -> Result<Admitted, RouterError> {
+    ) -> Result<Option<Admitted>, RouterError> {
+        if !valid() {
+            return Ok(None);
+        }
         let mut release = release;
         self.prune_directed(&stanza, None)?;
         let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
@@ -972,7 +977,7 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
             .and_then(|sessions| sessions.get(resource));
         let result = recipient.map(|session| {
             let delivery = if !valid() {
-                Ok(Admitted::None)
+                Ok(None)
             } else if session.alive.load(Ordering::Acquire) {
                 session
                     .outbound
@@ -980,7 +985,7 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
                         stanza: stanza.clone(),
                         release: release.take(),
                     })
-                    .map(|()| Admitted::One(SessionId::new(session.token)))
+                    .map(|()| Some(Admitted::One(SessionId::new(session.token))))
                     .map_err(|error| {
                         let closed = error.is_closed();
                         release = error.into_inner().release;
@@ -1003,7 +1008,11 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
                 if fallback_chat
                     && view.stanza_type() == StanzaType::Message(MessageType::Chat) =>
             {
-                self.deliver_bare(stanza, true, release)
+                if valid() {
+                    self.deliver_bare(stanza, true, release).map(Some)
+                } else {
+                    Ok(None)
+                }
             }
             result => result,
         }

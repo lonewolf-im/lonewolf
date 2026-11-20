@@ -1352,7 +1352,10 @@ fn stopped_initial_broadcast_or_probe_releases_ticket_and_completion() -> TestRe
 #[derive(Default)]
 struct SubscriptionSender {
     calls: PlMutex<Vec<&'static str>>,
+    sending: PlMutex<Option<SubscriptionSendGate>>,
 }
+
+type SubscriptionSendGate = (oneshot::Sender<()>, oneshot::Receiver<()>);
 
 impl Extension<GlobalChunkAllocator, RedbStorage> for SubscriptionSender {
     fn name(&self) -> &'static str {
@@ -1396,7 +1399,16 @@ impl lonewolf_extension::presence::PresenceHandler<GlobalChunkAllocator, RedbSto
         _: &'a dyn lonewolf_extension::delivery::HostLookup,
     ) -> lonewolf_extension::presence::SendFuture<'a, GlobalChunkAllocator> {
         self.calls.lock().push("send");
-        Box::pin(async { Ok(PresenceSend::Continue) })
+        let gate = self.sending.lock().take();
+        Box::pin(async move {
+            if let Some((entered, resume)) = gate {
+                let _ = entered.send(());
+                resume
+                    .await
+                    .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+            }
+            Ok(PresenceSend::Continue)
+        })
     }
 }
 
@@ -1452,6 +1464,57 @@ async fn subscription_session<'a>(
     )?;
     session.outbox.account = owner;
     Ok((router, session))
+}
+
+#[test]
+fn subscription_handoff_checks_the_original_session_after_sender_work() -> TestResult {
+    Runtime::new()?.block_on(compio::time::timeout(Duration::from_secs(5), async {
+        let fixture = Fixture::new(&[]).await?;
+        let mut remote = RemoteFixture::new(AdmissionState::Link)?;
+        let sender = Arc::new(SubscriptionSender::default());
+        let (entered, waiting) = oneshot::channel();
+        let (resume, released) = oneshot::channel();
+        *sender.sending.lock() = Some((entered, released));
+        let policy = Arc::new(Policy {
+            verdict: Verdict::Allow,
+            fail: false,
+            checks: PlMutex::new(Vec::new()),
+        });
+        let (router, mut session) =
+            subscription_session(&fixture, &remote, true, "continue", policy, sender.clone())
+                .await?;
+        let handle = router.handle();
+        let owner = session.registration.account().clone();
+        let original_jid = session.registration.full_jid();
+        let retired = session.registration.wait_retired();
+        let stanza = parsed("<presence type='subscribe' to='bob@remote.test/phone'/>").await?;
+        let replacement;
+        {
+            let mut forwarding =
+                pin!(session.handle_subscription(stanza, PresenceRequestType::Subscribe));
+            match select(waiting, forwarding.as_mut()).await {
+                Either::Left((entered, _)) => entered?,
+                Either::Right(_) => return Err("subscription finished before sender work".into()),
+            }
+            handle.retire_account(&owner).await?;
+            retired.await?;
+            replacement = handle
+                .register(&owner, Some("desk"), NonZeroUsize::MIN)
+                .await?;
+            assert_eq!(replacement.full_jid(), original_jid);
+            resume.send(()).map_err(|_| "sender work canceled")?;
+            forwarding.await.map_err(|error| format!("{error:?}"))?;
+        }
+        assert_eq!(*sender.calls.lock(), ["authorize", "send"]);
+        assert_eq!(remote.occupancy(), (0, 0));
+        assert!(remote.receive()?.is_none());
+        drop((replacement, session));
+        remote
+            .finish(Instant::now() + Duration::from_secs(5))
+            .await?;
+        router.shutdown().await?;
+        fixture.finish().await
+    }))?
 }
 
 #[test]

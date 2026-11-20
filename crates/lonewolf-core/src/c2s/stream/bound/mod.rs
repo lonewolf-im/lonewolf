@@ -151,6 +151,19 @@ enum Output<A: ChunkAllocator> {
     },
 }
 
+enum SubscriptionPreparation<T> {
+    Done,
+    OutboundBlocked,
+    Rejected(HandlerError),
+    Commit(T),
+}
+
+enum ServiceAdmission<A: ChunkAllocator> {
+    Refused(Verdict, RoutedStanza<A>),
+    Directed(RoutedStanza<A>, ServiceRoute<A>),
+    Dispatched(Pending<Result<Option<Reply<A>>, crate::stages::StageFailure>>),
+}
+
 enum StoredKind<'a> {
     Subscription(&'a RosterJid),
     Message,
@@ -563,223 +576,215 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         route: ServiceRoute<A>,
     ) -> Result<(), CloseOutcome> {
         let routed = self.stamp(parsed)?;
-        let verdict = {
-            let view = routed.resolve()?;
-            let peer = view.to()?.ok_or(CloseOutcome::InternalError)?;
-            let checks = [policy::Check {
-                account: self.registration.account(),
-                direction: Direction::Outbound,
-                peer,
-            }];
-            let stage = Stage {
-                router: &self.router,
-                storage: &self.storage,
-                allocator: &self.allocator,
-                work: &self.work,
-            };
-            self.outbox
-                .drain_until(&self.registration, async {
-                    if ingress::checks::policy_applies_for(
-                        stage.router,
-                        Some(self.registration.account().domain()),
-                        false,
-                    ) {
-                        policy::evaluate(&stage, view.stanza_type(), &checks).await
-                    } else {
-                        Ok(Verdict::Allow)
-                    }
-                })
-                .await??
-        };
-        match verdict {
-            Verdict::Allow => {}
-            Verdict::OutboundBlocked => return self.reply_outbound_blocked(&routed),
-            Verdict::Reject {
-                condition,
-                application,
-                text,
-            } => {
-                return self.reply_rejection_with_text(
-                    &routed,
-                    condition,
-                    application,
-                    text.unwrap_or_else(|| condition.default_text()),
-                );
-            }
-            Verdict::Drop => return Ok(()),
-        }
-        let mut sent = None;
-        let is_message = matches!(routed.resolve()?.stanza_type(), StanzaType::Message(_));
-        let routed = if is_message
-            && self
-                .router
-                .archive_handler(self.registration.account().domain())
-                .is_some()
-        {
-            let stage = Stage {
-                router: &self.router,
-                storage: &self.storage,
-                allocator: &self.allocator,
-                work: &self.work,
-            };
-            match self
-                .outbox
-                .drain_until(
-                    &self.registration,
-                    archive::archive(&stage, routed, Some(self.registration.account()), None),
-                )
-                .await??
-            {
-                archive::ArchiveStep::Accepted(archived) => {
-                    sent = archived.sent;
-                    archived.stanza
-                }
-                archive::ArchiveStep::Rejected {
-                    stanza,
-                    condition,
-                    text,
-                } => {
-                    return self.reply_rejection_with_text(&stanza, condition, None, text);
-                }
-            }
-        } else {
-            routed
-        };
-        let observed = if is_message
-            && !self
-                .router
-                .message_observers(self.registration.account().domain())
-                .is_empty()
-        {
-            Some(routed.clone())
-        } else {
-            None
-        };
-        let presence = {
-            let view = routed.resolve()?;
-            matches!(
-                view.stanza_type(),
-                StanzaType::Presence(PresenceType::Available | PresenceType::Unavailable)
-            )
-        };
-        let outcome = if presence {
-            if self.service_presence.is_none() {
-                let from = routed
-                    .resolve()?
-                    .from()?
-                    .ok_or(CloseOutcome::InternalError)?;
-                let gate = self
-                    .router
-                    .service_presence_gate(from.as_str())
-                    .ok_or(CloseOutcome::InternalError)?;
-                let lease = self
-                    .outbox
-                    .drain_until(&self.registration, gate.acquire())
-                    .await?;
-                self.service_presence = Some(Arc::new(lease));
-            }
-            let (completion, completed) = oneshot::channel();
-            self.service_pending = Some(completed.shared());
-            let work = DirectedServiceWork {
-                session: self.registration.handle(),
-                router: self.router.clone(),
-                storage: self.storage.clone(),
-                allocator: self.allocator.clone(),
-                work: self.work.clone(),
-                lease: self
-                    .service_presence
-                    .as_ref()
-                    .cloned()
-                    .ok_or(CloseOutcome::InternalError)?,
-                completion,
-                stanza: routed.clone(),
-                route,
-            };
-            let pending = Pending::spawn(self.work.start(), work.run());
-            match self
-                .outbox
-                .drain_until(&self.registration, pending.finished())
-                .await?
-                .ok_or(CloseOutcome::InternalError)?
-            {
-                Ok(outcome) => outcome,
-                Err(RouterError::DirectedPresenceLimit) => {
-                    tracing::warn!(
-                        account_jid = ?self.registration.account().as_str(),
-                        stanza_kind = "presence",
-                        outcome = "directed_presence_limit",
-                        "directed presence rejected"
-                    );
-                    return self.reply_error(&routed, StanzaErrorCondition::ResourceConstraint);
-                }
-                Err(_) => return Err(CloseOutcome::InternalError),
-            }
-        } else {
-            let stage = Stage {
-                router: &self.router,
-                storage: &self.storage,
-                allocator: &self.allocator,
-                work: &self.work,
-            };
-            self.outbox
-                .drain_until(
-                    &self.registration,
-                    service::dispatch(&stage, &route, routed),
-                )
-                .await??
-        };
-        let rejection = match (&observed, &outcome) {
-            (
-                Some(_),
-                ServiceOutcome::Rejected {
-                    stanza,
-                    condition,
-                    text,
-                },
-            ) => Some(self.rejection_reply(stanza, *condition, None, *text)?),
-            _ => None,
-        };
-        if let Some(observed) = observed {
-            let sender = self.registration.session_id();
-            let stage = Stage {
-                router: &self.router,
-                storage: &self.storage,
-                allocator: &self.allocator,
-                work: &self.work,
-            };
-            let delivery = self.delivery();
-            self.outbox
-                .drain_until(
-                    &self.registration,
-                    observe::message(
-                        &stage,
-                        &delivery,
-                        MessageEvent {
-                            account: self.registration.account(),
-                            role: MessageRole::Sent,
-                            stanza: &observed,
-                            outcome: MessageOutcome::from(&outcome),
-                            archived: sent,
-                            holders: std::slice::from_ref(&sender),
-                            rejection: rejection.as_ref(),
-                        },
-                    ),
+        let liveness = self.registration.liveness();
+        let account = self.registration.account();
+        let kind = routed.resolve()?.stanza_type();
+        let is_message = matches!(kind, StanzaType::Message(_));
+        let directed = matches!(
+            kind,
+            StanzaType::Presence(PresenceType::Available | PresenceType::Unavailable)
+        );
+        let archive_needed = is_message && self.router.archive_handler(account.domain()).is_some();
+        let prepared = self
+            .outbox
+            .drain_until(&self.registration, async {
+                let stage = Stage {
+                    router: &self.router,
+                    storage: &self.storage,
+                    allocator: &self.allocator,
+                    work: &self.work,
+                };
+                let view = routed.resolve()?;
+                let peer = view.to()?.ok_or(CloseOutcome::InternalError)?;
+                let checks = [policy::Check {
+                    account,
+                    direction: Direction::Outbound,
+                    peer,
+                }];
+                let ordered = ingress::checks::fix_explicit_snapshot(
+                    stage.router,
+                    stage.storage,
+                    Some(account),
+                    None,
                 )
                 .await?;
+                let (verdict, mut admission) = if let Some((snapshot, ticket)) = ordered {
+                    (
+                        policy::evaluate_in(stage.router, &snapshot, view.stanza_type(), &checks)
+                            .await?,
+                        Some(ticket),
+                    )
+                } else {
+                    (
+                        policy::evaluate(&stage, view.stanza_type(), &checks).await?,
+                        None,
+                    )
+                };
+                if verdict != Verdict::Allow {
+                    return Ok(ServiceAdmission::Refused(verdict, routed));
+                }
+                if let Some(ticket) = &mut admission {
+                    ticket.turn().await;
+                }
+                if !liveness.is_alive() {
+                    return Ok(ServiceAdmission::Refused(Verdict::Drop, routed));
+                }
+                if directed {
+                    return Ok(ServiceAdmission::Directed(routed, route));
+                }
+                let archived = if archive_needed {
+                    archive::archive_addressed(&stage, routed, Some(account), None, Some(&liveness))
+                        .await?
+                } else {
+                    archive::ArchiveStep::Accepted(archive::Archived {
+                        stanza: routed,
+                        sent: None,
+                        received: None,
+                    })
+                };
+                let archive::Archived { stanza, sent, .. } = match archived {
+                    archive::ArchiveStep::Accepted(archived) => archived,
+                    archive::ArchiveStep::Rejected {
+                        stanza,
+                        condition,
+                        text,
+                    } => {
+                        return Ok(ServiceAdmission::Refused(
+                            Verdict::Reject {
+                                condition,
+                                application: None,
+                                text: Some(text),
+                            },
+                            stanza,
+                        ));
+                    }
+                };
+                if !liveness.is_alive() {
+                    return Ok(ServiceAdmission::Refused(Verdict::Drop, stanza));
+                }
+                let observer = (is_message
+                    && !self.router.message_observers(account.domain()).is_empty())
+                .then(|| self.registration.handle());
+                let work = ServiceWork {
+                    router: self.router.clone(),
+                    storage: self.storage.clone(),
+                    allocator: self.allocator.clone(),
+                    work: self.work.clone(),
+                    observer,
+                    archived: sent,
+                    stanza,
+                    route,
+                };
+                let pending = Pending::spawn(self.work.start(), work.run());
+                drop(admission);
+                Ok::<_, CloseOutcome>(ServiceAdmission::Dispatched(pending))
+            })
+            .await??;
+        match prepared {
+            ServiceAdmission::Refused(Verdict::OutboundBlocked, stanza) => {
+                self.reply_outbound_blocked(&stanza)
+            }
+            ServiceAdmission::Refused(
+                Verdict::Reject {
+                    condition,
+                    application,
+                    text,
+                },
+                stanza,
+            ) => self.reply_rejection_with_text(
+                &stanza,
+                condition,
+                application,
+                text.unwrap_or_else(|| condition.default_text()),
+            ),
+            ServiceAdmission::Refused(Verdict::Drop | Verdict::Allow, _) => Ok(()),
+            ServiceAdmission::Directed(routed, route) => {
+                self.handle_directed_service(routed, route, liveness).await
+            }
+            ServiceAdmission::Dispatched(pending) => {
+                let reply = self
+                    .outbox
+                    .drain_until(&self.registration, pending.finished())
+                    .await?
+                    .ok_or(CloseOutcome::InternalError)??;
+                match reply {
+                    Some(reply) => self.reply_from_ingress(reply),
+                    None => Ok(()),
+                }
+            }
         }
+    }
+
+    async fn handle_directed_service(
+        &mut self,
+        routed: RoutedStanza<A>,
+        route: ServiceRoute<A>,
+        liveness: SessionLiveness,
+    ) -> Result<(), CloseOutcome> {
+        let account = self.registration.account();
+        let policy_account = policy::Selection::Explicit
+            .configured(&self.router, account.domain())
+            .then(|| account.clone());
+        if self.service_presence.is_none() {
+            let from = routed
+                .resolve()?
+                .from()?
+                .ok_or(CloseOutcome::InternalError)?;
+            let gate = self
+                .router
+                .service_presence_gate(from.as_str())
+                .ok_or(CloseOutcome::InternalError)?;
+            let lease = self
+                .outbox
+                .drain_until(&self.registration, gate.acquire())
+                .await?;
+            self.service_presence = Some(Arc::new(lease));
+        }
+        let (completion, completed) = oneshot::channel();
+        self.service_pending = Some(completed.shared());
+        let work = DirectedServiceWork {
+            session: self.registration.handle(),
+            liveness,
+            policy_account,
+            router: self.router.clone(),
+            storage: self.storage.clone(),
+            allocator: self.allocator.clone(),
+            work: self.work.clone(),
+            lease: self
+                .service_presence
+                .as_ref()
+                .cloned()
+                .ok_or(CloseOutcome::InternalError)?,
+            completion,
+            stanza: routed.clone(),
+            route,
+        };
+        let pending = Pending::spawn(self.work.start(), work.run());
+        let outcome = match self
+            .outbox
+            .drain_until(&self.registration, pending.finished())
+            .await?
+            .ok_or(CloseOutcome::InternalError)?
+        {
+            Ok(DirectedServiceOutcome::Dispatched(outcome)) => outcome,
+            Ok(DirectedServiceOutcome::Blocked) => return self.reply_outbound_blocked(&routed),
+            Err(RouterError::DirectedPresenceLimit) => {
+                tracing::warn!(
+                    account_jid = ?self.registration.account().as_str(),
+                    stanza_kind = "presence",
+                    outcome = "directed_presence_limit",
+                    "directed presence rejected"
+                );
+                return self.reply_error(&routed, StanzaErrorCondition::ResourceConstraint);
+            }
+            Err(_) => return Err(CloseOutcome::InternalError),
+        };
         match outcome {
             ServiceOutcome::Rejected {
                 stanza,
                 condition,
                 text,
-            } => {
-                if let Some(reply) = rejection {
-                    self.outbox.push(Output::Routed(reply));
-                    Ok(())
-                } else {
-                    self.reply_rejection_with_text(&stanza, condition, None, text)
-                }
-            }
+            } => self.reply_rejection_with_text(&stanza, condition, None, text),
             ServiceOutcome::Handled => Ok(()),
         }
     }
@@ -1174,24 +1179,43 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                 (None, PresenceType::Probe) => self.handle_probe(parsed).await,
                 (None, PresenceType::Error) => {
                     let routed = self.stamp(parsed)?;
-                    if self.router.federation_enabled()
-                        && self.router.destination(
-                            routed.resolve()?.to()?.ok_or(CloseOutcome::InternalError)?,
-                        ) == Destination::Remote
-                    {
-                        let _ = self.router.route_remote_or_bounce(routed);
-                        return Ok(());
-                    }
-                    match self.router.route_presence_error(routed).await {
-                        Ok(())
-                        | Err(
-                            RouterError::NotFound
-                            | RouterError::Busy
-                            | RouterError::InvalidTarget
-                            | RouterError::RemoteUnsupported,
-                        ) => Ok(()),
-                        Err(_) => Err(CloseOutcome::InternalError),
-                    }
+                    self.outbox
+                        .drain_until(&self.registration, async {
+                            let (verdict, _admission) = Self::explicit_presence_policy(
+                                &self.router,
+                                &self.storage,
+                                &self.registration,
+                                &routed,
+                            )
+                            .await?;
+                            let liveness = self.registration.liveness();
+                            if verdict != Verdict::Allow || !liveness.is_alive() {
+                                return Ok(());
+                            }
+                            if self.router.federation_enabled()
+                                && self.router.destination(
+                                    routed.resolve()?.to()?.ok_or(CloseOutcome::InternalError)?,
+                                ) == Destination::Remote
+                            {
+                                let _ = self.router.route_remote_or_bounce(routed);
+                                return Ok(());
+                            }
+                            match self
+                                .router
+                                .route_addressed_presence_error(routed, Some(liveness))
+                                .await
+                            {
+                                Ok(())
+                                | Err(
+                                    RouterError::NotFound
+                                    | RouterError::Busy
+                                    | RouterError::InvalidTarget
+                                    | RouterError::RemoteUnsupported,
+                                ) => Ok(()),
+                                Err(_) => Err(CloseOutcome::InternalError),
+                            }
+                        })
+                        .await?
                 }
                 (None, _) => Ok(()),
             };
@@ -1202,6 +1226,71 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                     .await
             }
             _ => Ok(()),
+        }
+    }
+
+    async fn explicit_presence_policy(
+        router: &RouterHandle<A>,
+        storage: &RedbStorage,
+        registration: &Registration<A>,
+        stanza: &RoutedStanza<A>,
+    ) -> Result<(Verdict, Option<Ticket>), CloseOutcome> {
+        let view = stanza.resolve()?;
+        let to = view.to()?.ok_or(CloseOutcome::InternalError)?;
+        let sender = Some(registration.account());
+        let parties = ingress::checks::parties_for(router, sender, to, view.kind())?;
+        let Some((snapshot, mut ticket)) = ingress::checks::fix_explicit_snapshot(
+            router,
+            storage,
+            sender,
+            parties.recipient.as_ref(),
+        )
+        .await?
+        else {
+            return Ok((Verdict::Allow, None));
+        };
+        let verdict = ingress::checks::check_selected(
+            (router, storage),
+            sender,
+            parties.recipient.as_ref(),
+            &view,
+            None,
+            ingress::checks::Snapshot::Ordered(&snapshot),
+            policy::Selection::Explicit,
+        )
+        .await?;
+        drop(snapshot);
+        if verdict != Verdict::Allow {
+            return Ok((verdict, None));
+        }
+        ticket.turn().await;
+        Ok((verdict, Some(ticket)))
+    }
+
+    async fn directed_presence_fallback(
+        &mut self,
+        routed: &RoutedStanza<A>,
+        destination: Destination,
+    ) -> Result<(), CloseOutcome> {
+        let verdict = self
+            .outbox
+            .drain_until(&self.registration, async {
+                Self::explicit_presence_policy(
+                    &self.router,
+                    &self.storage,
+                    &self.registration,
+                    routed,
+                )
+                .await
+                .map(|(verdict, _admission)| verdict)
+            })
+            .await??;
+        match verdict {
+            Verdict::Allow if destination == Destination::Remote => {
+                self.reply_error(routed, StanzaErrorCondition::RemoteServerNotFound)
+            }
+            Verdict::OutboundBlocked => self.reply_outbound_blocked(routed),
+            Verdict::Allow | Verdict::Drop | Verdict::Reject { .. } => Ok(()),
         }
     }
 
@@ -1218,13 +1307,11 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                     Some(AccountKey::try_from(to.bare()).map_err(|_| CloseOutcome::InternalError)?)
                 }
                 Destination::Remote if self.router.federation_enabled() => None,
-                Destination::Remote => {
-                    return self.reply_error(&routed, StanzaErrorCondition::RemoteServerNotFound);
-                }
-                _ => return Ok(()),
+                destination => return self.directed_presence_fallback(&routed, destination).await,
             }
         };
         let session = self.registration.handle();
+        let liveness = self.registration.liveness();
         let router = self.router.clone();
         let storage = self.storage.clone();
         let account = self.registration.account().clone();
@@ -1244,6 +1331,9 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                 ProbeAuthorization::OutboundBlocked => return Ok::<_, CloseOutcome>(Some(routed)),
                 ProbeAuthorization::Denied => return Ok(None),
             };
+            if !liveness.is_alive() {
+                return Ok(None);
+            }
             let result = if local {
                 router
                     .probe_presence(&session, &routed, grant.subscribed)
@@ -1288,56 +1378,64 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                     Some(AccountKey::try_from(to.bare()).map_err(|_| CloseOutcome::InternalError)?)
                 }
                 Destination::Remote if self.router.federation_enabled() => None,
-                Destination::Remote => {
-                    return self.reply_error(&routed, StanzaErrorCondition::RemoteServerNotFound);
-                }
-                _ => return Ok(()),
+                destination => return self.directed_presence_fallback(&routed, destination).await,
             }
         };
-        if target.as_ref() != Some(self.registration.account()) {
-            let view = routed.resolve()?;
-            view.to()?.ok_or(CloseOutcome::InternalError)?;
-            view.from()?.ok_or(CloseOutcome::InternalError)?;
-            let verdict = self
-                .outbox
-                .drain_until(
-                    &self.registration,
-                    ingress::checks::check_from(
-                        &self.router,
-                        &self.storage,
-                        Some(self.registration.account()),
-                        target.as_ref(),
-                        &view,
-                        None,
-                        ingress::checks::Snapshot::Fresh,
-                    ),
-                )
-                .await??;
-            match verdict {
-                Verdict::Allow => {}
-                Verdict::OutboundBlocked => return self.reply_outbound_blocked(&routed),
-                Verdict::Drop | Verdict::Reject { .. } => return Ok(()),
-            }
-        }
         let session = self.registration.handle();
+        let liveness = self.registration.liveness();
         let router = self.router.clone();
+        let storage = self.storage.clone();
         let account = self.registration.account().clone();
         let directed = routed.clone();
         let pending = Pending::spawn(self.outbox.work.start(), async move {
             let remote = target.is_none();
-            let mut accounts = vec![account];
-            if let Some(target) = target
-                && accounts[0] != target
+            let mut accounts = vec![account.clone()];
+            if let Some(target) = &target
+                && &account != target
             {
-                accounts.push(target);
+                accounts.push(target.clone());
             }
-            let ((), mut ticket) = router
+            let policies = target.as_ref() != Some(&account)
+                && (!router.policies(account.domain()).is_empty()
+                    || target
+                        .as_ref()
+                        .is_some_and(|target| !router.policies(target.domain()).is_empty()));
+            let (snapshot, mut ticket) = router
                 .order()
-                .fix(accounts, async { Ok::<_, RouterError>(()) })
+                .fix(accounts, async {
+                    if policies {
+                        storage.begin_read().await.map(Some).map_err(|error| {
+                            close_storage_failure(error, "directed_presence_begin_read", &account);
+                            RouterError::Unavailable
+                        })
+                    } else {
+                        Ok(None)
+                    }
+                })
                 .await?;
+            if let Some(snapshot) = snapshot {
+                let view = directed.resolve().map_err(|_| RouterError::InvalidTarget)?;
+                let verdict = ingress::checks::check_from(
+                    &router,
+                    &storage,
+                    Some(&account),
+                    target.as_ref(),
+                    &view,
+                    None,
+                    ingress::checks::Snapshot::Ordered(&snapshot),
+                )
+                .await
+                .map_err(|_| RouterError::Unavailable)?;
+                if verdict != Verdict::Allow {
+                    return Ok(verdict);
+                }
+            }
             ticket.turn().await;
+            if !liveness.is_alive() {
+                return Ok(Verdict::Drop);
+            }
             if !remote {
-                session.directed_presence(directed, available).await
+                session.directed_presence(directed, available).await?;
             } else {
                 let to = directed
                     .resolve()
@@ -1346,11 +1444,16 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                     .map_err(|_| RouterError::InvalidTarget)?
                     .ok_or(RouterError::InvalidTarget)?;
                 session.record_service_presence(to, available).await?;
-                match router.route_remote_or_bounce(directed) {
-                    Err(RouterError::Stopped) => Err(RouterError::Stopped),
-                    _ => Ok(()),
+                if liveness.is_alive()
+                    && matches!(
+                        router.route_remote_or_bounce(directed),
+                        Err(RouterError::Stopped)
+                    )
+                {
+                    return Err(RouterError::Stopped);
                 }
             }
+            Ok(Verdict::Allow)
         });
         let result = self
             .outbox
@@ -1358,7 +1461,8 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             .await?
             .ok_or(CloseOutcome::InternalError)?;
         match result {
-            Ok(()) => Ok(()),
+            Ok(Verdict::OutboundBlocked) => self.reply_outbound_blocked(&routed),
+            Ok(Verdict::Allow | Verdict::Drop | Verdict::Reject { .. }) => Ok(()),
             Err(RouterError::DirectedPresenceLimit) => {
                 tracing::warn!(
                     account_jid = ?self.registration.account().as_str(),
@@ -1381,32 +1485,50 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         if !self.admit_routed(&routed)? {
             return Ok(());
         }
-        let stage = Stage {
-            router: &self.router,
-            storage: &self.storage,
-            allocator: &self.allocator,
-            work: &self.work,
-        };
-        let origin = Origin::Session(&self.registration);
+        let router = self.router.clone();
+        let storage = self.storage.clone();
+        let allocator = self.allocator.clone();
+        let work = self.work.clone();
+        let sender = self.registration.handle();
+        let pending = Pending::spawn(self.work.start(), async move {
+            let stage = Stage {
+                router: &router,
+                storage: &storage,
+                allocator: &allocator,
+                work: &work,
+            };
+            ingress::message::handle_from(
+                &stage,
+                Some(&sender),
+                routed,
+                kind,
+                crate::stages::message::MissingRecipientPolicy::Discard,
+            )
+            .await
+        });
         let disposition = self
             .outbox
-            .drain_until(
-                &self.registration,
-                ingress::message::handle(&stage, &origin, routed, kind),
-            )
-            .await??;
+            .drain_until(&self.registration, pending.finished())
+            .await?
+            .ok_or(CloseOutcome::InternalError)??;
         match disposition {
             MessageDisposition::Done => Ok(()),
-            MessageDisposition::Reply(Reply::Built(reply)) => {
+            MessageDisposition::Reply(reply) => self.reply_from_ingress(reply),
+        }
+    }
+
+    fn reply_from_ingress(&mut self, reply: Reply<A>) -> Result<(), CloseOutcome> {
+        match reply {
+            Reply::Built(reply) => {
                 self.outbox.push(Output::Routed(reply));
                 Ok(())
             }
-            MessageDisposition::Reply(Reply::Error {
+            Reply::Error {
                 stanza,
                 condition,
                 application,
                 text,
-            }) => self.reply_rejection_with_text(&stanza, condition, application, text),
+            } => self.reply_rejection_with_text(&stanza, condition, application, text),
         }
     }
 
@@ -1756,20 +1878,24 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             .router
             .presence_handlers(self.registration.account().domain())
             .and_then(|handlers| handlers.find(kind));
-        if sender_host.is_none() && !remote {
-            return Ok(());
-        }
-
         let (policy_sender, policy_target) = presence_addresses(&routed)?;
         let account = self.registration.account();
         let same_account = policy_target.as_str() == account.as_str();
         let outbound_policy =
-            ingress::checks::policy_applies_for(&self.router, Some(account.domain()), same_account);
+            !same_account && policy::Selection::Standard.configured(&self.router, account.domain());
         let inbound_domain = (!same_account
             && self.router.destination(policy_target) == Destination::Account)
             .then_some(policy_target.domainpart());
-        let inbound_policy =
-            ingress::checks::policy_applies_for(&self.router, inbound_domain, same_account);
+        let inbound_policy = inbound_domain
+            .is_some_and(|domain| policy::Selection::Standard.configured(&self.router, domain));
+        let explicit_policy = !same_account
+            && (policy::Selection::Explicit.configured(&self.router, account.domain())
+                || inbound_domain.is_some_and(|domain| {
+                    policy::Selection::Explicit.configured(&self.router, domain)
+                }));
+        if sender_host.is_none() && !remote && !explicit_policy {
+            return Ok(());
+        }
         let policy_snapshot = if outbound_policy || inbound_policy {
             let read = async {
                 self.storage.begin_read().await.map_err(|error| {
@@ -1790,11 +1916,12 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                 .outbox
                 .drain_until(
                     &self.registration,
-                    policy::evaluate_in(
+                    policy::evaluate_selected_in(
                         &self.router,
                         snapshot,
                         routed.resolve()?.stanza_type(),
                         &checks,
+                        policy::Selection::Standard,
                     ),
                 )
                 .await??;
@@ -1837,13 +1964,38 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         }
         if sender_host.is_none() {
             drop(policy_snapshot);
-            if federated {
-                return match Self::subscription_admission(self.router.route_remote(routed))? {
-                    Some(condition) => self.reply_error(&source, condition),
-                    None => Ok(()),
-                };
+            let (verdict, condition) = self
+                .outbox
+                .drain_until(&self.registration, async {
+                    let (verdict, _admission) = Self::explicit_presence_policy(
+                        &self.router,
+                        &self.storage,
+                        &self.registration,
+                        &source,
+                    )
+                    .await?;
+                    let condition = if verdict != Verdict::Allow
+                        || !remote
+                        || !self.registration.liveness().is_alive()
+                    {
+                        None
+                    } else if federated {
+                        Self::subscription_admission(self.router.route_remote(routed))?
+                    } else {
+                        Some(StanzaErrorCondition::RemoteServerNotFound)
+                    };
+                    Ok::<_, CloseOutcome>((verdict, condition))
+                })
+                .await??;
+            match verdict {
+                Verdict::Allow => {}
+                Verdict::OutboundBlocked => return self.reply_outbound_blocked(&source),
+                Verdict::Drop | Verdict::Reject { .. } => return Ok(()),
             }
-            return self.reply_error(&source, StanzaErrorCondition::RemoteServerNotFound);
+            return match condition {
+                Some(condition) => self.reply_error(&source, condition),
+                None => Ok(()),
+            };
         }
         let registration = &self.registration;
         let storage = &self.storage;
@@ -1859,6 +2011,41 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                     registration.account(),
                 )
             })?;
+            if explicit_policy {
+                let snapshot = storage.begin_read().await.map_err(|error| {
+                    close_storage_failure(
+                        error,
+                        "presence_subscription_policy_begin_read",
+                        registration.account(),
+                    )
+                })?;
+                let view = source.resolve()?;
+                let recipient = inbound_domain
+                    .map(|_| AccountKey::try_from(policy_target))
+                    .transpose()?;
+                let verdict = ingress::checks::check_selected(
+                    (router, storage),
+                    Some(registration.account()),
+                    recipient.as_ref(),
+                    &view,
+                    None,
+                    ingress::checks::Snapshot::Ordered(&snapshot),
+                    policy::Selection::Explicit,
+                )
+                .await?;
+                match verdict {
+                    Verdict::Allow => {}
+                    Verdict::OutboundBlocked => {
+                        return Ok(SubscriptionPreparation::OutboundBlocked);
+                    }
+                    Verdict::Drop | Verdict::Reject { .. } => {
+                        return Ok(SubscriptionPreparation::Done);
+                    }
+                }
+            }
+            if !registration.liveness().is_alive() {
+                return Ok(SubscriptionPreparation::Done);
+            }
             let sent = match sender_host {
                 Some(sender_host) => {
                     let (sender, target) = presence_addresses(&source)?;
@@ -1890,37 +2077,43 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                             direction: Direction::Inbound,
                             peer: policy_sender,
                         }];
-                        if policy::evaluate_in(
+                        if policy::evaluate_selected_in(
                             router,
                             snapshot,
                             routed.resolve()?.stanza_type(),
                             &checks,
+                            policy::Selection::Standard,
                         )
                         .await?
                             != Verdict::Allow
                         {
-                            return Ok::<_, CloseOutcome>(None);
+                            return Ok(SubscriptionPreparation::Done);
                         }
                     }
                     drop(policy_snapshot);
+                    if !registration.liveness().is_alive() {
+                        return Ok(SubscriptionPreparation::Done);
+                    }
                     if component {
                         drop(transaction);
                         router
                             .route_to_component_or_bounce(routed.clone())
                             .await
                             .map_err(|_| CloseOutcome::InternalError)?;
-                        return Ok(None);
+                        return Ok(SubscriptionPreparation::Done);
                     }
                     if remote {
                         if federated {
                             return Ok(Self::subscription_admission(
                                 router.route_remote(routed.clone()),
                             )?
-                            .map(|condition| Err(HandlerError::Stanza(condition))));
+                            .map_or(SubscriptionPreparation::Done, |condition| {
+                                SubscriptionPreparation::Rejected(condition.into())
+                            }));
                         }
-                        return Ok(Some(Err(HandlerError::Stanza(
-                            StanzaErrorCondition::RemoteServerNotFound,
-                        ))));
+                        return Ok(SubscriptionPreparation::Rejected(
+                            StanzaErrorCondition::RemoteServerNotFound.into(),
+                        ));
                     }
                     let (_, original_target) = presence_addresses(&source)?;
                     if kind != PresenceRequestType::Subscribe
@@ -1930,7 +2123,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                             .await?
                             .is_none()
                     {
-                        return Ok(None);
+                        return Ok(SubscriptionPreparation::Done);
                     }
                     match router
                         .presence_handlers(target.domainpart())
@@ -1960,8 +2153,11 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                     Err(error)
                 }
             };
-            Ok(Some(match effects {
-                Ok(effects) => Ok(commit_and_deliver(
+            if !registration.liveness().is_alive() {
+                return Ok(SubscriptionPreparation::Done);
+            }
+            Ok::<_, CloseOutcome>(match effects {
+                Ok(effects) => SubscriptionPreparation::Commit(commit_and_deliver(
                     work.start(),
                     Arc::clone(router.order()),
                     transaction,
@@ -1979,13 +2175,14 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                 Err(error) => {
                     drop(transaction);
                     report_handler_failure(&error, registration.account());
-                    Err(error)
+                    SubscriptionPreparation::Rejected(error)
                 }
-            }))
+            })
         };
         match self.outbox.drain_until(registration, prepare).await?? {
-            None => Ok(()),
-            Some(Ok(mut committed)) => {
+            SubscriptionPreparation::Done => Ok(()),
+            SubscriptionPreparation::OutboundBlocked => self.reply_outbound_blocked(&source),
+            SubscriptionPreparation::Commit(mut committed) => {
                 self.outbox
                     .drain_until(registration, committed.turned())
                     .await?;
@@ -1997,7 +2194,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                 self.outbox.delivered(queued);
                 Ok(())
             }
-            Some(Err(error)) => {
+            SubscriptionPreparation::Rejected(error) => {
                 self.reply_rejection_with_text(&source, error.condition(), None, error.text())
             }
         }
@@ -2699,8 +2896,82 @@ async fn acknowledge_backlog<A: ChunkAllocator>(
     }
 }
 
+struct ServiceWork<A: ChunkAllocator> {
+    router: RouterHandle<A>,
+    storage: RedbStorage,
+    allocator: A,
+    work: WorkHandle,
+    observer: Option<SessionHandle<A>>,
+    archived: Option<lonewolf_extension::archive::ArchiveId>,
+    stanza: RoutedStanza<A>,
+    route: ServiceRoute<A>,
+}
+
+impl<A: ChunkAllocator + Clone + 'static> ServiceWork<A> {
+    async fn run(self) -> Result<Option<Reply<A>>, crate::stages::StageFailure> {
+        let stage = Stage {
+            router: &self.router,
+            storage: &self.storage,
+            allocator: &self.allocator,
+            work: &self.work,
+        };
+        let observed = self.observer.map(|session| (session, self.stanza.clone()));
+        let outcome = service::dispatch(&stage, &self.route, self.stanza).await?;
+        if let Some((sender, observed)) = observed {
+            let id = sender.session_id();
+            let account = sender.account().clone();
+            let delivery =
+                RouterDelivery::with_session(stage.router, stage.allocator, Some(sender));
+            let rejection = match &outcome {
+                ServiceOutcome::Rejected {
+                    stanza,
+                    condition,
+                    text,
+                } => Some(ingress::rejection_reply(
+                    stage.allocator,
+                    stanza,
+                    *condition,
+                    None,
+                    *text,
+                )?),
+                ServiceOutcome::Handled => None,
+            };
+            observe::message(
+                &stage,
+                &delivery,
+                MessageEvent {
+                    account: &account,
+                    role: MessageRole::Sent,
+                    stanza: &observed,
+                    outcome: MessageOutcome::from(&outcome),
+                    archived: self.archived,
+                    holders: std::slice::from_ref(&id),
+                    rejection: rejection.as_ref(),
+                },
+            )
+            .await;
+            return Ok(rejection.map(Reply::Built));
+        }
+        Ok(match outcome {
+            ServiceOutcome::Rejected {
+                stanza,
+                condition,
+                text,
+            } => Some(Reply::Error {
+                stanza,
+                condition,
+                application: None,
+                text,
+            }),
+            ServiceOutcome::Handled => None,
+        })
+    }
+}
+
 struct DirectedServiceWork<A: ChunkAllocator> {
     session: SessionHandle<A>,
+    liveness: SessionLiveness,
+    policy_account: Option<AccountKey>,
     router: RouterHandle<A>,
     storage: RedbStorage,
     allocator: A,
@@ -2711,8 +2982,16 @@ struct DirectedServiceWork<A: ChunkAllocator> {
     route: ServiceRoute<A>,
 }
 
+enum DirectedServiceOutcome<A: ChunkAllocator> {
+    Dispatched(ServiceOutcome<A>),
+    Blocked,
+}
+
 impl<A: ChunkAllocator + Clone> DirectedServiceWork<A> {
-    async fn run(self) -> Result<ServiceOutcome<A>, RouterError> {
+    async fn run(self) -> Result<DirectedServiceOutcome<A>, RouterError> {
+        if !self.liveness.is_alive() {
+            return Ok(DirectedServiceOutcome::Dispatched(ServiceOutcome::Handled));
+        }
         let view = self
             .stanza
             .resolve()
@@ -2722,7 +3001,48 @@ impl<A: ChunkAllocator + Clone> DirectedServiceWork<A> {
             .map_err(|_| RouterError::InvalidTarget)?
             .ok_or(RouterError::InvalidTarget)?;
         let available = view.stanza_type() == StanzaType::Presence(PresenceType::Available);
+        let ordered = ingress::checks::fix_explicit_snapshot(
+            &self.router,
+            &self.storage,
+            self.policy_account.as_ref(),
+            None,
+        )
+        .await
+        .map_err(|_| RouterError::Unavailable)?;
+        let admission = if let Some((snapshot, mut ticket)) = ordered {
+            let verdict = ingress::checks::check_selected(
+                (&self.router, &self.storage),
+                self.policy_account.as_ref(),
+                None,
+                &view,
+                None,
+                ingress::checks::Snapshot::Ordered(&snapshot),
+                policy::Selection::Explicit,
+            )
+            .await
+            .map_err(|_| RouterError::Unavailable)?;
+            drop(snapshot);
+            match verdict {
+                Verdict::Allow => {
+                    ticket.turn().await;
+                    Some(ticket)
+                }
+                Verdict::OutboundBlocked => return Ok(DirectedServiceOutcome::Blocked),
+                Verdict::Drop | Verdict::Reject { .. } => {
+                    return Ok(DirectedServiceOutcome::Dispatched(ServiceOutcome::Handled));
+                }
+            }
+        } else {
+            None
+        };
+        if !self.liveness.is_alive() {
+            return Ok(DirectedServiceOutcome::Dispatched(ServiceOutcome::Handled));
+        }
         self.session.record_service_presence(to, available).await?;
+        drop(admission);
+        if !self.liveness.is_alive() {
+            return Ok(DirectedServiceOutcome::Dispatched(ServiceOutcome::Handled));
+        }
         let stage = Stage {
             router: &self.router,
             storage: &self.storage,
@@ -2731,6 +3051,7 @@ impl<A: ChunkAllocator + Clone> DirectedServiceWork<A> {
         };
         let result = service::dispatch(&stage, &self.route, self.stanza)
             .await
+            .map(DirectedServiceOutcome::Dispatched)
             .map_err(|_| RouterError::Unavailable);
         drop(self.lease);
         let _ = self.completion.send(());

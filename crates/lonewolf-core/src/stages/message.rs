@@ -4,6 +4,7 @@ use std::time::SystemTime;
 
 use lonewolf_extension::delivery::HandlerError;
 use lonewolf_extension::message::{StoreOutcome, UndeliverableMessage};
+use lonewolf_extension::policy::Verdict;
 use lonewolf_storage::Storage;
 use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::{Arena, ArenaConfig, ChunkAllocator};
@@ -14,8 +15,12 @@ use crate::delivery::{
     Pending, StoredDelivery, commit_and_store, report_failure, report_handler_failure,
     storage_failure,
 };
+use crate::order::Ticket;
+use crate::router::local::SessionLiveness;
 use crate::router::metrics::MessageOutcome;
 use crate::router::{Admitted, Destination, RoutedStanza, RouterError};
+use crate::stages::ingress::checks::{self, Snapshot};
+use crate::stages::policy::Selection;
 
 #[derive(Clone, Copy)]
 pub(crate) enum MissingRecipientPolicy {
@@ -32,6 +37,11 @@ pub(crate) enum DeliveryOutcome<A: ChunkAllocator> {
     },
     /// RFC 6121 or the offline fallback discards the message without a reply.
     Discarded,
+    Retired,
+    Policy {
+        stanza: RoutedStanza<A>,
+        verdict: Verdict,
+    },
     Rejected {
         stanza: RoutedStanza<A>,
         condition: StanzaErrorCondition,
@@ -45,21 +55,39 @@ enum StorePreparation<A: ChunkAllocator> {
         error: HandlerError,
     },
     Discarded,
+    Retired,
+    Policy {
+        stanza: RoutedStanza<A>,
+        verdict: Verdict,
+    },
     Committed(Pending<Result<Admitted, crate::delivery::EffectsError>>),
 }
 
 /// Requires a stanza with an authenticated sender.
-pub(crate) async fn deliver<A: ChunkAllocator + Clone + 'static>(
+pub(crate) async fn deliver_addressed<A: ChunkAllocator + Clone + 'static>(
     stage: &Stage<'_, A>,
     routed: RoutedStanza<A>,
     kind: MessageType,
     missing_recipient: MissingRecipientPolicy,
+    source: Option<&AccountKey>,
+    liveness: Option<&SessionLiveness>,
+    admission: Option<Ticket>,
 ) -> Result<DeliveryOutcome<A>, StageFailure> {
-    let result = deliver_unrecorded(stage, routed, kind, missing_recipient).await;
+    let result = deliver_unrecorded(
+        stage,
+        routed,
+        kind,
+        missing_recipient,
+        source,
+        liveness,
+        admission,
+    )
+    .await;
     let outcome = match &result {
         Ok(DeliveryOutcome::Routed { .. }) => MessageOutcome::Routed,
         Ok(DeliveryOutcome::Stored { .. }) => MessageOutcome::Stored,
         Ok(DeliveryOutcome::Discarded) => MessageOutcome::Discarded,
+        Ok(DeliveryOutcome::Retired | DeliveryOutcome::Policy { .. }) => return result,
         Ok(DeliveryOutcome::Rejected { .. }) => MessageOutcome::Rejected,
         Err(_) => MessageOutcome::Failed,
     };
@@ -67,12 +95,28 @@ pub(crate) async fn deliver<A: ChunkAllocator + Clone + 'static>(
     result
 }
 
+#[cfg(test)]
+pub(crate) async fn deliver<A: ChunkAllocator + Clone + 'static>(
+    stage: &Stage<'_, A>,
+    stanza: RoutedStanza<A>,
+    kind: MessageType,
+    missing_recipient: MissingRecipientPolicy,
+) -> Result<DeliveryOutcome<A>, StageFailure> {
+    deliver_addressed(stage, stanza, kind, missing_recipient, None, None, None).await
+}
+
 async fn deliver_unrecorded<A: ChunkAllocator + Clone + 'static>(
     stage: &Stage<'_, A>,
     routed: RoutedStanza<A>,
     kind: MessageType,
     missing_recipient: MissingRecipientPolicy,
+    source: Option<&AccountKey>,
+    liveness: Option<&SessionLiveness>,
+    admission: Option<Ticket>,
 ) -> Result<DeliveryOutcome<A>, StageFailure> {
+    if liveness.is_some_and(|session| !session.is_alive()) {
+        return Ok(DeliveryOutcome::Retired);
+    }
     let (bare, destination) = {
         let view = routed.resolve()?;
         let to = view.to()?.ok_or(StageFailure)?;
@@ -91,8 +135,13 @@ async fn deliver_unrecorded<A: ChunkAllocator + Clone + 'static>(
             text: StanzaErrorCondition::ServiceUnavailable.default_text(),
         });
     }
-    let admitted = match stage.router.route_message(routed.clone()).await {
-        Ok(admitted) => admitted,
+    let admitted = match stage
+        .router
+        .route_addressed_message(routed.clone(), liveness.cloned())
+        .await
+    {
+        Ok(Some(admitted)) => admitted,
+        Ok(None) => return Ok(DeliveryOutcome::Retired),
         Err(error) => {
             if kind == MessageType::Error
                 || (bare && kind == MessageType::Headline && error == RouterError::NotFound)
@@ -103,7 +152,8 @@ async fn deliver_unrecorded<A: ChunkAllocator + Clone + 'static>(
             if error == RouterError::Offline
                 && matches!(kind, MessageType::Normal | MessageType::Chat)
             {
-                return store(stage, routed, missing_recipient).await;
+                drop(admission);
+                return store(stage, routed, missing_recipient, source, liveness).await;
             }
             let condition = match error {
                 RouterError::Busy
@@ -138,6 +188,8 @@ async fn store<A: ChunkAllocator + Clone + 'static>(
     stage: &Stage<'_, A>,
     routed: RoutedStanza<A>,
     missing_recipient: MissingRecipientPolicy,
+    source: Option<&AccountKey>,
+    liveness: Option<&SessionLiveness>,
 ) -> Result<DeliveryOutcome<A>, StageFailure> {
     let recipient = AccountKey::try_from(routed.resolve()?.to()?.ok_or(StageFailure)?.bare())
         .map_err(|_| StageFailure)?;
@@ -168,6 +220,37 @@ async fn store<A: ChunkAllocator + Clone + 'static>(
             );
             StageFailure
         })?;
+        if liveness.is_some_and(|session| !session.is_alive()) {
+            return Ok(StorePreparation::Retired);
+        }
+        if checks::explicit_applies(stage.router, source, Some(&recipient)) {
+            let snapshot = stage.storage.begin_read().await.map_err(|error| {
+                report_failure(
+                    storage_failure(error, "offline_store_policy_begin_read"),
+                    &recipient,
+                );
+                StageFailure
+            })?;
+            let verdict = checks::check_selected(
+                (stage.router, stage.storage),
+                source,
+                Some(&recipient),
+                &routed.resolve()?,
+                None,
+                Snapshot::Ordered(&snapshot),
+                Selection::Explicit,
+            )
+            .await?;
+            if verdict != Verdict::Allow {
+                return Ok(StorePreparation::Policy {
+                    stanza: routed,
+                    verdict,
+                });
+            }
+        }
+        if liveness.is_some_and(|session| !session.is_alive()) {
+            return Ok(StorePreparation::Retired);
+        }
         let mut scratch = Arena::try_new_in(ArenaConfig::default(), stage.allocator.clone())?;
         let outcome = handler
             .store(
@@ -181,6 +264,9 @@ async fn store<A: ChunkAllocator + Clone + 'static>(
             )
             .await;
         drop(scratch);
+        if liveness.is_some_and(|session| !session.is_alive()) {
+            return Ok(StorePreparation::Retired);
+        }
         Ok::<_, StageFailure>(match outcome {
             Err(error) => {
                 drop(transaction);
@@ -210,6 +296,7 @@ async fn store<A: ChunkAllocator + Clone + 'static>(
                 transaction,
                 handler,
                 StoredDelivery {
+                    source: source.cloned(),
                     recipient,
                     sequence,
                     stanza: routed,
@@ -225,6 +312,10 @@ async fn store<A: ChunkAllocator + Clone + 'static>(
             text: error.text(),
         }),
         StorePreparation::Discarded => Ok(DeliveryOutcome::Discarded),
+        StorePreparation::Retired => Ok(DeliveryOutcome::Retired),
+        StorePreparation::Policy { stanza, verdict } => {
+            Ok(DeliveryOutcome::Policy { stanza, verdict })
+        }
         StorePreparation::Committed(pending) => {
             let admitted = pending
                 .finished()

@@ -2,17 +2,18 @@
 
 use std::sync::Arc;
 
-use lonewolf_storage::Storage;
 use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::blocking::{BlockChange, BlockError, BlockingReads, BlockingWrites};
+use lonewolf_storage::{Storage, StorageErrorKind};
 use lonewolf_util::arena::{Arena, ChunkAllocator};
-use lonewolf_xmpp::stanza::{BuildError, Element, StanzaErrorCondition};
+use lonewolf_xmpp::stanza::{BuildError, Element, IqType, StanzaErrorCondition, StanzaType};
 
 use crate::delivery::{Failure, FailureKind, HandlerError, HostLookup, SessionTag};
 use crate::iq::{
     IqDestinationRule, IqError, IqFuture, IqHandler, IqReply, IqRequest, IqRequestKey,
     IqRequestType, IqRoute, IqScope, Requester,
 };
+use crate::policy::{Direction, PolicyFuture, PolicyHandler, PolicyRequest, Verdict};
 use crate::{Effects, Extension, RegistrationError, Slots};
 
 mod xml;
@@ -36,6 +37,7 @@ impl<A: ChunkAllocator, S: Storage> Extension<A, S> for Blocking {
         _host: &str,
         slots: &mut Slots<'_, A, S>,
     ) -> Result<(), RegistrationError> {
+        slots.policy(self.clone());
         let handler: Arc<dyn IqHandler<A, S>> = self;
         for (kind, name) in [
             (IqRequestType::Get, BLOCKLIST),
@@ -62,6 +64,58 @@ impl<A: ChunkAllocator, S: Storage> Extension<A, S> for Blocking {
         }
         Ok(())
     }
+}
+
+impl<S: Storage> PolicyHandler<S> for Blocking {
+    fn checks_explicit_addresses(&self) -> bool {
+        true
+    }
+
+    fn check<'a>(
+        &'a self,
+        request: PolicyRequest<'a>,
+        transaction: &'a S::Read,
+    ) -> PolicyFuture<'a> {
+        Box::pin(check_blocklist(request, transaction))
+    }
+}
+
+async fn check_blocklist(
+    request: PolicyRequest<'_>,
+    transaction: &impl BlockingReads,
+) -> Result<Verdict, HandlerError> {
+    if request.peer.bare().as_str() == request.account.as_str() {
+        return Ok(Verdict::Allow);
+    }
+    let matched = transaction
+        .is_blocked(request.account, request.peer)
+        .await
+        .map_err(|error| HandlerError::Internal {
+            condition: StanzaErrorCondition::ServiceUnavailable,
+            failure: Failure {
+                kind: match error {
+                    BlockError::Storage(error) => FailureKind::Storage(error.kind()),
+                    _ => FailureKind::Storage(StorageErrorKind::Other),
+                },
+                operation: "blocklist_policy_read",
+            },
+        })?;
+    if !matched {
+        return Ok(Verdict::Allow);
+    }
+    Ok(match (request.direction, request.kind) {
+        (Direction::Outbound, _) => Verdict::OutboundBlocked,
+        (Direction::Inbound, kind) if kind.is_error() => Verdict::Drop,
+        (
+            Direction::Inbound,
+            StanzaType::Message(_) | StanzaType::Iq(IqType::Get | IqType::Set),
+        ) => Verdict::Reject {
+            condition: StanzaErrorCondition::ServiceUnavailable,
+            application: None,
+            text: None,
+        },
+        (Direction::Inbound, _) => Verdict::Drop,
+    })
 }
 
 impl<A: ChunkAllocator, S: Storage> IqHandler<A, S> for Blocking {

@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+mod mutations;
+
 use compio::runtime::Runtime;
 use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::blocking::{

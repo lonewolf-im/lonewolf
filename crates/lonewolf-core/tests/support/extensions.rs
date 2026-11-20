@@ -124,6 +124,7 @@ const SUBSCRIPTION_KINDS: [PresenceRequestType; 4] = [
 pub fn catalog() -> TestResult<Extensions<Arc<PooledChunkAllocator>, RedbStorage>> {
     let mut extensions = Extensions::default();
     extensions.register(Arc::new(Blocking))?;
+    extensions.register(Arc::new(PresencePolicyWitness))?;
     extensions.register(Arc::new(TestService {
         joined: PlMutex::new(BTreeSet::new()),
     }))?;
@@ -2065,6 +2066,51 @@ impl<A: ChunkAllocator> IqHandler<A, RedbStorage> for RouterFailureIq {
                 })
             });
             Ok(IqReply::new(None, effects))
+        })
+    }
+}
+
+struct PresencePolicyWitness;
+
+impl<A: ChunkAllocator> Extension<A, RedbStorage> for PresencePolicyWitness {
+    fn name(&self) -> &'static str {
+        "presence-policy-witness"
+    }
+
+    fn register(
+        self: Arc<Self>,
+        _: &str,
+        slots: &mut Slots<'_, A, RedbStorage>,
+    ) -> Result<(), RegistrationError> {
+        slots.policy(self);
+        Ok(())
+    }
+}
+
+impl PolicyHandler<RedbStorage> for PresencePolicyWitness {
+    fn checks_explicit_addresses(&self) -> bool {
+        true
+    }
+
+    fn check<'a>(&'a self, request: PolicyRequest<'a>, _: &'a RedbRead) -> PolicyFuture<'a> {
+        Box::pin(async move {
+            if request.account.as_str() == "alice@localhost"
+                && request.peer.as_str() == "bob@localhost/desk"
+                && matches!(request.kind, StanzaType::Presence(PresenceType::Available))
+            {
+                let signal = match request.direction {
+                    Direction::Inbound => Signal::ConcretePresenceSource,
+                    Direction::Outbound => Signal::ConcretePresenceTarget,
+                };
+                signal.raise().map_err(|_| HandlerError::Internal {
+                    condition: StanzaErrorCondition::InternalServerError,
+                    failure: Failure {
+                        kind: FailureKind::Delivery,
+                        operation: "presence_policy_witness",
+                    },
+                })?;
+            }
+            Ok(Verdict::Allow)
         })
     }
 }

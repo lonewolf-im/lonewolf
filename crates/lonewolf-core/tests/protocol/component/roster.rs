@@ -665,6 +665,38 @@ fn blocked_component_contacts_receive_no_probe_or_broadcast(contact: &str) -> Te
     suite.stop()
 }
 
+#[test]
+fn generated_presence_denial_is_silent() -> TestResult {
+    let (mut suite, mut alice, mut component) = unavailable_setup(&format!(
+        "{CONFIG}\n[hosts.localhost]\nextensions=['blocking','roster','ping']"
+    ))?;
+    for contact in [SERVER, OTHER] {
+        follow(&mut alice, &mut component, contact)?;
+        grant(&mut alice, &mut component, contact, true, false)?;
+    }
+    alice.send(&format!("<iq type='set' id='rule'><block xmlns='urn:xmpp:blocking'><item jid='{SERVER}'/><item jid='{OTHER}/console'/></block></iq>"))?;
+    let result = alice.receive()?;
+    result.assert_name(CLIENT, "iq");
+    assert_eq!(result.attribute("type"), Some("result"));
+    assert_eq!(result.attribute("id"), Some("rule"));
+
+    publish(&mut alice, None, "initial")?;
+    expect_audience(&mut component, &[OTHER], &[OTHER], None, Some("initial"))?;
+    publish(&mut alice, None, "update")?;
+    expect_audience(&mut component, &[], &[OTHER], None, Some("update"))?;
+    publish(&mut alice, Some("unavailable"), "gone")?;
+    expect_audience(
+        &mut component,
+        &[],
+        &[OTHER],
+        Some("unavailable"),
+        Some("gone"),
+    )?;
+    alice.close()?;
+    component.close()?;
+    suite.stop()
+}
+
 fn presence_updates_and_unavailable_reach_component_subscribers(contact: &str) -> TestResult {
     let (mut suite, mut alice, mut component) = online()?;
     roster_audience(&mut alice, &mut component, contact, true)?;

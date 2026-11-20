@@ -337,7 +337,7 @@ impl Resolver {
 
     async fn query(&self, name: &Name, record_type: RecordType) -> Result<Answer, QueryError> {
         let mut id = [0; 2];
-        graviola::random::fill(&mut id).map_err(|_| QueryError::Unavailable)?;
+        aws_lc_rs::rand::fill(&mut id).map_err(|_| QueryError::Unavailable)?;
         let mut message = Message::new(u16::from_ne_bytes(id), MessageType::Query, OpCode::Query);
         message.metadata.recursion_desired = true;
         message
@@ -535,12 +535,12 @@ pub(crate) fn order_srv(
     Ok(ordered)
 }
 
-fn random_inclusive(total: u32) -> Result<u32, graviola::Error> {
+fn random_inclusive(total: u32) -> Result<u32, aws_lc_rs::error::Unspecified> {
     let range = u64::from(total) + 1;
     let ceiling = (1_u64 << 32) / range * range;
     loop {
         let mut bytes = [0; 4];
-        graviola::random::fill(&mut bytes)?;
+        aws_lc_rs::rand::fill(&mut bytes)?;
         let value = u32::from_ne_bytes(bytes);
         if u64::from(value) < ceiling {
             return Ok((u64::from(value) % range) as u32);

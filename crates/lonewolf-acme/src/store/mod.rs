@@ -10,9 +10,9 @@ use std::sync::{Arc, Weak};
 use std::task::Poll;
 use std::time::Instant;
 
+use aws_lc_rs::digest::{SHA256, digest};
 use futures_util::future::{Either, poll_fn, select};
 use futures_util::task::AtomicWaker;
-use graviola::hashing::{Hash, Sha256};
 use lonewolf_util::blocking::BlockingExecutor;
 use parking_lot::Mutex as PlMutex;
 use redb::backends::FileBackend;
@@ -138,7 +138,7 @@ impl StateStore {
                     .create_with_backend(backend)
                     .map_err(backend_error)?;
                 let mut namespace = [0; 32];
-                namespace.copy_from_slice(Sha256::hash(directory_url.as_bytes()).as_ref());
+                namespace.copy_from_slice(digest(&SHA256, directory_url.as_bytes()).as_ref());
                 let transaction = begin_write(&database)?;
                 {
                     let mut directories =

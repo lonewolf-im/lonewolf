@@ -1,0 +1,3 @@
+# Build AWS-LC from the bundled source so a system copy is never linked instead.
+[env]
+AWS_LC_SYS_USE_SYSTEM = { value = "0", force = true }

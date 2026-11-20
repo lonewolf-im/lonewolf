@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use crate::config::{Config, HostConfig, HostTlsConfig, HostTlsSource};
 use crate::hosts::test_support::{TestSigner, pem};
 use crate::hosts::{Hosts, HostsError};
-use graviola::signing::eddsa::Ed25519SigningKey;
+use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
 use rcgen::{CertificateParams, PublicKeyData};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -407,11 +407,7 @@ fn configured_localhost_certificate_replaces_generated_certificate() -> TestResu
 #[test]
 fn hashless_certificate_signature_is_rejected_at_bootstrap() -> TestResult {
     let directory = tempfile::tempdir()?;
-    let key = Ed25519SigningKey::generate()?;
-    let signer = Ed25519TestSigner {
-        public_key: key.public_key().as_bytes(),
-        key,
-    };
+    let signer = Ed25519TestSigner(Ed25519KeyPair::generate()?);
     let mut parameters = CertificateParams::new(vec!["example.com".into()])?;
     parameters.serial_number = Some(rcgen::SerialNumber::from(1_u64));
     let certificate = parameters.self_signed(&signer)?;
@@ -421,10 +417,9 @@ fn hashless_certificate_signature_is_rejected_at_bootstrap() -> TestResult {
         &certificate_chain_path,
         pem("CERTIFICATE", certificate.der())?,
     )?;
-    let mut private_key = [0_u8; 512];
     fs::write(
         &private_key_path,
-        pem("PRIVATE KEY", signer.key.to_pkcs8_der(&mut private_key)?)?,
+        pem("PRIVATE KEY", signer.0.to_pkcs8v1()?.as_ref())?,
     )?;
     let mut config = Config::default();
     config.hosts.clear();
@@ -529,15 +524,14 @@ fn test_tls_parameters(
     let signer = TestSigner::new()?;
     parameters.serial_number = Some(rcgen::SerialNumber::from(1_u64));
     let certificate = parameters.self_signed(&signer)?;
-    let mut private_key = [0_u8; 512];
-    let private_key = signer.key.to_pkcs8_der(&mut private_key)?;
+    let private_key = signer.key.to_pkcs8v1()?;
     let certificate_chain_path = directory.path().join(format!("certificate-{suffix}.pem"));
     let private_key_path = directory.path().join(format!("private-key-{suffix}.pem"));
     fs::write(
         &certificate_chain_path,
         pem("CERTIFICATE", certificate.der())?,
     )?;
-    fs::write(&private_key_path, pem("PRIVATE KEY", private_key)?)?;
+    fs::write(&private_key_path, pem("PRIVATE KEY", private_key.as_ref())?)?;
     Ok(HostTlsConfig {
         source: HostTlsSource::Files {
             certificate_chain_path,
@@ -547,14 +541,11 @@ fn test_tls_parameters(
     })
 }
 
-struct Ed25519TestSigner {
-    key: Ed25519SigningKey,
-    public_key: [u8; 32],
-}
+struct Ed25519TestSigner(Ed25519KeyPair);
 
 impl PublicKeyData for Ed25519TestSigner {
     fn der_bytes(&self) -> &[u8] {
-        &self.public_key
+        self.0.public_key().as_ref()
     }
 
     fn algorithm(&self) -> &'static rcgen::SignatureAlgorithm {
@@ -564,7 +555,7 @@ impl PublicKeyData for Ed25519TestSigner {
 
 impl rcgen::SigningKey for Ed25519TestSigner {
     fn sign(&self, message: &[u8]) -> Result<Vec<u8>, rcgen::Error> {
-        Ok(self.key.sign(message).to_vec())
+        Ok(self.0.sign(message).as_ref().to_vec())
     }
 }
 
@@ -806,7 +797,7 @@ fn managed_publication_keeps_captured_generations_and_resumption_coherent() -> T
             roots.add(b.clone())?;
             let client = Arc::new(
                 rustls::ClientConfig::builder_with_provider(Arc::new(
-                    rustls_graviola::default_provider(),
+                    rustls::crypto::aws_lc_rs::default_provider(),
                 ))
                 .with_protocol_versions(&[version])?
                 .with_root_certificates(roots)
@@ -922,18 +913,12 @@ fn managed_preparation_rejects_invalid_material_without_publication() -> TestRes
         vec![good.clone(), CertificateDer::from(vec![1, 2, 3])],
         key.clone_key(),
     ));
-    let ed_key = Ed25519SigningKey::generate()?;
-    let signer = Ed25519TestSigner {
-        public_key: ed_key.public_key().as_bytes(),
-        key: ed_key,
-    };
+    let signer = Ed25519TestSigner(Ed25519KeyPair::generate()?);
     let mut ed_parameters = parameters()?;
     ed_parameters.serial_number = Some(1u64.into());
     let unsupported = ed_parameters.self_signed(&signer)?;
-    let mut bytes = zeroize::Zeroizing::new([0; 512]);
-    let ed_key = rustls::pki_types::PrivatePkcs8KeyDer::from(
-        signer.key.to_pkcs8_der(&mut bytes[..])?.to_vec(),
-    );
+    let ed_key =
+        rustls::pki_types::PrivatePkcs8KeyDer::from(signer.0.to_pkcs8v1()?.as_ref().to_vec());
     assert!(matches!(
         hosts.prepare_managed_certificate(
             "example.com",
@@ -1039,11 +1024,12 @@ fn concurrent_handshake_readers_observe_only_complete_generations() -> TestResul
     let mut roots = rustls::RootCertStore::empty();
     roots.add(a.clone())?;
     roots.add(b.clone())?;
-    let mut client =
-        rustls::ClientConfig::builder_with_provider(Arc::new(rustls_graviola::default_provider()))
-            .with_safe_default_protocol_versions()?
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+    let mut client = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
     client.resumption = rustls::client::Resumption::disabled();
     let client = Arc::new(client);
     let barrier = Arc::new(Barrier::new(5));

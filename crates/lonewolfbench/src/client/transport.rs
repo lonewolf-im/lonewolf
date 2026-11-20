@@ -63,12 +63,13 @@ pub fn local_tls_config(certificate: CertificateDer<'static>) -> BenchResult<Arc
 }
 
 fn tls_config(roots: RootCertStore) -> BenchResult<Arc<ClientConfig>> {
-    let mut config =
-        ClientConfig::builder_with_provider(Arc::new(rustls_graviola::default_provider()))
-            .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
-            .map_err(|_| failure("tls_config"))?
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+    let mut config = ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+    .map_err(|_| failure("tls_config"))?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
     config.resumption = Resumption::disabled();
     config.enable_early_data = false;
     Ok(Arc::new(config))

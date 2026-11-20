@@ -630,7 +630,7 @@ pub fn server_config_with_roots(
     domain: &str,
     versions: &[&'static rustls::SupportedProtocolVersion],
 ) -> TestResult<Arc<rustls::ServerConfig>> {
-    let provider = Arc::new(rustls_graviola::default_provider());
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
         Arc::new(roots),
         Arc::clone(&provider),

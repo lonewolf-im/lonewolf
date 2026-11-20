@@ -7,11 +7,11 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+aws-lc-rs.workspace = true
 base64.workspace = true
 futures-rustls.workspace = true
 getrandom.workspace = true
 hmac.workspace = true
-graviola.workspace = true
 http-body-util.workspace = true
 hyper = { workspace = true, features = ["client"] }
 hyper-util.workspace = true
@@ -24,7 +24,6 @@ lonewolf-xmpp.workspace = true
 nix = { workspace = true, features = ["fs"] }
 pbkdf2.workspace = true
 rustls.workspace = true
-rustls-graviola = { version = "0.4.0", default-features = false }
 rcgen.workspace = true
 sha2.workspace = true
 stringprep.workspace = true

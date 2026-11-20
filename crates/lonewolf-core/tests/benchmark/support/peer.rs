@@ -58,10 +58,12 @@ impl Peer {
         let cert = CertificateDer::from_pem_slice(&fs::read(directory.join("certificate.pem"))?)?;
         let key = PrivateKeyDer::from_pem_slice(&fs::read(directory.join("private-key.pem"))?)?;
         let config = Arc::new(
-            ServerConfig::builder_with_provider(Arc::new(rustls_graviola::default_provider()))
-                .with_safe_default_protocol_versions()?
-                .with_no_client_auth()
-                .with_single_cert(vec![cert], key)?,
+            ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::aws_lc_rs::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()?
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)?,
         );
         let listener = TcpListener::bind("127.0.0.1:0")?;
         listener.set_nonblocking(true)?;

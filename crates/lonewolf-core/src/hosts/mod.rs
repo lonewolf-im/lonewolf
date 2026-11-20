@@ -10,9 +10,9 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use graviola::hashing::{Hash, Sha256, Sha384, Sha512};
-use graviola::key_agreement::p256::StaticPrivateKey;
-use graviola::signing::ecdsa::{P256, SigningKey};
+use aws_lc_rs::digest::{SHA256, SHA384, SHA512, digest};
+use aws_lc_rs::rand::SystemRandom;
+use aws_lc_rs::signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, KeyPair};
 use parking_lot::RwLock as PlRwLock;
 use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, KeyUsagePurpose, PublicKeyData};
 use rustls::pki_types::pem::{Error as PemError, PemObject};
@@ -24,7 +24,6 @@ use rustls::sign::CertifiedKey;
 use x509_cert::Certificate;
 use x509_cert::der::Decode;
 use x509_cert::ext::pkix::{ExtendedKeyUsage, KeyUsage, SubjectAltName, name::GeneralName};
-use zeroize::Zeroizing;
 
 use crate::config::{HostConfig, HostTlsConfig, HostTlsSource};
 use lonewolf_util::blocking::BlockingExecutor;
@@ -235,7 +234,7 @@ impl Hosts {
                 .ok_or(HostsError::Empty)?,
             None => return Err(HostsError::DefaultRequired),
         };
-        let provider = Arc::new(rustls_graviola::default_provider());
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let mut sorted_hosts = Vec::with_capacity(hosts.len());
         let blocking = BlockingExecutor::new(const { NonZeroUsize::new(2).unwrap() });
         for (domain, config) in hosts {
@@ -740,16 +739,14 @@ pub(crate) fn tls_identity(domain: &str) -> Result<ServerName<'static>, HostsErr
 fn tls_server_end_point(certificate: &[u8]) -> Option<Vec<u8>> {
     let parsed = Certificate::from_der(certificate).ok()?;
     let oid = parsed.signature_algorithm().oid.to_string();
-    let digest = match oid.as_str() {
-        "1.2.840.113549.1.1.5" | "1.2.840.113549.1.1.4" => Sha256::hash(certificate),
-        "1.2.840.113549.1.1.11" | "1.2.840.10045.4.3.2" | "2.16.840.1.101.3.4.3.2" => {
-            Sha256::hash(certificate)
-        }
-        "1.2.840.113549.1.1.12" | "1.2.840.10045.4.3.3" => Sha384::hash(certificate),
-        "1.2.840.113549.1.1.13" | "1.2.840.10045.4.3.4" => Sha512::hash(certificate),
+    let algorithm = match oid.as_str() {
+        "1.2.840.113549.1.1.5" | "1.2.840.113549.1.1.4" => &SHA256,
+        "1.2.840.113549.1.1.11" | "1.2.840.10045.4.3.2" | "2.16.840.1.101.3.4.3.2" => &SHA256,
+        "1.2.840.113549.1.1.12" | "1.2.840.10045.4.3.3" => &SHA384,
+        "1.2.840.113549.1.1.13" | "1.2.840.10045.4.3.4" => &SHA512,
         _ => return None,
     };
-    Some(digest.as_ref().to_vec())
+    Some(digest(algorithm, certificate).as_ref().to_vec())
 }
 
 fn load_certified_key(
@@ -821,17 +818,15 @@ fn certified_key(
 fn generate_localhost_key(
     provider: &rustls::crypto::CryptoProvider,
 ) -> Result<CertifiedKey, HostsError> {
-    let key = SigningKey::<P256> {
-        private_key: StaticPrivateKey::new_random()
-            .map_err(|error| HostsError::GenerateLocalhost(format!("{error:?}")))?,
-    };
+    let key = EcdsaKeyPair::generate(&ECDSA_P256_SHA256_ASN1_SIGNING)
+        .map_err(|error| HostsError::GenerateLocalhost(error.to_string()))?;
     let mut parameters =
         CertificateParams::new(vec!["localhost".into(), "127.0.0.1".into(), "::1".into()])
             .map_err(|error| HostsError::GenerateLocalhost(error.to_string()))?;
     let now = time::OffsetDateTime::now_utc();
     let mut serial_number = [0_u8; 16];
-    graviola::random::fill(&mut serial_number)
-        .map_err(|error| HostsError::GenerateLocalhost(format!("{error:?}")))?;
+    aws_lc_rs::rand::fill(&mut serial_number)
+        .map_err(|error| HostsError::GenerateLocalhost(error.to_string()))?;
     parameters.serial_number = Some(rcgen::SerialNumber::from_slice(&serial_number));
     parameters.not_before = now - time::Duration::days(1);
     parameters.not_after = now + time::Duration::days(30);
@@ -841,34 +836,27 @@ fn generate_localhost_key(
         .push(DnType::CommonName, "localhost");
     parameters.key_usages = vec![KeyUsagePurpose::DigitalSignature];
     parameters.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-    let signer = LocalhostSigner {
-        public_key: key.private_key.public_key_uncompressed(),
-        key,
-    };
+    let signer = LocalhostSigner(key);
     let certificate = parameters
         .self_signed(&signer)
         .map_err(|error| HostsError::GenerateLocalhost(error.to_string()))?;
-    let mut key_bytes = Zeroizing::new([0_u8; 512]);
     let key_der = signer
-        .key
-        .to_pkcs8_der(&mut key_bytes[..])
-        .map_err(|error| HostsError::GenerateLocalhost(format!("{error:?}")))?;
+        .0
+        .to_pkcs8v1()
+        .map_err(|error| HostsError::GenerateLocalhost(error.to_string()))?;
     certified_key(
         "localhost",
         vec![certificate.der().clone()],
-        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der.to_vec())),
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der.as_ref().to_vec())),
         provider,
     )
 }
 
-struct LocalhostSigner {
-    key: SigningKey<P256>,
-    public_key: [u8; 65],
-}
+struct LocalhostSigner(EcdsaKeyPair);
 
 impl PublicKeyData for LocalhostSigner {
     fn der_bytes(&self) -> &[u8] {
-        &self.public_key
+        self.0.public_key().as_ref()
     }
 
     fn algorithm(&self) -> &'static rcgen::SignatureAlgorithm {
@@ -878,10 +866,9 @@ impl PublicKeyData for LocalhostSigner {
 
 impl rcgen::SigningKey for LocalhostSigner {
     fn sign(&self, message: &[u8]) -> Result<Vec<u8>, rcgen::Error> {
-        let mut signature = [0_u8; 80];
-        self.key
-            .sign_asn1::<Sha256>(&[message], &mut signature)
-            .map(<[u8]>::to_vec)
+        self.0
+            .sign(&SystemRandom::new(), message)
+            .map(|signature| signature.as_ref().to_vec())
             .map_err(|_| rcgen::Error::RemoteKeyError)
     }
 }

@@ -4,11 +4,10 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
+use aws_lc_rs::rand::SystemRandom;
+use aws_lc_rs::signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, KeyPair};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use graviola::hashing::Sha256;
-use graviola::key_agreement::p256::StaticPrivateKey;
-use graviola::signing::ecdsa::{P256, SigningKey};
 use rcgen::{CertificateParams, PublicKeyData};
 use rustls::{ClientConfig, RootCertStore, SupportedProtocolVersion};
 
@@ -23,13 +22,7 @@ pub fn configure_host(
     suffix: &str,
     identities: &[&str],
 ) -> TestResult<RootCertStore> {
-    let key = SigningKey::<P256> {
-        private_key: StaticPrivateKey::new_random()?,
-    };
-    let signer = TestSigner {
-        public_key: key.private_key.public_key_uncompressed(),
-        key,
-    };
+    let signer = TestSigner::new()?;
     let mut parameters = CertificateParams::new(
         identities
             .iter()
@@ -38,15 +31,14 @@ pub fn configure_host(
     )?;
     parameters.serial_number = Some(1u64.into());
     let certificate = parameters.self_signed(&signer)?;
-    let mut key_bytes = [0; 512];
-    let key_der = signer.key.to_pkcs8_der(&mut key_bytes)?;
+    let key_der = signer.key.to_pkcs8v1()?;
     fs::write(
         directory.join(format!("certificate{suffix}.pem")),
         pem("CERTIFICATE", certificate.der())?,
     )?;
     fs::write(
         directory.join(format!("private-key{suffix}.pem")),
-        pem("PRIVATE KEY", key_der)?,
+        pem("PRIVATE KEY", key_der.as_ref())?,
     )?;
     let mut roots = RootCertStore::empty();
     roots.add(certificate.der().clone())?;
@@ -58,10 +50,12 @@ pub fn client_config(
     versions: &[&'static SupportedProtocolVersion],
 ) -> TestResult<ClientConfig> {
     Ok(
-        ClientConfig::builder_with_provider(Arc::new(rustls_graviola::default_provider()))
-            .with_protocol_versions(versions)?
-            .with_root_certificates(roots)
-            .with_no_client_auth(),
+        ClientConfig::builder_with_provider(
+            Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
+        )
+        .with_protocol_versions(versions)?
+        .with_root_certificates(roots)
+        .with_no_client_auth(),
     )
 }
 
@@ -77,13 +71,12 @@ fn pem(label: &str, der: &[u8]) -> TestResult<String> {
 }
 
 struct TestSigner {
-    key: SigningKey<P256>,
-    public_key: [u8; 65],
+    key: EcdsaKeyPair,
 }
 
 impl PublicKeyData for TestSigner {
     fn der_bytes(&self) -> &[u8] {
-        &self.public_key
+        self.key.public_key().as_ref()
     }
 
     fn algorithm(&self) -> &'static rcgen::SignatureAlgorithm {
@@ -93,10 +86,9 @@ impl PublicKeyData for TestSigner {
 
 impl rcgen::SigningKey for TestSigner {
     fn sign(&self, message: &[u8]) -> Result<Vec<u8>, rcgen::Error> {
-        let mut signature = [0; 80];
         self.key
-            .sign_asn1::<Sha256>(&[message], &mut signature)
-            .map(<[u8]>::to_vec)
+            .sign(&SystemRandom::new(), message)
+            .map(|signature| signature.as_ref().to_vec())
             .map_err(|_| rcgen::Error::RemoteKeyError)
     }
 }
@@ -402,10 +394,9 @@ fn client_key_from_parameters(
 ) -> TestResult<Arc<rustls::sign::CertifiedKey>> {
     let signer = TestSigner::new()?;
     let certificate = parameters.signed_by(&signer, issuer)?;
-    let mut buffer = [0; 512];
-    let key = signer.key.to_pkcs8_der(&mut buffer)?;
-    let key = rustls::pki_types::PrivatePkcs8KeyDer::from(key.to_vec()).into();
-    let key = rustls_graviola::default_provider()
+    let key = signer.key.to_pkcs8v1()?;
+    let key = rustls::pki_types::PrivatePkcs8KeyDer::from(key.as_ref().to_vec()).into();
+    let key = rustls::crypto::aws_lc_rs::default_provider()
         .key_provider
         .load_private_key(key)?;
     Ok(Arc::new(rustls::sign::CertifiedKey::new(
@@ -416,12 +407,8 @@ fn client_key_from_parameters(
 
 impl TestSigner {
     fn new() -> TestResult<Self> {
-        let key = SigningKey::<P256> {
-            private_key: StaticPrivateKey::new_random()?,
-        };
         Ok(Self {
-            public_key: key.private_key.public_key_uncompressed(),
-            key,
+            key: EcdsaKeyPair::generate(&ECDSA_P256_SHA256_ASN1_SIGNING)?,
         })
     }
 }

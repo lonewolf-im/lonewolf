@@ -80,7 +80,7 @@ impl Fixture {
         Ok(ClientCertificatePolicy::load(
             "localhost",
             &self.config,
-            Arc::new(rustls_graviola::default_provider()),
+            Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
             blocking,
         )?)
     }

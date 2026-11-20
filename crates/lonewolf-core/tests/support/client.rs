@@ -437,7 +437,7 @@ impl Client {
             return Err("unsupported test client SCRAM mechanism".into());
         }
         let mut random = [0; 18];
-        graviola::random::fill(&mut random)?;
+        aws_lc_rs::rand::fill(&mut random)?;
         let nonce = STANDARD.encode(random);
         let username = username.replace('=', "=3D").replace(',', "=2C");
         let first = format!("n={username},r={nonce}");

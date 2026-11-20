@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::CertificateMaterial;
-use graviola::hashing::{Hash, Sha256};
-use graviola::key_agreement::p256::StaticPrivateKey;
-use graviola::signing::ecdsa::{P256, SigningKey};
+use aws_lc_rs::digest::{SHA256, digest};
+use aws_lc_rs::rand::SystemRandom;
+use aws_lc_rs::signature::{
+    ECDSA_P256_SHA256_ASN1_SIGNING, ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair,
+    EcdsaSigningAlgorithm, KeyPair,
+};
 use hmac::{KeyInit, Mac};
 use instant_acme::CertificateIdentifier;
 use instant_acme::{CryptoProvider, EcCurve, Jwk, JwkThumbFields, SigningAlgorithm};
@@ -27,33 +30,62 @@ pub fn crypto_provider() -> &'static CryptoProvider {
     &PROVIDER
 }
 
-struct AccountKey {
-    signer: CertificateSigner,
-}
-
-pub(crate) struct CertificateSigner {
-    key: SigningKey<P256>,
+struct P256Key {
+    key: EcdsaKeyPair,
     public_key: [u8; 65],
 }
 
+impl P256Key {
+    fn generate(algorithm: &'static EcdsaSigningAlgorithm) -> Result<Self, AcmeError> {
+        EcdsaKeyPair::generate(algorithm)
+            .map_err(|_| AcmeError::new(AcmeErrorKind::Crypto))
+            .and_then(Self::new)
+    }
+
+    fn from_pkcs8(
+        algorithm: &'static EcdsaSigningAlgorithm,
+        pkcs8: &[u8],
+    ) -> Result<Self, AcmeError> {
+        EcdsaKeyPair::from_pkcs8(algorithm, pkcs8)
+            .map_err(|_| AcmeError::new(AcmeErrorKind::Crypto))
+            .and_then(Self::new)
+    }
+
+    fn new(key: EcdsaKeyPair) -> Result<Self, AcmeError> {
+        let public_key = key
+            .public_key()
+            .as_ref()
+            .try_into()
+            .map_err(|_| AcmeError::new(AcmeErrorKind::Crypto))?;
+        Ok(Self { key, public_key })
+    }
+
+    fn pkcs8(&self) -> Result<Zeroizing<Vec<u8>>, AcmeError> {
+        self.key
+            .to_pkcs8v1()
+            .map(|der| Zeroizing::new(der.as_ref().to_vec()))
+            .map_err(|_| AcmeError::new(AcmeErrorKind::Crypto))
+    }
+
+    fn sign(&self, message: &[u8]) -> Option<Vec<u8>> {
+        self.key
+            .sign(&SystemRandom::new(), message)
+            .ok()
+            .map(|signature| signature.as_ref().to_vec())
+    }
+}
+
+struct AccountKey(P256Key);
+
+pub(crate) struct CertificateSigner(P256Key);
+
 impl CertificateSigner {
     pub(crate) fn generate() -> Result<Self, AcmeError> {
-        let key = SigningKey::<P256> {
-            private_key: StaticPrivateKey::new_random()
-                .map_err(|_| AcmeError::new(AcmeErrorKind::Crypto))?,
-        };
-        Ok(Self {
-            public_key: key.private_key.public_key_uncompressed(),
-            key,
-        })
+        P256Key::generate(&ECDSA_P256_SHA256_ASN1_SIGNING).map(Self)
     }
 
     pub(crate) fn pkcs8(&self) -> Result<Zeroizing<Vec<u8>>, AcmeError> {
-        let mut buffer = Zeroizing::new([0; 512]);
-        self.key
-            .to_pkcs8_der(&mut buffer[..])
-            .map(|der| Zeroizing::new(der.to_vec()))
-            .map_err(|_| AcmeError::new(AcmeErrorKind::Crypto))
+        self.0.pkcs8()
     }
 }
 
@@ -62,14 +94,9 @@ impl instant_acme::SigningKeyProvider for Provider {
         &self,
         pkcs8: PrivatePkcs8KeyDer<'static>,
     ) -> Result<Box<dyn instant_acme::SigningKey>, instant_acme::Error> {
-        let key = SigningKey::<P256>::from_pkcs8_der(pkcs8.secret_pkcs8_der())
+        let key = P256Key::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.secret_pkcs8_der())
             .map_err(|_| instant_acme::Error::Crypto)?;
-        Ok(Box::new(AccountKey {
-            signer: CertificateSigner {
-                public_key: key.private_key.public_key_uncompressed(),
-                key,
-            },
-        }))
+        Ok(Box::new(AccountKey(key)))
     }
 
     fn generate_key(
@@ -81,10 +108,11 @@ impl instant_acme::SigningKeyProvider for Provider {
         ),
         instant_acme::Error,
     > {
-        let signer = CertificateSigner::generate().map_err(|_| instant_acme::Error::Crypto)?;
-        let mut der = signer.pkcs8().map_err(|_| instant_acme::Error::Crypto)?;
+        let key = P256Key::generate(&ECDSA_P256_SHA256_FIXED_SIGNING)
+            .map_err(|_| instant_acme::Error::Crypto)?;
+        let mut der = key.pkcs8().map_err(|_| instant_acme::Error::Crypto)?;
         Ok((
-            Box::new(AccountKey { signer }),
+            Box::new(AccountKey(key)),
             PrivatePkcs8KeyDer::from(std::mem::take(&mut *der)),
         ))
     }
@@ -92,12 +120,7 @@ impl instant_acme::SigningKeyProvider for Provider {
 
 impl instant_acme::SigningKey for AccountKey {
     fn sign(&self, data: &[u8]) -> Result<Vec<u8>, instant_acme::Error> {
-        let mut signature = [0; 64];
-        self.signer
-            .key
-            .sign::<Sha256>(&[data], &mut signature)
-            .map(<[u8]>::to_vec)
-            .map_err(|_| instant_acme::Error::Crypto)
+        self.0.sign(data).ok_or(instant_acme::Error::Crypto)
     }
 
     fn as_jwk(&self) -> Jwk<'_> {
@@ -106,8 +129,8 @@ impl instant_acme::SigningKey for AccountKey {
             r#use: "sig",
             key: JwkThumbFields::Ec {
                 crv: EcCurve::P256,
-                x: &self.signer.public_key[1..33],
-                y: &self.signer.public_key[33..65],
+                x: &self.0.public_key[1..33],
+                y: &self.0.public_key[33..65],
             },
         }
     }
@@ -119,9 +142,9 @@ impl instant_acme::SigningKey for AccountKey {
 
 impl instant_acme::Sha256 for Provider {
     fn hash(&self, data: &[u8]) -> [u8; 32] {
-        let mut digest = [0; 32];
-        digest.copy_from_slice(Sha256::hash(data).as_ref());
-        digest
+        let mut output = [0; 32];
+        output.copy_from_slice(digest(&SHA256, data).as_ref());
+        output
     }
 }
 
@@ -149,7 +172,7 @@ impl instant_acme::HmacKey for HmacKey {
 
 impl PublicKeyData for CertificateSigner {
     fn der_bytes(&self) -> &[u8] {
-        &self.public_key
+        &self.0.public_key
     }
     fn algorithm(&self) -> &'static rcgen::SignatureAlgorithm {
         &rcgen::PKCS_ECDSA_P256_SHA256
@@ -158,11 +181,7 @@ impl PublicKeyData for CertificateSigner {
 
 impl rcgen::SigningKey for CertificateSigner {
     fn sign(&self, message: &[u8]) -> Result<Vec<u8>, rcgen::Error> {
-        let mut signature = [0; 80];
-        self.key
-            .sign_asn1::<Sha256>(&[message], &mut signature)
-            .map(<[u8]>::to_vec)
-            .map_err(|_| rcgen::Error::RemoteKeyError)
+        self.0.sign(message).ok_or(rcgen::Error::RemoteKeyError)
     }
 }
 

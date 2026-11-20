@@ -30,15 +30,17 @@ fn certificate(name: &str, expired: bool) -> (Vec<u8>, Vec<u8>) {
 
 fn server_config(certificate: Vec<u8>, key: Vec<u8>) -> Arc<rustls::ServerConfig> {
     Arc::new(
-        rustls::ServerConfig::builder_with_provider(Arc::new(rustls_graviola::default_provider()))
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .with_no_client_auth()
-            .with_single_cert(
-                vec![CertificateDer::from(certificate)],
-                PrivateKeyDer::try_from(key).unwrap(),
-            )
-            .unwrap(),
+        rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![CertificateDer::from(certificate)],
+            PrivateKeyDer::try_from(key).unwrap(),
+        )
+        .unwrap(),
     )
 }
 

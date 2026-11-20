@@ -13,30 +13,24 @@ use rcgen::{
     IsCa, KeyIdMethod, KeyUsagePurpose,
 };
 
-use graviola::hashing::Sha256;
-use graviola::key_agreement::p256::StaticPrivateKey;
-use graviola::signing::ecdsa::{P256, SigningKey};
+use aws_lc_rs::rand::SystemRandom;
+use aws_lc_rs::signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, KeyPair};
 
 struct TestSigner {
-    key: SigningKey<P256>,
-    public_key: [u8; 65],
+    key: EcdsaKeyPair,
 }
 
 impl TestSigner {
     fn new() -> Result<Self, Box<dyn Error>> {
-        let key = SigningKey::<P256> {
-            private_key: StaticPrivateKey::new_random()?,
-        };
         Ok(Self {
-            public_key: key.private_key.public_key_uncompressed(),
-            key,
+            key: EcdsaKeyPair::generate(&ECDSA_P256_SHA256_ASN1_SIGNING)?,
         })
     }
 }
 
 impl rcgen::PublicKeyData for TestSigner {
     fn der_bytes(&self) -> &[u8] {
-        &self.public_key
+        self.key.public_key().as_ref()
     }
     fn algorithm(&self) -> &'static rcgen::SignatureAlgorithm {
         &rcgen::PKCS_ECDSA_P256_SHA256
@@ -45,10 +39,9 @@ impl rcgen::PublicKeyData for TestSigner {
 
 impl rcgen::SigningKey for TestSigner {
     fn sign(&self, message: &[u8]) -> Result<Vec<u8>, rcgen::Error> {
-        let mut signature = [0; 80];
         self.key
-            .sign_asn1::<Sha256>(&[message], &mut signature)
-            .map(<[u8]>::to_vec)
+            .sign(&SystemRandom::new(), message)
+            .map(|signature| signature.as_ref().to_vec())
             .map_err(|_| rcgen::Error::RemoteKeyError)
     }
 }

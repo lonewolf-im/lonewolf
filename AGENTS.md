@@ -95,6 +95,7 @@ Do not add AI or tool attribution anywhere in commits or pull requests.
 - Apply this rule to enabled Cargo features and target-specific dependencies for every supported platform. Bundling, vendoring, static linking, dynamic linking, or installing a library through the operating system does not exempt it.
 - Normal operating-system interfaces and platform runtime libraries are allowed. Rust bindings to these interfaces, such as `libc`, are allowed. This exception does not permit application libraries such as SQLite, OpenSSL, or RocksDB.
 - A Rust wrapper does not make a C or C++ backend compliant. Check cryptography providers and other native backends separately from their Rust APIs.
+- The only exception is `aws-lc-rs` with its `aws-lc-sys` backend, used as the cryptography provider because it runs on every supported CPU. Build it from its bundled source, not a system copy. Do not enable its FIPS variant or add another C or C++ cryptography library.
 - Before adding or updating a dependency or enabling a feature, inspect the resolved dependency and feature graph, relevant build scripts, and native linkage. Do not introduce a C or C++ application library through any of these paths.
 
 ## 10. Configuration Reference Rule

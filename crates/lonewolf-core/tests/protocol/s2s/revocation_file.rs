@@ -373,7 +373,7 @@ fn stale_or_unusable_crl_files_stop_federation_until_refreshed_transport(
     let key = Arc::new(rustls::sign::CertifiedKey::from_der(
         vec![actual],
         key,
-        &rustls_graviola::default_provider(),
+        &rustls::crypto::aws_lc_rs::default_provider(),
     )?);
     let client = peer::client_config(&pair.ca, key)?;
     let path = pair.b_crls.as_deref().ok_or("missing b CRL file")?;
@@ -633,7 +633,7 @@ fn direct_tls_missing_crl_file_resets_bidi_ownership_and_rejects_the_next_handsh
     let key = Arc::new(rustls::sign::CertifiedKey::from_der(
         vec![actual],
         private,
-        &rustls_graviola::default_provider(),
+        &rustls::crypto::aws_lc_rs::default_provider(),
     )?);
     let mut remote = peer::RawS2sPeer::protected(
         TlsMode::Direct,

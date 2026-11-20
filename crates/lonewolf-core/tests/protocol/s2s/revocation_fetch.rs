@@ -649,7 +649,7 @@ fn crl_refresh_revoking_a_live_peer_closes_its_links_transport(mode: TlsMode) ->
     let key = Arc::new(rustls::sign::CertifiedKey::from_der(
         vec![actual],
         key,
-        &rustls_graviola::default_provider(),
+        &rustls::crypto::aws_lc_rs::default_provider(),
     )?);
     let client = peer::client_config(&pair.ca, key)?;
     let requests = http.requests("a.crl");

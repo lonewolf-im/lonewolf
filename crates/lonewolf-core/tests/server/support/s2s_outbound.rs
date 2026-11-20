@@ -66,7 +66,7 @@ pub fn config(
     client_only: bool,
     untrusted: bool,
 ) -> Result<Arc<rustls::ServerConfig>> {
-    let provider = Arc::new(rustls_graviola::default_provider());
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
         fixture.roots()?,
         Arc::clone(&provider),
@@ -92,7 +92,7 @@ pub fn expiring_config(
     fixture: &Fixture,
     until: time::OffsetDateTime,
 ) -> Result<Arc<rustls::ServerConfig>> {
-    let provider = Arc::new(rustls_graviola::default_provider());
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
         fixture.roots()?,
         Arc::clone(&provider),

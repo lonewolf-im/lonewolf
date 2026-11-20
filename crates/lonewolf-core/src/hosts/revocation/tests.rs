@@ -174,7 +174,7 @@ fn verify(
         &roots.roots,
         &[],
         UnixTime::since_unix_epoch(now.duration_since(UNIX_EPOCH)?),
-        rustls_graviola::default_provider()
+        rustls::crypto::aws_lc_rs::default_provider()
             .signature_verification_algorithms
             .all,
         usage,

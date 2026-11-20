@@ -34,7 +34,7 @@ multiple-versions = "warn"
 wildcards = "deny"
 allow-wildcard-paths = true
 deny = [
-    { crate = "aws-lc-sys", reason = "C cryptography backend" },
+    { crate = "aws-lc-sys", wrappers = ["aws-lc-rs"], reason = "C cryptography backend, allowed only through aws-lc-rs" },
     { crate = "aws-lc-fips-sys", reason = "C cryptography backend" },
     { crate = "ring", reason = "C and assembly cryptography backend" },
     { crate = "openssl-sys", reason = "C cryptography backend" },
@@ -48,7 +48,16 @@ deny = [
     { crate = "curl-sys", reason = "C HTTP backend" },
     { crate = "libgit2-sys", reason = "C Git backend" },
     { crate = "libssh2-sys", reason = "C SSH backend" },
+    { crate = "clang-sys", reason = "C++ build dependency" },
 ]
+
+[[bans.features]]
+crate = "aws-lc-sys"
+deny = ["bindgen", "fips", "ssl"]
+
+[[bans.features]]
+crate = "aws-lc-rs"
+deny = ["bindgen", "fips"]
 
 [sources]
 unknown-registry = "deny"

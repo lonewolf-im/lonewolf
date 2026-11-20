@@ -81,6 +81,65 @@ fn copy_builders_run_outside_the_shard_lock() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn resource_replacement_requires_new_eligibility() -> Result<(), Box<dyn Error>> {
+    Runtime::new()?.block_on(async {
+        let local = LocalRouter::new(GlobalChunkAllocator);
+        let local_handle = local.handle();
+        let hosts = crate::hosts::Hosts::new(&crate::config::Config::default().hosts, None)?;
+        let router = crate::router::Router::new(hosts, local);
+        let handle = router.handle();
+        let owner = account()?;
+        let old = handle
+            .register(&owner, Some("desk"), NonZeroUsize::MIN)
+            .await?;
+        old.handle().tag(SessionTag::Carbons).await?;
+        let index = local_handle.shard_index(owner.as_str());
+        let mut replacement = None;
+        let first = routed("<message to='alice@localhost/desk' id='first'/>").await?;
+        handle
+            .copy_to_tagged(
+                &owner,
+                SessionTag::Carbons,
+                &[],
+                Box::new(|targets| {
+                    assert_eq!(targets, ["alice@localhost/desk"]);
+                    replacement =
+                        local_handle.try_with_shard(index, |shard| -> Result<_, Box<dyn Error>> {
+                            shard.cleanup(&owner, "desk", old.token);
+                            let new = register_probe_session(shard, &local_handle, &owner, "desk")?;
+                            shard.tag(&owner, "desk", new.token, SessionTag::Carbons)?;
+                            Ok(new)
+                        });
+                    Ok(vec![first])
+                }),
+            )
+            .await?;
+        let replacement = replacement.ok_or("copy builder held the shard lock")???;
+        assert_ne!(old.session_id(), replacement.session_id());
+        assert!(old.take_queued().is_empty());
+        assert!(replacement.take_queued().is_empty());
+        let next = routed("<message to='alice@localhost/desk' id='next'/>").await?;
+        handle
+            .copy_to_tagged(
+                &owner,
+                SessionTag::Carbons,
+                &[],
+                Box::new(|targets| {
+                    assert_eq!(targets, ["alice@localhost/desk"]);
+                    Ok(vec![next])
+                }),
+            )
+            .await?;
+        let fresh = replacement.take_queued();
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].stanza.resolve()?.id()?, Some("next"));
+        drop((replacement, old));
+        router.shutdown().await?;
+        Ok(())
+    })
+}
+
+#[test]
 fn copies_skip_sessions_that_change_before_delivery() -> Result<(), Box<dyn Error>> {
     Runtime::new()?.block_on(async {
         let account = account()?;

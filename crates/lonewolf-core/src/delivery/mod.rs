@@ -22,7 +22,7 @@ use lonewolf_extension::{Deliver, Effects, ExtensionFuture};
 use lonewolf_storage::Storage;
 use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::offline::OfflineSequence;
-use lonewolf_storage::{RedbStorage, RedbWrite, StorageError, WriteTransaction};
+use lonewolf_storage::{RedbRead, RedbStorage, RedbWrite, StorageError, WriteTransaction};
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::stanza::{IqType, StanzaType};
@@ -33,6 +33,7 @@ use crate::router::{
     Admitted, DeliveryScope, Destination, Mailbox, MailboxEntry, Registration, RoutedStanza,
     RouterError, RouterHandle, SessionHandle, StoredRelease,
 };
+use crate::stages::message::{MessageRecipients, concrete_recipients};
 
 pub(crate) struct WorkGroup {
     state: Arc<WorkState>,
@@ -121,8 +122,9 @@ pub(crate) struct RouterDelivery<A: ChunkAllocator> {
     router: RouterHandle<A>,
     allocator: A,
     scope: DeliveryScope,
-    /// The requesting resource; server-initiated work has none and cannot tag a session.
+    /// Server-initiated work has no session to tag.
     session: Option<SessionHandle<A>>,
+    received_copies: Option<(AccountKey, Vec<SessionId>)>,
 }
 
 impl<A: ChunkAllocator + Clone> RouterDelivery<A> {
@@ -148,12 +150,21 @@ impl<A: ChunkAllocator + Clone> RouterDelivery<A> {
             allocator: allocator.clone(),
             scope: DeliveryScope::ComponentAware,
             session,
+            received_copies: None,
         }
     }
 
     pub(crate) fn with_scope(mut self, scope: DeliveryScope) -> Self {
         self.scope = scope;
         self
+    }
+
+    pub(crate) fn restrict_received_copies(
+        &mut self,
+        account: &AccountKey,
+        targets: Vec<SessionId>,
+    ) {
+        self.received_copies = Some((account.clone(), targets));
     }
 }
 
@@ -277,6 +288,12 @@ pub(crate) struct StoredDelivery<A: ChunkAllocator> {
     pub(crate) sequence: OfflineSequence,
     pub(crate) stanza: RoutedStanza<A>,
     pub(crate) bytes: usize,
+    pub(crate) policy: Option<(A, RedbRead)>,
+}
+
+pub(crate) struct StoreAdmission {
+    pub(crate) admitted: Admitted,
+    pub(crate) copies: Option<Vec<SessionId>>,
 }
 
 /// A preceding availability snapshot misses this commit, so retry routing after its ticket turns.
@@ -286,18 +303,19 @@ pub(crate) fn commit_and_store<A: ChunkAllocator + Clone + 'static>(
     transaction: RedbWrite,
     handler: Arc<dyn MessageHandler<A, RedbStorage>>,
     stored: StoredDelivery<A>,
-) -> Pending<Result<Admitted, EffectsError>> {
+) -> Pending<Result<StoreAdmission, EffectsError>> {
     let (report_turned, turned) = oneshot::channel();
     let (report_done, done) = oneshot::channel();
     compio::runtime::spawn(guard.run(async move {
-        let result: Result<Admitted, EffectsError> = async {
+        let result: Result<StoreAdmission, EffectsError> = async {
             let ((), mut ticket) = router
                 .order()
                 .fix(
                     stored
                         .source
-                        .into_iter()
-                        .filter(|source| source != &stored.recipient)
+                        .iter()
+                        .filter(|source| *source != &stored.recipient)
+                        .cloned()
                         .chain([stored.recipient.clone()])
                         .collect(),
                     transaction.commit(),
@@ -316,13 +334,36 @@ pub(crate) fn commit_and_store<A: ChunkAllocator + Clone + 'static>(
             );
             ticket.turn().await;
             let _ = report_turned.send(());
+            let copies = if let Some((allocator, snapshot)) = &stored.policy {
+                match concrete_recipients(
+                    &router,
+                    allocator,
+                    Some(snapshot),
+                    stored.source.as_ref(),
+                    Some(&stored.recipient),
+                    &stored.stanza,
+                )
+                .await
+                {
+                    Ok(MessageRecipients::Allowed(copies)) => copies,
+                    Ok(MessageRecipients::Refused(_)) | Err(_) => {
+                        return Ok(StoreAdmission {
+                            admitted: Admitted::None,
+                            copies: Some(Vec::new()),
+                        });
+                    }
+                }
+            } else {
+                None
+            };
             let admitted = match router
-                .route_stored_message(
+                .route_stored_message_to(
                     stored.stanza,
                     StoredRelease {
                         handler,
                         sequence: stored.sequence,
                     },
+                    copies.as_deref(),
                 )
                 .await
             {
@@ -360,7 +401,7 @@ pub(crate) fn commit_and_store<A: ChunkAllocator + Clone + 'static>(
                     Admitted::None
                 }
             };
-            Ok(admitted)
+            Ok(StoreAdmission { admitted, copies })
         }
         .await;
         if let Err(error) = &result {
@@ -519,6 +560,7 @@ impl<A: ChunkAllocator + Clone + 'static> Delivery<A> for RouterDelivery<A> {
             allocator: self.allocator.clone(),
             scope: self.scope,
             session: None,
+            received_copies: None,
         };
         compio::runtime::spawn(async move {
             if work(&delivery).await.is_err() {
@@ -612,8 +654,11 @@ impl<A: ChunkAllocator + Clone + 'static> Delivery<A> for RouterDelivery<A> {
         build: CopyFactory<'a, A>,
     ) -> DeliveryFuture<'a> {
         Box::pin(async move {
+            let targets = self.received_copies.as_ref().and_then(|(owner, targets)| {
+                (tag == SessionTag::Carbons && owner == account).then_some(targets.as_slice())
+            });
             self.router
-                .copy_to_tagged(account, tag, holders, build)
+                .copy_to_tagged_for(account, tag, holders, targets, build)
                 .await
                 .map_err(|_| DeliveryError)
         })

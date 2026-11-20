@@ -1259,7 +1259,7 @@ fn remote_message_admission_preserves_error_and_headline_rules() -> TestResult {
                     }
                     let outcome = deliver(&stage, stanza, kind, MissingRecipientPolicy::Discard).await;
                     if mode == "success" {
-                        assert!(matches!(outcome, Ok(DeliveryOutcome::Routed { admitted: Admitted::None })), "{target} {kind:?} {mode}");
+                        assert!(matches!(outcome, Ok(DeliveryOutcome::Routed { admitted: Admitted::None, .. })), "{target} {kind:?} {mode}");
                         assert_eq!(remote.occupancy(), (1, expected.len()));
                         let snapshot = remote.snapshot();
                         assert_eq!((snapshot.connecting, snapshot.ready, snapshot.queued_stanzas, snapshot.queued_bytes), (1, 0, 1, expected.len() as u64));

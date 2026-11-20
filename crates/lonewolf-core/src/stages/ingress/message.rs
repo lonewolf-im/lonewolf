@@ -9,7 +9,9 @@ use lonewolf_xmpp::stanza::{
 use super::checks::{self, Snapshot};
 use super::{Origin, outbound_blocked_reply, rejection_reply};
 use crate::router::local::SessionHandle;
-use crate::stages::message::{self, DeliveryOutcome, MissingRecipientPolicy};
+use crate::stages::message::{
+    self, DeliveryAdmission, DeliveryOutcome, MessageRecipients, MissingRecipientPolicy,
+};
 use crate::stages::{Stage, StageFailure, archive};
 
 pub(crate) enum Reply<A: ChunkAllocator> {
@@ -53,7 +55,7 @@ pub(crate) async fn handle_from<A: ChunkAllocator + Clone + 'static>(
     let to = view.to()?.ok_or(StageFailure)?;
     let sender = session.map(SessionHandle::account);
     let parties = checks::parties_for(stage.router, sender, to, view.kind())?;
-    let ordered = checks::fix_explicit_snapshot(
+    let mut ordered = checks::fix_explicit_snapshot(
         stage.router,
         stage.storage,
         sender,
@@ -76,14 +78,31 @@ pub(crate) async fn handle_from<A: ChunkAllocator + Clone + 'static>(
     if verdict != Verdict::Allow {
         return policy_disposition(stage.allocator, routed, verdict);
     }
-    let mut admission = ordered.map(|(_, ticket)| ticket);
-    if let Some(ticket) = &mut admission {
+    if let Some((_, ticket)) = &mut ordered {
         ticket.turn().await;
     }
     let liveness = session.map(SessionHandle::liveness);
     if liveness.is_some_and(|session| !session.is_alive()) {
         return Ok(MessageDisposition::Done);
     }
+    let recipients = match message::concrete_recipients(
+        stage.router,
+        stage.allocator,
+        ordered.as_ref().map(|(snapshot, _)| snapshot),
+        sender,
+        parties
+            .recipient
+            .as_ref()
+            .filter(|_| parties.local_recipient),
+        &routed,
+    )
+    .await?
+    {
+        MessageRecipients::Allowed(recipients) => recipients,
+        MessageRecipients::Refused(verdict) => {
+            return policy_disposition(stage.allocator, routed, verdict);
+        }
+    };
     let archive_needed = sender
         .is_some_and(|sender| stage.router.archive_handler(sender.domain()).is_some())
         || (parties.local_recipient && stage.router.archive_handler(to.domainpart()).is_some());
@@ -128,12 +147,15 @@ pub(crate) async fn handle_from<A: ChunkAllocator + Clone + 'static>(
         stanza,
         kind,
         missing_recipient,
-        sender,
-        liveness,
-        admission,
+        DeliveryAdmission {
+            source: sender,
+            liveness,
+            ticket: ordered.map(|(_, ticket)| ticket),
+            recipients,
+        },
     )
     .await?;
-    let outcome = match outcome {
+    let mut outcome = match outcome {
         DeliveryOutcome::Retired => return Ok(MessageDisposition::Done),
         DeliveryOutcome::Policy { stanza, verdict } => {
             return policy_disposition(stage.allocator, stanza, verdict);
@@ -164,7 +186,7 @@ pub(crate) async fn handle_from<A: ChunkAllocator + Clone + 'static>(
             session,
             &parties,
             &observed,
-            &outcome,
+            &mut outcome,
             (sent, received),
             rejection.as_ref(),
         )

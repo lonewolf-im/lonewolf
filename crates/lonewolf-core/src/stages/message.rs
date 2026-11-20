@@ -2,13 +2,14 @@
 
 use std::time::SystemTime;
 
-use lonewolf_extension::delivery::HandlerError;
+use lonewolf_extension::delivery::{HandlerError, SessionId};
 use lonewolf_extension::message::{StoreOutcome, UndeliverableMessage};
-use lonewolf_extension::policy::Verdict;
-use lonewolf_storage::Storage;
+use lonewolf_extension::policy::{Direction, Verdict};
 use lonewolf_storage::account::AccountKey;
+use lonewolf_storage::{RedbRead, Storage};
 use lonewolf_util::arena::{Arena, ArenaConfig, ChunkAllocator};
-use lonewolf_xmpp::stanza::{MessageType, StanzaErrorCondition};
+use lonewolf_xmpp::jid::Jid;
+use lonewolf_xmpp::stanza::{MessageType, StanzaErrorCondition, StanzaType};
 
 use super::{Stage, StageFailure};
 use crate::delivery::{
@@ -18,9 +19,9 @@ use crate::delivery::{
 use crate::order::Ticket;
 use crate::router::local::SessionLiveness;
 use crate::router::metrics::MessageOutcome;
-use crate::router::{Admitted, Destination, RoutedStanza, RouterError};
+use crate::router::{Admitted, Destination, RoutedStanza, RouterError, RouterHandle};
 use crate::stages::ingress::checks::{self, Snapshot};
-use crate::stages::policy::Selection;
+use crate::stages::policy::{self, Check, Selection};
 
 #[derive(Clone, Copy)]
 pub(crate) enum MissingRecipientPolicy {
@@ -31,9 +32,11 @@ pub(crate) enum MissingRecipientPolicy {
 pub(crate) enum DeliveryOutcome<A: ChunkAllocator> {
     Routed {
         admitted: Admitted,
+        copies: Option<Vec<SessionId>>,
     },
     Stored {
         admitted: Admitted,
+        copies: Option<Vec<SessionId>>,
     },
     /// RFC 6121 or the offline fallback discards the message without a reply.
     Discarded,
@@ -60,7 +63,85 @@ enum StorePreparation<A: ChunkAllocator> {
         stanza: RoutedStanza<A>,
         verdict: Verdict,
     },
-    Committed(Pending<Result<Admitted, crate::delivery::EffectsError>>),
+    Committed(Pending<Result<crate::delivery::StoreAdmission, crate::delivery::EffectsError>>),
+}
+
+pub(crate) enum MessageRecipients {
+    Allowed(Option<Vec<SessionId>>),
+    Refused(Verdict),
+}
+
+pub(crate) async fn concrete_recipients<A: ChunkAllocator + Clone>(
+    router: &RouterHandle<A>,
+    allocator: &A,
+    snapshot: Option<&RedbRead>,
+    source: Option<&AccountKey>,
+    recipient: Option<&AccountKey>,
+    stanza: &RoutedStanza<A>,
+) -> Result<MessageRecipients, StageFailure> {
+    let (Some(snapshot), Some(source), Some(recipient)) = (snapshot, source, recipient) else {
+        return Ok(MessageRecipients::Allowed(None));
+    };
+    if source == recipient || !Selection::Explicit.configured(router, source.domain()) {
+        return Ok(MessageRecipients::Allowed(None));
+    }
+    let view = stanza.resolve()?;
+    let kind = view.stanza_type();
+    let StanzaType::Message(message_kind) = kind else {
+        return Err(StageFailure);
+    };
+    let to = view.to()?.ok_or(StageFailure)?;
+    if to.is_bare() && matches!(message_kind, MessageType::Error | MessageType::Groupchat) {
+        return Ok(MessageRecipients::Allowed(None));
+    }
+    let targets = router
+        .message_targets(recipient, to.resourcepart(), message_kind)
+        .await
+        .map_err(|_| StageFailure)?;
+    if targets.is_empty() {
+        return Ok(MessageRecipients::Allowed(Some(Vec::new())));
+    }
+    let has_direct = targets.iter().any(|target| target.direct);
+    let mut allowed = Vec::with_capacity(targets.len());
+    let mut has_allowed_original = false;
+    let mut refusal = Verdict::Allow;
+    let mut arena = Arena::try_new_in(ArenaConfig::default(), allocator.clone())?;
+    for target in targets {
+        let verdict = if target.direct {
+            Verdict::Allow
+        } else {
+            let jid = Jid::from_trusted_parts_in(
+                to.localpart(),
+                to.domainpart(),
+                Some(&target.resource),
+                &mut arena,
+            )?;
+            let checks = [Check {
+                account: source,
+                direction: Direction::Outbound,
+                peer: jid.resolve(&arena)?,
+            }];
+            policy::evaluate_selected_in(router, snapshot, kind, &checks, Selection::Explicit)
+                .await?
+        };
+        if verdict == Verdict::Allow {
+            allowed.push(target.session);
+            has_allowed_original |= target.direct || (!has_direct && target.bare);
+        } else if !has_direct && target.bare {
+            refusal = refusal.strictest(verdict);
+        }
+    }
+    if !has_allowed_original && refusal != Verdict::Allow {
+        return Ok(MessageRecipients::Refused(refusal));
+    }
+    Ok(MessageRecipients::Allowed(Some(allowed)))
+}
+
+pub(crate) struct DeliveryAdmission<'a> {
+    pub(crate) source: Option<&'a AccountKey>,
+    pub(crate) liveness: Option<&'a SessionLiveness>,
+    pub(crate) ticket: Option<Ticket>,
+    pub(crate) recipients: Option<Vec<SessionId>>,
 }
 
 /// Requires a stanza with an authenticated sender.
@@ -69,20 +150,9 @@ pub(crate) async fn deliver_addressed<A: ChunkAllocator + Clone + 'static>(
     routed: RoutedStanza<A>,
     kind: MessageType,
     missing_recipient: MissingRecipientPolicy,
-    source: Option<&AccountKey>,
-    liveness: Option<&SessionLiveness>,
-    admission: Option<Ticket>,
+    admission: DeliveryAdmission<'_>,
 ) -> Result<DeliveryOutcome<A>, StageFailure> {
-    let result = deliver_unrecorded(
-        stage,
-        routed,
-        kind,
-        missing_recipient,
-        source,
-        liveness,
-        admission,
-    )
-    .await;
+    let result = deliver_unrecorded(stage, routed, kind, missing_recipient, admission).await;
     let outcome = match &result {
         Ok(DeliveryOutcome::Routed { .. }) => MessageOutcome::Routed,
         Ok(DeliveryOutcome::Stored { .. }) => MessageOutcome::Stored,
@@ -102,7 +172,19 @@ pub(crate) async fn deliver<A: ChunkAllocator + Clone + 'static>(
     kind: MessageType,
     missing_recipient: MissingRecipientPolicy,
 ) -> Result<DeliveryOutcome<A>, StageFailure> {
-    deliver_addressed(stage, stanza, kind, missing_recipient, None, None, None).await
+    deliver_addressed(
+        stage,
+        stanza,
+        kind,
+        missing_recipient,
+        DeliveryAdmission {
+            source: None,
+            liveness: None,
+            ticket: None,
+            recipients: None,
+        },
+    )
+    .await
 }
 
 async fn deliver_unrecorded<A: ChunkAllocator + Clone + 'static>(
@@ -110,10 +192,14 @@ async fn deliver_unrecorded<A: ChunkAllocator + Clone + 'static>(
     routed: RoutedStanza<A>,
     kind: MessageType,
     missing_recipient: MissingRecipientPolicy,
-    source: Option<&AccountKey>,
-    liveness: Option<&SessionLiveness>,
-    admission: Option<Ticket>,
+    admission: DeliveryAdmission<'_>,
 ) -> Result<DeliveryOutcome<A>, StageFailure> {
+    let DeliveryAdmission {
+        source,
+        liveness,
+        ticket,
+        recipients,
+    } = admission;
     if liveness.is_some_and(|session| !session.is_alive()) {
         return Ok(DeliveryOutcome::Retired);
     }
@@ -135,11 +221,11 @@ async fn deliver_unrecorded<A: ChunkAllocator + Clone + 'static>(
             text: StanzaErrorCondition::ServiceUnavailable.default_text(),
         });
     }
-    let admitted = match stage
+    let route = stage
         .router
-        .route_addressed_message(routed.clone(), liveness.cloned())
-        .await
-    {
+        .route_addressed_message(routed.clone(), liveness.cloned(), recipients.as_deref())
+        .await;
+    let admitted = match route {
         Ok(Some(admitted)) => admitted,
         Ok(None) => return Ok(DeliveryOutcome::Retired),
         Err(error) => {
@@ -152,7 +238,7 @@ async fn deliver_unrecorded<A: ChunkAllocator + Clone + 'static>(
             if error == RouterError::Offline
                 && matches!(kind, MessageType::Normal | MessageType::Chat)
             {
-                drop(admission);
+                drop(ticket);
                 return store(stage, routed, missing_recipient, source, liveness).await;
             }
             let condition = match error {
@@ -181,7 +267,10 @@ async fn deliver_unrecorded<A: ChunkAllocator + Clone + 'static>(
             });
         }
     };
-    Ok(DeliveryOutcome::Routed { admitted })
+    Ok(DeliveryOutcome::Routed {
+        admitted,
+        copies: recipients,
+    })
 }
 
 async fn store<A: ChunkAllocator + Clone + 'static>(
@@ -223,7 +312,7 @@ async fn store<A: ChunkAllocator + Clone + 'static>(
         if liveness.is_some_and(|session| !session.is_alive()) {
             return Ok(StorePreparation::Retired);
         }
-        if checks::explicit_applies(stage.router, source, Some(&recipient)) {
+        let snapshot = if checks::explicit_applies(stage.router, source, Some(&recipient)) {
             let snapshot = stage.storage.begin_read().await.map_err(|error| {
                 report_failure(
                     storage_failure(error, "offline_store_policy_begin_read"),
@@ -247,7 +336,12 @@ async fn store<A: ChunkAllocator + Clone + 'static>(
                     verdict,
                 });
             }
-        }
+            source
+                .filter(|source| Selection::Explicit.configured(stage.router, source.domain()))
+                .map(|_| snapshot)
+        } else {
+            None
+        };
         if liveness.is_some_and(|session| !session.is_alive()) {
             return Ok(StorePreparation::Retired);
         }
@@ -301,6 +395,7 @@ async fn store<A: ChunkAllocator + Clone + 'static>(
                     sequence,
                     stanza: routed,
                     bytes,
+                    policy: snapshot.map(|snapshot| (stage.allocator.clone(), snapshot)),
                 },
             )),
         })
@@ -317,12 +412,15 @@ async fn store<A: ChunkAllocator + Clone + 'static>(
             Ok(DeliveryOutcome::Policy { stanza, verdict })
         }
         StorePreparation::Committed(pending) => {
-            let admitted = pending
+            let admission = pending
                 .finished()
                 .await
                 .ok_or(StageFailure)?
                 .map_err(|_| StageFailure)?;
-            Ok(DeliveryOutcome::Stored { admitted })
+            Ok(DeliveryOutcome::Stored {
+                admitted: admission.admitted,
+                copies: admission.copies,
+            })
         }
     }
 }

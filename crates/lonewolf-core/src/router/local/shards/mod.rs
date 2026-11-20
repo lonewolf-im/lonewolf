@@ -15,7 +15,7 @@ use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::{ArenaRead, ChunkAllocator};
 #[cfg(test)]
 use lonewolf_xmpp::jid::JidRef;
-use lonewolf_xmpp::stanza::{PresenceType, StanzaRef, StanzaType};
+use lonewolf_xmpp::stanza::{MessageType, PresenceType, StanzaRef, StanzaType};
 use parking_lot::Mutex as PlMutex;
 
 use super::registration::{
@@ -28,7 +28,9 @@ use super::shard::Shard;
 #[cfg(test)]
 use crate::config::limits::default_max_directed_presence_recipients_per_resource;
 use crate::router::metrics::RouterMetrics;
-use crate::router::{Admitted, RoutedStanza, RouterError, RouterFailure, RouterState};
+use crate::router::{
+    Admitted, MessageTarget, RoutedStanza, RouterError, RouterFailure, RouterState,
+};
 
 const SHARD_COUNT: usize = 256;
 
@@ -259,8 +261,9 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
         stanza: RoutedStanza<A>,
         release: Option<StoredRelease<A>>,
         source: Option<SessionLiveness>,
+        allowed: Option<&[SessionId]>,
     ) -> Result<Option<Admitted>, RouterError> {
-        self.deliver_full_or_chat_fallback(stanza, true, source, release)
+        self.deliver_full_with_filter(stanza, true, source, release, allowed)
             .await
     }
 
@@ -271,16 +274,29 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
         source: Option<SessionLiveness>,
         release: Option<StoredRelease<A>>,
     ) -> Result<Option<Admitted>, RouterError> {
+        self.deliver_full_with_filter(stanza, fallback_chat, source, release, None)
+            .await
+    }
+
+    async fn deliver_full_with_filter(
+        &self,
+        stanza: RoutedStanza<A>,
+        fallback_chat: bool,
+        source: Option<SessionLiveness>,
+        release: Option<StoredRelease<A>>,
+        allowed: Option<&[SessionId]>,
+    ) -> Result<Option<Admitted>, RouterError> {
         let shard = {
             let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
             self.full_target_shard(&view)?
         };
         self.with_shard(shard, |shard| {
-            shard.deliver_with_guard(
+            shard.deliver_full_with_filter(
                 stanza,
                 fallback_chat,
                 || source.as_ref().is_none_or(SessionLiveness::is_alive),
                 release,
+                allowed,
             )
         })
         .await?
@@ -308,7 +324,7 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
         stanza: RoutedStanza<A>,
         release: Option<StoredRelease<A>>,
     ) -> Result<Admitted, RouterError> {
-        self.deliver_bare_message(stanza, release, None)
+        self.deliver_bare_message(stanza, release, None, None)
             .await
             .map(|result| result.unwrap_or(Admitted::None))
     }
@@ -318,6 +334,7 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
         stanza: RoutedStanza<A>,
         release: Option<StoredRelease<A>>,
         source: Option<SessionLiveness>,
+        allowed: Option<&[SessionId]>,
     ) -> Result<Option<Admitted>, RouterError> {
         let shard = {
             let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
@@ -327,9 +344,23 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
             if source.as_ref().is_some_and(|session| !session.is_alive()) {
                 return Ok(None);
             }
-            shard.deliver_bare(stanza, false, release).map(Some)
+            shard
+                .deliver_bare_with_filter(stanza, false, release, allowed)
+                .map(Some)
         })
         .await?
+    }
+
+    pub(crate) async fn message_targets(
+        &self,
+        account: &AccountKey,
+        resource: Option<&str>,
+        kind: MessageType,
+    ) -> Result<Vec<MessageTarget>, RouterError> {
+        self.with_shard(self.shard_index(account.as_str()), |shard| {
+            shard.message_targets(account, resource, kind)
+        })
+        .await
     }
 
     pub(crate) async fn deliver_presence(
@@ -560,7 +591,7 @@ impl<A: ChunkAllocator> LocalRouterHandle<A> {
         self.inner.lifecycle.lock().state
     }
 
-    /// The operation must borrow, not own, values whose drop can wake a task.
+    /// Borrow values whose drop can wake a task while the shard is locked.
     pub(super) async fn with_shard<R>(
         &self,
         index: usize,

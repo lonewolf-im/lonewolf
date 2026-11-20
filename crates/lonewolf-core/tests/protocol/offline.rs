@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+mod blocking;
+
 use lonewolf_storage::roster::RosterQuota;
 
 use crate::support::{ALTERNATE_PASSWORD, OTHER_PASSWORD};

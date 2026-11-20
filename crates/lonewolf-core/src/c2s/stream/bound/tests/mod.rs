@@ -38,6 +38,7 @@ mod iq_errors;
 mod iq_policy;
 mod observers;
 mod remote;
+mod replay_policy;
 mod session_iq;
 mod vcard;
 
@@ -54,6 +55,7 @@ pub(super) struct ControlledWriter {
     pub(super) partial_entered: Option<oneshot::Sender<()>>,
     pub(super) partial_release: Option<oneshot::Receiver<()>>,
     pub(super) fail_write: bool,
+    fail_write_id: Option<&'static str>,
     fail_flush: bool,
     fail_flush_at: Option<usize>,
     pub(super) flush_entered: Option<oneshot::Sender<()>>,
@@ -68,7 +70,7 @@ impl ControlledWriter {
         &mut self,
         stanza: &StanzaRef<'_, R>,
     ) -> Result<(), CloseOutcome> {
-        if self.fail_write {
+        if self.fail_write || (self.fail_write_id.is_some() && self.fail_write_id == stanza.id()?) {
             return Err(CloseOutcome::TransportError);
         }
         if let Some(pool) = &self.pool {
@@ -3001,6 +3003,28 @@ fn page_message(index: usize, length: usize) -> Vec<u8> {
     bytes.resize(length - suffix.len(), b'x');
     bytes.extend_from_slice(suffix);
     bytes
+}
+
+async fn parsed(xml: &str) -> TestResult<Parsed<Stanza, GlobalChunkAllocator>> {
+    let xml = format!(
+        "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client'>{xml}"
+    );
+    let mut parser = XmppParser::new(
+        xml.as_bytes(),
+        ParserConfig {
+            max_stanza_bytes: NonZeroUsize::new(4096).ok_or("limit")?,
+            arena: ArenaConfig::default(),
+        },
+        GlobalChunkAllocator,
+    );
+    assert!(matches!(
+        parser.next_event().await?,
+        Some(StreamEvent::StreamStart { .. })
+    ));
+    match parser.next_event().await? {
+        Some(StreamEvent::Stanza(stanza)) => Ok(stanza),
+        _ => Err("missing stanza".into()),
+    }
 }
 
 async fn paged_fixture() -> TestResult<Fixture> {

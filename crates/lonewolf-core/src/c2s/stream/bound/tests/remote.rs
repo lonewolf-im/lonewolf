@@ -60,28 +60,6 @@ impl PolicyHandler<RedbStorage> for Policy {
     }
 }
 
-async fn parsed(xml: &str) -> TestResult<Parsed<Stanza, GlobalChunkAllocator>> {
-    let xml = format!(
-        "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client'>{xml}"
-    );
-    let mut parser = XmppParser::new(
-        xml.as_bytes(),
-        ParserConfig {
-            max_stanza_bytes: NonZeroUsize::new(4096).ok_or("limit")?,
-            arena: ArenaConfig::default(),
-        },
-        GlobalChunkAllocator,
-    );
-    assert!(matches!(
-        parser.next_event().await?,
-        Some(StreamEvent::StreamStart { .. })
-    ));
-    match parser.next_event().await? {
-        Some(StreamEvent::Stanza(stanza)) => Ok(stanza),
-        _ => Err("missing stanza".into()),
-    }
-}
-
 async fn session<'a>(
     fixture: &'a Fixture,
     remote: &RemoteFixture,

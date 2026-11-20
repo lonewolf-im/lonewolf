@@ -106,7 +106,8 @@ pub trait MessageHandler<A: ChunkAllocator, S: Storage>: Send + Sync {
         })
     }
 
-    /// Removes messages through `through` after a session delivers the replayed copies.
+    /// Removes records through `through` inclusive.
+    /// Each record must have a flushed replay copy or a permanent discard decision.
     fn acknowledge<'a>(
         &'a self,
         _account: &'a AccountKey,
@@ -116,7 +117,8 @@ pub trait MessageHandler<A: ChunkAllocator, S: Storage>: Send + Sync {
         Box::pin(async { Ok(()) })
     }
 
-    /// Removes a stored message after a session delivers its live copy; the row may already be gone.
+    /// Removes only `sequence` after its copy flushes or replay permanently discards it.
+    /// Succeeds if the record is already absent.
     fn acknowledge_one<'a>(
         &'a self,
         _account: &'a AccountKey,

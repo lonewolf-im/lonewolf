@@ -558,13 +558,16 @@ fn filtered_delivery_cannot_inherit_a_retired_session_admission() -> TestResult 
         replacement.handle().tag(SessionTag::Carbons).await?;
         assert_eq!(old.full_jid(), replacement.full_jid());
         assert_ne!(approved[0], replacement.session_id());
-        for target in ["alice@localhost", "alice@localhost/desk"] {
+        for (target, expected) in [
+            ("alice@localhost", RouterError::NotFound),
+            ("alice@localhost/desk", RouterError::Offline),
+        ] {
             let stanza = parse_stanza(&format!("<message to='{target}' type='chat'/>")).await?;
             assert_eq!(
                 handle
                     .route_addressed_message(stanza, None, Some(&approved))
                     .await,
-                Err(RouterError::NotFound)
+                Err(expected)
             );
         }
         handle

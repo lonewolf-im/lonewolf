@@ -987,14 +987,10 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
         let recipient = self
             .accounts
             .get(account)
-            .and_then(|sessions| sessions.get(resource));
-        if recipient.is_some_and(|session| {
-            session.alive.load(Ordering::Acquire)
-                && !session.outbound.is_closed()
-                && allowed.is_some_and(|ids| !ids.contains(&SessionId::new(session.token)))
-        }) {
-            return Err(RouterError::NotFound);
-        }
+            .and_then(|sessions| sessions.get(resource))
+            .filter(|session| {
+                allowed.is_none_or(|ids| ids.contains(&SessionId::new(session.token)))
+            });
         let result = recipient.map(|session| {
             let delivery = if !valid() {
                 Ok(None)
@@ -1127,8 +1123,16 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
             session.accepts_bare_message()
                 && allowed.is_none_or(|ids| ids.contains(&SessionId::new(session.token)))
         };
+        let addressed = to
+            .resourcepart()
+            .and_then(|resource| sessions.get(resource))
+            .map(|session| session.token);
         let offline_or_filtered = || {
-            if allowed.is_some() && sessions.values().any(Session::accepts_bare_message) {
+            if allowed.is_some()
+                && sessions.values().any(|session| {
+                    Some(session.token) != addressed && session.accepts_bare_message()
+                })
+            {
                 RouterError::NotFound
             } else {
                 RouterError::Offline
@@ -1141,7 +1145,13 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
                     .filter(filter)
                     .max_by_key(|session| (session.priority, std::cmp::Reverse(session.token)))
                     .ok_or_else(offline_or_filtered)?;
-                enqueue_bare_message(sessions, recipient, stanza, release)
+                enqueue_bare_message(sessions, recipient, stanza, release).map_err(|error| {
+                    if allowed.is_some() && error == RouterError::NotFound {
+                        offline_or_filtered()
+                    } else {
+                        error
+                    }
+                })
             }
             StanzaType::Message(MessageType::Headline) => {
                 debug_assert!(release.is_none());

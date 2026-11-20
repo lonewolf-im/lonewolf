@@ -1199,8 +1199,7 @@ fn guarded_delivery_from_a_stopped_source_reports_no_session() -> Result<(), Box
         shard.remove(owner.as_str(), "source", source.token, RetireCause::Evicted);
         assert!(!liveness.is_alive());
         let admitted = shard.deliver_with_guard(message, true, || liveness.is_alive(), None)?;
-        assert!(matches!(admitted, Admitted::None));
-        assert_eq!(admitted.as_slice(), []);
+        assert!(admitted.is_none());
         assert!(target.take_queued().is_empty());
         assert!(target.liveness().is_alive());
         Ok(())

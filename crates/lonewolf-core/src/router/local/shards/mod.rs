@@ -258,8 +258,9 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
         &self,
         stanza: RoutedStanza<A>,
         release: Option<StoredRelease<A>>,
-    ) -> Result<Admitted, RouterError> {
-        self.deliver_full_or_chat_fallback(stanza, true, None, release)
+        source: Option<SessionLiveness>,
+    ) -> Result<Option<Admitted>, RouterError> {
+        self.deliver_full_or_chat_fallback(stanza, true, source, release)
             .await
     }
 
@@ -269,16 +270,18 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
         fallback_chat: bool,
         source: Option<SessionLiveness>,
         release: Option<StoredRelease<A>>,
-    ) -> Result<Admitted, RouterError> {
+    ) -> Result<Option<Admitted>, RouterError> {
         let shard = {
             let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
             self.full_target_shard(&view)?
         };
-        self.with_shard(shard, |shard| match &source {
-            Some(source) => {
-                shard.deliver_with_guard(stanza, fallback_chat, || source.is_alive(), release)
-            }
-            None => shard.deliver(stanza, fallback_chat, release),
+        self.with_shard(shard, |shard| {
+            shard.deliver_with_guard(
+                stanza,
+                fallback_chat,
+                || source.as_ref().is_none_or(SessionLiveness::is_alive),
+                release,
+            )
         })
         .await?
     }
@@ -299,17 +302,34 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
         .await?
     }
 
+    #[cfg(test)]
     pub(crate) async fn deliver_bare(
         &self,
         stanza: RoutedStanza<A>,
         release: Option<StoredRelease<A>>,
     ) -> Result<Admitted, RouterError> {
+        self.deliver_bare_message(stanza, release, None)
+            .await
+            .map(|result| result.unwrap_or(Admitted::None))
+    }
+
+    pub(crate) async fn deliver_bare_message(
+        &self,
+        stanza: RoutedStanza<A>,
+        release: Option<StoredRelease<A>>,
+        source: Option<SessionLiveness>,
+    ) -> Result<Option<Admitted>, RouterError> {
         let shard = {
             let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
             self.bare_target_shard(&view)?
         };
-        self.with_shard(shard, |shard| shard.deliver_bare(stanza, false, release))
-            .await?
+        self.with_shard(shard, |shard| {
+            if source.as_ref().is_some_and(|session| !session.is_alive()) {
+                return Ok(None);
+            }
+            shard.deliver_bare(stanza, false, release).map(Some)
+        })
+        .await?
     }
 
     pub(crate) async fn deliver_presence(
@@ -354,9 +374,18 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
             .await?
     }
 
+    #[cfg(test)]
     pub(crate) async fn deliver_presence_error(
         &self,
         stanza: RoutedStanza<A>,
+    ) -> Result<(), RouterError> {
+        self.deliver_presence_error_guarded(stanza, None).await
+    }
+
+    pub(crate) async fn deliver_presence_error_guarded(
+        &self,
+        stanza: RoutedStanza<A>,
+        source: Option<SessionLiveness>,
     ) -> Result<(), RouterError> {
         let shard = {
             let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
@@ -366,6 +395,9 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
             self.bare_target_shard(&view)?
         };
         self.with_shard(shard, |shard| {
+            if source.as_ref().is_some_and(|session| !session.is_alive()) {
+                return Ok(());
+            }
             shard.deliver_presence_where(stanza, |session| session.priority.is_some())
         })
         .await?

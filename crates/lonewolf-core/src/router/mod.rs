@@ -717,11 +717,22 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         self.local.deliver_full_guarded(stanza, source).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn route_message(
         &self,
         stanza: RoutedStanza<A>,
     ) -> Result<Admitted, RouterError> {
-        self.route_message_with(stanza, None).await
+        self.route_addressed_message(stanza, None)
+            .await
+            .map(|result| result.unwrap_or(Admitted::None))
+    }
+
+    pub(crate) async fn route_addressed_message(
+        &self,
+        stanza: RoutedStanza<A>,
+        source: Option<SessionLiveness>,
+    ) -> Result<Option<Admitted>, RouterError> {
+        self.route_message_with(stanza, None, source).await
     }
 
     pub(crate) async fn route_stored_message(
@@ -729,14 +740,20 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         stanza: RoutedStanza<A>,
         release: StoredRelease<A>,
     ) -> Result<Admitted, RouterError> {
-        self.route_message_with(stanza, Some(release)).await
+        self.route_message_with(stanza, Some(release), None)
+            .await
+            .map(|result| result.unwrap_or(Admitted::None))
     }
 
     async fn route_message_with(
         &self,
         stanza: RoutedStanza<A>,
         release: Option<StoredRelease<A>>,
-    ) -> Result<Admitted, RouterError> {
+        source: Option<SessionLiveness>,
+    ) -> Result<Option<Admitted>, RouterError> {
+        if source.as_ref().is_some_and(|session| !session.is_alive()) {
+            return Ok(None);
+        }
         let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
         if !matches!(view.stanza_type(), StanzaType::Message(_)) {
             return Err(RouterError::InvalidTarget);
@@ -749,12 +766,16 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         match destination {
             Destination::Remote if release.is_some() => Err(RouterError::InvalidTarget),
             Destination::Remote if self.federation_enabled() => {
-                self.route_remote(stanza).map(|()| Admitted::None)
+                self.route_remote(stanza).map(|()| Some(Admitted::None))
             }
             Destination::Service | Destination::Remote => Err(RouterError::RemoteUnsupported),
             Destination::Server | Destination::ServerResource => Err(RouterError::NotFound),
-            Destination::Resource => self.local.deliver_message(stanza, release).await,
-            Destination::Account => self.local.deliver_bare(stanza, release).await,
+            Destination::Resource => self.local.deliver_message(stanza, release, source).await,
+            Destination::Account => {
+                self.local
+                    .deliver_bare_message(stanza, release, source)
+                    .await
+            }
         }
     }
 
@@ -809,6 +830,14 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         &self,
         stanza: RoutedStanza<A>,
     ) -> Result<(), RouterError> {
+        self.route_addressed_presence_error(stanza, None).await
+    }
+
+    pub(crate) async fn route_addressed_presence_error(
+        &self,
+        stanza: RoutedStanza<A>,
+        source: Option<SessionLiveness>,
+    ) -> Result<(), RouterError> {
         let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
         if view.stanza_type() != StanzaType::Presence(PresenceType::Error) {
             return Err(RouterError::InvalidTarget);
@@ -824,9 +853,14 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
             return Err(RouterError::InvalidTarget);
         }
         if to.resourcepart().is_some() {
-            self.route_full(stanza).await
+            match source {
+                Some(source) => self.route_full_guarded(stanza, source).await,
+                None => self.route_full(stanza).await,
+            }
         } else {
-            self.local.deliver_presence_error(stanza).await
+            self.local
+                .deliver_presence_error_guarded(stanza, source)
+                .await
         }
     }
 

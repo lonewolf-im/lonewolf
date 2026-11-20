@@ -57,8 +57,8 @@ impl<A: ChunkAllocator> From<&DeliveryOutcome<A>> for MessageOutcome {
         match outcome {
             DeliveryOutcome::Routed { .. } => Self::Routed,
             DeliveryOutcome::Stored { .. } => Self::Stored,
-            DeliveryOutcome::Discarded => Self::Discarded,
-            DeliveryOutcome::Rejected { .. } => Self::Rejected,
+            DeliveryOutcome::Discarded | DeliveryOutcome::Retired => Self::Discarded,
+            DeliveryOutcome::Rejected { .. } | DeliveryOutcome::Policy { .. } => Self::Rejected,
         }
     }
 }

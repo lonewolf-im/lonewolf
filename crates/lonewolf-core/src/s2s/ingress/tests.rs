@@ -1428,6 +1428,50 @@ fn inbound_presence_routes_available_unavailable_full_offline_and_errors() -> Te
 }
 
 #[test]
+fn federated_addressed_presence_checks_full_peer_before_normalizing() -> TestResult {
+    use lonewolf_extension::blocking::{Blocking, NAME};
+    use lonewolf_extension::roster::Roster;
+    use lonewolf_storage::blocking::{BlockChange, BlockingWrites};
+    use lonewolf_storage::roster::{RosterJid, RosterReads};
+
+    compio::runtime::Runtime::new()?.block_on(async {
+        let mut extensions = Extensions::default();
+        extensions.register(Arc::new(Blocking))?;
+        extensions.register(Arc::new(Roster::default()))?;
+        let fixture = Fixture::new(extensions, &[NAME, "roster"])?;
+        create_iq_account(&fixture).await?;
+        let owner = account()?;
+        let phone = fixture.context.router.register(&owner, Some("phone"), NonZeroUsize::MIN).await?;
+        let mut arena = Arena::try_new(Default::default())?;
+        let blocked = Jid::parse_in("alice@remote.test/desk", &mut arena)?;
+        let blocked = blocked.resolve(&arena)?;
+        let bare = RosterJid::from(blocked.bare());
+        let mut write = fixture.context.storage.begin_write().await?;
+        write.change_blocklist(&owner, BlockChange::Block(&[RosterJid::from(blocked)])).await?;
+        write.commit().await?;
+
+        for (resource, denied) in [("desk", true), ("tablet", false)] {
+            fixture.dispatch(&format!(
+                "<presence type='error' from='alice@remote.test/{resource}' to='bob@example.com/phone'><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></presence>"
+            )).await?;
+            let delivered = phone.take_queued();
+            assert_eq!(delivered.len(), usize::from(!denied));
+            if let Some(entry) = delivered.first() {
+                assert_eq!(entry.stanza.resolve()?.stanza_type(), StanzaType::Presence(PresenceType::Error));
+            }
+            fixture.dispatch(&format!(
+                "<presence type='subscribe' from='alice@remote.test/{resource}' to='bob@example.com'/>"
+            )).await?;
+            let read = fixture.context.storage.begin_read().await?;
+            assert_eq!(read.pending_request_exists(&owner, &bare).await?, !denied);
+            assert!(fixture.remote.receive()?.is_none());
+        }
+        drop(phone);
+        fixture.finish().await
+    })
+}
+
+#[test]
 fn inbound_probes_preserve_authorization_availability_and_directed_privacy() -> TestResult {
     compio::runtime::Runtime::new()?.block_on(async {
         let handler = Arc::new(Iqs::new(Verdict::Allow, true));

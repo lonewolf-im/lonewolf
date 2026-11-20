@@ -103,6 +103,7 @@ impl<A: ChunkAllocator> Clone for Retired<A> {
 }
 
 impl<A: ChunkAllocator> Registration<A> {
+    #[cfg(test)]
     pub(crate) fn session_id(&self) -> SessionId {
         SessionId::new(self.token)
     }
@@ -249,6 +250,18 @@ impl<A: ChunkAllocator + Clone> Clone for SessionHandle<A> {
 }
 
 impl<A: ChunkAllocator> SessionHandle<A> {
+    pub(crate) fn account(&self) -> &AccountKey {
+        &self.account
+    }
+
+    pub(crate) fn session_id(&self) -> SessionId {
+        SessionId::new(self.token)
+    }
+
+    pub(crate) fn liveness(&self) -> &SessionLiveness {
+        &self.liveness
+    }
+
     pub(crate) fn matches(&self, jid: JidRef<'_>) -> bool {
         jid.bare().as_str() == self.account.as_str()
             && jid.resourcepart() == Some(self.resource.as_ref())

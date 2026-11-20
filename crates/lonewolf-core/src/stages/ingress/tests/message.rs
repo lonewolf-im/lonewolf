@@ -6,10 +6,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use compio::runtime::Runtime;
+use futures_channel::oneshot;
 use futures_util::FutureExt;
+use futures_util::future::{Either, select};
 use lonewolf_extension::archive::{
     ArchiveDirection, ArchiveFuture, ArchiveHandler, ArchiveId, ArchiveOutcome, ArchiveRequest,
 };
+use lonewolf_extension::blocking::{Blocking, NAME as BLOCKING};
 use lonewolf_extension::delivery::{Delivery, DeliveryError, DeliveryFuture, SessionId};
 use lonewolf_extension::observer::{MessageEvent, MessageObserver, MessageOutcome, MessageRole};
 use lonewolf_extension::policy::{Direction, PolicyFuture, PolicyHandler, PolicyRequest, Verdict};
@@ -31,7 +34,11 @@ use crate::router::metrics::MessageOutcome as MetricOutcome;
 use crate::router::{Router, RouterHandle};
 use crate::stages::Stage;
 use crate::stages::ingress::Origin;
+use crate::stages::ingress::message::handle_from;
 use crate::stages::ingress::message::{MessageDisposition, Reply, handle};
+use crate::stages::message::MissingRecipientPolicy;
+
+type ObserverGate = (oneshot::Sender<()>, oneshot::Receiver<()>);
 
 #[derive(Debug, PartialEq)]
 enum Call {
@@ -52,6 +59,8 @@ struct Recorder {
     archive_rejects: bool,
     observer_fails: bool,
     calls: PlMutex<Vec<Call>>,
+    checking: PlMutex<Option<oneshot::Sender<()>>>,
+    observing: PlMutex<Option<ObserverGate>>,
 }
 
 impl Extension<GlobalChunkAllocator, RedbStorage> for Recorder {
@@ -76,6 +85,9 @@ impl PolicyHandler<RedbStorage> for Recorder {
             request.account.as_str().into(),
             request.direction,
         ));
+        if let Some(checking) = self.checking.lock().take() {
+            let _ = checking.send(());
+        }
         Box::pin(async move { Ok(self.verdict) })
     }
 }
@@ -124,7 +136,12 @@ impl MessageObserver<GlobalChunkAllocator, RedbStorage> for Recorder {
             holders: event.holders.to_vec(),
             rejection: event.rejection.is_some(),
         });
+        let gate = self.observing.lock().take();
         Box::pin(async move {
+            if let Some((entered, resume)) = gate {
+                let _ = entered.send(());
+                resume.await.map_err(|_| DeliveryError)?;
+            }
             if self.observer_fails {
                 Err(DeliveryError)
             } else {
@@ -145,6 +162,15 @@ struct Fixture {
 
 impl Fixture {
     fn new(verdict: Verdict, archive_rejects: bool, observer_fails: bool) -> TestResult<Self> {
+        Self::configured(verdict, archive_rejects, observer_fails, false)
+    }
+
+    fn configured(
+        verdict: Verdict,
+        archive_rejects: bool,
+        observer_fails: bool,
+        blocking: bool,
+    ) -> TestResult<Self> {
         let directory = tempfile::tempdir()?;
         let storage = RedbStorage::open(directory.path().join("lonewolf.dat"))?;
         let recorder = Arc::new(Recorder {
@@ -152,16 +178,24 @@ impl Fixture {
             archive_rejects,
             observer_fails,
             calls: PlMutex::new(Vec::new()),
+            checking: PlMutex::new(None),
+            observing: PlMutex::new(None),
         });
         let mut extensions = Extensions::default();
         extensions.register(recorder.clone())?;
+        extensions.register(Arc::new(Blocking))?;
+        let names = if blocking {
+            &[BLOCKING, "pipeline-recorder"][..]
+        } else {
+            &["pipeline-recorder"][..]
+        };
         let router = Router::new(
             Hosts::new(&Config::default().hosts, None)?,
             LocalRouter::new(GlobalChunkAllocator),
         )
         .with_extensions(BTreeMap::from([(
             "localhost".into(),
-            extensions.enable_host("localhost", ["pipeline-recorder"])?,
+            extensions.enable_host("localhost", names.iter().copied())?,
         )]));
         let handle = router.handle();
         Ok(Self {
@@ -181,6 +215,182 @@ impl Fixture {
             work: &self.work,
         }
     }
+}
+
+#[test]
+fn admitted_message_finishes_both_observers_after_sender_retirement() -> TestResult {
+    Runtime::new()?.block_on(compio::time::timeout(Duration::from_secs(5), async {
+        let fixture = Fixture::configured(Verdict::Allow, false, false, true)?;
+        let sender = account("alice@localhost")?;
+        let recipient = account("bob@localhost")?;
+        let origin = fixture
+            .handle
+            .register(&sender, Some("desk"), NonZeroUsize::MIN)
+            .await?;
+        let target = fixture
+            .handle
+            .register(&recipient, Some("phone"), NonZeroUsize::MIN)
+            .await?;
+        let origin_id = origin.session_id();
+        let target_id = target.session_id();
+        let (entered, observing) = oneshot::channel();
+        let (resume, waiting) = oneshot::channel();
+        *fixture.recorder.observing.lock() = Some((entered, waiting));
+        let source = origin.handle();
+        let message = stanza("alice@localhost/desk", "bob@localhost/phone")?;
+        let service_router = fixture.handle.clone();
+        let storage = fixture.storage.clone();
+        let mut work = WorkGroup::new();
+        let worker = work.handle();
+        let pending = crate::delivery::Pending::spawn(work.start(), async move {
+            let stage = Stage {
+                router: &service_router,
+                storage: &storage,
+                allocator: &GlobalChunkAllocator,
+                work: &worker,
+            };
+            handle_from(
+                &stage,
+                Some(&source),
+                message,
+                MessageType::Chat,
+                MissingRecipientPolicy::Discard,
+            )
+            .await
+        });
+        observing.await?;
+        assert_eq!(target.take_queued().len(), 1);
+        fixture.handle.retire_account(&sender).await?;
+        origin.wait_retired().await?;
+        let replacement = fixture
+            .handle
+            .register(&sender, Some("desk"), NonZeroUsize::MIN)
+            .await?;
+        assert_ne!(replacement.session_id(), origin_id);
+        drop(pending);
+        resume.send(()).map_err(|_| "observer canceled")?;
+        work.drain().await;
+        let observations = fixture
+            .recorder
+            .calls
+            .lock()
+            .iter()
+            .filter_map(|call| {
+                if let Call::Observe {
+                    role,
+                    outcome,
+                    holders,
+                    ..
+                } = call
+                {
+                    Some((*role, *outcome, holders.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            observations,
+            [
+                (MessageRole::Sent, MessageOutcome::Routed, vec![origin_id]),
+                (
+                    MessageRole::Received,
+                    MessageOutcome::Routed,
+                    vec![target_id]
+                ),
+            ]
+        );
+        drop((replacement, origin, target));
+        fixture.router.shutdown().await?;
+        Ok(())
+    }))?
+}
+
+#[test]
+fn retired_sender_cannot_admit_message_with_its_replacement_address() -> TestResult {
+    Runtime::new()?.block_on(compio::time::timeout(Duration::from_secs(5), async {
+        let fixture = Fixture::configured(Verdict::Allow, false, false, true)?;
+        let sender = account("alice@localhost")?;
+        let recipient = account("bob@localhost")?;
+        let stale = fixture
+            .handle
+            .register(&sender, Some("desk"), NonZeroUsize::MIN)
+            .await?;
+        let target = fixture
+            .handle
+            .register(&recipient, Some("phone"), NonZeroUsize::MIN)
+            .await?;
+        let ((), mut blocker) = fixture
+            .handle
+            .order()
+            .fix(vec![sender.clone()], async {
+                Ok::<_, crate::stages::StageFailure>(())
+            })
+            .await
+            .map_err(|_| "could not fix admission ticket")?;
+        blocker.turn().await;
+        let (checking, checked) = oneshot::channel();
+        *fixture.recorder.checking.lock() = Some(checking);
+        let stage = fixture.stage();
+        let source = Origin::Session(&stale);
+        let message = stanza("alice@localhost/desk", "bob@localhost/phone")?;
+        let mut pending = Box::pin(handle(&stage, &source, message.clone(), MessageType::Chat));
+        match select(checked, pending.as_mut()).await {
+            Either::Left((signal, _)) => signal?,
+            Either::Right(_) => return Err("message completed before the admission ticket".into()),
+        }
+        fixture.handle.retire_account(&sender).await?;
+        stale.wait_retired().await?;
+        let replacement = fixture
+            .handle
+            .register(&sender, Some("desk"), NonZeroUsize::MIN)
+            .await?;
+        assert_eq!(stale.full_jid(), replacement.full_jid());
+        assert_ne!(stale.session_id(), replacement.session_id());
+        drop(blocker);
+        assert!(matches!(
+            pending.await.map_err(|_| "message stage")?,
+            MessageDisposition::Done
+        ));
+        assert!(target.take_queued().is_empty());
+        assert!(
+            fixture
+                .recorder
+                .calls
+                .lock()
+                .iter()
+                .all(|call| matches!(call, Call::Policy(_, _)))
+        );
+        fixture.recorder.calls.lock().clear();
+
+        let live = Origin::Session(&replacement);
+        assert!(matches!(
+            handle(&stage, &live, message, MessageType::Chat)
+                .await
+                .map_err(|_| "message stage")?,
+            MessageDisposition::Done
+        ));
+        assert_eq!(target.take_queued().len(), 1);
+        assert!(
+            fixture
+                .recorder
+                .calls
+                .lock()
+                .iter()
+                .any(|call| matches!(call, Call::Archive(_, _)))
+        );
+        assert!(
+            fixture
+                .recorder
+                .calls
+                .lock()
+                .iter()
+                .any(|call| matches!(call, Call::Observe { .. }))
+        );
+        drop((replacement, stale, target));
+        fixture.router.shutdown().await?;
+        Ok(())
+    }))?
 }
 
 #[test]

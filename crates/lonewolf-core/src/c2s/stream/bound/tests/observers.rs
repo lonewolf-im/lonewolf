@@ -71,6 +71,39 @@ struct TestService {
     reply: Option<RoutedStanza<GlobalChunkAllocator>>,
 }
 
+struct GatedService {
+    accepted: PlMutex<Option<oneshot::Sender<RoutedStanza<GlobalChunkAllocator>>>>,
+    release: PlMutex<Option<oneshot::Receiver<()>>>,
+    reply: RoutedStanza<GlobalChunkAllocator>,
+}
+
+impl ServiceHandler<GlobalChunkAllocator, RedbStorage> for GatedService {
+    fn route<'a>(
+        &'a self,
+        stanza: RoutedStanza<GlobalChunkAllocator>,
+        context: ServiceContext<'a, GlobalChunkAllocator, RedbStorage>,
+    ) -> ExtensionFuture<'a, Result<(), HandlerError>> {
+        let accepted = self.accepted.lock().take();
+        let release = self.release.lock().take();
+        Box::pin(async move {
+            accepted
+                .ok_or(StanzaErrorCondition::InternalServerError)?
+                .send(stanza)
+                .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+            release
+                .ok_or(StanzaErrorCondition::InternalServerError)?
+                .await
+                .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+            context
+                .outbound
+                .route(self.reply.clone())
+                .await
+                .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+            Ok(())
+        })
+    }
+}
+
 impl ServiceHandler<GlobalChunkAllocator, RedbStorage> for TestService {
     fn route<'a>(
         &'a self,
@@ -388,6 +421,75 @@ fn rejected_sent_events_carry_the_queued_error() -> TestResult {
         assert!(written[0].contains("service-unavailable"));
         assert!(fixture.registration.take_queued().is_empty());
         drop(session);
+        fixture.finish().await
+    }))?
+}
+
+#[test]
+fn service_work_and_callback_progress_during_a_separate_client_flush() -> TestResult {
+    Runtime::new()?.block_on(compio::time::timeout(Duration::from_secs(5), async {
+        use lonewolf_extension::blocking::{Blocking, NAME};
+
+        let (mut fixture, recorder) = fixture(false).await?;
+        let mut extensions = Extensions::default();
+        extensions.register(Arc::new(Blocking))?;
+        extensions.register(recorder.clone())?;
+        let (accepted, admitted) = oneshot::channel();
+        let (resume_handler, release) = oneshot::channel();
+        let reply = RoutedStanza::from_parsed(
+            parsed("<message type='chat' from='echo.localhost' to='alice@localhost/phone' id='callback'/>").await?,
+        );
+        let service = Arc::new(GatedService {
+            accepted: PlMutex::new(Some(accepted)),
+            release: PlMutex::new(Some(release)),
+            reply,
+        });
+        fixture.router = fixture.router.with_extensions(BTreeMap::from([(
+            "localhost".into(),
+            extensions.enable_host("localhost", [NAME, "recording"])?,
+        )])).with_services(BTreeMap::from([(
+            "echo.localhost".into(),
+            ServiceRoute::extension(Arc::from("echo.localhost"), service),
+        )]));
+        let desk = register(&fixture, "alice@localhost", "desk").await?;
+        let phone = register(&fixture, "alice@localhost", "phone").await?;
+        let account = desk.account().clone();
+        let mut session = bound(&fixture, desk)?;
+        let (flushing, flushing_started) = oneshot::channel();
+        let (finish_flush, flush_release) = oneshot::channel();
+        session.outbox.writer.flush_entered = Some(flushing);
+        session.outbox.writer.flush_release = Some(flush_release);
+        let router = fixture.router.handle();
+        let ((), preceding) = router.order().fix(vec![account], async { Ok::<_, RouterError>(()) }).await?;
+        router.route_full(RoutedStanza::from_parsed(parsed(
+            "<message from='bob@localhost/desk' to='alice@localhost/desk' id='already-queued'/>",
+        ).await?)).await?;
+        let request = parsed("<message type='chat' to='echo.localhost' id='request'/>").await?;
+        {
+            let mut dispatch = pin!(session.handle_stanza(request));
+            match select(flushing_started, dispatch.as_mut()).await {
+                Either::Left((entered, _)) => entered?,
+                Either::Right(_) => return Err("the scheduled delivery did not start".into()),
+            }
+            drop(preceding);
+            let accepted = match select(admitted, dispatch.as_mut()).await {
+                Either::Left((admitted, _)) => admitted?,
+                Either::Right(_) => return Err("service work did not start".into()),
+            };
+            let view = accepted.resolve()?;
+            assert_eq!(view.from()?.ok_or("stamped sender")?.as_str(), "alice@localhost/desk");
+            assert_eq!(view.to()?.ok_or("service destination")?.as_str(), "echo.localhost");
+            assert_eq!(view.id()?, Some("request"));
+            resume_handler.send(()).map_err(|_| "service stopped")?;
+            let delivered = phone.recv().await.ok_or("service callback")?;
+            assert_eq!(delivered.stanza.resolve()?.id()?, Some("callback"));
+            finish_flush.send(()).map_err(|_| "writer stopped")?;
+            dispatch.await.map_err(|error| format!("{error:?}"))?;
+        }
+        assert_eq!(session.outbox.writer.written.len(), 1);
+        assert!(recorder.0.lock().iter().any(|event| event.role == MessageRole::Sent
+            && event.outcome == MessageOutcome::Forwarded && event.account == "alice@localhost"));
+        drop((phone, session));
         fixture.finish().await
     }))?
 }

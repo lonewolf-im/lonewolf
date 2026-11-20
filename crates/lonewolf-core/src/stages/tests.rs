@@ -368,6 +368,90 @@ fn deliver_rejects_a_chat_message_without_an_offline_handler() -> TestResult {
 }
 
 #[test]
+fn offline_message_policy_is_checked_in_the_final_writer() -> TestResult {
+    use lonewolf_auth::scram::{
+        SCRAM_POLICY_ITERATIONS, ScramCredentials, ScramSha1Verifier, ScramVerifier,
+    };
+    use lonewolf_extension::blocking::{Blocking, NAME};
+    use lonewolf_extension::offline::Offline;
+    use lonewolf_extension::policy::Verdict;
+    use lonewolf_storage::account::{AccountWrites, NewAccount};
+    use lonewolf_storage::blocking::{BlockChange, BlockingWrites};
+    use lonewolf_storage::offline::OfflineReads;
+    use lonewolf_storage::roster::RosterJid;
+    use lonewolf_storage::{Storage, WriteTransaction};
+
+    Runtime::new()?.block_on(compio::time::timeout(Duration::from_secs(5), async {
+        let mut fixture = Fixture::new()?;
+        let mut extensions = Extensions::default();
+        extensions.register(Arc::new(Blocking))?;
+        extensions.register(Arc::new(Offline::new(BTreeMap::new())))?;
+        fixture.router = fixture.router.with_extensions(BTreeMap::from([(
+            "localhost".into(),
+            extensions.enable_host("localhost", [NAME, "offline"])?,
+        )]));
+        fixture.handle = fixture.router.handle();
+        let sender = account("alice@localhost")?;
+        let receiver = account("bob@localhost")?;
+        let mut write = fixture.storage.begin_write().await?;
+        write
+            .create_account(NewAccount {
+                key: receiver.clone(),
+                credentials: ScramCredentials::new(ScramVerifier::Sha1(ScramSha1Verifier::new(
+                    [21; 16],
+                    SCRAM_POLICY_ITERATIONS,
+                    [22; 20],
+                    [23; 20],
+                ))),
+            })
+            .await?;
+        write.commit().await?;
+        let message =
+            parsed("<message type='chat' from='alice@localhost/desk' to='bob@localhost'/>").await?;
+        let rule = RosterJid::from(message.resolve()?.from()?.ok_or("sender")?);
+        let mut preceding = fixture.storage.begin_write().await?;
+        preceding
+            .change_blocklist(&receiver, BlockChange::Block(&[rule]))
+            .await?;
+        {
+            let stage = fixture.stage();
+            let mut storing = std::pin::pin!(super::store(
+                &stage,
+                message,
+                MissingRecipientPolicy::Discard,
+                Some(&sender),
+                None
+            ));
+            assert!(futures_util::poll!(&mut storing).is_pending());
+            preceding.commit().await?;
+            let outcome = storing.await.map_err(|_| "offline admission")?;
+            assert!(matches!(
+                outcome,
+                DeliveryOutcome::Policy {
+                    verdict: Verdict::Reject {
+                        condition: StanzaErrorCondition::ServiceUnavailable,
+                        application: None,
+                        ..
+                    },
+                    ..
+                }
+            ));
+        }
+        assert_eq!(
+            fixture
+                .storage
+                .begin_read()
+                .await?
+                .offline_count(&receiver)
+                .await?,
+            0
+        );
+        fixture.router.shutdown().await?;
+        Ok(())
+    }))?
+}
+
+#[test]
 fn deliver_discards_messages_when_offline_storage_reports_no_recipient() -> TestResult {
     Runtime::new()?.block_on(compio::time::timeout(Duration::from_secs(5), async {
         let mut fixture = Fixture::new()?;

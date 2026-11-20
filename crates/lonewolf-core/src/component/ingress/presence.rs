@@ -13,9 +13,13 @@ use crate::delivery::{report_failure, report_handler_failure, storage_failure};
 use crate::router::{Destination, RoutedStanza, RouterError};
 use crate::stages::Stage;
 use crate::stages::ingress::{
-    checks::{Snapshot, check_from},
+    checks::{Snapshot, check_selected, fix_explicit_snapshot},
     presence::{ProbeAuthorization, SubscriptionIngress, authorize_probe, receive_subscription},
 };
+use crate::stages::policy::Selection;
+
+#[cfg(test)]
+mod tests;
 
 pub(super) async fn handle<A: ChunkAllocator + Clone + 'static>(
     context: &Context<A>,
@@ -41,13 +45,6 @@ pub(super) async fn handle<A: ChunkAllocator + Clone + 'static>(
         }
         Destination::Account | Destination::Resource => {}
         Destination::Server | Destination::ServerResource | Destination::Service => return Ok(()),
-    }
-    if kind == PresenceType::Error {
-        return match context.router.route_presence_error(routed).await {
-            Ok(())
-            | Err(RouterError::NotFound | RouterError::Busy | RouterError::InvalidTarget) => Ok(()),
-            Err(_) => Err(IngressFailure),
-        };
     }
     let subscription = PresenceRequestType::from_subscription_stanza(kind);
     if let Some(kind) = subscription
@@ -87,14 +84,24 @@ pub(super) async fn handle<A: ChunkAllocator + Clone + 'static>(
         drop(grant.ticket);
         return Ok(());
     }
-    if check_from(
-        &context.router,
-        &context.storage,
+    let selection = if kind == PresenceType::Error {
+        Selection::Explicit
+    } else {
+        Selection::All
+    };
+    let ordered =
+        fix_explicit_snapshot(&context.router, &context.storage, None, Some(&account)).await?;
+    let snapshot = ordered
+        .as_ref()
+        .map_or(Snapshot::Fresh, |(read, _)| Snapshot::Ordered(read));
+    if check_selected(
+        (&context.router, &context.storage),
         None,
         Some(&account),
         &view,
         None,
-        Snapshot::Fresh,
+        snapshot,
+        selection,
     )
     .await?
         != Verdict::Allow
@@ -113,18 +120,24 @@ pub(super) async fn handle<A: ChunkAllocator + Clone + 'static>(
             .map_err(|_| IngressFailure)?
             .ok_or(IngressFailure)?
             .bare();
-        let transaction = match context.storage.begin_read().await {
-            Ok(transaction) => transaction,
-            Err(error) => {
-                report_failure(
-                    storage_failure(error, "presence_filter_begin_read"),
-                    &account,
-                );
-                return Ok(());
-            }
+        let fresh;
+        let transaction = if let Some((transaction, _)) = &ordered {
+            transaction
+        } else {
+            fresh = match context.storage.begin_read().await {
+                Ok(transaction) => transaction,
+                Err(error) => {
+                    report_failure(
+                        storage_failure(error, "presence_filter_begin_read"),
+                        &account,
+                    );
+                    return Ok(());
+                }
+            };
+            &fresh
         };
         match handler
-            .accepts_presence(&account, sender, &transaction)
+            .accepts_presence(&account, sender, transaction)
             .await
         {
             Ok(true) => {}
@@ -147,7 +160,13 @@ pub(super) async fn handle<A: ChunkAllocator + Clone + 'static>(
             }
         }
     }
-    let result = if subscription.is_some() {
+    let mut admission = ordered.map(|(_, ticket)| ticket);
+    if let Some(ticket) = &mut admission {
+        ticket.turn().await;
+    }
+    let result = if kind == PresenceType::Error {
+        context.router.route_presence_error(routed).await
+    } else if subscription.is_some() {
         context.router.route_subscription_presence(routed).await
     } else if destination == Destination::Resource {
         context.router.route_full(routed).await
@@ -156,6 +175,7 @@ pub(super) async fn handle<A: ChunkAllocator + Clone + 'static>(
     };
     match result {
         Ok(()) | Err(RouterError::NotFound | RouterError::Busy) => Ok(()),
+        Err(RouterError::InvalidTarget) if kind == PresenceType::Error => Ok(()),
         Err(_) => Err(IngressFailure),
     }
 }

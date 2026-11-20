@@ -40,6 +40,60 @@ impl BlockingReads for FailingRead {
     }
 }
 
+struct FailingMatch;
+
+impl BlockingReads for FailingMatch {
+    async fn blocklist(&self, _: &AccountKey) -> Result<Vec<RosterJid>, BlockError> {
+        panic!("policy must look up only the addressed peer");
+    }
+
+    async fn is_blocked(&self, _: &AccountKey, _: JidRef<'_>) -> Result<bool, BlockError> {
+        Err(StorageError::new(StorageErrorKind::Unavailable).into())
+    }
+}
+
+#[test]
+fn policy_read_failure_refuses_admission_without_a_blocked_condition() -> Result<(), Box<dyn Error>>
+{
+    block_on(async {
+        let mut arena = Arena::<GlobalChunkAllocator>::try_new(Default::default())?;
+        let owner = Jid::parse_in("alice@example.test", &mut arena)?;
+        let own_resource = Jid::parse_in("alice@example.test/phone", &mut arena)?;
+        let peer = Jid::parse_in("bob@example.test/desk", &mut arena)?;
+        let account = AccountKey::try_from(owner.resolve(&arena)?)?;
+        let kind = StanzaType::Iq(IqType::Get);
+        for direction in [Direction::Outbound, Direction::Inbound] {
+            let request = PolicyRequest {
+                account: &account,
+                direction,
+                peer: peer.resolve(&arena)?,
+                kind,
+            };
+            assert!(matches!(
+                check_blocklist(request, &FailingMatch).await,
+                Err(HandlerError::Internal {
+                    condition: StanzaErrorCondition::ServiceUnavailable,
+                    failure: Failure {
+                        kind: FailureKind::Storage(StorageErrorKind::Unavailable),
+                        ..
+                    },
+                })
+            ));
+            let request = PolicyRequest {
+                account: &account,
+                direction,
+                peer: own_resource.resolve(&arena)?,
+                kind,
+            };
+            assert_eq!(
+                check_blocklist(request, &FailingMatch).await,
+                Ok(Verdict::Allow)
+            );
+        }
+        Ok(())
+    })
+}
+
 #[derive(Default)]
 struct FailingWrite(usize);
 

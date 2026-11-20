@@ -10,12 +10,13 @@ use super::{InboundPeer, IngressContext, IngressFailure, reply_error};
 use crate::router::{Destination, RoutedStanza, RouterError};
 use crate::stages::Stage;
 use crate::stages::ingress::{
-    checks::{Snapshot, check_from},
+    checks::{Snapshot, check_selected, fix_explicit_snapshot},
     presence::{
         ProbeAuthorization, SubscriptionIngress, SubscriptionReceipt, authorize_probe,
         receive_subscription,
     },
 };
+use crate::stages::policy::Selection;
 
 pub(crate) async fn handle<A: ChunkAllocator + Clone + 'static>(
     context: &IngressContext<A>,
@@ -25,13 +26,6 @@ pub(crate) async fn handle<A: ChunkAllocator + Clone + 'static>(
 ) -> Result<(), IngressFailure> {
     if let Some(kind) = PresenceRequestType::from_subscription_stanza(kind) {
         return subscription(context, routed, kind).await;
-    }
-    if kind == PresenceType::Error {
-        return match context.router.route_presence_error(routed).await {
-            Ok(())
-            | Err(RouterError::NotFound | RouterError::Busy | RouterError::InvalidTarget) => Ok(()),
-            Err(_) => Err(IngressFailure),
-        };
     }
     let view = routed.resolve().map_err(|_| IngressFailure)?;
     let target = view
@@ -73,27 +67,44 @@ pub(crate) async fn handle<A: ChunkAllocator + Clone + 'static>(
         drop(grant.ticket);
         return Ok(());
     }
-    if check_from(
-        &context.router,
-        &context.storage,
+    let selection = if kind == PresenceType::Error {
+        Selection::Explicit
+    } else {
+        Selection::All
+    };
+    let ordered =
+        fix_explicit_snapshot(&context.router, &context.storage, None, Some(&account)).await?;
+    let snapshot = ordered
+        .as_ref()
+        .map_or(Snapshot::Fresh, |(read, _)| Snapshot::Ordered(read));
+    if check_selected(
+        (&context.router, &context.storage),
         None,
         Some(&account),
         &view,
         None,
-        Snapshot::Fresh,
+        snapshot,
+        selection,
     )
     .await?
         != Verdict::Allow
     {
         return Ok(());
     }
-    let result = if destination == Destination::Resource {
+    let mut admission = ordered.map(|(_, ticket)| ticket);
+    if let Some(ticket) = &mut admission {
+        ticket.turn().await;
+    }
+    let result = if kind == PresenceType::Error {
+        context.router.route_presence_error(routed).await
+    } else if destination == Destination::Resource {
         context.router.route_full(routed).await
     } else {
         context.router.route_presence(routed).await
     };
     match result {
         Ok(()) | Err(RouterError::NotFound | RouterError::Busy) => Ok(()),
+        Err(RouterError::InvalidTarget) if kind == PresenceType::Error => Ok(()),
         Err(_) => Err(IngressFailure),
     }
 }

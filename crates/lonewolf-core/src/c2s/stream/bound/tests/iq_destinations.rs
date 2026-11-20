@@ -124,6 +124,38 @@ impl PolicyHandler<RedbStorage> for Probe {
     }
 }
 
+#[derive(Default)]
+struct TargetRefusal(AtomicUsize);
+
+impl Extension<GlobalChunkAllocator, RedbStorage> for TargetRefusal {
+    fn name(&self) -> &'static str {
+        "target-refusal"
+    }
+
+    fn register(
+        self: Arc<Self>,
+        _: &str,
+        slots: &mut Slots<'_, GlobalChunkAllocator, RedbStorage>,
+    ) -> Result<(), RegistrationError> {
+        slots.policy(self);
+        Ok(())
+    }
+}
+
+impl PolicyHandler<RedbStorage> for TargetRefusal {
+    fn check<'a>(&'a self, request: PolicyRequest<'a>, _: &'a RedbRead) -> PolicyFuture<'a> {
+        Box::pin(async move {
+            assert_eq!(request.direction, Direction::Inbound);
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(Verdict::Reject {
+                condition: StanzaErrorCondition::ServiceUnavailable,
+                application: None,
+                text: None,
+            })
+        })
+    }
+}
+
 fn recipients_without_refill(burst: NonZeroUsize) -> RecipientLimiter {
     RecipientLimiter::new(
         NonZeroUsize::MIN,
@@ -278,6 +310,111 @@ fn assert_error(
         assert_eq!(condition.error_type(), "auth");
     }
     Ok(())
+}
+
+#[test]
+fn cross_host_iq_set_reports_own_block_before_the_recipient_policy() -> TestResult {
+    use lonewolf_extension::blocking::{Blocking, NAME};
+    use lonewolf_storage::blocking::{BlockChange, BlockingWrites};
+    use lonewolf_storage::roster::RosterJid;
+
+    Runtime::new()?.block_on(compio::time::timeout(Duration::from_secs(5), async {
+        let fixture = Fixture::new(&[]).await?;
+        let mut config = Config::default();
+        config.hosts.insert(
+            "other.localhost".into(),
+            crate::config::HostConfig {
+                tls: Some(crate::config::HostTlsConfig {
+                    source: crate::config::HostTlsSource::LetsEncrypt,
+                    client_auth: None,
+                }),
+                ..Default::default()
+            },
+        );
+        let mut extensions = Extensions::default();
+        extensions.register(Arc::new(Blocking))?;
+        let refusal = Arc::new(TargetRefusal::default());
+        extensions.register(refusal.clone())?;
+        let router = Router::new(
+            Hosts::new(&config.hosts, Some("localhost"))?,
+            LocalRouter::new(GlobalChunkAllocator),
+        )
+        .with_extensions(BTreeMap::from([
+            (
+                "localhost".into(),
+                extensions.enable_host("localhost", [NAME])?,
+            ),
+            (
+                "other.localhost".into(),
+                extensions.enable_host("other.localhost", ["target-refusal"])?,
+            ),
+        ]));
+        let owner = fixture.registration.account().clone();
+        let target = "alice@other.localhost";
+        let mut arena = Arena::try_new(Default::default())?;
+        let rule = RosterJid::from(Jid::parse_in(target, &mut arena)?.resolve(&arena)?);
+        let registration = router
+            .handle()
+            .register(&owner, Some("desk"), NonZeroUsize::MIN)
+            .await?;
+        let (_input, incoming) = async_channel::bounded(1);
+        let mut session = fixture.bound_session(
+            GlobalChunkAllocator,
+            registration,
+            router.handle(),
+            incoming,
+        )?;
+
+        for blocked in [true, false] {
+            let mut writer = fixture.storage.begin_write().await?;
+            let rules = std::slice::from_ref(&rule);
+            let change = if blocked {
+                BlockChange::Block(rules)
+            } else {
+                BlockChange::Unblock(rules)
+            };
+            writer.change_blocklist(&owner, change).await?;
+            writer.commit().await?;
+            session
+                .handle_stanza(request("set", Some(target), KEY.namespace, KEY.name).await?)
+                .await
+                .map_err(|error| format!("{error:?}"))?;
+            let Some(Output::Owned { stanza, arena }) = session.outbox.queue.pop_front() else {
+                return Err("missing IQ response".into());
+            };
+            assert!(session.outbox.queue.is_empty());
+            let view = stanza.resolve(&arena)?;
+            assert_eq!(view.stanza_type(), StanzaType::Iq(IqType::Error));
+            assert_eq!(view.id()?, Some("guard&id"));
+            assert_eq!(view.from()?.ok_or("error sender")?.as_str(), target);
+            if blocked {
+                assert_eq!(
+                    view.to()?.ok_or("error recipient")?.as_str(),
+                    "bob@localhost/desk"
+                );
+            }
+            let error = view
+                .child("error", "jabber:client")?
+                .ok_or("error payload")?;
+            assert_eq!(error.attribute("type", "")?, Some("cancel"));
+            let condition = if blocked {
+                "not-acceptable"
+            } else {
+                "service-unavailable"
+            };
+            assert!(error.child(condition, STANZA_ERROR_NAMESPACE)?.is_some());
+            assert_eq!(
+                error
+                    .child("blocked", "urn:xmpp:blocking:errors")?
+                    .is_some(),
+                blocked
+            );
+            assert_eq!(refusal.0.load(Ordering::Relaxed), usize::from(!blocked));
+        }
+        drop(session);
+        router.shutdown().await?;
+        fixture.finish().await
+    }))?
 }
 
 async fn account(storage: &RedbStorage, address: &str) -> TestResult<AccountKey> {

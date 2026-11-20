@@ -173,7 +173,7 @@ impl<A: ChunkAllocator + Clone + 'static> ServiceOutbound<A> for Outbound<'_, A>
             };
             let to = view.to()?.ok_or(DeliveryError)?;
             let destination = self.router.destination(to);
-            if matches!(destination, Destination::Account | Destination::Resource)
+            let _admission = if matches!(destination, Destination::Account | Destination::Resource)
                 && !matches!(view.stanza_type(), StanzaType::Message(_))
                 && !self.router.policies(to.domainpart()).is_empty()
             {
@@ -188,7 +188,18 @@ impl<A: ChunkAllocator + Clone + 'static> ServiceOutbound<A> for Outbound<'_, A>
                     allocator: self.allocator,
                     work: self.work,
                 };
-                match checks::check(&stage, &origin, &view, &parties, Snapshot::Fresh)
+                let ordered = checks::fix_explicit_snapshot(
+                    self.router,
+                    self.storage,
+                    None,
+                    parties.recipient.as_ref(),
+                )
+                .await
+                .map_err(|_| DeliveryError)?;
+                let snapshot = ordered
+                    .as_ref()
+                    .map_or(Snapshot::Fresh, |(read, _)| Snapshot::Ordered(read));
+                match checks::check(&stage, &origin, &view, &parties, snapshot)
                     .await
                     .map_err(|_| DeliveryError)?
                 {
@@ -196,7 +207,14 @@ impl<A: ChunkAllocator + Clone + 'static> ServiceOutbound<A> for Outbound<'_, A>
                     Verdict::Drop | Verdict::OutboundBlocked => return Ok(()),
                     Verdict::Reject { .. } => return Err(DeliveryError),
                 }
-            }
+                let mut admission = ordered.map(|(_, ticket)| ticket);
+                if let Some(ticket) = &mut admission {
+                    ticket.turn().await;
+                }
+                admission
+            } else {
+                None
+            };
             match destination {
                 Destination::Account | Destination::Resource => match view.stanza_type() {
                     StanzaType::Message(kind) => {

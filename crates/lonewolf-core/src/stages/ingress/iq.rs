@@ -34,6 +34,7 @@ use crate::stages::iq::{
     IqTarget, ReplyError, error_reply_omitting_payload, iq_requester, iq_target,
     require_iq_account, result_reply,
 };
+use crate::stages::policy::Selection;
 use crate::stages::{Stage, StageFailure};
 
 pub(crate) enum IqInput<A: ChunkAllocator> {
@@ -46,6 +47,13 @@ pub(crate) enum IqInput<A: ChunkAllocator> {
 }
 
 impl<A: ChunkAllocator + Clone> IqInput<A> {
+    fn addressed_to(&self) -> Result<Option<JidRef<'_>>, StageFailure> {
+        Ok(match self {
+            Self::Owned { request, arena, .. } => request.resolve(arena)?.to()?,
+            Self::Routed(stanza) => stanza.resolve()?.to()?,
+        })
+    }
+
     pub(crate) fn into_routed(self) -> Result<RoutedStanza<A>, StageFailure> {
         match self {
             Self::Owned {
@@ -67,6 +75,7 @@ impl<A: ChunkAllocator + Clone> IqInput<A> {
         source: Option<&AccountKey>,
         recipient: Option<&AccountKey>,
         snapshot: Snapshot<'_>,
+        selection: Selection,
     ) -> Result<Verdict, StageFailure> {
         match self {
             Self::Owned {
@@ -74,26 +83,26 @@ impl<A: ChunkAllocator + Clone> IqInput<A> {
                 arena,
                 sender,
             } => {
-                checks::check_from(
-                    router,
-                    storage,
+                checks::check_selected(
+                    (router, storage),
                     source,
                     recipient,
                     &request.resolve(arena)?,
                     Some(sender.resolve(arena)?),
                     snapshot,
+                    selection,
                 )
                 .await
             }
             Self::Routed(stanza) => {
-                checks::check_from(
-                    router,
-                    storage,
+                checks::check_selected(
+                    (router, storage),
                     source,
                     recipient,
                     &stanza.resolve()?,
                     None,
                     snapshot,
+                    selection,
                 )
                 .await
             }
@@ -215,6 +224,24 @@ pub(crate) async fn handle<A: ChunkAllocator + Clone + 'static>(
         destination,
         origin.session().is_some() && stage.router.federation_enabled(),
     )?;
+    if destination == Destination::ServerResource
+        && let Some(source) = origin.sender()
+        && Selection::Explicit.configured(stage.router, source.domain())
+    {
+        let verdict = input
+            .check_policy(
+                stage.router,
+                stage.storage,
+                Some(source),
+                None,
+                Snapshot::Fresh,
+                Selection::Explicit,
+            )
+            .await?;
+        if verdict != Verdict::Allow {
+            return Ok(policy_disposition(input, verdict));
+        }
+    }
     if matches!(
         destination,
         Destination::Resource | Destination::ServerResource
@@ -310,19 +337,75 @@ pub(crate) async fn handle<A: ChunkAllocator + Clone + 'static>(
     } else {
         None
     };
-    if policies {
+    let addressed_peer = input.addressed_to()?.is_some_and(|target| {
+        origin
+            .sender()
+            .is_none_or(|source| source.as_str() != target.bare().as_str())
+    });
+    let account_or_server = matches!(destination, Destination::Account | Destination::Server);
+    let explicit_set = addressed_peer
+        && account_or_server
+        && request_type == Some(IqRequestType::Set)
+        && checks::explicit_applies(stage.router, origin.sender(), target_account.as_ref());
+    let selection = if policies {
+        Selection::All
+    } else {
+        Selection::Explicit
+    };
+    let ordered = if addressed_peer && !explicit_set {
+        checks::fix_explicit_snapshot(
+            stage.router,
+            stage.storage,
+            origin.sender(),
+            target_account.as_ref(),
+        )
+        .await?
+    } else {
+        None
+    };
+    if policies || explicit_set || ordered.is_some() {
+        let snapshot = ordered
+            .as_ref()
+            .map_or(Snapshot::Fresh, |(read, _)| Snapshot::Ordered(read));
         let verdict = input
             .check_policy(
                 stage.router,
                 stage.storage,
                 origin.sender(),
                 target_account.as_ref(),
-                Snapshot::Fresh,
+                snapshot,
+                selection,
             )
             .await?;
         if verdict != Verdict::Allow {
             return Ok(policy_disposition(input, verdict));
         }
+    }
+    if account_or_server && let Some(request_type) = request_type {
+        return handle_admitted_request(
+            stage,
+            origin,
+            input,
+            destination,
+            request_type,
+            RequestAdmission {
+                target_account,
+                ordered,
+                explicit_set,
+            },
+        )
+        .await;
+    }
+    let mut admission = ordered.map(|(_, ticket)| ticket);
+    if let Some(ticket) = &mut admission {
+        ticket.turn().await;
+    }
+    if (admission.is_some() || destination == Destination::Remote)
+        && origin
+            .session()
+            .is_some_and(|session| !session.liveness().is_alive())
+    {
+        return Ok(IqDisposition::Done);
     }
     if destination == Destination::Remote
         && !matches!(origin, Origin::Remote { .. })
@@ -356,7 +439,7 @@ pub(crate) async fn handle<A: ChunkAllocator + Clone + 'static>(
             kind: UnavailableKind::Remote,
         });
     }
-    let Some(request_type) = request_type else {
+    if request_type.is_none() {
         if origin.session().is_some() && destination == Destination::Server {
             let id = match &input {
                 IqInput::Owned { request, arena, .. } => request.resolve(arena)?.id()?,
@@ -372,39 +455,28 @@ pub(crate) async fn handle<A: ChunkAllocator + Clone + 'static>(
             }
         }
         return Ok(IqDisposition::Done);
-    };
-    if !matches!(destination, Destination::Account | Destination::Server) {
-        if destination == Destination::Remote && matches!(origin, Origin::Remote { .. }) {
-            return Err(StageFailure);
-        }
-        let response = if matches!(&input, IqInput::Owned { .. }) {
-            Some(Arena::try_new_in(
-                Default::default(),
-                stage.allocator.clone(),
-            )?)
-        } else {
-            None
-        };
-        return Ok(IqDisposition::Unavailable {
-            input,
-            condition: if destination == Destination::Remote {
-                StanzaErrorCondition::RemoteServerNotFound
-            } else {
-                StanzaErrorCondition::ServiceUnavailable
-            },
-            response,
-            kind: UnavailableKind::Handler,
-        });
     }
-    handle_request(
-        stage,
-        origin,
+    if destination == Destination::Remote && matches!(origin, Origin::Remote { .. }) {
+        return Err(StageFailure);
+    }
+    let response = if matches!(&input, IqInput::Owned { .. }) {
+        Some(Arena::try_new_in(
+            Default::default(),
+            stage.allocator.clone(),
+        )?)
+    } else {
+        None
+    };
+    Ok(IqDisposition::Unavailable {
         input,
-        destination,
-        request_type,
-        target_account,
-    )
-    .await
+        condition: if destination == Destination::Remote {
+            StanzaErrorCondition::RemoteServerNotFound
+        } else {
+            StanzaErrorCondition::ServiceUnavailable
+        },
+        response,
+        kind: UnavailableKind::Handler,
+    })
 }
 
 fn policy_needed<A: ChunkAllocator + Clone>(
@@ -418,11 +490,7 @@ fn policy_needed<A: ChunkAllocator + Clone>(
     if !(local || destination == Destination::Remote && remote_enabled) {
         return Ok(false);
     }
-    let to = match input {
-        IqInput::Owned { request, arena, .. } => request.resolve(arena)?.to()?,
-        IqInput::Routed(stanza) => stanza.resolve()?.to()?,
-    };
-    let Some(to) = to else {
+    let Some(to) = input.addressed_to()? else {
         return Ok(false);
     };
     Ok(
@@ -569,6 +637,7 @@ impl<'a, A: ChunkAllocator + Clone> ResourceIqWork<'a, A> {
                     self.source.as_ref(),
                     Some(&self.target),
                     Snapshot::Ordered(&transaction),
+                    Selection::All,
                 )
                 .await
                 .map_err(|_| RouterError::Unavailable)?;
@@ -699,7 +768,13 @@ fn effective_sender<'a, A: ChunkAllocator>(
     })
 }
 
-/// Requires an admitted request addressed to an account or server.
+struct RequestAdmission {
+    target_account: Option<AccountKey>,
+    ordered: Option<(RedbRead, Ticket)>,
+    explicit_set: bool,
+}
+
+#[cfg(test)]
 pub(crate) async fn handle_request<A: ChunkAllocator + Clone + 'static>(
     stage: &Stage<'_, A>,
     origin: &Origin<'_, A>,
@@ -707,6 +782,33 @@ pub(crate) async fn handle_request<A: ChunkAllocator + Clone + 'static>(
     destination: Destination,
     kind: IqRequestType,
     target_account: Option<AccountKey>,
+) -> Result<IqDisposition<A>, StageFailure> {
+    handle_admitted_request(
+        stage,
+        origin,
+        input,
+        destination,
+        kind,
+        RequestAdmission {
+            target_account,
+            ordered: None,
+            explicit_set: false,
+        },
+    )
+    .await
+}
+
+async fn handle_admitted_request<A: ChunkAllocator + Clone + 'static>(
+    stage: &Stage<'_, A>,
+    origin: &Origin<'_, A>,
+    input: IqInput<A>,
+    destination: Destination,
+    kind: IqRequestType,
+    RequestAdmission {
+        target_account,
+        ordered,
+        explicit_set,
+    }: RequestAdmission,
 ) -> Result<IqDisposition<A>, StageFailure> {
     let response = if matches!(&input, IqInput::Owned { .. }) {
         Some(Arena::try_new_in(
@@ -796,8 +898,12 @@ pub(crate) async fn handle_request<A: ChunkAllocator + Clone + 'static>(
         results: Vec::new(),
     };
     match kind {
-        IqRequestType::Get => prepare_get(stage, origin, answer, handler, target_account).await,
-        IqRequestType::Set => prepare_set(stage, origin, answer, handler, target_account).await,
+        IqRequestType::Get => {
+            prepare_ordered_get(stage, origin, answer, handler, target_account, ordered).await
+        }
+        IqRequestType::Set => {
+            prepare_checked_set(stage, origin, answer, handler, target_account, explicit_set).await
+        }
     }
 }
 
@@ -825,12 +931,24 @@ fn diagnostic_account<'a, A: ChunkAllocator + Clone>(
     origin.sender().or(target)
 }
 
+#[cfg(test)]
 pub(crate) async fn prepare_get<A: ChunkAllocator + Clone + 'static>(
     stage: &Stage<'_, A>,
     origin: &Origin<'_, A>,
     answer: IqAnswer<A>,
     handler: Arc<dyn IqHandler<A, RedbStorage>>,
     target_account: Option<AccountKey>,
+) -> Result<IqDisposition<A>, StageFailure> {
+    prepare_ordered_get(stage, origin, answer, handler, target_account, None).await
+}
+
+async fn prepare_ordered_get<A: ChunkAllocator + Clone + 'static>(
+    stage: &Stage<'_, A>,
+    origin: &Origin<'_, A>,
+    answer: IqAnswer<A>,
+    handler: Arc<dyn IqHandler<A, RedbStorage>>,
+    target_account: Option<AccountKey>,
+    ordered: Option<(RedbRead, Ticket)>,
 ) -> Result<IqDisposition<A>, StageFailure> {
     let sender = effective_sender(&answer.request, &answer.arena, answer.sender)?;
     let target = answer
@@ -845,19 +963,25 @@ pub(crate) async fn prepare_get<A: ChunkAllocator + Clone + 'static>(
             .ok_or(StageFailure)?,
     );
     let delivery = RouterDelivery::new(stage.router, stage.allocator, origin.session());
-    let (transaction, ticket) = Arc::clone(stage.router.order())
-        .fix(
-            target_account.iter().cloned().collect(),
-            stage.storage.begin_read(),
-        )
-        .await
-        .map_err(|error| {
-            origin.report(
-                storage_failure(error, "iq_get_begin_read"),
-                diagnostic_account(origin, target_account.as_ref()),
-            );
-            StageFailure
-        })?;
+    let (transaction, ticket) = if let Some(ordered) = ordered {
+        ordered
+    } else {
+        stage
+            .router
+            .order()
+            .fix(
+                target_account.iter().cloned().collect(),
+                stage.storage.begin_read(),
+            )
+            .await
+            .map_err(|error| {
+                origin.report(
+                    storage_failure(error, "iq_get_begin_read"),
+                    diagnostic_account(origin, target_account.as_ref()),
+                );
+                StageFailure
+            })?
+    };
     let diagnostics = match origin {
         Origin::Session(session) => Diagnostics::Session(session.account().clone()),
         Origin::Remote { local, .. } => Diagnostics::External(Box::from(*local)),
@@ -882,11 +1006,15 @@ pub(crate) async fn prepare_get<A: ChunkAllocator + Clone + 'static>(
         response,
         delivery,
     };
+    let liveness = origin.session().map(|session| session.liveness());
     let pending = after_turn(
         stage.work.start(),
         ticket,
         origin.session().map(|session| session.mailbox()),
         move |queued, ticket| async move {
+            if liveness.as_ref().is_some_and(|session| !session.is_alive()) {
+                return Err(StageFailure);
+            }
             let result = work.run(queued).await;
             drop(ticket);
             result
@@ -895,12 +1023,24 @@ pub(crate) async fn prepare_get<A: ChunkAllocator + Clone + 'static>(
     Ok(IqDisposition::Ordered(IqPending::Get(pending)))
 }
 
+#[cfg(test)]
 pub(crate) async fn prepare_set<A: ChunkAllocator + Clone + 'static>(
+    stage: &Stage<'_, A>,
+    origin: &Origin<'_, A>,
+    answer: IqAnswer<A>,
+    handler: Arc<dyn IqHandler<A, RedbStorage>>,
+    target_account: Option<AccountKey>,
+) -> Result<IqDisposition<A>, StageFailure> {
+    prepare_checked_set(stage, origin, answer, handler, target_account, false).await
+}
+
+async fn prepare_checked_set<A: ChunkAllocator + Clone + 'static>(
     stage: &Stage<'_, A>,
     origin: &Origin<'_, A>,
     mut answer: IqAnswer<A>,
     handler: Arc<dyn IqHandler<A, RedbStorage>>,
     target_account: Option<AccountKey>,
+    explicit: bool,
 ) -> Result<IqDisposition<A>, StageFailure> {
     let sender = effective_sender(&answer.request, &answer.arena, answer.sender)?;
     let target = answer
@@ -922,6 +1062,43 @@ pub(crate) async fn prepare_set<A: ChunkAllocator + Clone + 'static>(
         );
         StageFailure
     })?;
+    let liveness = origin.session().map(|session| session.liveness());
+    if liveness.as_ref().is_some_and(|session| !session.is_alive()) {
+        return Ok(IqDisposition::Done);
+    }
+    if explicit {
+        let snapshot = stage.storage.begin_read().await.map_err(|error| {
+            origin.report(
+                storage_failure(error, "iq_set_policy_begin_read"),
+                diagnostic_account(origin, target_account.as_ref()),
+            );
+            StageFailure
+        })?;
+        let verdict = checks::check_selected(
+            (stage.router, stage.storage),
+            origin.sender(),
+            target_account.as_ref(),
+            &answer.request.resolve(&answer.arena)?,
+            Some(sender),
+            Snapshot::Ordered(&snapshot),
+            Selection::Explicit,
+        )
+        .await?;
+        if verdict != Verdict::Allow {
+            let input = match answer.sender {
+                Some(sender) => IqInput::Owned {
+                    request: answer.request,
+                    arena: answer.arena,
+                    sender,
+                },
+                None => IqInput::Routed(RoutedStanza::from_parts(answer.request, answer.arena)),
+            };
+            return Ok(policy_disposition(input, verdict));
+        }
+    }
+    if liveness.as_ref().is_some_and(|session| !session.is_alive()) {
+        return Ok(IqDisposition::Done);
+    }
     let reply = match require_iq_account(&transaction, target_account.as_ref()).await {
         Err(error) => Err(error.into()),
         Ok(()) => {
@@ -942,14 +1119,30 @@ pub(crate) async fn prepare_set<A: ChunkAllocator + Clone + 'static>(
                 .await
         }
     };
+    if liveness.as_ref().is_some_and(|session| !session.is_alive()) {
+        return Ok(IqDisposition::Done);
+    }
     match reply {
         Ok(IqReply {
             payload,
-            effects,
+            mut effects,
             results,
         }) => {
             answer.reply = Ok(payload);
             answer.results = results;
+            if explicit {
+                effects.accounts.extend(
+                    origin
+                        .sender()
+                        .into_iter()
+                        .chain(target_account.as_ref())
+                        .cloned(),
+                );
+                effects
+                    .accounts
+                    .sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+                effects.accounts.dedup();
+            }
             let identity = match origin {
                 Origin::Session(session) => EffectsIdentity::Account(session.account().clone()),
                 Origin::Remote { local, .. } => target_account.map_or_else(

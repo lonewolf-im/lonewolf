@@ -7,18 +7,28 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use compio::runtime::Runtime;
+use futures_channel::oneshot;
+use futures_util::future::{Either, select};
+use lonewolf_auth::scram::{
+    SCRAM_POLICY_ITERATIONS, ScramCredentials, ScramSha1Verifier, ScramVerifier,
+};
+use lonewolf_extension::Effects;
 use lonewolf_extension::delivery::HandlerError;
 use lonewolf_extension::iq::{
     IqError, IqErrorPayload, IqHandler, IqRequest, IqRequestType, IqRoute, IqScope, Requester,
 };
+use lonewolf_extension::policy::{PolicyFuture, PolicyHandler, PolicyRequest, Verdict};
 use lonewolf_extension::{Extension, Extensions, RegistrationError, Slots};
-use lonewolf_storage::{RedbRead, RedbStorage};
+use lonewolf_storage::account::{AccountKey, AccountWrites, NewAccount};
+use lonewolf_storage::vcard::{VCardQuota, VCardReads, VCardWrites};
+use lonewolf_storage::{RedbRead, RedbStorage, RedbWrite, Storage, WriteTransaction};
 use lonewolf_util::arena::{
     AllocationError, Arena, ArenaConfig, Chunk, ChunkAllocator, GlobalChunkAllocator,
 };
 use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::stanza::{
-    Element, IqType, RoutedStanza, STANZA_ERROR_NAMESPACE, Stanza, StanzaNamespace, StanzaType,
+    Element, IqType, RoutedStanza, STANZA_ERROR_NAMESPACE, Stanza, StanzaErrorCondition,
+    StanzaNamespace, StanzaType,
 };
 use parking_lot::Mutex as PlMutex;
 
@@ -31,9 +41,281 @@ use crate::router::{Destination, Router};
 use crate::stages::Stage;
 use crate::stages::ingress::Origin;
 use crate::stages::ingress::iq::{
-    AnswerStanzas, IqAnswer, IqDisposition, IqInput, handle_request, render_answer,
+    AnswerStanzas, IqAnswer, IqDisposition, IqInput, handle, handle_request, render_answer,
 };
 use crate::stages::iq::{error_reply_omitting_payload, result_reply};
+
+const FIRST_CARD: &str = "<vCard xmlns='vcard-temp'><FN>First</FN></vCard>";
+const SECOND_CARD: &str = "<vCard xmlns='vcard-temp'><FN>Second</FN></vCard>";
+
+#[derive(Default)]
+struct AddressedIq {
+    read: PlMutex<Option<Box<str>>>,
+    set_calls: AtomicUsize,
+}
+
+impl Extension<GlobalChunkAllocator, RedbStorage> for AddressedIq {
+    fn name(&self) -> &'static str {
+        "addressed-iq"
+    }
+
+    fn register(
+        self: Arc<Self>,
+        _: &str,
+        slots: &mut Slots<'_, GlobalChunkAllocator, RedbStorage>,
+    ) -> Result<(), RegistrationError> {
+        slots.policy(self.clone());
+        for kind in [IqRequestType::Get, IqRequestType::Set] {
+            slots.iq(
+                IqRoute {
+                    scope: IqScope::Account,
+                    kind,
+                    namespace: "urn:test:shared-iq",
+                    name: "query",
+                },
+                self.clone(),
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl PolicyHandler<RedbStorage> for AddressedIq {
+    fn checks_explicit_addresses(&self) -> bool {
+        true
+    }
+
+    fn check<'a>(&'a self, request: PolicyRequest<'a>, read: &'a RedbRead) -> PolicyFuture<'a> {
+        Box::pin(async move {
+            let card = read
+                .vcard(request.account)
+                .await
+                .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+            if card
+                .as_ref()
+                .is_some_and(|card| card.xml.as_ref() == SECOND_CARD)
+            {
+                Ok(Verdict::Reject {
+                    condition: StanzaErrorCondition::ServiceUnavailable,
+                    application: None,
+                    text: None,
+                })
+            } else {
+                Ok(Verdict::Allow)
+            }
+        })
+    }
+}
+
+impl IqHandler<GlobalChunkAllocator, RedbStorage> for AddressedIq {
+    fn get<'a>(
+        &'a self,
+        request: IqRequest<'a, GlobalChunkAllocator>,
+        read: &'a RedbRead,
+        _: &'a mut Arena<GlobalChunkAllocator>,
+    ) -> lonewolf_extension::iq::IqFuture<'a, GlobalChunkAllocator> {
+        Box::pin(async move {
+            let owner = AccountKey::try_from(request.target)
+                .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+            let card = read
+                .vcard(&owner)
+                .await
+                .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+            *self.read.lock() = card.map(|card| card.xml);
+            Ok(lonewolf_extension::iq::IqReply::new(None, Effects::none()))
+        })
+    }
+
+    fn set<'a>(
+        &'a self,
+        _: IqRequest<'a, GlobalChunkAllocator>,
+        _: &'a mut RedbWrite,
+        _: &'a dyn lonewolf_extension::delivery::HostLookup,
+        _: &'a mut Arena<GlobalChunkAllocator>,
+    ) -> lonewolf_extension::iq::IqFuture<'a, GlobalChunkAllocator> {
+        self.set_calls.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async { Ok(lonewolf_extension::iq::IqReply::new(None, Effects::none())) })
+    }
+}
+
+#[derive(Default)]
+struct OrdinaryCheck(PlMutex<Option<oneshot::Sender<()>>>);
+
+impl Extension<GlobalChunkAllocator, RedbStorage> for OrdinaryCheck {
+    fn name(&self) -> &'static str {
+        "ordinary-check"
+    }
+
+    fn register(
+        self: Arc<Self>,
+        _: &str,
+        slots: &mut Slots<'_, GlobalChunkAllocator, RedbStorage>,
+    ) -> Result<(), RegistrationError> {
+        slots.policy(self);
+        Ok(())
+    }
+}
+
+impl PolicyHandler<RedbStorage> for OrdinaryCheck {
+    fn check<'a>(&'a self, _: PolicyRequest<'a>, _: &'a RedbRead) -> PolicyFuture<'a> {
+        if let Some(ready) = self.0.lock().take() {
+            let _ = ready.send(());
+        }
+        Box::pin(async { Ok(Verdict::Allow) })
+    }
+}
+
+#[test]
+fn addressed_iq_get_keeps_the_admitted_read_and_set_uses_the_writer_view() -> TestResult {
+    Runtime::new()?.block_on(compio::time::timeout(
+        std::time::Duration::from_secs(5),
+        async {
+            let directory = tempfile::tempdir()?;
+            let storage = RedbStorage::open(directory.path().join("state.redb"))?;
+            let mut extensions = Extensions::default();
+            let iq = Arc::new(AddressedIq::default());
+            let ordinary = Arc::new(OrdinaryCheck::default());
+            extensions.register(iq.clone())?;
+            extensions.register(ordinary.clone())?;
+            let router = Router::new(
+                Hosts::new(&Config::default().hosts, None)?,
+                LocalRouter::new(GlobalChunkAllocator),
+            )
+            .with_extensions(BTreeMap::from([(
+                "localhost".into(),
+                extensions.enable_host("localhost", ["addressed-iq", "ordinary-check"])?,
+            )]));
+            let handle_router = router.handle();
+            let owner = account("bob@localhost")?;
+            let mut write = storage.begin_write().await?;
+            write
+                .create_account(NewAccount {
+                    key: owner.clone(),
+                    credentials: ScramCredentials::new(ScramVerifier::Sha1(
+                        ScramSha1Verifier::new(
+                            [21; 16],
+                            SCRAM_POLICY_ITERATIONS,
+                            [22; 20],
+                            [23; 20],
+                        ),
+                    )),
+                })
+                .await?;
+            write
+                .replace_vcard(&owner, FIRST_CARD, VCardQuota::default())
+                .await?;
+            write.commit().await?;
+            let sender = handle_router
+                .register(
+                    &account("alice@localhost")?,
+                    Some("desk"),
+                    NonZeroUsize::MIN,
+                )
+                .await?;
+            let work = WorkGroup::new().handle();
+            let stage = Stage {
+                router: &handle_router,
+                storage: &storage,
+                allocator: &GlobalChunkAllocator,
+                work: &work,
+            };
+            let origin = Origin::Session(&sender);
+            let ((), ahead) = handle_router
+                .order()
+                .fix(vec![owner.clone()], async { Ok::<_, HandlerError>(()) })
+                .await
+                .map_err(|_| "order test")?;
+            let (request, arena, sender_jid) = request(
+                GlobalChunkAllocator,
+                "alice@localhost/desk",
+                "bob@localhost",
+                "",
+            )?;
+            let get = handle(
+                &stage,
+                &origin,
+                IqInput::Owned {
+                    request,
+                    arena,
+                    sender: sender_jid,
+                },
+                Destination::Account,
+                IqType::Get,
+            )
+            .await
+            .map_err(|_| "admitting GET")?;
+            let IqDisposition::Ordered(get) = get else {
+                return Err("missing GET turn".into());
+            };
+            assert!(iq.read.lock().is_none());
+            let mut write = storage.begin_write().await?;
+            write
+                .replace_vcard(&owner, SECOND_CARD, VCardQuota::default())
+                .await?;
+            write.commit().await?;
+            drop(ahead);
+            get.finished()
+                .await
+                .ok_or("GET completion")?
+                .map_err(|_| "GET worker")?;
+            assert_eq!(iq.read.lock().as_deref(), Some(FIRST_CARD));
+
+            let mut write = storage.begin_write().await?;
+            write
+                .replace_vcard(&owner, FIRST_CARD, VCardQuota::default())
+                .await?;
+            write.commit().await?;
+            let mut write = storage.begin_write().await?;
+            write
+                .replace_vcard(&owner, SECOND_CARD, VCardQuota::default())
+                .await?;
+            let (ordinary_checked, ready) = oneshot::channel();
+            *ordinary.0.lock() = Some(ordinary_checked);
+            let (request, mut arena, sender_jid) = self::request(
+                GlobalChunkAllocator,
+                "alice@localhost/desk",
+                "bob@localhost",
+                "",
+            )?;
+            let request = request
+                .derive_in(&mut arena)?
+                .stanza_type(StanzaType::Iq(IqType::Set))
+                .build()?;
+            {
+                let mut set = std::pin::pin!(handle(
+                    &stage,
+                    &origin,
+                    IqInput::Owned {
+                        request,
+                        arena,
+                        sender: sender_jid
+                    },
+                    Destination::Account,
+                    IqType::Set
+                ));
+                match select(ready, set.as_mut()).await {
+                    Either::Left((ready, _)) => ready?,
+                    Either::Right(_) => {
+                        return Err("SET finished while the preceding writer was active".into());
+                    }
+                }
+                write.commit().await?;
+                assert!(matches!(
+                    set.await.map_err(|_| "admitting SET")?,
+                    IqDisposition::PolicyRejected {
+                        condition: StanzaErrorCondition::ServiceUnavailable,
+                        application: None,
+                        ..
+                    }
+                ));
+            }
+            assert_eq!(iq.set_calls.load(Ordering::Relaxed), 0);
+            drop(sender);
+            router.shutdown().await?;
+            Ok(())
+        },
+    ))?
+}
 
 fn request<A: ChunkAllocator + Clone>(
     allocator: A,

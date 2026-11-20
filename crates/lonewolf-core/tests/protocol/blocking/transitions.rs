@@ -126,6 +126,8 @@ fn block_and_unblock_send_presence_only_on_effective_transitions() -> TestResult
     expect_presence(&mut carol, "carol@localhost/desk", BOTH_VISIBLE)?;
     let same = &[][..];
     for (command, item, tablet_updates, watch_updates, carol_updates) in [
+        ("block", "localhost/watch", same, same, same),
+        ("unblock", "localhost/watch", same, same, same),
         ("block", TABLET, BOTH_HIDDEN, same, same),
         ("block", TABLET, same, same, same),
         ("block", BOB, same, BOTH_HIDDEN, same),
@@ -134,8 +136,6 @@ fn block_and_unblock_send_presence_only_on_effective_transitions() -> TestResult
         ("unblock", BOB, same, BOTH_VISIBLE, same),
         ("unblock", TABLET, BOTH_VISIBLE, same, same),
         ("unblock", TABLET, same, same, same),
-        ("block", "localhost/watch", same, BOTH_HIDDEN, same),
-        ("unblock", "localhost/watch", same, BOTH_VISIBLE, same),
         ("block", "localhost", BOTH_HIDDEN, BOTH_HIDDEN, BOTH_HIDDEN),
         ("block", BOB, same, same, same),
         ("block", TABLET, same, same, same),

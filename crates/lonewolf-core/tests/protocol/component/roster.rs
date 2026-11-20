@@ -724,6 +724,37 @@ fn component_subscription_receives_block_transitions_at_its_wire_address() -> Te
 }
 
 #[test]
+fn domain_resource_rules_change_presence_only_at_the_exact_component_address() -> TestResult {
+    let (mut suite, mut alice, mut component) = unavailable_setup(&format!(
+        "{CONFIG}\n[hosts.localhost]\nextensions=['blocking','roster','ping']"
+    ))?;
+    for contact in [DOMAIN, SERVER] {
+        grant(&mut alice, &mut component, contact, false, false)?;
+    }
+    publish(&mut alice, None, "current")?;
+    expect_audience(
+        &mut component,
+        &[],
+        &[DOMAIN, SERVER],
+        None,
+        Some("current"),
+    )?;
+    let exact = format!("{DOMAIN}/watch");
+    let user = format!("{SERVER}/watch");
+    for target in [&exact, &user] {
+        alice.send(&format!("<presence to='{target}'/>"))?;
+        component_presence(&mut component, DESK, target, None)?;
+    }
+    crate::blocking::change_rule(&mut alice, "block", &exact)?;
+    expect_audience(&mut component, &[], &[&exact], Some("unavailable"), None)?;
+    crate::blocking::change_rule(&mut alice, "unblock", &exact)?;
+    expect_audience(&mut component, &[], &[&exact], None, Some("current"))?;
+    component.close()?;
+    alice.close()?;
+    suite.stop()
+}
+
+#[test]
 fn overlapping_component_rules_restore_only_known_eligible_full_addresses() -> TestResult {
     let (mut suite, mut alice, mut component) = unavailable_setup(&format!(
         "{CONFIG}\n[hosts.localhost]\nextensions=['blocking','roster','ping']"

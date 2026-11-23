@@ -48,7 +48,7 @@ fn assert_roster_result(reply: &Element) -> TestResult {
     Ok(())
 }
 
-fn get_roster(alice: &mut Client) -> TestResult<Element> {
+pub(super) fn get_roster(alice: &mut Client) -> TestResult<Element> {
     request_roster(alice)?;
     let reply = alice.receive()?;
     assert_roster_result(&reply)?;
@@ -106,7 +106,7 @@ fn acknowledge_push(
     alice.send(&format!("<iq type='result' id='{id}'/>"))
 }
 
-fn push(
+pub(super) fn push(
     alice: &mut Client,
     contact: &str,
     state: &str,
@@ -516,7 +516,7 @@ fn other_contact(contact: &str) -> &'static str {
     if contact == DOMAIN { SERVER } else { DOMAIN }
 }
 
-fn unavailable_setup(config: &str) -> TestResult<(C2sSuite, Client, ComponentClient)> {
+pub(super) fn unavailable_setup(config: &str) -> TestResult<(C2sSuite, Client, ComponentClient)> {
     let suite = C2sSuite::with_components(config)?;
     suite.create_account("alice", PASSWORD)?;
     let mut alice = suite.connect("alice", PASSWORD, "desk")?;
@@ -525,7 +525,7 @@ fn unavailable_setup(config: &str) -> TestResult<(C2sSuite, Client, ComponentCli
     Ok((suite, alice, component))
 }
 
-fn grant(
+pub(super) fn grant(
     alice: &mut Client,
     component: &mut ComponentClient,
     contact: &str,
@@ -569,7 +569,7 @@ fn roster_audience(
     push(alice, FOURTH, "none", Some("subscribe"), false)
 }
 
-fn publish(alice: &mut Client, kind: Option<&str>, status: &str) -> TestResult {
+pub(super) fn publish(alice: &mut Client, kind: Option<&str>, status: &str) -> TestResult {
     let ty = kind.map_or(String::new(), |kind| format!(" type='{kind}'"));
     alice.send(&format!(
         "<presence{ty}><status>{status}</status></presence>"
@@ -580,7 +580,7 @@ fn publish(alice: &mut Client, kind: Option<&str>, status: &str) -> TestResult {
     barrier(alice)
 }
 
-fn expect_audience(
+pub(super) fn expect_audience(
     component: &mut ComponentClient,
     probes: &[&str],
     broadcasts: &[&str],

@@ -2,6 +2,7 @@
 
 use crate::support::{C2sSuite, TestResult};
 
+mod blocking;
 mod direct_tls;
 mod loss;
 mod negotiation;

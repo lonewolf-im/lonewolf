@@ -171,7 +171,7 @@ fn selective_and_global_unblock_notify_fetchers_on_each_request() -> TestResult 
     suite.stop()
 }
 
-fn expect_error(client: &mut Client, error_type: &str, condition: &str) -> TestResult {
+pub(super) fn expect_error(client: &mut Client, error_type: &str, condition: &str) -> TestResult {
     let reply = client.receive()?;
     reply.assert_name("jabber:client", "iq");
     assert_eq!(reply.attribute("type"), Some("error"), "{reply:?}");

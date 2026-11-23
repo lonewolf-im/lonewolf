@@ -54,7 +54,7 @@ fn publish(client: &mut Client, status: &str) -> TestResult {
     Ok(())
 }
 
-fn expect_presence(
+pub(super) fn expect_presence(
     client: &mut Client,
     recipient: &str,
     expected: &[(&str, Option<&str>)],

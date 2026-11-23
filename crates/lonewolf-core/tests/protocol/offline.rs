@@ -51,7 +51,7 @@ fn inspect(
     barrier(client, owner)
 }
 
-fn receive_stored(client: &mut Client, expected: &str) -> TestResult {
+pub(super) fn receive_stored(client: &mut Client, expected: &str) -> TestResult {
     let mut message = client.receive()?;
     let delay = message.child("urn:xmpp:delay", "delay")?;
     assert_eq!(delay.attribute("from"), Some("localhost"));
@@ -64,7 +64,7 @@ fn receive_stored(client: &mut Client, expected: &str) -> TestResult {
     message.assert_xml(expected)
 }
 
-fn await_empty(client: &mut Client, owner: &str) -> TestResult {
+pub(super) fn await_empty(client: &mut Client, owner: &str) -> TestResult {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         client.send("<iq type='get' id='empty'><query xmlns='urn:lonewolf:test:offline'/></iq>")?;

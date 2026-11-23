@@ -15,7 +15,7 @@ fn accounts(suite: &C2sSuite) -> TestResult {
     suite.create_account("bob", PASSWORD)
 }
 
-fn enable(client: &mut Client, full: &str) -> TestResult {
+pub(super) fn enable(client: &mut Client, full: &str) -> TestResult {
     client.send("<iq type='set' id='enable'><enable xmlns='urn:xmpp:carbons:2'/></iq>")?;
     client.expect_xml(&format!(
         "<iq xmlns='jabber:client' type='result' id='enable' to='{full}'/>"
@@ -44,7 +44,13 @@ fn sentinel(client: &mut Client, full: &str) -> TestResult {
     ))
 }
 
-fn copy(client: &mut Client, full: &str, direction: &str, kind: &str, inner: &str) -> TestResult {
+pub(super) fn copy(
+    client: &mut Client,
+    full: &str,
+    direction: &str,
+    kind: &str,
+    inner: &str,
+) -> TestResult {
     let bare = full.split_once('/').ok_or("missing resource")?.0;
     client.expect_xml(&format!("<message xmlns='jabber:client' from='{bare}' to='{full}'{kind}><{direction} xmlns='urn:xmpp:carbons:2'><forwarded xmlns='urn:xmpp:forward:0'>{inner}</forwarded></{direction}></message>"))
 }

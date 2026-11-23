@@ -185,7 +185,7 @@ fn list_push_and_restart() -> TestResult {
 
 #[test]
 fn first_get_orders_its_snapshot_with_overlapping_block_and_unblock() -> TestResult {
-    use mutations::{assert_result, fetch, push_id, send_change};
+    use mutations::{fetch, push_id};
     let mut suite = C2sSuite::with_extensions("'blocking', 'ping'")?;
     suite.create_account("alice", PASSWORD)?;
     let mut writer = suite.connect("alice", PASSWORD, "writer")?;
@@ -193,11 +193,23 @@ fn first_get_orders_its_snapshot_with_overlapping_block_and_unblock() -> TestRes
     let mut witness = suite.connect("alice", PASSWORD, "witness")?;
     fetch(&mut witness, "")?;
     let item = "<item jid='bob@localhost'/>";
-    send_change(&mut writer, "block", item)?;
+    writer.send(&format!(
+        "<iq type='set' id='add'><block xmlns='urn:xmpp:blocking'>{item}</block></iq>"
+    ))?;
     reader.send("<iq type='get' id='race'><blocklist xmlns='urn:xmpp:blocking'/></iq>")?;
-    send_change(&mut writer, "unblock", item)?;
-    assert_result(&writer.receive()?);
-    assert_result(&writer.receive()?);
+    writer.send(&format!(
+        "<iq type='set' id='remove'><unblock xmlns='urn:xmpp:blocking'>{item}</unblock></iq>"
+    ))?;
+    let replies = [writer.receive()?, writer.receive()?];
+    let mut ids = replies.each_ref().map(|reply| {
+        reply.assert_name("jabber:client", "iq");
+        assert_eq!(reply.attribute("type"), Some("result"), "{reply:?}");
+        assert!(reply.children.is_empty(), "{reply:?}");
+        reply.attribute("id")
+    });
+    ids.sort_unstable();
+    assert_eq!(ids, [Some("add"), Some("remove")]);
+    barrier(&mut writer)?;
     for command in ["block", "unblock"] {
         acknowledge_push(
             &mut witness,

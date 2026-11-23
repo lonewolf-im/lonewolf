@@ -10,7 +10,7 @@ use super::{
 };
 use crate::account::AccountKey;
 use crate::account::redb::account_exists;
-use crate::redb::{RedbRead, RedbWrite, storage_error};
+use crate::redb::{RedbBackendRead, RedbBackendWrite, storage_error};
 use crate::{StorageError, StorageErrorKind};
 
 pub(crate) const ELEMENTS: TableDefinition<(&str, &str, &str), &[u8]> =
@@ -73,10 +73,10 @@ macro_rules! private_reads {
     };
 }
 
-private_reads!(RedbRead);
-private_reads!(RedbWrite);
+private_reads!(RedbBackendRead);
+private_reads!(RedbBackendWrite);
 
-impl PrivateXmlWrites for RedbWrite {
+impl PrivateXmlWrites for RedbBackendWrite {
     async fn update_private_xml(
         &mut self,
         owner: &AccountKey,

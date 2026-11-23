@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod addressed;
+mod cache;
 mod discovery;
 pub(crate) mod external;
 mod mutations;

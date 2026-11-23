@@ -54,7 +54,7 @@ impl StorageBackend for FailingSyncBackend {
 
 /// Records the thread of every backend call and can hold the next sync open.
 #[derive(Clone, Debug, Default)]
-pub(super) struct ObservedBackend {
+pub(crate) struct ObservedBackend {
     inner: Arc<InMemoryBackend>,
     threads: Arc<PlMutex<Vec<ThreadId>>>,
     sync_gate: Arc<PlMutex<Option<SyncGate>>>,
@@ -72,7 +72,7 @@ impl ObservedBackend {
     }
 
     /// Returns a receiver that fires when the sync starts and a sender that lets it finish.
-    pub(super) fn block_next_sync(
+    pub(crate) fn block_next_sync(
         &self,
     ) -> Result<(mpsc::Receiver<()>, mpsc::Sender<()>), Box<dyn Error>> {
         let (entered, started) = mpsc::channel();

@@ -18,7 +18,7 @@ use lonewolf_auth::server::ScramDecoy;
 use lonewolf_util::blocking::BlockingExecutor;
 
 use crate::metrics::{StoreMetrics, StoreOperation};
-use crate::storage::{ReadTransaction, Storage, WriteTransaction};
+use crate::storage::{CommitObserver, ReadTransaction, Storage, WriteTransaction};
 use crate::{StorageError, StorageErrorKind, account, blocking, offline, private, roster, vcard};
 
 mod error;
@@ -27,9 +27,8 @@ mod jid;
 pub(crate) use error::{commit_error, storage_error};
 pub(crate) use jid::with_canonical_jid;
 
-/// Clones share the database, admission limits, and SCRAM decoy secret.
 #[derive(Clone)]
-pub struct RedbStorage {
+pub struct RedbBackend {
     inner: Arc<Inner>,
 }
 
@@ -45,12 +44,12 @@ struct Inner {
     metrics: Arc<StoreMetrics>,
 }
 
-pub struct RedbRead {
+pub struct RedbBackendRead {
     transaction: Arc<RedbReadTransaction>,
     reads: BlockingExecutor,
 }
 
-pub struct RedbWrite {
+pub struct RedbBackendWrite {
     inner: Arc<Inner>,
     transaction: Arc<RedbWriteTransaction>,
     writes: BlockingExecutor,
@@ -58,15 +57,13 @@ pub struct RedbWrite {
     metrics: Arc<StoreMetrics>,
 }
 
-impl RedbRead {
+impl RedbBackendRead {
     pub(crate) fn snapshot(&self) -> Arc<RedbReadTransaction> {
         Arc::clone(&self.transaction)
     }
 }
 
-impl RedbStorage {
-    /// Wraps an open database and initializes every table the current code needs.
-    ///
+impl RedbBackend {
     /// # Errors
     ///
     /// Returns [`StorageErrorKind::CorruptData`] when the existing tables are
@@ -115,7 +112,7 @@ impl RedbStorage {
 }
 
 /// Direct database access bypasses the admission limits and can block the caller.
-impl AsRef<Database> for RedbStorage {
+impl AsRef<Database> for RedbBackend {
     fn as_ref(&self) -> &Database {
         &self.inner.database
     }
@@ -133,11 +130,11 @@ fn initialize(database: &Database) -> Result<ScramDecoy, StorageError> {
     Ok(decoy)
 }
 
-impl Storage for RedbStorage {
-    type Read = RedbRead;
-    type Write = RedbWrite;
+impl Storage for RedbBackend {
+    type Read = RedbBackendRead;
+    type Write = RedbBackendWrite;
 
-    async fn begin_read(&self) -> Result<RedbRead, StorageError> {
+    async fn begin_read(&self) -> Result<RedbBackendRead, StorageError> {
         let inner = Arc::clone(&self.inner);
         let transaction = self
             .inner
@@ -149,13 +146,13 @@ impl Storage for RedbStorage {
                     .metrics
                     .record_failure(StoreOperation::BeginRead, error.kind());
             })?;
-        Ok(RedbRead {
+        Ok(RedbBackendRead {
             transaction: Arc::new(transaction),
             reads: self.inner.reads.clone(),
         })
     }
 
-    async fn begin_write(&self) -> Result<RedbWrite, StorageError> {
+    async fn begin_write(&self) -> Result<RedbBackendWrite, StorageError> {
         let started = Instant::now();
         let writer = Arc::clone(&self.inner.writer).lock_arc().await;
         let inner = Arc::clone(&self.inner);
@@ -173,7 +170,7 @@ impl Storage for RedbStorage {
             .metrics
             .write_wait_duration()
             .observe(started.elapsed().as_secs_f64());
-        Ok(RedbWrite {
+        Ok(RedbBackendWrite {
             inner: Arc::clone(&self.inner),
             transaction: Arc::new(transaction),
             writes: self.inner.writes.clone(),
@@ -187,7 +184,7 @@ impl Storage for RedbStorage {
     }
 }
 
-impl RedbRead {
+impl RedbBackendRead {
     pub(crate) fn run<T: Send + 'static>(
         &self,
         operation: impl FnOnce(&RedbReadTransaction) -> T + Send + 'static,
@@ -197,7 +194,7 @@ impl RedbRead {
     }
 }
 
-impl RedbWrite {
+impl RedbBackendWrite {
     pub(crate) fn run_with_snapshot<T: Send + 'static, E: From<StorageError> + Send + 'static>(
         &self,
         operation: impl FnOnce(&RedbWriteTransaction, &RedbReadTransaction) -> Result<T, E>
@@ -220,11 +217,11 @@ impl RedbWrite {
     }
 }
 
-impl ReadTransaction for RedbRead {}
-impl ReadTransaction for RedbWrite {}
+impl ReadTransaction for RedbBackendRead {}
+impl ReadTransaction for RedbBackendWrite {}
 
-impl WriteTransaction for RedbWrite {
-    async fn commit(self) -> Result<(), StorageError> {
+impl WriteTransaction for RedbBackendWrite {
+    async fn commit_observed(self, mut observer: impl CommitObserver) -> Result<(), StorageError> {
         let Self {
             transaction,
             writes,
@@ -239,7 +236,12 @@ impl WriteTransaction for RedbWrite {
         })?;
         let started = Instant::now();
         let result = writes
-            .run(move || transaction.commit().map_err(commit_error))
+            .run(move || {
+                observer.before_commit();
+                let result = transaction.commit().map_err(commit_error);
+                observer.after_commit(result.is_ok());
+                result
+            })
             .await;
         metrics
             .commit_duration()

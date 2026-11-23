@@ -11,7 +11,7 @@ use super::{
 };
 use crate::account::AccountKey;
 use crate::account::redb::account_exists;
-use crate::redb::{RedbRead, RedbWrite, storage_error};
+use crate::redb::{RedbBackendRead, RedbBackendWrite, storage_error};
 use crate::{StorageError, StorageErrorKind};
 
 pub(crate) const MESSAGES: TableDefinition<(&str, u64), &[u8]> =
@@ -134,10 +134,10 @@ macro_rules! offline_reads {
     };
 }
 
-offline_reads!(RedbRead);
-offline_reads!(RedbWrite);
+offline_reads!(RedbBackendRead);
+offline_reads!(RedbBackendWrite);
 
-impl OfflineWrites for RedbWrite {
+impl OfflineWrites for RedbBackendWrite {
     fn push_offline_message(
         &mut self,
         owner: &AccountKey,

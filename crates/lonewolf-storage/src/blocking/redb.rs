@@ -12,7 +12,7 @@ use super::{
 use crate::StorageError;
 use crate::account::AccountKey;
 use crate::account::redb::account_exists;
-use crate::redb::{RedbRead, RedbWrite, storage_error, with_canonical_jid};
+use crate::redb::{RedbBackendRead, RedbBackendWrite, storage_error, with_canonical_jid};
 use crate::roster::RosterJid;
 
 pub(crate) const ITEMS: TableDefinition<(&str, &str), ()> =
@@ -87,8 +87,8 @@ macro_rules! blocking_reads {
     };
 }
 
-blocking_reads!(RedbRead);
-blocking_reads!(RedbWrite);
+blocking_reads!(RedbBackendRead);
+blocking_reads!(RedbBackendWrite);
 
 enum OwnedChange {
     Block(Vec<RosterJid>),
@@ -96,7 +96,7 @@ enum OwnedChange {
     Clear,
 }
 
-impl BlockingWrites for RedbWrite {
+impl BlockingWrites for RedbBackendWrite {
     async fn change_blocklist(
         &mut self,
         owner: &AccountKey,

@@ -47,6 +47,12 @@ pub(crate) fn storage() -> TestResult<RedbStorage> {
     )?)?)
 }
 
+pub(crate) fn observed_storage() -> TestResult<(RedbStorage, ObservedBackend)> {
+    let backend = ObservedBackend::default();
+    let storage = RedbStorage::new(database(backend.clone(), 1024 * 1024)?)?;
+    Ok((storage, backend))
+}
+
 fn database(
     backend: impl StorageBackend,
     cache_size: usize,
@@ -639,7 +645,7 @@ fn full_read_capacity_does_not_block_a_writer() -> TestResult {
         for _ in 0..32 {
             let (entered, started) = mpsc::channel();
             let (release, gate) = mpsc::channel();
-            let mut operation = Box::pin(reader.run(move |_| {
+            let mut operation = Box::pin(reader.inner().run(move |_| {
                 let _ = entered.send(());
                 gate.recv_timeout(TIMEOUT)
             }));
@@ -647,7 +653,7 @@ fn full_read_capacity_does_not_block_a_writer() -> TestResult {
             started.recv_timeout(TIMEOUT)?;
             blocked.push((operation, release));
         }
-        let mut waiting = Box::pin(reader.run(|_| 42));
+        let mut waiting = Box::pin(reader.inner().run(|_| 42));
         assert!(poll(waiting.as_mut()).is_pending());
 
         write(&storage, async |tx| tx.create_account(account).await).await?;
@@ -673,7 +679,7 @@ fn full_read_capacity_does_not_block_opening_a_snapshot() -> TestResult {
         for _ in 0..32 {
             let (entered, started) = mpsc::channel();
             let (release, gate) = mpsc::channel();
-            let mut operation = Box::pin(busy.run(move |_| {
+            let mut operation = Box::pin(busy.inner().run(move |_| {
                 let _ = entered.send(());
                 gate.recv_timeout(TIMEOUT)
             }));
@@ -799,7 +805,7 @@ fn commit_fails_while_a_cancelled_operation_still_holds_the_transaction() -> Tes
         let writer = storage.begin_write().await?;
         let (entered, started) = mpsc::channel();
         let (release, gate) = mpsc::channel();
-        let mut blocked = Box::pin(writer.run(move |_| {
+        let mut blocked = Box::pin(writer.inner().run(move |_| {
             let _ = entered.send(());
             gate.recv_timeout(TIMEOUT)
         }));

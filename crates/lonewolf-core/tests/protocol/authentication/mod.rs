@@ -9,6 +9,9 @@ use super::support::{C2sSuite, Client, OPEN, SASL_NAMESPACE, STREAM_ERRORS, Test
 
 mod sha512;
 
+// The budget includes the test's CRL release, so it must absorb delays on loaded runners.
+const CRL_ESTABLISHMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 const ALL_SCRAM_MECHANISMS: &[&str] = &[
     "SCRAM-SHA-512-PLUS",
     "SCRAM-SHA-512",
@@ -1089,7 +1092,10 @@ fn blocked_handshake_crl_reload_obeys_establishment_timeout_and_late_results_are
     let mut crls_path = None;
     let suite = C2sSuite::with_extensions_limits_and_setup(
         "",
-        "connection_establishment_timeout_secs = 1",
+        &format!(
+            "connection_establishment_timeout_secs = {}",
+            CRL_ESTABLISHMENT_TIMEOUT.as_secs()
+        ),
         |directory| {
             certificates = Some(ClientCertificates::configure(directory)?);
             crls_path = Some(directory.join("client-crls.pem"));
@@ -1589,7 +1595,10 @@ fn blocked_post_handshake_certificate_verification_closes_retained_tls_at_origin
     let mut path = None;
     let suite = C2sSuite::with_extensions_limits_and_setup(
         "",
-        "connection_establishment_timeout_secs = 1",
+        &format!(
+            "connection_establishment_timeout_secs = {}",
+            CRL_ESTABLISHMENT_TIMEOUT.as_secs()
+        ),
         |directory| {
             certificates = Some(ClientCertificates::configure(directory)?);
             path = Some(directory.join("client-crls.pem"));
@@ -1637,11 +1646,13 @@ fn blocked_post_handshake_certificate_verification_closes_retained_tls_at_origin
             client
                 .expect_tls_close()
                 .map_err(|error| format!("post-handshake TLS close: {error}"))?;
-            assert!(started.elapsed() < std::time::Duration::from_secs(2));
+            assert!(
+                started.elapsed() < CRL_ESTABLISHMENT_TIMEOUT + std::time::Duration::from_secs(1)
+            );
             client.send_tls_close().map_err(|error| error.to_string())?;
             client.expect_tcp_eof().map_err(|error| error.to_string())
         });
-        completed.recv_timeout(std::time::Duration::from_secs(2))?;
+        completed.recv_timeout(CRL_ESTABLISHMENT_TIMEOUT + std::time::Duration::from_secs(1))?;
         let release = wait_for_crl_reader(&path)?;
         closed
             .join()

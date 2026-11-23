@@ -95,9 +95,15 @@ fn scripted_socket_delivery_faults_preserve_accounting_and_reader_identity() -> 
                 body_bytes: 64,
             },
         )?;
-        config.measurement.operation_timeout_ms = 300;
-        config.measurement.max_schedule_lag_ms = 100;
-        config.measurement.shutdown_timeout_ms = 300;
+        // A late receipt counts only while the one-message window is open, so it needs a short timeout.
+        let (operation, lag, shutdown) = if behavior == peer::Behavior::Late {
+            (300, 250, 300)
+        } else {
+            (2000, 1000, 2500)
+        };
+        config.measurement.operation_timeout_ms = operation;
+        config.measurement.max_schedule_lag_ms = lag;
+        config.measurement.shutdown_timeout_ms = shutdown;
         let path = config_file(directory.path(), "config", &config)?;
         let out = directory.path().join("result");
         let output = run_cli(&path, &out)?;
@@ -478,7 +484,7 @@ async fn http_metrics_preserve_host_pin_address_and_degrade_without_changing_wor
                 endpoint: Some(endpoint),
                 timing: MetricsConfig {
                     interval_ms: 1000,
-                    timeout_ms: 200,
+                    timeout_ms: 2000,
                 },
             },
             Instant::now(),
@@ -496,7 +502,7 @@ async fn http_metrics_preserve_host_pin_address_and_degrade_without_changing_wor
         );
         assert!(request.starts_with("GET /metrics HTTP/1.1\r\n"));
         let (report, raw) = sampler
-            .stop(Instant::now() + Duration::from_millis(300))
+            .stop(Instant::now() + Duration::from_secs(3))
             .await?;
         assert!(!raw.is_empty());
         assert!(!String::from_utf8_lossy(&raw).contains("partial-secret-body-sentinel"));

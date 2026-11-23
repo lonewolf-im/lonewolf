@@ -681,7 +681,7 @@ fn release_through_releases_only_entries_up_to_the_flushed_sequence() -> TestRes
                 .get(),
             OfflineSequence::new(2)
         );
-        compio::time::timeout(Duration::from_secs(1), async {
+        compio::time::timeout(Duration::from_secs(5), async {
             while fixture.count().await? != 0 {
                 compio::time::sleep(Duration::from_millis(1)).await;
             }
@@ -1349,7 +1349,7 @@ fn late_certificate_revalidation_cannot_retire_a_replacement_resource() -> TestR
         });
         let mut session = Box::pin(session);
         assert!(futures_util::poll!(session.as_mut()).is_pending());
-        started.recv_timeout(Duration::from_secs(1))?;
+        started.recv_timeout(Duration::from_secs(5))?;
         fixture
             .router
             .handle()

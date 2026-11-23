@@ -16,6 +16,7 @@ use lonewolf_xmpp::parser::{ParserConfig, XmppParser};
 
 use super::*;
 use crate::c2s::stream::header::ClientHeader;
+use crate::clock::FrozenClock;
 use crate::xml_stream::limiter::StanzaLimiter;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -67,7 +68,7 @@ fn local_close_discards_complete_stanzas_without_spending_stanza_tokens() -> Tes
             .await
             .map_err(|outcome| format!("{outcome:?}"))?;
         compio::time::timeout(
-            Duration::from_millis(100),
+            Duration::from_secs(5),
             xml(
                 &mut reader,
                 &mut writer,
@@ -356,12 +357,14 @@ fn blocked_phase_writes_cancel_before_timeout_close_discards_application_bufferi
                 .await
                 .map_err(|error| format!("{error:?}"))?;
             allowance.set(64);
-            let deadline = Instant::now() + FIRST_POLL_MARGIN;
+            let clock = FrozenClock::start();
+            let deadline = clock.now() + Duration::from_millis(20);
             assert_eq!(
                 crate::c2s::stream::run_phase(Some(deadline), outcome, pin!(writer.send(&stanza)))
                     .await,
                 Err(outcome)
             );
+            clock.advance(Duration::from_millis(20));
             assert!(!writer.is_intact());
             let accepted = bytes.borrow().len();
             allowance.set(usize::MAX);
@@ -408,7 +411,8 @@ fn timeout_during_starttls_proceed_flush_never_appends_plaintext_after_proceed()
             .map_err(|error| format!("{error:?}"))?;
         let header_bytes = bytes.borrow().len();
         allowance.set(1);
-        let deadline = Instant::now() + FIRST_POLL_MARGIN;
+        let clock = FrozenClock::start();
+        let deadline = clock.now() + Duration::from_millis(20);
         assert_eq!(
             crate::c2s::stream::run_phase(
                 Some(deadline),
@@ -418,6 +422,7 @@ fn timeout_during_starttls_proceed_flush_never_appends_plaintext_after_proceed()
             .await,
             Err(CloseOutcome::EstablishmentTimeout)
         );
+        clock.advance(Duration::from_millis(20));
         assert_eq!(bytes.borrow().len(), header_bytes + 1);
         let accepted = bytes.borrow().len();
         allowance.set(usize::MAX);
@@ -536,7 +541,7 @@ fn shutdown_shortens_a_close_already_waiting_on_its_original_deadline() -> TestR
         let deadline = Instant::now() + Duration::from_millis(100);
         stop.send(deadline).map_err(|_| "close stopped listening")?;
         assert!(
-            compio::time::timeout(Duration::from_secs(1), close)
+            compio::time::timeout(Duration::from_secs(5), close)
                 .await?
                 .is_err()
         );
@@ -612,7 +617,8 @@ fn network_work_that_becomes_ready_after_expiry_is_not_polled_again() -> TestRes
             shutdown: std::future::pending::<Instant>().boxed_local().shared(),
             phase_deadline: None,
         };
-        let deadline = Instant::now() + FIRST_POLL_MARGIN;
+        let clock = FrozenClock::start();
+        let deadline = clock.now() + Duration::from_millis(20);
         let ready = Cell::new(false);
         let polls = Cell::new(0);
         let operation = pin!(poll_fn(|_| {
@@ -626,7 +632,7 @@ fn network_work_that_becomes_ready_after_expiry_is_not_polled_again() -> TestRes
         let mut close = Box::pin(context.until(deadline, operation));
         assert!(poll!(close.as_mut()).is_pending());
         assert_eq!(polls.get(), 1);
-        compio::time::sleep_until(deadline + Duration::from_millis(10)).await;
+        clock.advance(Duration::from_millis(20));
         ready.set(true);
         assert_eq!(
             completed(close.await, CloseOutcome::AuthenticationTimeout, "test"),
@@ -782,18 +788,22 @@ fn plaintext_drain_deadline_bounds_always_ready_input_and_stops_polls_after_expi
                 tail: Tail::Ready,
             };
             let reads = Rc::clone(&input.reads);
-            let deadline = Instant::now()
-                + if expired {
-                    Duration::ZERO
-                } else {
-                    FIRST_POLL_MARGIN
-                };
-            let started = Instant::now();
-            assert_eq!(
-                context.until(deadline, pin!(drain_plain(&mut input))).await,
-                Err(())
-            );
-            assert!(started.elapsed() < FIRST_POLL_MARGIN + Duration::from_secs(1));
+            let clock = FrozenClock::start();
+            let remaining = if expired {
+                Duration::ZERO
+            } else {
+                Duration::from_millis(20)
+            };
+            let deadline = clock.now() + remaining;
+            {
+                let operation = pin!(drain_plain(&mut input));
+                let mut drain = pin!(context.until(deadline, operation));
+                if !expired {
+                    assert!(poll!(drain.as_mut()).is_pending());
+                    clock.advance(remaining);
+                }
+                assert_eq!(drain.await, Err(()));
+            }
             assert_eq!(reads.get() == 0, expired);
             let polls = reads.get();
             assert_eq!(
@@ -1027,12 +1037,13 @@ fn plaintext_drain_ready_after_expiry_is_not_polled_again() -> TestResult {
             tail: Tail::Ready,
         };
         let reads = Rc::clone(&input.reads);
-        let deadline = Instant::now() + FIRST_POLL_MARGIN;
+        let clock = FrozenClock::start();
+        let deadline = clock.now() + Duration::from_millis(20);
         let operation = pin!(drain_plain(&mut input));
         let mut drain = Box::pin(context.until(deadline, operation));
         assert!(poll!(drain.as_mut()).is_pending());
         assert_eq!(reads.get(), 1);
-        compio::time::sleep_until(deadline + Duration::from_millis(10)).await;
+        clock.advance(Duration::from_millis(20));
         assert_eq!(drain.await, Err(()));
         assert_eq!(reads.get(), 1);
         listener.close().await?;

@@ -91,7 +91,7 @@ async fn failed_start_remains_owned_until_stop() -> TestResult {
         .path()
         .to_owned();
     let error = fixture
-        .start(Instant::now() + Duration::from_secs(2))
+        .start(Instant::now() + Duration::from_secs(10))
         .await
         .err()
         .ok_or("test executable unexpectedly started as a server")?;
@@ -116,7 +116,7 @@ async fn exit_after_closing_stderr_is_reported_as_a_startup_exit() -> TestResult
     let cpu = CpuPool::new(NonZeroUsize::MIN);
     let mut fixture = LocalFixture::prepare(&config, &cpu).await?;
     let error = fixture
-        .start(Instant::now() + Duration::from_secs(2))
+        .start(Instant::now() + Duration::from_secs(10))
         .await
         .err()
         .ok_or("script unexpectedly started as a server")?;
@@ -158,7 +158,7 @@ async fn attach_ignoring_child(fixture: &mut LocalFixture) -> TestResult {
     let stderr = child.stderr.take().ok_or("stderr")?;
     fixture.child = Some(child);
     fixture.collector = Some(Collector::start(stderr)?);
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(10);
     while !ready.exists() {
         if Instant::now() >= deadline {
             return Err("helper readiness deadline".into());

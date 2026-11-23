@@ -237,7 +237,8 @@ fn phase_work_ready_after_expiry_is_not_polled_again() -> io::Result<()> {
             CloseOutcome::BindingTimeout,
         ] {
             let (mut socket, mut peer) = phase_socket_pair().await?;
-            let deadline = Instant::now() + Duration::from_millis(20);
+            let clock = crate::clock::FrozenClock::start();
+            let deadline = clock.now() + Duration::from_millis(20);
             let ready = Cell::new(false);
             let polls = Cell::new(0);
             let operation = pin!(std::future::poll_fn(|_| {
@@ -251,9 +252,7 @@ fn phase_work_ready_after_expiry_is_not_polled_again() -> io::Result<()> {
             let mut phase = pin!(run_phase(Some(deadline), outcome, operation));
             assert!(futures_util::poll!(phase.as_mut()).is_pending());
             assert_eq!(polls.get(), 1);
-            std::thread::sleep(
-                deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
-            );
+            clock.advance(Duration::from_millis(20));
             ready.set(true);
             assert_eq!(phase.await, Err(outcome));
             assert_eq!(polls.get(), 1);
@@ -478,10 +477,12 @@ fn blocked_certificate_preparation_cancels_without_losing_completed_tls()
         .await?;
         let version = transport.get_ref().1.protocol_version();
         transport.get_mut().0.handshake_complete(version);
+        let clock = crate::clock::FrozenClock::start();
+        let phase = Duration::from_millis(20);
         let context = close::CloseContext {
             socket,
             shutdown: std::future::pending::<Instant>().boxed_local().shared(),
-            phase_deadline: Some(Instant::now() + Duration::from_millis(20)),
+            phase_deadline: Some(clock.now() + phase),
         };
         let entered = Cell::new(false);
         let cancelled = Cell::new(false);
@@ -493,6 +494,7 @@ fn blocked_certificate_preparation_cancels_without_losing_completed_tls()
         }
         let result = establish::prepare_tls(&mut transport, &context, async |_| {
             entered.set(true);
+            clock.advance(phase);
             let _cancellation = Cancellation(&cancelled);
             std::future::pending::<Result<(), CloseOutcome>>().await
         })

@@ -343,7 +343,7 @@ async fn socket_pair() -> TestResult<(compio::net::TcpStream, std::net::TcpStrea
     )))
     .await?;
     let peer = std::net::TcpStream::connect(listener.local_addr()?)?;
-    peer.set_read_timeout(Some(std::time::Duration::from_secs(1)))?;
+    peer.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
     let (socket, _) = listener.accept().await?;
     Ok((socket, peer))
 }

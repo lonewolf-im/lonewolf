@@ -75,13 +75,21 @@ mod tests {
         let peak = Arc::new(AtomicUsize::new(0));
         let finished = Arc::new(AtomicUsize::new(0));
         let mut jobs = Vec::new();
-        for _ in 0..4 {
+        for index in 0..4 {
             let pool = pool.clone();
             let (running, peak, finished) = (running.clone(), peak.clone(), finished.clone());
             let mut job = Box::pin(async move {
                 pool.run(move || {
                     let now = running.fetch_add(1, Ordering::SeqCst) + 1;
                     peak.fetch_max(now, Ordering::SeqCst);
+                    if index < 2 {
+                        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                        while running.load(Ordering::SeqCst) < 2
+                            && std::time::Instant::now() < deadline
+                        {
+                            std::thread::yield_now();
+                        }
+                    }
                     std::thread::sleep(Duration::from_millis(50));
                     running.fetch_sub(1, Ordering::SeqCst);
                     finished.fetch_add(1, Ordering::SeqCst);

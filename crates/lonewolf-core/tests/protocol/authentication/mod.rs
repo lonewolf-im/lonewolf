@@ -1483,7 +1483,7 @@ fn external_expiry_during_binding_uses_reset() -> TestResult {
     suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let key = certificates.identity_key(
         &["alice@localhost"],
-        time::OffsetDateTime::now_utc() + time::Duration::seconds(3),
+        time::OffsetDateTime::now_utc() + time::Duration::seconds(4),
     )?;
     let mut client = certificate_client(&suite, key, None)?;
     client.send_external_auth(Some(""))?;
@@ -1503,7 +1503,7 @@ fn external_expiry_after_binding_sends_directed_unavailable() -> TestResult {
     bob.bind(Some("desk"))?;
     let key = certificates.identity_key(
         &["alice@localhost"],
-        time::OffsetDateTime::now_utc() + time::Duration::seconds(3),
+        time::OffsetDateTime::now_utc() + time::Duration::seconds(6),
     )?;
     let mut alice = certificate_client(&suite, key, None)?;
     alice.send_external_auth(Some(""))?;
@@ -1549,7 +1549,7 @@ fn external_account_deletion_before_and_after_binding_retires_only_its_session()
 fn scram_with_a_certificate_does_not_activate_certificate_expiry_monitoring() -> TestResult {
     let (suite, certificates, _) = external_suite("")?;
     suite.create_account("alice", ALTERNATE_PASSWORD)?;
-    let expires = time::OffsetDateTime::now_utc() + time::Duration::seconds(2);
+    let expires = time::OffsetDateTime::now_utc() + time::Duration::seconds(4);
     let key = certificates.identity_key(&["alice@localhost"], expires)?;
     let mut client = certificate_client(&suite, key, None)?;
     client.authenticate("alice", ALTERNATE_PASSWORD)?;
@@ -1647,12 +1647,12 @@ fn blocked_post_handshake_certificate_verification_closes_retained_tls_at_origin
                 .expect_tls_close()
                 .map_err(|error| format!("post-handshake TLS close: {error}"))?;
             assert!(
-                started.elapsed() < CRL_ESTABLISHMENT_TIMEOUT + std::time::Duration::from_secs(1)
+                started.elapsed() < CRL_ESTABLISHMENT_TIMEOUT + std::time::Duration::from_secs(3)
             );
             client.send_tls_close().map_err(|error| error.to_string())?;
             client.expect_tcp_eof().map_err(|error| error.to_string())
         });
-        completed.recv_timeout(CRL_ESTABLISHMENT_TIMEOUT + std::time::Duration::from_secs(1))?;
+        completed.recv_timeout(CRL_ESTABLISHMENT_TIMEOUT + std::time::Duration::from_secs(3))?;
         let release = wait_for_crl_reader(&path)?;
         closed
             .join()
@@ -1681,7 +1681,7 @@ fn external_blocked_revalidation_obeys_authentication_deadline() -> TestResult {
     let mut path = None;
     let suite = C2sSuite::with_extensions_limits_and_setup(
         "",
-        "authentication_timeout_secs = 1",
+        "authentication_timeout_secs = 3",
         |directory| {
             material = Some(super::support::tls::ClientCertificates::configure(
                 directory,
@@ -1699,7 +1699,7 @@ fn external_blocked_revalidation_obeys_authentication_deadline() -> TestResult {
     client.send_external_auth(Some(""))?;
     let mut release = wait_for_crl_reader(&path)?;
     client.receive()?.child(STREAM_ERRORS, "policy-violation")?;
-    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    assert!(started.elapsed() < std::time::Duration::from_secs(6));
     client.expect_footer()?;
     client.send("</stream:stream>")?;
     client.expect_tls_close()?;

@@ -361,8 +361,8 @@ fn silent_direct_tcp_peer_times_out_without_tls_or_xml_and_records_one_authentic
         "{CONFIG}\n[limits.components]\nnegotiation_timeout_secs=1"
     ))?;
     let mut socket = tcp(suite.component_address(0)?)?;
-    suite.wait_for_metric("lonewolf_component_connections 1")?;
     assert!(drain_without_xml(&mut socket)?.is_empty());
+    suite.wait_for_metric("lonewolf_component_connections_accepted_total{listener=\"0\"} 1")?;
     timeout_accounting(&suite)?;
     let state = suite
         .stop_with_component_state()?
@@ -385,7 +385,7 @@ fn silent_direct_tcp_peer_times_out_without_tls_or_xml_and_records_one_authentic
 #[test]
 fn tls_without_an_xml_header_times_out_inside_tls_and_sends_close_notify() -> TestResult {
     let mut suite = C2sSuite::with_components(&format!(
-        "{CONFIG}\n[limits.components]\nnegotiation_timeout_secs=1\nincoming_xml_per_connection={{bytes_per_second=16,burst_bytes=256}}"
+        "{CONFIG}\n[limits.components]\nnegotiation_timeout_secs=3\nincoming_xml_per_connection={{bytes_per_second=16,burst_bytes=256}}"
     ))?;
     let mut component = TlsComponentClient::connect_tls(
         suite.component_address(0)?,

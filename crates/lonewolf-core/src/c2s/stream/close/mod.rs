@@ -260,9 +260,9 @@ pub(super) async fn before_deadline<T>(
     mut future: std::pin::Pin<&mut impl Future<Output = T>>,
 ) -> Result<T, ()> {
     compio::time::timeout(
-        deadline.saturating_duration_since(Instant::now()),
+        deadline.saturating_duration_since(crate::clock::now()),
         poll_fn(|context| {
-            if Instant::now() >= deadline {
+            if crate::clock::now() >= deadline {
                 Poll::Ready(Err(()))
             } else {
                 future.as_mut().poll(context).map(Ok)

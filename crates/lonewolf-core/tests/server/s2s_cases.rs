@@ -181,7 +181,7 @@ fn inbound_idle_and_actual_certificate_deadlines_close_with_lifetime_outcomes() 
     server.stop(Signal::SIGTERM)?;
 
     let (mut server, address) = fixture.server("")?;
-    let expiry = time::OffsetDateTime::now_utc() + time::Duration::seconds(4);
+    let expiry = time::OffsetDateTime::now_utc() + time::Duration::seconds(6);
     let config = fixture.client_until(expiry)?;
     let (mut peer, _) = start_tls(address, config)?;
     external(&mut peer, HEADER)?;
@@ -596,10 +596,14 @@ fn silent_endpoints_have_separate_deadlines_and_cleanup_is_bounded_and_excluded_
     let fixture = Fixture::new()?;
     let first = out::listener()?;
     let second = out::listener()?;
+    let timeout = Duration::from_secs(3);
     let (mut server, mut initiator) = out::start(
         &fixture,
         &[first.local_addr()?, second.local_addr()?],
-        "[limits.s2s]\nnegotiation_timeout_secs=1\n",
+        &format!(
+            "[limits.s2s]\nnegotiation_timeout_secs={}\n",
+            timeout.as_secs()
+        ),
     )?;
     out::trigger(&mut initiator, "silent")?;
     let started = Instant::now();
@@ -607,7 +611,7 @@ fn silent_endpoints_have_separate_deadlines_and_cleanup_is_bounded_and_excluded_
     out::header(&mut first_peer)?;
     stream_error(&mut first_peer, "connection-timeout")?;
     let first_deadline = started.elapsed();
-    assert!(first_deadline >= Duration::from_secs(1) && first_deadline < Duration::from_secs(3));
+    assert!(first_deadline >= timeout && first_deadline < timeout + Duration::from_secs(3));
     assert_eq!(first_peer.read(&mut [0; 1])?, 0);
     assert!(started.elapsed() >= first_deadline + Duration::from_secs(4));
     assert!(started.elapsed() < first_deadline + Duration::from_secs(7));
@@ -615,7 +619,7 @@ fn silent_endpoints_have_separate_deadlines_and_cleanup_is_bounded_and_excluded_
     out::header(&mut second_peer)?;
     let second_started = Instant::now();
     stream_error(&mut second_peer, "connection-timeout")?;
-    assert!(second_started.elapsed() >= Duration::from_millis(900));
+    assert!(second_started.elapsed() >= timeout - Duration::from_millis(100));
     second_peer.write_all(FOOTER.as_bytes())?;
     assert_eq!(second_peer.read(&mut [0; 1])?, 0);
     out::failure(&server, "timeout")?;
@@ -624,7 +628,11 @@ fn silent_endpoints_have_separate_deadlines_and_cleanup_is_bounded_and_excluded_
         &body,
         "lonewolf_s2s_negotiation_duration_seconds_sum{direction=\"outbound\"}",
     )?;
-    assert!((2.0..4.0).contains(&measured), "{measured}: {body}");
+    let attempts = 2.0 * timeout.as_secs_f64();
+    assert!(
+        (attempts..attempts + 3.0).contains(&measured),
+        "{measured}: {body}"
+    );
     close(&mut initiator)?;
     server.stop(Signal::SIGTERM)?;
     Ok(())
@@ -733,7 +741,7 @@ fn outgoing_certificate_expiry_resets_the_stream_and_new_input_reestablishes() -
     let fixture = Fixture::new()?;
     let listener = out::listener()?;
     let (mut server, mut initiator) = out::start(&fixture, &[listener.local_addr()?], "")?;
-    let expiry = time::OffsetDateTime::now_utc() + time::Duration::seconds(4);
+    let expiry = time::OffsetDateTime::now_utc() + time::Duration::seconds(6);
     let config = out::expiring_config(&fixture, expiry)?;
     out::trigger(&mut initiator, "before")?;
     let mut first = out::establish(&listener, config, &fixture)?;

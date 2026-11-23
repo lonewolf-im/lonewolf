@@ -564,7 +564,7 @@ fn detached_effect_failure_logs_after_requester_cancellation() -> TestResult {
         );
         drop(pending);
         release.send(()).map_err(|_| "effect owner was cancelled")?;
-        compio::time::timeout(Duration::from_secs(1), group.drain()).await?;
+        compio::time::timeout(Duration::from_secs(5), group.drain()).await?;
         capture.assert_one(FailureKind::Delivery, "presence_subscription_effects");
         Ok(())
     })

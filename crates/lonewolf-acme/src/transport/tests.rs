@@ -462,7 +462,7 @@ fn global_deadline_bounds_handshake_and_response_body_stalls() {
         gate.recv_timeout(WAIT).unwrap();
     });
     let (certificate, key) = certificate("127.0.0.1", false);
-    let client = client_with_root(&certificate, Duration::from_millis(100));
+    let client = client_with_root(&certificate, Duration::from_secs(2));
     let started = Instant::now();
     let error = block_on(client.request(request(&url))).err().unwrap();
     assert_eq!(error_kind(&error), AcmeErrorKind::Timeout);

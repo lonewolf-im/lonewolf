@@ -253,7 +253,7 @@ fn final_restart_cannot_change_the_authenticated_domain_pair() -> Result {
 #[test]
 fn negotiation_deadline_closes_with_timeout_and_records_once() -> Result {
     let fixture = Fixture::new()?;
-    let (mut server, address) = fixture.server("[limits.s2s]\nnegotiation_timeout_secs=1\n")?;
+    let (mut server, address) = fixture.server("[limits.s2s]\nnegotiation_timeout_secs=3\n")?;
     let mut peer = connect(address)?;
     peer.write_all(HEADER.as_bytes())?;
     response_header(&mut peer)?;

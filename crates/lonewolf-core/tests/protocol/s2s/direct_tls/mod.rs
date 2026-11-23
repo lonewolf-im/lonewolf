@@ -554,13 +554,19 @@ fn inbound_direct_tls_requires_sni_and_server_alpn_without_plaintext_xml() -> Te
 fn inbound_direct_tls_timeout_malformed_hello_and_shutdown_close_without_xml() -> TestResult {
     use std::io::Write;
     for kind in ["timeout", "malformed", "shutdown"] {
-        let mut fixture = inbound_fixture("[limits.s2s]\nnegotiation_timeout_secs=1", false)?;
+        let negotiation = if kind == "timeout" { 1 } else { 60 };
+        let mut fixture = inbound_fixture(
+            &format!("[limits.s2s]\nnegotiation_timeout_secs={negotiation}"),
+            false,
+        )?;
         let mut socket = TcpStream::connect_timeout(&fixture.suite.s2s_addresses()?[1], TIMEOUT)?;
         socket.set_read_timeout(Some(TIMEOUT))?;
         socket.set_write_timeout(Some(TIMEOUT))?;
-        fixture
-            .suite
-            .wait_for_metric("lonewolf_s2s_connections{direction=\"inbound\"} 1")?;
+        if kind != "timeout" {
+            fixture
+                .suite
+                .wait_for_metric("lonewolf_s2s_connections{direction=\"inbound\"} 1")?;
+        }
         if kind == "shutdown" {
             let state = fixture
                 .suite

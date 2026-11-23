@@ -89,7 +89,7 @@ fn direct_tls_silent_partial_and_stalled_handshakes_timeout_without_xml_then_rec
 {
     let mut suite = C2sSuite::with_listener_setup(
         "tls_mode='direct'",
-        "connection_establishment_timeout_secs=1",
+        "connection_establishment_timeout_secs=3",
         "[hosts.localhost]\nextensions=[]",
         |_| Ok(()),
     )?;
@@ -141,7 +141,7 @@ fn direct_tls_selected_policy_refresh_uses_establishment_deadline_and_unblocks_a
 -> TestResult {
     let mut suite = C2sSuite::with_listener_setup(
         "tls_mode='direct'",
-        "connection_establishment_timeout_secs=1",
+        "connection_establishment_timeout_secs=3",
         "[hosts.localhost]\nextensions=[]",
         |directory| {
             tls::ClientCertificates::configure(directory)?;

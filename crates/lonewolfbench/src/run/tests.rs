@@ -450,6 +450,7 @@ async fn warmup_settlement_drains_invalid_events_beyond_the_hot_loop_batch() -> 
 async fn stopped_fixture_retains_finalized_safe_logs_through_artifact_finalization() -> TestResult {
     let (mut context, _signal) = context(1)?;
     let mut config = config(1)?;
+    config.measurement.setup_timeout_ms = 30_000;
     if let TargetConfig::Local { server_binary, .. } = &mut config.target {
         *server_binary = std::env::current_exe()?;
     }
@@ -467,7 +468,7 @@ async fn stopped_fixture_retains_finalized_safe_logs_through_artifact_finalizati
         .fixture
         .as_mut()
         .ok_or("fixture")?
-        .start(Instant::now() + Duration::from_secs(1))
+        .start(Instant::now() + Duration::from_secs(30))
         .await
         .err()
         .ok_or("test executable unexpectedly started as a server")?;

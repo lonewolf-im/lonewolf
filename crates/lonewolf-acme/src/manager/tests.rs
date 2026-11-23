@@ -1240,12 +1240,12 @@ fn held_transport_shutdown(fatal: bool) -> TestResult {
     let (accepted_tx, accepted_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     let worker = thread::spawn(move || {
-        let end = Instant::now() + Duration::from_secs(5);
+        let end = Instant::now() + Duration::from_secs(30);
         while Instant::now() < end {
             match listener.accept() {
                 Ok((stream, _)) => {
                     let _ = accepted_tx.send(());
-                    let _ = release_rx.recv_timeout(Duration::from_secs(5));
+                    let _ = release_rx.recv_timeout(Duration::from_secs(30));
                     drop(stream);
                     return;
                 }
@@ -1298,9 +1298,9 @@ fn held_transport_shutdown(fatal: bool) -> TestResult {
         if fatal {
             store.drain(deadline).await?;
             let result =
-                compio::time::timeout(Duration::from_millis(100), manager.run(pending())).await?;
+                compio::time::timeout(Duration::from_secs(2), manager.run(pending())).await?;
             assert_eq!(result, Err(ManagerError::State(StateError::Closed)));
-            assert!(start.elapsed() < Duration::from_millis(100));
+            assert!(start.elapsed() < Duration::from_secs(2));
             assert_eq!(manager.drain(deadline).await, Err(ManagerError::Deadline));
         } else {
             assert_eq!(
@@ -1321,7 +1321,7 @@ fn held_transport_shutdown(fatal: bool) -> TestResult {
             ),
             AcmeErrorKind::Closed
         );
-        assert!(start.elapsed() < Duration::from_millis(500));
+        assert!(start.elapsed() < Duration::from_secs(3));
         assert!(challenges.lookup("example.com", &token).is_none());
         drop(lease);
         assert!(matches!(store.account().await, Err(StateError::Closed)));

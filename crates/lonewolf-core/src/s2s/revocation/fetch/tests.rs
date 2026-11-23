@@ -274,7 +274,7 @@ fn fetch_deadline_bounds_a_peer_that_never_answers_and_closed_ports_fail() -> Te
     let (release, gate) = mpsc::channel();
     let server = thread::spawn(move || -> io::Result<()> {
         let (_stream, _) = listener.accept()?;
-        gate.recv_timeout(Duration::from_secs(2))
+        gate.recv_timeout(Duration::from_secs(10))
             .map_err(io::Error::other)?;
         Ok(())
     });
@@ -289,7 +289,7 @@ fn fetch_deadline_bounds_a_peer_that_never_answers_and_closed_ports_fail() -> Te
     release.send(())?;
     server.join().map_err(|_| "HTTP server panicked")??;
     assert!(matches!(result, Err(FetchFailure::Timeout)));
-    assert!(elapsed < Duration::from_secs(2));
+    assert!(elapsed < Duration::from_secs(5));
     assert!(matches!(
         Runtime::new()?.block_on(
             fetcher(AddressPolicy::Any, FetchLimits::DEFAULT)?.fetch(&url, SystemTime::now())

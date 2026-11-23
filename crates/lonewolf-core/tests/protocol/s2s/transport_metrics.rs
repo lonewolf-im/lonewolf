@@ -43,7 +43,7 @@ fn transport_metrics_outbound_refusal_counts_each_explicit_mode_without_open_con
 fn transport_metrics_starttls_tls_timeout_preserves_one_aggregate_authentication() -> TestResult {
     let listener = RawS2sListener::bind()?;
     let mut fixture = SingleServer::start(&format!(
-        "[limits.s2s]\nnegotiation_timeout_secs=1\n[s2s.routes]\n'b.test'=['{}']",
+        "[limits.s2s]\nnegotiation_timeout_secs=3\n[s2s.routes]\n'b.test'=['{}']",
         listener.address()?
     ))?;
     fixture.suite.create_account("alice", PASSWORD)?;

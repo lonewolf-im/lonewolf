@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::error::Error;
+use std::pin::pin;
 use std::time::Duration;
 
 use compio::runtime::Runtime;
 use compio::time::timeout;
+use futures_util::poll;
 
 use super::*;
+use crate::clock::FrozenClock;
 
 struct Observer(Cell<usize>);
 
@@ -41,6 +44,7 @@ fn acquisition_charges_the_configured_burst_and_refill_rate() -> TestResult {
 #[test]
 fn acquisition_waits_for_refill_after_the_burst_and_survives_cancellation() -> TestResult {
     Runtime::new()?.block_on(async {
+        let clock = FrozenClock::start();
         let mut limiter = StanzaLimiter::new(
             NonZeroUsize::new(20).ok_or("invalid rate")?,
             NonZeroUsize::new(2).ok_or("invalid burst")?,
@@ -56,17 +60,13 @@ fn acquisition_waits_for_refill_after_the_burst_and_survives_cancellation() -> T
                 .is_err()
         );
         assert_eq!(observer.0.get(), 1);
-        timeout(
-            Duration::from_millis(200),
-            limiter.acquire(&mode, &observer),
-        )
-        .await?;
-        assert_eq!(observer.0.get(), 2);
-        timeout(
-            Duration::from_millis(200),
-            limiter.acquire(&mode, &observer),
-        )
-        .await?;
+        for reported in [2, 3] {
+            let mut acquire = pin!(limiter.acquire(&mode, &observer));
+            assert!(poll!(acquire.as_mut()).is_pending());
+            assert_eq!(observer.0.get(), reported);
+            clock.advance(Duration::from_millis(50));
+            timeout(Duration::from_secs(5), acquire).await?;
+        }
         assert_eq!(observer.0.get(), 3);
         Ok(())
     })

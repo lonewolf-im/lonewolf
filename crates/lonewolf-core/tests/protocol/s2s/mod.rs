@@ -2,6 +2,7 @@
 
 mod bidi;
 mod bidi_pair;
+mod blocking;
 mod components;
 mod direct_tls;
 mod failures;

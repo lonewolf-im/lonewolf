@@ -17,7 +17,7 @@ fn encrypted(fixture: &SingleServer) -> TestResult<RawS2sPeer> {
     Ok(peer)
 }
 
-fn authenticated(fixture: &SingleServer) -> TestResult<RawS2sPeer> {
+pub(super) fn authenticated(fixture: &SingleServer) -> TestResult<RawS2sPeer> {
     let mut peer = encrypted(fixture)?;
     peer.request_bidi()?;
     peer.auth_external(Some("b.test"))?;

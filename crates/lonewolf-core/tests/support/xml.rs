@@ -147,6 +147,11 @@ impl Element {
         self.attributes.get(name).map(String::as_str)
     }
 
+    pub fn without_attribute(mut self, name: &str) -> Self {
+        self.attributes.remove(name);
+        self
+    }
+
     pub fn resolve_qname<'a>(&'a self, value: &'a str) -> TestResult<(&'a str, &'a str)> {
         let (prefix, local) = value.split_once(':').unwrap_or(("", value));
         let namespace = if prefix == "xml" {

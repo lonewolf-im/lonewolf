@@ -249,6 +249,7 @@ impl Default for HostConfig {
                 lonewolf_extension::carbons::NAME.into(),
                 lonewolf_extension::version::NAME.into(),
                 lonewolf_extension::private::NAME.into(),
+                lonewolf_extension::blocking::NAME.into(),
             ],
             federation: true,
             options: BTreeMap::new(),

@@ -11,6 +11,7 @@ use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::stanza::{BuildError, Element, IqType, StanzaErrorCondition, StanzaType};
 
 use crate::delivery::{Failure, FailureKind, HandlerError, HostLookup, SessionTag};
+use crate::discovery::DiscoScope;
 use crate::iq::{
     IqDestinationRule, IqError, IqFuture, IqHandler, IqReply, IqRequest, IqRequestKey,
     IqRequestType, IqRoute, IqScope, Requester,
@@ -54,6 +55,7 @@ impl<A: ChunkAllocator, S: Storage> Extension<A, S> for Blocking {
         _host: &str,
         slots: &mut Slots<'_, A, S>,
     ) -> Result<(), RegistrationError> {
+        slots.disco_feature(DiscoScope::Server, NAMESPACE);
         slots.policy(self.clone());
         let handler: Arc<dyn IqHandler<A, S>> = self;
         for (kind, name) in [

@@ -13,7 +13,6 @@ use lonewolf_core::test_support::{
 use lonewolf_extension::archive::{
     ArchiveDirection, ArchiveFuture, ArchiveHandler, ArchiveId, ArchiveOutcome, ArchiveRequest,
 };
-use lonewolf_extension::blocking::Blocking;
 use lonewolf_extension::delivery::{
     Delivery, DeliveryError, DeliveryFuture, Failure, FailureKind, HandlerError, HostLookup,
     SessionTag,
@@ -123,7 +122,6 @@ const SUBSCRIPTION_KINDS: [PresenceRequestType; 4] = [
 
 pub fn catalog() -> TestResult<Extensions<Arc<PooledChunkAllocator>, RedbStorage>> {
     let mut extensions = Extensions::default();
-    extensions.register(Arc::new(Blocking))?;
     extensions.register(Arc::new(PresencePolicyWitness))?;
     extensions.register(Arc::new(TestService {
         joined: PlMutex::new(BTreeSet::new()),

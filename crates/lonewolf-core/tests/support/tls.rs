@@ -14,7 +14,11 @@ use rustls::{ClientConfig, RootCertStore, SupportedProtocolVersion};
 use super::TestResult;
 
 pub fn configure(directory: &Path) -> TestResult<RootCertStore> {
-    configure_host(directory, "", &["localhost", "other.localhost"])
+    configure_host(
+        directory,
+        "",
+        &["localhost", "other.localhost", "enabled.localhost"],
+    )
 }
 
 pub fn configure_host(

@@ -461,10 +461,10 @@ pub fn wait_for_crl_reader(path: &Path) -> TestResult<fs::File> {
             .open(path)
         {
             Ok(writer) => return Ok(writer),
-            Err(error)
-                if error.raw_os_error() == Some(nix::libc::ENXIO)
-                    && std::time::Instant::now() < deadline =>
-            {
+            Err(error) if error.raw_os_error() == Some(nix::libc::ENXIO) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err("the server did not open the blocked CRL file in time".into());
+                }
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             Err(error) => return Err(error.into()),

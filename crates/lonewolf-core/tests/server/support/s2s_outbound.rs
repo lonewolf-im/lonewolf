@@ -271,13 +271,10 @@ pub fn failure(server: &Server, outcome: &str) -> Result {
         1,
     )?;
     wait_zero(server)?;
+    support::wait_sample(server, "lonewolf_s2s_outbound_links{state=\"backoff\"}", 1)?;
     let body = support::metrics(server)?;
     let total = authentication_total(&body)?;
     assert_eq!(total, 1, "{body}");
-    assert_eq!(
-        support::sample(&body, "lonewolf_s2s_outbound_links{state=\"backoff\"}")?,
-        1
-    );
     Ok(())
 }
 

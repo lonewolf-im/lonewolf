@@ -660,7 +660,7 @@ fn a_probe_waiting_for_account_order_keeps_draining_a_healthy_reader() -> TestRe
     assert_eq!(source.receive()?.attribute("id"), Some("source"));
     requester.send("<iq type='get' id='roster'><query xmlns='jabber:iq:roster'/></iq>")?;
     assert_eq!(requester.receive()?.attribute("id"), Some("roster"));
-    slow.send("<iq type='set' id='slow'><slow xmlns='urn:lonewolf:test:iq' millis='4000'/></iq>")?;
+    slow.send("<iq type='set' id='slow'><slow xmlns='urn:lonewolf:test:iq'/></iq>")?;
     assert_eq!(requester.receive()?.attribute("id"), Some("slow"));
     requester.send("<presence type='probe' to='alice@localhost/desk' id='probe'/>")?;
     for batch in 0..75 {
@@ -678,6 +678,8 @@ fn a_probe_waiting_for_account_order_keeps_draining_a_healthy_reader() -> TestRe
             );
         }
     }
+    bob.send("<iq type='get' to='localhost' id='release'><release-effects xmlns='urn:lonewolf:test:iq'/></iq>")?;
+    assert_eq!(bob.receive()?.attribute("id"), Some("release"));
     requester.expect_xml("<presence xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost/phone' id='source'/>")?;
     assert_eq!(slow.receive()?.attribute("id"), Some("slow"));
     requester.send("<message to='bob@localhost/desk' id='after'/>")?;

@@ -22,6 +22,8 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 type TestReader = Reader<GlobalChunkAllocator, std::io::Cursor<Vec<u8>>>;
 const HEADER: &str =
     "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client'>";
+// A loaded runner can delay a test's first poll past a deadline of a few milliseconds.
+const FIRST_POLL_MARGIN: Duration = Duration::from_millis(500);
 
 fn reader(xml: String) -> TestResult<TestReader> {
     Ok(Reader::new(
@@ -354,7 +356,7 @@ fn blocked_phase_writes_cancel_before_timeout_close_discards_application_bufferi
                 .await
                 .map_err(|error| format!("{error:?}"))?;
             allowance.set(64);
-            let deadline = Instant::now() + Duration::from_millis(20);
+            let deadline = Instant::now() + FIRST_POLL_MARGIN;
             assert_eq!(
                 crate::c2s::stream::run_phase(Some(deadline), outcome, pin!(writer.send(&stanza)))
                     .await,
@@ -406,7 +408,7 @@ fn timeout_during_starttls_proceed_flush_never_appends_plaintext_after_proceed()
             .map_err(|error| format!("{error:?}"))?;
         let header_bytes = bytes.borrow().len();
         allowance.set(1);
-        let deadline = Instant::now() + Duration::from_millis(20);
+        let deadline = Instant::now() + FIRST_POLL_MARGIN;
         assert_eq!(
             crate::c2s::stream::run_phase(
                 Some(deadline),
@@ -610,7 +612,7 @@ fn network_work_that_becomes_ready_after_expiry_is_not_polled_again() -> TestRes
             shutdown: std::future::pending::<Instant>().boxed_local().shared(),
             phase_deadline: None,
         };
-        let deadline = Instant::now() + Duration::from_millis(20);
+        let deadline = Instant::now() + FIRST_POLL_MARGIN;
         let ready = Cell::new(false);
         let polls = Cell::new(0);
         let operation = pin!(poll_fn(|_| {
@@ -624,7 +626,7 @@ fn network_work_that_becomes_ready_after_expiry_is_not_polled_again() -> TestRes
         let mut close = Box::pin(context.until(deadline, operation));
         assert!(poll!(close.as_mut()).is_pending());
         assert_eq!(polls.get(), 1);
-        compio::time::sleep(Duration::from_millis(30)).await;
+        compio::time::sleep_until(deadline + Duration::from_millis(10)).await;
         ready.set(true);
         assert_eq!(
             completed(close.await, CloseOutcome::AuthenticationTimeout, "test"),
@@ -784,14 +786,14 @@ fn plaintext_drain_deadline_bounds_always_ready_input_and_stops_polls_after_expi
                 + if expired {
                     Duration::ZERO
                 } else {
-                    Duration::from_millis(20)
+                    FIRST_POLL_MARGIN
                 };
             let started = Instant::now();
             assert_eq!(
                 context.until(deadline, pin!(drain_plain(&mut input))).await,
                 Err(())
             );
-            assert!(started.elapsed() < Duration::from_secs(1));
+            assert!(started.elapsed() < FIRST_POLL_MARGIN + Duration::from_secs(1));
             assert_eq!(reads.get() == 0, expired);
             let polls = reads.get();
             assert_eq!(
@@ -877,7 +879,7 @@ fn failed_plaintext_parser_drains_raw_input_with_original_deadline_and_outcome()
                 .send_header(&header())
                 .await
                 .map_err(|error| format!("{error:?}"))?;
-            let deadline = Instant::now() + Duration::from_millis(30);
+            let deadline = Instant::now() + FIRST_POLL_MARGIN;
             context.phase_deadline = Some(if outcome.is_phase_timeout() {
                 deadline - CLOSE_TIMEOUT
             } else {
@@ -939,7 +941,7 @@ fn peer_footer_plaintext_drain_preserves_outcome_and_deadline() -> TestResult {
                 std::future::pending::<Instant>().boxed_local().shared(),
             )
             .await?;
-            let deadline = Instant::now() + Duration::from_millis(30);
+            let deadline = Instant::now() + FIRST_POLL_MARGIN;
             context.phase_deadline = Some(deadline);
             assert_eq!(context.deadline_for(CloseOutcome::StreamEnd), deadline);
             let result = finish_plain(
@@ -1025,12 +1027,12 @@ fn plaintext_drain_ready_after_expiry_is_not_polled_again() -> TestResult {
             tail: Tail::Ready,
         };
         let reads = Rc::clone(&input.reads);
-        let deadline = Instant::now() + Duration::from_millis(20);
+        let deadline = Instant::now() + FIRST_POLL_MARGIN;
         let operation = pin!(drain_plain(&mut input));
         let mut drain = Box::pin(context.until(deadline, operation));
         assert!(poll!(drain.as_mut()).is_pending());
         assert_eq!(reads.get(), 1);
-        compio::time::sleep(Duration::from_millis(30)).await;
+        compio::time::sleep_until(deadline + Duration::from_millis(10)).await;
         assert_eq!(drain.await, Err(()));
         assert_eq!(reads.get(), 1);
         listener.close().await?;

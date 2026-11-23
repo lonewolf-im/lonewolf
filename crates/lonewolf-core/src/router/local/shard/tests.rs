@@ -1181,6 +1181,99 @@ fn directed_presence_limit_resets_on_withdrawal_and_retirement_without_touching_
 }
 
 #[test]
+fn blocking_presence_admission_checks_the_full_target_and_retires_a_full_mailbox()
+-> Result<(), Box<dyn Error>> {
+    Runtime::new()?.block_on(async {
+        let account = account()?;
+        let router = test_router();
+        let mut shard = Shard::<GlobalChunkAllocator>::new();
+        let limit = NonZeroUsize::MIN.saturating_add(1);
+        let (outbound, inbound) = async_channel::bounded(1);
+        let desk = shard.register(
+            account.clone(),
+            Some("desk".into()),
+            limit,
+            outbound,
+            inbound,
+            router.clone(),
+        )?;
+        let phone = register_probe_session(&mut shard, &router, &account, "phone")?;
+        let target = SessionId::new(desk.token);
+        let from = "bob@localhost/desk";
+        let to = desk.full_jid();
+        let stanza = routed(&format!(
+            "<presence from='{from}' to='{to}' type='unavailable'/>"
+        ))
+        .await?;
+        assert_eq!(
+            shard.deliver_blocking_presence(
+                stanza.clone(),
+                SessionId::new(phone.token),
+                false,
+                None
+            ),
+            Err(RouterError::NotFound)
+        );
+        assert_eq!(
+            shard.deliver_blocking_presence(stanza.clone(), target, true, None),
+            Err(RouterError::NotFound)
+        );
+        let retired = SessionLiveness(Arc::new(AtomicBool::new(false)));
+        assert_eq!(
+            shard.deliver_blocking_presence(stanza.clone(), target, false, Some(&retired)),
+            Err(RouterError::NotFound)
+        );
+        assert!(desk.take_queued().is_empty());
+        shard.deliver_blocking_presence(stanza.clone(), target, false, None)?;
+        assert_eq!(
+            shard.deliver_blocking_presence(stanza, target, false, None),
+            Err(RouterError::Busy)
+        );
+        assert_eq!(
+            desk.wait_retired().await?.cause,
+            RetireCause::MailboxOverflow
+        );
+        assert!(phone.take_queued().is_empty());
+        Ok(())
+    })
+}
+
+#[test]
+fn blocking_withdrawal_keeps_pending_directed_grants_until_terminal_delivery()
+-> Result<(), Box<dyn Error>> {
+    Runtime::new()?.block_on(async {
+        for evict in [false, true] {
+            let alice = account()?;
+            let mut shard = Shard::<GlobalChunkAllocator>::new();
+            let desk = register_probe_session(&mut shard, &test_router(), &alice, "desk")?;
+            let peer = "bob@localhost/desk";
+            shard.record_directed_presence(
+                &alice,
+                "desk",
+                desk.token,
+                directed_recipient(peer)?,
+                true,
+            )?;
+            if evict {
+                shard.remove(alice.as_str(), "desk", desk.token, RetireCause::Evicted);
+            } else {
+                shard.end_presence(&alice, "desk", desk.token)?;
+            }
+            assert!(shard.blocking_presence_sources(&alice, false).is_empty());
+            let pending = shard.blocking_presence_sources(&alice, true);
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].resource.as_ref(), "desk");
+            assert_eq!(pending[0].directed.len(), 1);
+            assert_eq!(pending[0].directed[0].as_str(), peer);
+            assert!(!pending[0].published);
+            shard.finish_presence(&alice, desk.token);
+            assert!(shard.blocking_presence_sources(&alice, true).is_empty());
+        }
+        Ok(())
+    })
+}
+
+#[test]
 fn committed_directed_unavailable_survives_source_retirement_and_replacement()
 -> Result<(), Box<dyn Error>> {
     Runtime::new()?.block_on(async {
@@ -2228,7 +2321,7 @@ fn filtered_presence_admits_only_the_selected_session_tokens() -> Result<(), Box
         let approved = shard
             .presence_targets(&owner)
             .into_iter()
-            .map(|(_, token)| token)
+            .map(|target| target.session)
             .collect::<Vec<_>>();
 
         shard.cleanup(&owner, "desk", desk.token);

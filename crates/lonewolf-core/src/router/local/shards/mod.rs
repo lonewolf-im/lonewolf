@@ -22,15 +22,14 @@ use super::registration::{
     MailboxEntry, Registration, ResourceMatch, SessionHandle, SessionLiveness, StoredRelease,
     release_deferred, validate_resource,
 };
-#[cfg(test)]
-use super::shard::DirectedRecipient;
-use super::shard::Shard;
+use super::shard::{DirectedRecipient, Shard};
 #[cfg(test)]
 use crate::config::limits::default_max_directed_presence_recipients_per_resource;
+use crate::router::blocking_presence::BlockingPresenceSource;
 use crate::router::metrics::RouterMetrics;
 use crate::router::{
-    Admitted, MessageTarget, PresenceDelivery, RoutedStanza, RouterError, RouterFailure,
-    RouterState,
+    Admitted, MessageTarget, PresenceDelivery, PresenceTarget, RoutedStanza, RouterError,
+    RouterFailure, RouterState,
 };
 
 const SHARD_COUNT: usize = 256;
@@ -367,11 +366,50 @@ impl<A: ChunkAllocator + Clone> LocalRouterHandle<A> {
     pub(crate) async fn presence_targets(
         &self,
         account: &AccountKey,
-    ) -> Result<Vec<(Box<str>, SessionId)>, RouterError> {
+    ) -> Result<Vec<PresenceTarget>, RouterError> {
         self.with_shard(self.shard_index(account.as_str()), |shard| {
             shard.presence_targets(account)
         })
         .await
+    }
+
+    pub(in crate::router) async fn blocking_presence_sources(
+        &self,
+        account: &AccountKey,
+        include_retiring: bool,
+    ) -> Result<Vec<BlockingPresenceSource<A>>, RouterError> {
+        self.with_shard(self.shard_index(account.as_str()), |shard| {
+            shard.blocking_presence_sources(account, include_retiring)
+        })
+        .await
+    }
+
+    pub(in crate::router) async fn blocking_directed_recipients(
+        &self,
+        owner: &AccountKey,
+        matches: impl Fn(&str) -> bool,
+    ) -> Result<Vec<DirectedRecipient>, RouterError> {
+        self.with_shard(self.shard_index(owner.as_str()), |shard| {
+            shard.blocking_directed_recipients(owner, matches)
+        })
+        .await
+    }
+
+    pub(in crate::router) async fn deliver_blocking_presence(
+        &self,
+        stanza: RoutedStanza<A>,
+        target: SessionId,
+        require_available: bool,
+        source: Option<&SessionLiveness>,
+    ) -> Result<(), RouterError> {
+        let shard = {
+            let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
+            self.full_target_shard(&view)?
+        };
+        self.with_shard(shard, |shard| {
+            shard.deliver_blocking_presence(stanza, target, require_available, source)
+        })
+        .await?
     }
 
     pub(crate) async fn deliver_filtered_presence(

@@ -1379,14 +1379,15 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         if !self.admit_routed(&routed)? {
             return Ok(());
         }
-        let target = {
+        let (target, full) = {
             let view = routed.resolve()?;
             let to = view.to()?.ok_or(CloseOutcome::InternalError)?;
             match self.router.destination(to) {
-                Destination::Account | Destination::Resource => {
-                    Some(AccountKey::try_from(to.bare()).map_err(|_| CloseOutcome::InternalError)?)
-                }
-                Destination::Remote if self.router.federation_enabled() => None,
+                Destination::Account | Destination::Resource => (
+                    Some(AccountKey::try_from(to.bare()).map_err(|_| CloseOutcome::InternalError)?),
+                    (available && to.is_full()).then(|| Box::from(to.as_str())),
+                ),
+                Destination::Remote if self.router.federation_enabled() => (None, None),
                 destination => return self.directed_presence_fallback(&routed, destination).await,
             }
         };
@@ -1398,30 +1399,33 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         let directed = routed.clone();
         let pending = Pending::spawn(self.outbox.work.start(), async move {
             let remote = target.is_none();
-            let mut accounts = vec![account.clone()];
-            if let Some(target) = &target
-                && &account != target
-            {
-                accounts.push(target.clone());
-            }
+            let peer = target.as_ref().filter(|target| *target != &account);
             let policies = target.as_ref() != Some(&account)
                 && (!router.policies(account.domain()).is_empty()
-                    || target
-                        .as_ref()
-                        .is_some_and(|target| !router.policies(target.domain()).is_empty()));
-            let (snapshot, mut ticket) = router
-                .order()
-                .fix(accounts, async {
-                    if policies {
-                        storage.begin_read().await.map(Some).map_err(|error| {
-                            close_storage_failure(error, "directed_presence_begin_read", &account);
-                            RouterError::Unavailable
-                        })
-                    } else {
-                        Ok(None)
-                    }
-                })
-                .await?;
+                    || peer.is_some_and(|target| !router.policies(target.domain()).is_empty()));
+            let read = async {
+                if policies {
+                    storage.begin_read().await.map(Some).map_err(|error| {
+                        close_storage_failure(error, "directed_presence_begin_read", &account);
+                        RouterError::Unavailable
+                    })
+                } else {
+                    Ok(None)
+                }
+            };
+            let (snapshot, mut ticket) = match peer {
+                Some(target) if available => {
+                    router
+                        .order()
+                        .fix_directed_grant(account.clone(), target.clone(), full, read)
+                        .await?
+                }
+                target => {
+                    let mut accounts = vec![account.clone()];
+                    accounts.extend(target.cloned());
+                    router.order().fix(accounts, read).await?
+                }
+            };
             if let Some(snapshot) = snapshot.as_ref() {
                 let view = directed.resolve().map_err(|_| RouterError::InvalidTarget)?;
                 let verdict = ingress::checks::check_from(

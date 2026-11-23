@@ -103,7 +103,10 @@ pub(crate) async fn evaluate_selected_in<A: ChunkAllocator + Clone>(
     checks: &[Check<'_>],
     selection: Selection,
 ) -> Result<Verdict, StageFailure> {
-    evaluate_checks(router, transaction, kind, checks, selection, false).await
+    evaluate_checks(router, transaction, kind, checks, false, |_, handler| {
+        selection.includes(handler)
+    })
+    .await
 }
 
 async fn evaluate_checks<A: ChunkAllocator + Clone>(
@@ -111,14 +114,14 @@ async fn evaluate_checks<A: ChunkAllocator + Clone>(
     transaction: &RedbRead,
     kind: StanzaType,
     checks: &[Check<'_>],
-    selection: Selection,
     fail_on_error: bool,
+    includes: impl Fn(&str, &dyn PolicyHandler<RedbStorage>) -> bool,
 ) -> Result<Verdict, StageFailure> {
     let mut verdict = Verdict::Allow;
     let mut decided_by = None;
     'checks: for check in checks {
         for (name, handler) in router.policies(check.account.domain()) {
-            if !selection.includes(handler.as_ref()) {
+            if !includes(name, handler.as_ref()) {
                 continue;
             }
             let next = match handler
@@ -196,8 +199,12 @@ pub(crate) async fn check_offline_replay<A: ChunkAllocator + Clone>(
         return Ok(Deliver);
     }
     let selection = Selection::Explicit;
-    let check =
-        async |check| evaluate_checks(router, snapshot, kind, &[check], selection, true).await;
+    let check = async |check| {
+        evaluate_checks(router, snapshot, kind, &[check], true, |_, handler| {
+            selection.includes(handler)
+        })
+        .await
+    };
     if selection.configured(router, owner.domain())
         && check(Check {
             account: owner,
@@ -224,6 +231,33 @@ pub(crate) async fn check_offline_replay<A: ChunkAllocator + Clone>(
         }
     }
     Ok(Deliver)
+}
+
+pub(crate) async fn allows_block_transition<A: ChunkAllocator + Clone>(
+    router: &RouterHandle<A>,
+    before: &RedbRead,
+    owner: &AccountKey,
+    peer: JidRef<'_>,
+    transition: PresenceType,
+) -> Result<bool, StageFailure> {
+    let checks = [Check {
+        account: owner,
+        direction: Direction::Outbound,
+        peer,
+    }];
+    Ok(evaluate_checks(
+        router,
+        before,
+        StanzaType::Presence(transition),
+        &checks,
+        true,
+        |name, _| {
+            // The committed delta supplies the owner's new rules for restoration.
+            transition != PresenceType::Available || name != lonewolf_extension::blocking::NAME
+        },
+    )
+    .await?
+        == Verdict::Allow)
 }
 
 pub(crate) struct PresencePolicy<'a, A: ChunkAllocator> {

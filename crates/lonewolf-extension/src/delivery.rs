@@ -10,6 +10,7 @@ use lonewolf_util::arena::{Arena, ArenaError, ChunkAllocator, HandleError};
 use lonewolf_xmpp::jid::{Jid, JidError};
 use lonewolf_xmpp::stanza::{BuildError, RoutedStanza, Stanza, StanzaErrorCondition, WriteError};
 
+use crate::blocking::BlockingPresenceChange;
 use crate::{Deliver, ExtensionFuture};
 
 /// Identifies one bound session among its account's sessions; a rebound resource gets a new value.
@@ -289,6 +290,11 @@ pub trait Delivery<A: ChunkAllocator>: HostLookup {
     /// Sends unavailable presence to a bare JID, which may be domain-only.
     /// Includes each available resource and each retiring resource with a pending withdrawal.
     fn unavailable_presence<'a>(&'a self, from: &'a AccountKey, to: &'a str) -> DeliveryFuture<'a>;
+
+    /// Applies the visibility changes from a committed blocklist edit.
+    fn blocking_presence<'a>(&'a self, _change: &'a BlockingPresenceChange) -> DeliveryFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 #[cfg(test)]

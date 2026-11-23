@@ -11,6 +11,7 @@ use std::time::Duration;
 use futures_channel::oneshot;
 use futures_util::FutureExt;
 use futures_util::task::AtomicWaker;
+use lonewolf_extension::blocking::BlockingPresenceChange;
 use lonewolf_extension::delivery::{
     BoundResource, CopyFactory, Delivery, DeliveryError, DeliveryFuture, Failure, FailureKind,
     HandlerError, HostLookup, IqResponseFuture, SessionId, SessionLookup, SessionTag,
@@ -22,12 +23,13 @@ use lonewolf_extension::{Deliver, Effects, ExtensionFuture};
 use lonewolf_storage::Storage;
 use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::offline::OfflineSequence;
+use lonewolf_storage::roster::RosterJid;
 use lonewolf_storage::{RedbRead, RedbStorage, RedbWrite, StorageError, WriteTransaction};
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::stanza::{IqType, StanzaKind, StanzaType};
 
-use crate::order::{Order, Ticket};
+use crate::order::{Order, PendingDirectedGrant, Ticket};
 use crate::router::iq_requests::{ID_PREFIX, MAX_TIMEOUT};
 use crate::router::{
     Admitted, DeliveryScope, Destination, Mailbox, MailboxEntry, Registration, RoutedStanza,
@@ -126,6 +128,13 @@ pub(crate) struct RouterDelivery<A: ChunkAllocator> {
     session: Option<SessionHandle<A>>,
     received_copies: Option<(AccountKey, Vec<SessionId>)>,
     presence_snapshot: Option<Arc<RedbRead>>,
+    local_block: Option<LocalBlock>,
+}
+
+struct LocalBlock {
+    change: Arc<BlockingPresenceChange>,
+    subscribers: Result<Vec<RosterJid>, DeliveryError>,
+    base_accounts: usize,
 }
 
 impl<A: ChunkAllocator + Clone> RouterDelivery<A> {
@@ -153,6 +162,7 @@ impl<A: ChunkAllocator + Clone> RouterDelivery<A> {
             session,
             received_copies: None,
             presence_snapshot: None,
+            local_block: None,
         }
     }
 
@@ -172,6 +182,14 @@ impl<A: ChunkAllocator + Clone> RouterDelivery<A> {
         targets: Vec<SessionId>,
     ) {
         self.received_copies = Some((account.clone(), targets));
+    }
+
+    fn block_snapshot(&self, change: &BlockingPresenceChange) -> Result<&RedbRead, DeliveryError> {
+        let session = self.session.as_ref().ok_or(DeliveryError)?;
+        if session.account() != change.owner() {
+            return Err(DeliveryError);
+        }
+        self.presence_snapshot.as_deref().ok_or(DeliveryError)
     }
 }
 
@@ -420,46 +438,125 @@ pub(crate) fn commit_and_store<A: ChunkAllocator + Clone + 'static>(
     Pending { turned, done }
 }
 
+pub(crate) trait OrderedEffectsDelivery<A: ChunkAllocator>: Delivery<A> {
+    fn prepare_local_block(
+        &mut self,
+        _change: &Arc<BlockingPresenceChange>,
+        _accounts: &mut Vec<AccountKey>,
+    ) -> impl Future<Output = ()> {
+        std::future::ready(())
+    }
+
+    fn extend_local_block_scope(
+        &mut self,
+        _pending: Vec<PendingDirectedGrant>,
+        _accounts: &mut Vec<AccountKey>,
+    ) -> impl Future<Output = ()> {
+        std::future::ready(())
+    }
+}
+
+impl<A: ChunkAllocator + Clone + 'static> OrderedEffectsDelivery<A> for RouterDelivery<A> {
+    async fn prepare_local_block(
+        &mut self,
+        change: &Arc<BlockingPresenceChange>,
+        accounts: &mut Vec<AccountKey>,
+    ) {
+        let base_accounts = accounts.len();
+        let subscribers = match self.block_snapshot(change) {
+            Ok(snapshot) => self
+                .router
+                .blocking_subscribers(change.owner(), snapshot)
+                .await
+                .map_err(|_| DeliveryError),
+            Err(error) => Err(error),
+        };
+        if let Ok(subscribers) = &subscribers {
+            self.router
+                .extend_blocking_roster_accounts(change, subscribers, accounts);
+        }
+        self.local_block = Some(LocalBlock {
+            change: Arc::clone(change),
+            subscribers,
+            base_accounts,
+        });
+    }
+
+    async fn extend_local_block_scope(
+        &mut self,
+        pending: Vec<PendingDirectedGrant>,
+        accounts: &mut Vec<AccountKey>,
+    ) {
+        if let Some(block) = &mut self.local_block
+            && block.subscribers.is_ok()
+            && self
+                .router
+                .extend_blocking_directed_accounts(&block.change, pending, accounts)
+                .await
+                .is_err()
+        {
+            accounts.truncate(block.base_accounts);
+            block.subscribers = Err(DeliveryError);
+        }
+    }
+}
+
 /// Detached work owns commit and ticket admission even when the caller retires.
 /// The caller must write the returned deliveries before its reply.
 pub(crate) fn commit_and_deliver<A, D, W>(
     guard: WorkGuard,
     order: Arc<Order>,
     transaction: W,
-    Effects { accounts, deliver }: Effects<A>,
-    delivery: D,
+    effects: Effects<A>,
+    mut delivery: D,
     mailbox: Option<Mailbox<A>>,
     diagnostics: EffectsDiagnostics,
 ) -> Pending<Result<Vec<MailboxEntry<A>>, EffectsError>>
 where
     A: ChunkAllocator + Clone + 'static,
-    D: Delivery<A> + 'static,
+    D: OrderedEffectsDelivery<A> + 'static,
     W: WriteTransaction + 'static,
 {
     let (report_turned, turned) = oneshot::channel();
     let (report_done, done) = oneshot::channel();
     compio::runtime::spawn(guard.run(async move {
         let result = async {
-            let ((), mut ticket) =
+            let commit_error =
+                |error| EffectsError::Commit(storage_failure(error, diagnostics.commit_operation));
+            let delivery_error = |_| {
+                EffectsError::Delivery(Failure {
+                    kind: FailureKind::Delivery,
+                    operation: diagnostics.delivery_operation,
+                })
+            };
+            let local_edit = effects.local_blocklist_edit().cloned();
+            let mut accounts = effects.accounts;
+            let mut ticket = if let Some(change) = &local_edit {
+                delivery.prepare_local_block(change, &mut accounts).await;
                 order
+                    .fix_block(
+                        change.owner(),
+                        accounts,
+                        transaction.commit(),
+                        async |pending, accounts| {
+                            delivery.extend_local_block_scope(pending, accounts).await;
+                        },
+                    )
+                    .await
+                    .map_err(commit_error)?
+            } else {
+                let ((), ticket) = order
                     .fix(accounts, transaction.commit())
                     .await
-                    .map_err(|error| {
-                        let failure = storage_failure(error, diagnostics.commit_operation);
-                        EffectsError::Commit(failure)
-                    })?;
+                    .map_err(commit_error)?;
+                ticket
+            };
             ticket.turn().await;
             let _ = report_turned.send(());
             let queued = mailbox.map_or_else(Vec::new, |mailbox| mailbox.take_queued());
-            let delivered = deliver(&delivery).await;
+            let delivered = (effects.deliver)(&delivery).await;
             drop(ticket);
-            delivered.map(|()| queued).map_err(|_| {
-                let failure = Failure {
-                    kind: FailureKind::Delivery,
-                    operation: diagnostics.delivery_operation,
-                };
-                EffectsError::Delivery(failure)
-            })
+            delivered.map(|()| queued).map_err(delivery_error)
         }
         .await;
         if let Err(error) = &result {
@@ -569,6 +666,7 @@ impl<A: ChunkAllocator + Clone + 'static> Delivery<A> for RouterDelivery<A> {
             session: None,
             received_copies: None,
             presence_snapshot: None,
+            local_block: None,
         };
         compio::runtime::spawn(async move {
             if work(&delivery).await.is_err() {
@@ -708,6 +806,23 @@ impl<A: ChunkAllocator + Clone + 'static> Delivery<A> for RouterDelivery<A> {
         Box::pin(async move {
             self.router
                 .route_unavailable_presence(from, to, self.scope, self.presence_snapshot.as_deref())
+                .await
+                .map_err(|_| DeliveryError)
+        })
+    }
+
+    fn blocking_presence<'a>(&'a self, change: &'a BlockingPresenceChange) -> DeliveryFuture<'a> {
+        Box::pin(async move {
+            let before = self.block_snapshot(change)?;
+            let subscribers = match &self.local_block {
+                Some(block) if std::ptr::eq(block.change.as_ref(), change) => {
+                    Some(block.subscribers.as_deref().map_err(|_| DeliveryError)?)
+                }
+                Some(_) => return Err(DeliveryError),
+                None => None,
+            };
+            self.router
+                .route_blocking_presence(change, before, self.scope, subscribers)
                 .await
                 .map_err(|_| DeliveryError)
         })

@@ -473,6 +473,8 @@ fn stored_message_commits_and_reroutes_after_its_requester_drops_before_the_tick
 
 pub(super) struct NoDelivery;
 
+impl super::OrderedEffectsDelivery<GlobalChunkAllocator> for NoDelivery {}
+
 impl HostLookup for NoDelivery {
     fn is_local_host(&self, _: &str) -> bool {
         true

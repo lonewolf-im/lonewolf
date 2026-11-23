@@ -651,25 +651,22 @@ impl Iqs {
         let fail = self.fail_effect;
         let mut reply = IqReply::new(
             None,
-            Effects {
-                accounts: Vec::new(),
-                deliver: Box::new(move |_| {
-                    Box::pin(async move {
-                        if let Some((entered, release)) = gate {
-                            let _ = entered.send(());
-                            release
-                                .await
-                                .map_err(|_| lonewolf_extension::delivery::DeliveryError)?;
-                        }
-                        effects.fetch_add(1, Ordering::SeqCst);
-                        if fail {
-                            Err(lonewolf_extension::delivery::DeliveryError)
-                        } else {
-                            Ok(())
-                        }
-                    })
-                }),
-            },
+            Effects::new(Vec::new(), move |_| {
+                Box::pin(async move {
+                    if let Some((entered, release)) = gate {
+                        let _ = entered.send(());
+                        release
+                            .await
+                            .map_err(|_| lonewolf_extension::delivery::DeliveryError)?;
+                    }
+                    effects.fetch_add(1, Ordering::SeqCst);
+                    if fail {
+                        Err(lonewolf_extension::delivery::DeliveryError)
+                    } else {
+                        Ok(())
+                    }
+                })
+            }),
         );
         if self.bad_results || self.additional {
             for (index, target) in [

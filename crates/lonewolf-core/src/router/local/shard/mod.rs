@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::mem;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -27,9 +27,10 @@ use super::registration::{
 use super::shards::LocalRouterHandle;
 #[cfg(test)]
 use crate::config::limits::default_max_directed_presence_recipients_per_resource;
+use crate::router::blocking_presence::BlockingPresenceSource;
 use crate::router::{
-    Admitted, MessageTarget, PresenceDelivery, RoutedStanza, RouterError, RouterState,
-    validate_target,
+    Admitted, MessageTarget, PresenceDelivery, PresenceTarget, RoutedStanza, RouterError,
+    RouterState, validate_target,
 };
 
 const LAST_UNAVAILABLE_PER_SHARD: usize = 64;
@@ -43,7 +44,7 @@ fn mailbox_retire_cause<T>(error: TrySendError<T>) -> RetireCause {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DirectedRecipient(Box<str>);
 
 impl DirectedRecipient {
@@ -85,7 +86,22 @@ fn take_directed(grants: &mut Vec<DirectedRecipient>, token: u64) -> DirectedWit
 
 struct RetiredPresence<A: ChunkAllocator> {
     resource: Box<str>,
-    stanza: RoutedStanza<A>,
+    current: Option<RoutedStanza<A>>,
+    directed: Vec<DirectedRecipient>,
+}
+
+impl<A: ChunkAllocator> RetiredPresence<A> {
+    fn pending(
+        resource: &str,
+        current: Option<RoutedStanza<A>>,
+        directed: &DirectedWithdrawal,
+    ) -> Option<Self> {
+        (current.is_some() || !directed.recipients.is_empty()).then(|| Self {
+            resource: resource.into(),
+            current,
+            directed: directed.recipients.clone(),
+        })
+    }
 }
 
 pub(super) struct Session<A: ChunkAllocator> {
@@ -235,23 +251,16 @@ impl<A: ChunkAllocator> Shard<A> {
                     }
                 }
             }
-            if let (Some(stanza), Some(_)) = (session.presence, session.unavailable.as_ref()) {
-                retiring.push((
-                    token,
-                    RetiredPresence {
-                        resource: resource.into(),
-                        stanza,
-                    },
-                ));
+            let directed = take_directed(&mut session.directed, token);
+            let current = session.unavailable.as_ref().and(session.presence);
+            if let Some(pending) = RetiredPresence::pending(resource, current, &directed) {
+                retiring.push((token, pending));
             }
             // Report retirement before closing the mailbox so the stream can observe its cause.
             let _ = session.retired.send(Retired {
                 cause,
                 unavailable: session.unavailable,
-                directed: SharedDirectedWithdrawal(Arc::new(PlMutex::new(Some(take_directed(
-                    &mut session.directed,
-                    token,
-                ))))),
+                directed: SharedDirectedWithdrawal(Arc::new(PlMutex::new(Some(directed)))),
             });
             session.outbound.close();
         }
@@ -470,17 +479,12 @@ impl<A: ChunkAllocator> Shard<A> {
             }
             self.remove_batch(account.as_str(), &failed);
         }
-        if let (Some(stanza), Some(_)) = (presence, unavailable.as_ref()) {
+        let current = unavailable.as_ref().and(presence);
+        if let Some(pending) = RetiredPresence::pending(resource, current, &directed) {
             self.retiring
                 .entry(account.as_str().into())
                 .or_default()
-                .insert(
-                    token,
-                    RetiredPresence {
-                        resource: resource.into(),
-                        stanza,
-                    },
-                );
+                .insert(token, pending);
         }
         if had_available && !self.has_available(account.as_str()) {
             self.record_last_unavailable(account.as_str());
@@ -1235,7 +1239,7 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
             .collect()
     }
 
-    pub(super) fn presence_targets(&self, account: &AccountKey) -> Vec<(Box<str>, SessionId)> {
+    pub(super) fn presence_targets(&self, account: &AccountKey) -> Vec<PresenceTarget> {
         self.accounts
             .get(account.as_str())
             .into_iter()
@@ -1243,8 +1247,122 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
             .filter(|(_, session)| {
                 session.alive.load(Ordering::Acquire) && !session.outbound.is_closed()
             })
-            .map(|(resource, session)| (resource.clone(), SessionId::new(session.token)))
+            .map(|(resource, session)| PresenceTarget {
+                resource: resource.clone(),
+                session: SessionId::new(session.token),
+                available: session.priority.is_some(),
+            })
             .collect()
+    }
+
+    pub(super) fn blocking_presence_sources(
+        &self,
+        account: &AccountKey,
+        include_retiring: bool,
+    ) -> Vec<BlockingPresenceSource<A>> {
+        let mut sources: BTreeMap<_, _> = self
+            .accounts
+            .get(account.as_str())
+            .into_iter()
+            .flat_map(HashMap::iter)
+            .filter(|(_, session)| {
+                session.alive.load(Ordering::Acquire)
+                    && !session.outbound.is_closed()
+                    && (session.presence.is_some() || !session.directed.is_empty())
+            })
+            .map(|(resource, session)| {
+                (
+                    resource.as_ref(),
+                    BlockingPresenceSource {
+                        resource: resource.clone(),
+                        current: session.presence.clone(),
+                        published: session.presence.is_some(),
+                        directed: session.directed.clone(),
+                        liveness: Some(SessionLiveness(Arc::clone(&session.alive))),
+                    },
+                )
+            })
+            .collect();
+        // A later terminal effect can be suppressed by the block that owns this turn.
+        if include_retiring && let Some(retiring) = self.retiring.get(account.as_str()) {
+            for pending in retiring.values() {
+                let source = sources.entry(pending.resource.as_ref()).or_insert_with(|| {
+                    BlockingPresenceSource {
+                        resource: pending.resource.clone(),
+                        current: None,
+                        published: false,
+                        directed: Vec::new(),
+                        liveness: None,
+                    }
+                });
+                source.published |= pending.current.is_some();
+                source.directed.extend(pending.directed.iter().cloned());
+            }
+        }
+        sources.into_values().collect()
+    }
+
+    pub(super) fn blocking_directed_recipients(
+        &self,
+        owner: &AccountKey,
+        matches: impl Fn(&str) -> bool,
+    ) -> Vec<DirectedRecipient> {
+        let live = self
+            .accounts
+            .get(owner.as_str())
+            .into_iter()
+            .flat_map(HashMap::values)
+            .flat_map(|session| &session.directed);
+        let retiring = self
+            .retiring
+            .get(owner.as_str())
+            .into_iter()
+            .flat_map(|retiring| retiring.values())
+            .flat_map(|session| &session.directed);
+        live.chain(retiring)
+            .filter(|recipient| matches(recipient.as_str()))
+            .cloned()
+            .collect()
+    }
+
+    pub(super) fn deliver_blocking_presence(
+        &mut self,
+        stanza: RoutedStanza<A>,
+        target: SessionId,
+        require_available: bool,
+        source: Option<&SessionLiveness>,
+    ) -> Result<(), RouterError> {
+        let view = stanza.resolve().map_err(|_| RouterError::InvalidTarget)?;
+        let to = view
+            .to()
+            .map_err(|_| RouterError::InvalidTarget)?
+            .ok_or(RouterError::InvalidTarget)?;
+        let account = to.bare();
+        let resource = to.resourcepart().ok_or(RouterError::InvalidTarget)?;
+        let session = self
+            .accounts
+            .get(account.as_str())
+            .and_then(|sessions| sessions.get(resource))
+            .filter(|session| {
+                session.token == target.get() && (!require_available || session.priority.is_some())
+            })
+            .ok_or(RouterError::NotFound)?;
+        if source.is_some_and(|session| !session.is_alive()) {
+            return Err(RouterError::NotFound);
+        }
+        let cause = if session.alive.load(Ordering::Acquire) {
+            match session.outbound.try_send(MailboxEntry::new(stanza.clone())) {
+                Ok(()) => return Ok(()),
+                Err(error) => mailbox_retire_cause(error),
+            }
+        } else {
+            RetireCause::Evicted
+        };
+        self.remove(account.as_str(), resource, target.get(), cause);
+        match cause {
+            RetireCause::MailboxOverflow => Err(RouterError::Busy),
+            _ => Err(RouterError::NotFound),
+        }
     }
 
     pub(super) fn deliver_filtered_presence(
@@ -1450,8 +1568,8 @@ impl<A: ChunkAllocator + Clone> Shard<A> {
                             && session.alive.load(Ordering::Acquire)
                             && session.presence.is_some()
                     });
-                if !replaced {
-                    snapshot.push(presence.stanza.clone());
+                if !replaced && let Some(stanza) = &presence.current {
+                    snapshot.push(stanza.clone());
                 }
             }
         }

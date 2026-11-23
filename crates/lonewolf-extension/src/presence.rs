@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use lonewolf_storage::Storage;
 use lonewolf_storage::account::AccountKey;
-use lonewolf_storage::roster::{PendingPage, RosterJid};
+use lonewolf_storage::roster::{PendingPage, RosterJid, RosterQuota};
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::JidRef;
 use lonewolf_xmpp::stanza::{Element, PresenceType, RoutedStanza, StanzaErrorCondition};
@@ -108,6 +108,11 @@ pub trait PresenceHandler<A: ChunkAllocator, S: Storage>: Send + Sync {
         _transaction: &'a S::Read,
     ) -> PresenceFuture<'a, bool> {
         Box::pin(async { Ok(false) })
+    }
+
+    /// Includes stored roster subscribers in blocklist transitions under this quota.
+    fn blocklist_roster_quota(&self, _owner: &AccountKey) -> Option<RosterQuota> {
+        None
     }
 
     /// Selects who receives an availability change from one consistent snapshot; the

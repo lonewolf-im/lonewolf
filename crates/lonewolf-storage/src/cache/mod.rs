@@ -46,13 +46,13 @@ pub struct CachedWrite<W> {
 }
 
 impl<B: Storage> CachedStorage<B> {
-    /// Route all local writes for this backend through this single wrapper and its clones.
-    /// Use the wrapper even when the caller holds a cloned or raw backend handle.
-    pub fn wrap(backend: B) -> Self {
+    /// Wrap the sole local write path for this backend.
+    /// A backend that serializes writes must hold admission through observer completion.
+    pub(crate) fn wrap(backend: B, backend_serializes_writes: bool) -> Self {
         Self {
             backend,
             blocklists: Arc::new(BlocklistCache::new()),
-            writer: Some(Arc::new(Mutex::new(()))),
+            writer: (!backend_serializes_writes).then(|| Arc::new(Mutex::new(()))),
         }
     }
 
@@ -90,11 +90,7 @@ impl CachedStorage<RedbBackend> {
     }
 
     fn from_redb(backend: RedbBackend) -> Self {
-        Self {
-            backend,
-            blocklists: Arc::new(BlocklistCache::new()),
-            writer: None,
-        }
+        Self::wrap(backend, true)
     }
 
     pub fn metrics(&self) -> &StoreMetrics {

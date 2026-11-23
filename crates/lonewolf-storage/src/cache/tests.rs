@@ -510,10 +510,13 @@ fn generic_writer_admission_outlives_a_cancelled_commit_and_its_observer() -> Te
     let directory = tempfile::tempdir()?;
     let backend = RedbBackend::open(directory.path().join("storage.redb"))?;
     let openings = Arc::new(AtomicUsize::new(0));
-    let storage = CachedStorage::wrap(OpeningProbe {
-        backend,
-        openings: Arc::clone(&openings),
-    });
+    let storage = CachedStorage::wrap(
+        OpeningProbe {
+            backend,
+            openings: Arc::clone(&openings),
+        },
+        false,
+    );
     let cloned = storage.clone();
     let owner = key(ALICE)?;
     let caller = thread::current().id();

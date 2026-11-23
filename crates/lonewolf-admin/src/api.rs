@@ -648,8 +648,13 @@ mod tests {
     impl ReadTransaction for MemoryTransaction {}
 
     impl WriteTransaction for MemoryTransaction {
-        async fn commit(self) -> Result<(), StorageError> {
+        async fn commit_observed(
+            self,
+            mut observer: impl lonewolf_storage::CommitObserver,
+        ) -> Result<(), StorageError> {
+            observer.before_commit();
             self.storage.state().accounts = self.accounts;
+            observer.after_commit(true);
             Ok(())
         }
     }

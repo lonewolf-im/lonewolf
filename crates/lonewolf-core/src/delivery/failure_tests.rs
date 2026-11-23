@@ -163,9 +163,14 @@ pub(crate) fn fail_commit(
 
 impl ReadTransaction for FailedCommit {}
 impl WriteTransaction for FailedCommit {
-    async fn commit(self) -> Result<(), StorageError> {
+    async fn commit_observed(
+        self,
+        mut observer: impl lonewolf_storage::CommitObserver,
+    ) -> Result<(), StorageError> {
         let _ = self.release.await;
+        observer.before_commit();
         drop(self.transaction);
+        observer.after_commit(false);
         Err(seeded_error(self.kind))
     }
 }

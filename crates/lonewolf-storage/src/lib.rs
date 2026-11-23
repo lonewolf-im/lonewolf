@@ -7,6 +7,7 @@ compile_error!("Lonewolf supports Unix targets only.");
 
 pub mod account;
 pub mod blocking;
+pub mod cache;
 pub mod metrics;
 pub mod offline;
 pub mod page;
@@ -21,6 +22,11 @@ mod storage;
 #[cfg(test)]
 mod tests;
 
+pub use cache::{CachedRead, CachedStorage, CachedWrite};
 pub use error::{StorageError, StorageErrorKind};
-pub use redb::{RedbRead, RedbStorage, RedbWrite};
-pub use storage::{ReadTransaction, Storage, WriteTransaction};
+pub use redb::{RedbBackend, RedbBackendRead, RedbBackendWrite};
+pub use storage::{CommitObserver, ReadTransaction, Storage, WriteTransaction};
+
+pub type RedbStorage = CachedStorage<RedbBackend>;
+pub type RedbRead = CachedRead<RedbBackendRead>;
+pub type RedbWrite = CachedWrite<RedbBackendWrite>;

@@ -5,7 +5,7 @@ use std::fmt;
 use lonewolf_storage::RedbStorage;
 use prometheus_client::collector::Collector;
 use prometheus_client::encoding::{DescriptorEncoder, EncodeMetric};
-use prometheus_client::metrics::{MetricType, counter::ConstCounter};
+use prometheus_client::metrics::{MetricType, counter::ConstCounter, gauge::ConstGauge};
 use prometheus_client::registry::Unit;
 
 pub(crate) struct StorageCollector {
@@ -82,6 +82,96 @@ impl Collector for StorageCollector {
                 }
             }
         }
+        self.encode_blocklist(encoder)
+    }
+}
+
+impl StorageCollector {
+    fn encode_blocklist(&self, mut encoder: DescriptorEncoder) -> Result<(), fmt::Error> {
+        {
+            let mut family = encoder.encode_descriptor(
+                "storage_blocklist_cache_lookups",
+                "Blocklist lookups by cache outcome.",
+                None,
+                MetricType::Counter,
+            )?;
+            for (name, storage) in &self.stores {
+                for (outcome, count) in storage.cache_metrics().blocklist_lookups() {
+                    ConstCounter::new(count).encode(family.encode_family(&[
+                        ("store", name.as_str()),
+                        ("outcome", outcome.as_str()),
+                    ])?)?;
+                }
+            }
+        }
+        {
+            let mut family = encoder.encode_descriptor(
+                "storage_blocklist_cache_fills",
+                "Blocklists loaded after a cache miss by fill outcome.",
+                None,
+                MetricType::Counter,
+            )?;
+            for (name, storage) in &self.stores {
+                for (outcome, count) in storage.cache_metrics().blocklist_fills() {
+                    ConstCounter::new(count).encode(family.encode_family(&[
+                        ("store", name.as_str()),
+                        ("outcome", outcome.as_str()),
+                    ])?)?;
+                }
+            }
+        }
+        {
+            let mut family = encoder.encode_descriptor(
+                "storage_blocklist_cache_updates",
+                "Blocklist cache updates at commit by outcome.",
+                None,
+                MetricType::Counter,
+            )?;
+            for (name, storage) in &self.stores {
+                for (outcome, count) in storage.cache_metrics().blocklist_updates() {
+                    ConstCounter::new(count).encode(family.encode_family(&[
+                        ("store", name.as_str()),
+                        ("outcome", outcome.as_str()),
+                    ])?)?;
+                }
+            }
+        }
+        {
+            let mut family = encoder.encode_descriptor(
+                "storage_blocklist_cache_evictions",
+                "Blocklist cache entries evicted to stay within capacity.",
+                None,
+                MetricType::Counter,
+            )?;
+            for (name, storage) in &self.stores {
+                ConstCounter::new(storage.cache_metrics().blocklist_evictions())
+                    .encode(family.encode_family(&[("store", name.as_str())])?)?;
+            }
+        }
+        {
+            let mut family = encoder.encode_descriptor(
+                "storage_blocklist_cache_entries",
+                "Current blocklist cache entries.",
+                None,
+                MetricType::Gauge,
+            )?;
+            for (name, storage) in &self.stores {
+                ConstGauge::new(storage.cache_metrics().blocklist_entries())
+                    .encode(family.encode_family(&[("store", name.as_str())])?)?;
+            }
+        }
+        {
+            let mut family = encoder.encode_descriptor(
+                "storage_blocklist_cache_size",
+                "Estimated size of current blocklist cache entries.",
+                Some(&Unit::Bytes),
+                MetricType::Gauge,
+            )?;
+            for (name, storage) in &self.stores {
+                ConstGauge::new(storage.cache_metrics().blocklist_size_bytes())
+                    .encode(family.encode_family(&[("store", name.as_str())])?)?;
+            }
+        }
         Ok(())
     }
 }
@@ -114,6 +204,16 @@ mod tests {
         for sample in [
             "lonewolf_storage_commit_duration_seconds_count{store=\"primary\"} 1",
             "lonewolf_storage_write_wait_duration_seconds_count{store=\"primary\"} 1",
+            "lonewolf_storage_blocklist_cache_lookups_total{store=\"primary\",outcome=\"hit\"} 0",
+            "lonewolf_storage_blocklist_cache_lookups_total{store=\"primary\",outcome=\"miss\"} 0",
+            "lonewolf_storage_blocklist_cache_lookups_total{store=\"primary\",outcome=\"bypass\"} 0",
+            "lonewolf_storage_blocklist_cache_fills_total{store=\"primary\",outcome=\"inserted\"} 0",
+            "lonewolf_storage_blocklist_cache_fills_total{store=\"primary\",outcome=\"discarded\"} 0",
+            "lonewolf_storage_blocklist_cache_updates_total{store=\"primary\",outcome=\"written\"} 0",
+            "lonewolf_storage_blocklist_cache_updates_total{store=\"primary\",outcome=\"invalidated\"} 0",
+            "lonewolf_storage_blocklist_cache_evictions_total{store=\"primary\"} 0",
+            "lonewolf_storage_blocklist_cache_entries{store=\"primary\"} 0",
+            "lonewolf_storage_blocklist_cache_size_bytes{store=\"primary\"} 0",
         ] {
             assert!(output.lines().any(|line| line == sample), "{output}");
         }

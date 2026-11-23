@@ -17,13 +17,28 @@ pub trait Storage: Clone + Send + Sync + 'static {
     type Read: ReadTransaction + 'static;
     type Write: WriteTransaction + RosterWrites<Snapshot = Self::Read>;
 
-    /// Reads use one consistent snapshot.
+    /// Fix the consistent read snapshot before the future returns.
     fn begin_read(&self) -> impl Future<Output = Result<Self::Read, StorageError>> + Send;
 
     fn begin_write(&self) -> impl Future<Output = Result<Self::Write, StorageError>> + Send;
 
     /// The per-store secret that keeps authentication timing equal for absent accounts.
     fn scram_decoy(&self) -> &ScramDecoy;
+}
+
+pub trait CommitObserver: Send + 'static {
+    fn before_commit(&mut self);
+
+    /// Reports false when the commit failed or its outcome is unknown.
+    fn after_commit(&mut self, committed: bool);
+}
+
+struct NoObserver;
+
+impl CommitObserver for NoObserver {
+    fn before_commit(&mut self) {}
+
+    fn after_commit(&mut self, _: bool) {}
 }
 
 pub trait ReadTransaction:
@@ -52,5 +67,18 @@ pub trait WriteTransaction:
     /// # Errors
     ///
     /// [`crate::StorageErrorKind::CommitUnknown`] means the writes may have landed.
-    fn commit(self) -> impl Future<Output = Result<(), StorageError>> + Send;
+    fn commit(self) -> impl Future<Output = Result<(), StorageError>> + Send
+    where
+        Self: Sized,
+    {
+        self.commit_observed(NoObserver)
+    }
+
+    /// Call both observer methods on the committing thread even if the caller drops
+    /// the future. Call neither if the attempt never starts. Between the calls,
+    /// only run the commit and its bookkeeping. Unwinding can skip the second call.
+    fn commit_observed(
+        self,
+        observer: impl CommitObserver,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send;
 }

@@ -243,6 +243,8 @@ Cluster requirements:
 - Authenticate node connections and route through bounded queues with defined
   retry, duplicate, timeout, and overload behavior.
 - Use ownership generations so stale owners cannot mutate state after transfer.
+- After a blocklist commit, tell every other node to drop the affected entries.
+  Clear the local cache when a node link drops or a node joins.
 - Route federation and component traffic through the same authorized delivery
   rules as local ingress.
 - Make sessions, resource conflicts, presence, Carbons, offline replay, archives,

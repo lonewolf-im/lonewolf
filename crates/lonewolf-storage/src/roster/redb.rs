@@ -14,7 +14,7 @@ use super::{
 };
 use crate::account::AccountKey;
 use crate::account::redb::account_exists;
-use crate::redb::{RedbRead, RedbWrite, storage_error, with_canonical_jid};
+use crate::redb::{RedbBackendRead, RedbBackendWrite, storage_error, with_canonical_jid};
 use crate::{StorageError, StorageErrorKind};
 
 pub(crate) const ITEMS: TableDefinition<&str, &[u8]> =
@@ -155,11 +155,11 @@ macro_rules! roster_reads {
     };
 }
 
-roster_reads!(RedbRead);
-roster_reads!(RedbWrite);
+roster_reads!(RedbBackendRead);
+roster_reads!(RedbBackendWrite);
 
-impl RosterWrites for RedbWrite {
-    type Snapshot = RedbRead;
+impl RosterWrites for RedbBackendWrite {
+    type Snapshot = RedbBackendRead;
     async fn put_roster_item(
         &mut self,
         owner: &AccountKey,
@@ -196,7 +196,7 @@ impl RosterWrites for RedbWrite {
 
     fn set_roster_subscription(
         &mut self,
-        before: &RedbRead,
+        before: &RedbBackendRead,
         owner: &AccountKey,
         jid: &RosterJid,
         subscription: RosterSubscription,

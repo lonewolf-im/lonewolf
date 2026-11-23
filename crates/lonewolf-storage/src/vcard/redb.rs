@@ -5,7 +5,7 @@ use ::redb::{ReadableTable, TableDefinition, WriteTransaction};
 use super::{MAX_VCARD_BYTES, StoredVCard, VCardError, VCardQuota, VCardReads, VCardWrites};
 use crate::account::AccountKey;
 use crate::account::redb::account_exists;
-use crate::redb::{RedbRead, RedbWrite, storage_error};
+use crate::redb::{RedbBackendRead, RedbBackendWrite, storage_error};
 use crate::{StorageError, StorageErrorKind};
 
 pub(crate) const VCARDS: TableDefinition<&str, &[u8]> = TableDefinition::new("lonewolf_vcards");
@@ -34,10 +34,10 @@ macro_rules! vcard_reads {
     };
 }
 
-vcard_reads!(RedbRead);
-vcard_reads!(RedbWrite);
+vcard_reads!(RedbBackendRead);
+vcard_reads!(RedbBackendWrite);
 
-impl VCardWrites for RedbWrite {
+impl VCardWrites for RedbBackendWrite {
     async fn replace_vcard(
         &mut self,
         owner: &AccountKey,

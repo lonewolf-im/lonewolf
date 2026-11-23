@@ -72,6 +72,7 @@ impl From<StorageError> for BlockError {
 }
 
 pub trait BlockingReads {
+    /// Returns distinct rules in canonical JID byte order.
     fn blocklist(
         &self,
         owner: &AccountKey,

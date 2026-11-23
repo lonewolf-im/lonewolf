@@ -16,7 +16,7 @@ use lonewolf_xmpp::jid::MAX_PART_LEN;
 use zeroize::Zeroizing;
 
 use crate::account::{Account, AccountError, AccountKey, AccountReads, AccountWrites, NewAccount};
-use crate::redb::{RedbRead, RedbWrite, storage_error, with_canonical_jid};
+use crate::redb::{RedbBackendRead, RedbBackendWrite, storage_error, with_canonical_jid};
 use crate::{StorageError, StorageErrorKind};
 
 pub(crate) const ACCOUNTS: TableDefinition<&str, &[u8]> = TableDefinition::new("lonewolf_accounts");
@@ -112,10 +112,10 @@ macro_rules! account_reads {
     };
 }
 
-account_reads!(RedbRead);
-account_reads!(RedbWrite);
+account_reads!(RedbBackendRead);
+account_reads!(RedbBackendWrite);
 
-impl AccountWrites for RedbWrite {
+impl AccountWrites for RedbBackendWrite {
     fn create_account(
         &mut self,
         account: NewAccount,

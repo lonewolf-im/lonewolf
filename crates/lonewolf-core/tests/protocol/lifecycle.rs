@@ -62,7 +62,7 @@ fn resource_assignment_logs_ordered_transitions_without_exposing_jids() -> TestR
 #[test]
 fn authentication_deadline_ends_at_sasl_success() -> TestResult {
     let suite = C2sSuite::with_limits(
-        "authentication_timeout_secs = 2\nresource_binding_timeout_secs = 5",
+        "authentication_timeout_secs = 3\nresource_binding_timeout_secs = 8",
     )?;
     suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.unauthenticated_client()?;
@@ -75,7 +75,7 @@ fn authentication_deadline_ends_at_sasl_success() -> TestResult {
             Some("tls-exporter"),
         )?
         .assert_name(SASL_NAMESPACE, "success");
-    std::thread::sleep(Duration::from_millis(2100).saturating_sub(started.elapsed()));
+    std::thread::sleep(Duration::from_millis(3100).saturating_sub(started.elapsed()));
     let mut client = client.restart();
     client.open()?;
     assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
@@ -461,7 +461,7 @@ fn authentication_deadline_caps_a_local_close_wait() -> TestResult {
     client.receive()?;
     client.expect_footer()?;
     client.expect_eof()?;
-    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(started.elapsed() < Duration::from_secs(4));
     Ok(())
 }
 

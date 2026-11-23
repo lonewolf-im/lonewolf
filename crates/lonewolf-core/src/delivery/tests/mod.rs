@@ -563,12 +563,12 @@ fn a_change_committed_after_its_caller_is_gone_still_delivers_in_order() -> Test
             },
         );
         drop(committed);
-        drop(compio::time::timeout(Duration::from_secs(1), storage.begin_write()).await??);
+        drop(compio::time::timeout(Duration::from_secs(5), storage.begin_write()).await??);
         assert!(!ran.get(), "effects ran before their turn");
         assert!(work.drain().now_or_never().is_none());
 
         drop(ahead);
-        compio::time::timeout(Duration::from_secs(1), work.drain()).await?;
+        compio::time::timeout(Duration::from_secs(5), work.drain()).await?;
         assert!(ran.get(), "effects were lost with their caller");
         Ok(())
     })

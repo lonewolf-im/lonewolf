@@ -66,12 +66,12 @@ fn peer_certificate_expiry_resets_stream() -> TestResult {
             &[(0, 0, listener.address()?.port(), "server.b.test")],
         );
         fixture.dns.a("server.b.test", Ipv4Addr::LOCALHOST);
+        fixture.suite.create_account("alice", PASSWORD)?;
+        let mut alice = fixture.suite.connect("alice", PASSWORD, "desk")?;
         let key = fixture
             .ca
             .short_lived(fixture.directory.path(), "b.test", 4)?;
         let config = peer::server_config(&fixture.ca, key, "a.test")?;
-        fixture.suite.create_account("alice", PASSWORD)?;
-        let mut alice = fixture.suite.connect("alice", PASSWORD, "desk")?;
         alice.send(
             "<message to='bob@b.test/phone' type='chat'><body>before expiry</body></message>",
         )?;
@@ -84,20 +84,20 @@ fn peer_certificate_expiry_resets_stream() -> TestResult {
         fixture.stop()?;
     }
     let mut pair = FederatedPair::start("a.test", "b.test", PairOptions::default())?;
+    pair.a.create_account("alice", PASSWORD)?;
+    pair.b.create_account("bob", PASSWORD)?;
+    let mut alice = pair.a.connect("alice", PASSWORD, "desk")?;
     pair.ca.server_until(
         pair.b.fixture_path(),
         "host",
         &["b.test"],
-        time::OffsetDateTime::now_utc() + time::Duration::seconds(4),
+        time::OffsetDateTime::now_utc() + time::Duration::seconds(8),
     )?;
     pair.b.restart()?;
     pair.dns.srv(
         "b.test",
         &[(0, 0, pair.b.s2s_addresses()?[0].port(), "b.b.test")],
     );
-    pair.a.create_account("alice", PASSWORD)?;
-    pair.b.create_account("bob", PASSWORD)?;
-    let mut alice = pair.a.connect("alice", PASSWORD, "desk")?;
     let mut bob = pair.b.connect("bob", PASSWORD, "phone")?;
     alice.send(
         "<message to='bob@b.test/phone' type='chat'><body>short certificate</body></message>",

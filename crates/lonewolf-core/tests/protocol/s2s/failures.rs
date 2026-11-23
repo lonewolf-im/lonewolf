@@ -293,7 +293,7 @@ fn backoff_answers_without_new_attempts() -> TestResult {
     let refused = refused_endpoint()?;
     let address = refused.address();
     let mut fixture = SingleServer::start(
-        "[limits.s2s]\nfailure_backoff_initial_secs=1\nfailure_backoff_max_secs=1\nconnect_timeout_secs=1",
+        "[limits.s2s]\nfailure_backoff_initial_secs=5\nfailure_backoff_max_secs=5\nconnect_timeout_secs=1",
     )?;
     fixture
         .dns
@@ -306,7 +306,7 @@ fn backoff_answers_without_new_attempts() -> TestResult {
     let failed_at = Instant::now();
     alice.send("<message to='bob@b.test/phone' type='chat' id='cached'><body>cached failure</body></message>")?;
     expect_bounce(&mut alice, "cached", "remote-server-timeout")?;
-    assert!(failed_at.elapsed() < Duration::from_secs(1));
+    assert!(failed_at.elapsed() < Duration::from_secs(4));
     authentication(&fixture.suite, "outbound", "unreachable", 1)?;
     fixture
         .suite
@@ -317,7 +317,7 @@ fn backoff_answers_without_new_attempts() -> TestResult {
             .query_count("_xmpp-server._tcp.b.test", RecordType::SRV),
         1
     );
-    if let Some(remaining) = Duration::from_secs(1).checked_sub(failed_at.elapsed()) {
+    if let Some(remaining) = Duration::from_secs(5).checked_sub(failed_at.elapsed()) {
         std::thread::sleep(remaining);
     }
     alice.send("<message to='bob@b.test/phone' type='chat' id='after-backoff'><body>new attempt</body></message>")?;

@@ -28,6 +28,7 @@ mod account_deletion;
 mod acme;
 mod admission;
 mod c2s;
+mod clock;
 mod component;
 pub mod config;
 mod connection;

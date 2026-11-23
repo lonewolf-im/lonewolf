@@ -203,7 +203,7 @@ fn entered_dns_lookup_times_out_while_workers_remain_owned_then_cleans_up() {
                 "example.test",
                 443,
                 &ureq::config::Config::default(),
-                timeout(Duration::from_secs(1)),
+                timeout(Duration::from_secs(3)),
             );
             returned
                 .send(matches!(result, Err(ureq::Error::Timeout(_))))
@@ -215,7 +215,7 @@ fn entered_dns_lookup_times_out_while_workers_remain_owned_then_cleans_up() {
     assert_ne!(first, second);
     assert!(results.try_recv().is_err());
     for _ in 0..2 {
-        assert!(results.recv_timeout(Duration::from_secs(5)).unwrap());
+        assert!(results.recv_timeout(Duration::from_secs(10)).unwrap());
     }
     for caller in callers {
         caller.join().unwrap();

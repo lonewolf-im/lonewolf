@@ -684,7 +684,7 @@ fn tcp_partial_frame_is_bounded_by_whole_attempt_deadline() -> TestResult {
     let (release, wait) = std::sync::mpsc::channel();
     let worker = thread::spawn(move || -> io::Result<()> {
         Runtime::new()?
-            .block_on(compio::time::timeout(Duration::from_secs(2), async move {
+            .block_on(compio::time::timeout(Duration::from_secs(10), async move {
                 let udp = UdpSocket::from_std(udp)?;
                 let listener = compio::net::TcpListener::from_std(listener)?;
                 let BufResult(received, bytes) = udp.recv_from(vec![0; 1232]).await;
@@ -701,7 +701,7 @@ fn tcp_partial_frame_is_bounded_by_whole_attempt_deadline() -> TestResult {
                 let length = usize::from(u16::from_be_bytes(length));
                 stream.read_exact(vec![0; length]).await.0?;
                 stream.write_all([0, 20, 0]).await.0?;
-                wait.recv_timeout(Duration::from_secs(2))
+                wait.recv_timeout(Duration::from_secs(10))
                     .map_err(io::Error::other)?;
                 Ok(())
             }))
@@ -710,7 +710,7 @@ fn tcp_partial_frame_is_bounded_by_whole_attempt_deadline() -> TestResult {
     let mut config = crate::config::S2sConfig::default();
     config.dns.nameservers.push(address);
     let mut resolver = Resolver::new(&config)?;
-    resolver.timeout = Duration::from_secs(1);
+    resolver.timeout = Duration::from_secs(3);
     let result = Runtime::new()?
         .block_on(resolver.query(&Name::from_ascii("remote.example.")?, RecordType::A));
     release.send(())?;

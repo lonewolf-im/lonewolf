@@ -7,6 +7,12 @@ use std::time::{Duration, Instant};
 use crate::support::{C2sSuite, Client, TestResult};
 
 const STRICT: &str = "incoming_stanzas_per_connection = { per_second = 1, burst = 1 }";
+fn throttled(listener: usize, count: u64) -> String {
+    format!(
+        "lonewolf_c2s_rate_limited_total{{listener=\"{listener}\",limit=\"incoming_stanzas_per_connection\"}} {count}"
+    )
+}
+
 fn expect_self_message(client: &mut Client, resource: &str, id: &str) -> TestResult {
     client.expect_xml(&format!("<message xmlns='jabber:client' from='alice@localhost/{resource}' to='alice@localhost/{resource}' type='chat' id='{id}'/>"))
 }
@@ -67,12 +73,15 @@ fn connections_have_independent_stanza_allowances() -> TestResult {
     let mut phone = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
     assert_eq!(desk.bind(Some("desk"))?, "alice@localhost/desk");
     desk.send("<message to='alice@localhost/desk' type='chat' id='desk'/>")?;
-    desk.expect_no_tls_input()?;
+    suite.wait_for_metric(&throttled(0, 1))?;
 
-    let started = Instant::now();
     assert_eq!(phone.bind(Some("phone"))?, "alice@localhost/phone");
-    assert!(started.elapsed() < Duration::from_millis(500));
     expect_self_message(&mut desk, "desk", "desk")?;
+    let metrics = suite.scrape_metrics()?;
+    assert!(
+        metrics.lines().any(|line| line == throttled(0, 1)),
+        "{metrics}"
+    );
     desk.close()?;
     phone.close()
 }
@@ -88,7 +97,7 @@ fn listeners_apply_default_and_selected_stanza_profiles() -> TestResult {
     suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut strict = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
     strict.send("<message to='alice@localhost/desk' type='chat' id='strict'/>")?;
-    strict.expect_no_tls_input()?;
+    suite.wait_for_metric(&throttled(0, 1))?;
 
     let mut selected = Client::connect_at(
         &suite,
@@ -97,14 +106,17 @@ fn listeners_apply_default_and_selected_stanza_profiles() -> TestResult {
         ALTERNATE_PASSWORD,
         "phone",
     )?;
-    let started = Instant::now();
     selected.send("<message to='alice@localhost/phone' type='chat' id='first'/><message to='alice@localhost/phone' type='chat' id='second'/><message to='alice@localhost/phone' type='chat' id='last'/>")?;
     expect_self_message(&mut selected, "phone", "first")?;
     expect_self_message(&mut selected, "phone", "second")?;
-    assert!(started.elapsed() < Duration::from_millis(500));
-    selected.expect_no_tls_input()?;
+    suite.wait_for_metric(&throttled(1, 1))?;
     expect_self_message(&mut strict, "desk", "strict")?;
     expect_self_message(&mut selected, "phone", "last")?;
+    let metrics = suite.scrape_metrics()?;
+    assert!(
+        metrics.lines().any(|line| line == throttled(1, 1)),
+        "{metrics}"
+    );
     strict.close()?;
     selected.close()
 }

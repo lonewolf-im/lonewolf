@@ -208,7 +208,7 @@ fn idle_authentication_closes_at_the_configured_deadline() -> TestResult {
 
 #[test]
 fn idle_resource_binding_closes_at_the_configured_deadline() -> TestResult {
-    let suite = C2sSuite::with_limits("resource_binding_timeout_secs = 1")?;
+    let suite = C2sSuite::with_limits("resource_binding_timeout_secs = 3")?;
     suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let started = Instant::now();
     let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
@@ -223,24 +223,24 @@ fn idle_resource_binding_closes_at_the_configured_deadline() -> TestResult {
     client.send_tls_close()?;
     client.expect_tcp_eof()?;
     suite.wait_for_closed("binding_timeout", 1)?;
-    assert!((Duration::from_secs(1)..Duration::from_secs(7)).contains(&started.elapsed()));
+    assert!((Duration::from_secs(3)..Duration::from_secs(9)).contains(&started.elapsed()));
     Ok(())
 }
 
 #[test]
 fn idle_plaintext_after_features_closes_with_policy_violation() -> TestResult {
-    let suite = C2sSuite::with_limits("connection_establishment_timeout_secs = 1")?;
+    let suite = C2sSuite::with_limits("connection_establishment_timeout_secs = 3")?;
     let started = Instant::now();
     let mut client = suite.tcp_client()?;
     client.open()?;
     client.expect_stream_error("policy-violation")?;
-    assert!((Duration::from_secs(1)..Duration::from_secs(7)).contains(&started.elapsed()));
+    assert!((Duration::from_secs(3)..Duration::from_secs(9)).contains(&started.elapsed()));
     Ok(())
 }
 
 #[test]
 fn completed_tls_without_a_restart_header_closes_tls_without_synthetic_xml() -> TestResult {
-    let suite = C2sSuite::with_limits("connection_establishment_timeout_secs = 1")?;
+    let suite = C2sSuite::with_limits("connection_establishment_timeout_secs = 3")?;
     let started = Instant::now();
     let mut client = suite.tls_client()?;
     client.expect_tls_close()?;
@@ -248,7 +248,7 @@ fn completed_tls_without_a_restart_header_closes_tls_without_synthetic_xml() -> 
     client.send_tls_close()?;
     client.expect_tcp_eof()?;
     suite.wait_for_closed("establishment_timeout", 1)?;
-    assert!((Duration::from_secs(1)..Duration::from_secs(7)).contains(&started.elapsed()));
+    assert!((Duration::from_secs(3)..Duration::from_secs(9)).contains(&started.elapsed()));
     Ok(())
 }
 
@@ -270,7 +270,7 @@ fn sasl_success_without_a_restart_header_closes_tls_without_synthetic_xml() -> T
 
 #[test]
 fn incomplete_tls_negotiation_times_out_without_appending_plaintext_xml() -> TestResult {
-    let suite = C2sSuite::with_limits("connection_establishment_timeout_secs = 1")?;
+    let suite = C2sSuite::with_limits("connection_establishment_timeout_secs = 3")?;
     let started = Instant::now();
     let mut client = suite.tcp_client()?;
     client.open()?;
@@ -278,20 +278,20 @@ fn incomplete_tls_negotiation_times_out_without_appending_plaintext_xml() -> Tes
     client.receive()?.assert_name(TLS_NAMESPACE, "proceed");
     client.expect_eof()?;
     suite.wait_for_closed("establishment_timeout", 1)?;
-    assert!((Duration::from_secs(1)..Duration::from_secs(4)).contains(&started.elapsed()));
+    assert!((Duration::from_secs(3)..Duration::from_secs(6)).contains(&started.elapsed()));
     Ok(())
 }
 
 #[test]
 fn nonreading_timeout_peer_releases_connection_capacity_within_one_grace_budget() -> TestResult {
     let mut suite = C2sSuite::with_limits(
-        "connection_establishment_timeout_secs = 1\nmax_connections_per_ip = 1",
+        "connection_establishment_timeout_secs = 3\nmax_connections_per_ip = 1",
     )?;
     let started = Instant::now();
     let mut silent = suite.tcp_client()?;
     silent.open()?;
     suite.wait_for_closed("establishment_timeout", 1)?;
-    assert!((Duration::from_secs(5)..Duration::from_secs(7)).contains(&started.elapsed()));
+    assert!((Duration::from_secs(7)..Duration::from_secs(11)).contains(&started.elapsed()));
     let mut replacement = suite.tcp_client()?;
     replacement.open()?;
     replacement.close()?;

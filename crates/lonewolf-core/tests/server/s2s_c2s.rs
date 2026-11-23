@@ -375,12 +375,15 @@ fn c2s_chat_iq_and_headline_establishment_failures_bounce_to_sending_resource() 
                 Some(endpoint) => out::address(endpoint)?,
                 None => listener.local_addr()?,
             };
+            let negotiation = if mode == "timeout" {
+                "[limits.s2s]\nnegotiation_timeout_secs=3\n"
+            } else {
+                ""
+            };
             let extra = if mode == "dns" {
                 format!("[s2s.dns]\nnameservers=['{}']\n", dns.local_addr()?)
             } else {
-                format!(
-                    "[s2s.routes]\n'peer.test'=['{endpoint}']\n[limits.s2s]\nnegotiation_timeout_secs=1\n"
-                )
+                format!("[s2s.routes]\n'peer.test'=['{endpoint}']\n{negotiation}")
             };
             let (mut server, mut sender) = client::start(&fixture, &extra)?;
             let id = format!("{mode}-{kind}");

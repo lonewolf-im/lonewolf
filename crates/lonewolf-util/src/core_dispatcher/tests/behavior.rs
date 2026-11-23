@@ -403,7 +403,7 @@ fn absolute_shutdown_deadline_is_forwarded_without_a_new_grace_period() -> TestR
             })
             .await?;
         running.await?;
-        let deadline = Instant::now() + Duration::from_secs(1);
+        let deadline = Instant::now() + TIMEOUT;
         dispatcher.shutdown_at(deadline).await?;
         assert_eq!(task.await?, deadline);
         Ok(())

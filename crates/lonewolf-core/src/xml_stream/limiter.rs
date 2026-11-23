@@ -21,7 +21,7 @@ impl StanzaLimiter {
         Self {
             per_second,
             burst,
-            bucket: TokenBucket::new(burst, Instant::now()),
+            bucket: TokenBucket::new(burst, crate::clock::now()),
         }
     }
 
@@ -32,7 +32,7 @@ impl StanzaLimiter {
     pub(crate) async fn acquire(&mut self, mode: &Cell<ReadMode>, observer: &impl ReadObserver) {
         let mut reported = false;
         loop {
-            if mode.get() != ReadMode::Open || self.try_acquire(Instant::now()) {
+            if mode.get() != ReadMode::Open || self.try_acquire(crate::clock::now()) {
                 break;
             }
             let mut wait = std::pin::pin!(compio::time::sleep(

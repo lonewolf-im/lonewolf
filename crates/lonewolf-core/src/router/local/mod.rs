@@ -8,5 +8,6 @@ pub(crate) use registration::{
     DirectedWithdrawal, Mailbox, MailboxEntry, PresenceChange, Registration, ResourceMatch,
     RetireCause, SessionHandle, SessionLiveness, StoredRelease, release_deferred,
 };
+pub(in crate::router) use shard::DirectedRecipient;
 pub(crate) use shards::LocalRouter;
 pub(super) use shards::LocalRouterHandle;

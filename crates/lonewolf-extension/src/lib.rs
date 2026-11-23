@@ -45,6 +45,7 @@ pub type ExtensionFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
 use account::AccountHandler;
 use archive::ArchiveHandler;
+use blocking::BlockingPresenceChange;
 use delivery::{Delivery, DeliveryFuture};
 use discovery::Discovery;
 use iq::{IqRegistry, IqRequestKey, IqRoute};
@@ -54,10 +55,12 @@ use policy::PolicyHandler;
 use presence::{PresenceDecorator, PresenceRegistry, PresenceRequestType};
 use service::ServiceHandler;
 
-/// Deliveries run after commit, in storage-view order for each account in `accounts`.
+/// Deliveries run after commit in storage-view order for the listed accounts.
+/// A blocklist edit also reserves authorized local recipients whose visibility changes.
 pub struct Effects<A> {
     pub accounts: Vec<AccountKey>,
     pub deliver: Deliver<A>,
+    local_blocklist_edit: Option<Arc<BlockingPresenceChange>>,
 }
 
 pub type Deliver<A> = Box<dyn for<'d> FnOnce(&'d dyn Delivery<A>) -> DeliveryFuture<'d>>;
@@ -70,7 +73,12 @@ impl<A: ChunkAllocator> Effects<A> {
         Self {
             accounts,
             deliver: Box::new(deliver),
+            local_blocklist_edit: None,
         }
+    }
+
+    pub fn local_blocklist_edit(&self) -> Option<&Arc<BlockingPresenceChange>> {
+        self.local_blocklist_edit.as_ref()
     }
 
     pub fn none() -> Self {

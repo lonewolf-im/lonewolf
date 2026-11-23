@@ -44,6 +44,55 @@ fn generated_federated_presence_retains_its_full_source_and_bare_wire_recipient(
 }
 
 #[test]
+fn federated_subscriber_receives_committed_block_presence_transitions() -> TestResult {
+    let mut options = workflow_options();
+    options.a_extensions.push_str(", 'blocking'");
+    let mut pair = FederatedPair::start("a.test", "b.test", options)?;
+    pair.a.create_account("alice", PASSWORD)?;
+    pair.b.create_account("bob", PASSWORD)?;
+    let mut alice = pair.a.connect("alice", PASSWORD, "desk")?;
+    let mut bob = pair.b.connect("bob", PASSWORD, "phone")?;
+    subscribe_mutually(&mut alice, "alice@a.test", &mut bob, "bob@b.test")?;
+    alice.send("<presence><status>current</status></presence>")?;
+    presence(&mut alice, "alice@a.test/desk", "alice@a.test", None)?;
+    presence(&mut bob, "alice@a.test/desk", "bob@b.test", None)?;
+
+    for (command, recipient, kind) in [
+        ("block", "bob@b.test/phone", Some("unavailable")),
+        ("unblock", "bob@b.test/phone", None),
+        ("block", "bob@b.test", Some("unavailable")),
+        ("unblock", "bob@b.test", None),
+    ] {
+        crate::blocking::change_rule(&mut alice, command, recipient)?;
+        alice.send("<iq type='get' id='remote' to='b.test'><ping xmlns='urn:xmpp:ping'/></iq>")?;
+        iq_reply(
+            &mut alice,
+            "remote",
+            "result",
+            "b.test",
+            "alice@a.test/desk",
+        )?;
+        bob.send("<iq type='get' id='local' to='b.test'><ping xmlns='urn:xmpp:ping'/></iq>")?;
+        let update = presence(&mut bob, "alice@a.test/desk", recipient, kind)?;
+        if kind.is_none() {
+            assert_eq!(update.child("jabber:client", "status")?.text, "current");
+        } else {
+            assert!(update.child("jabber:client", "status").is_err());
+        }
+        iq_reply(&mut bob, "local", "result", "b.test", "bob@b.test/phone")?;
+    }
+    alice.close()?;
+    presence(
+        &mut bob,
+        "alice@a.test/desk",
+        "bob@b.test",
+        Some("unavailable"),
+    )?;
+    bob.close()?;
+    pair.stop()
+}
+
+#[test]
 fn mutual_subscription_then_initial_presence_probes_remote_contacts() -> TestResult {
     for (ad, an, bd, bn) in DIRECTIONS {
         let mut pair = FederatedPair::start(ad, bd, workflow_options())?;

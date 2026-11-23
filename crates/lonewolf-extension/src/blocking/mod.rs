@@ -3,7 +3,9 @@
 use std::sync::Arc;
 
 use lonewolf_storage::account::AccountKey;
-use lonewolf_storage::blocking::{BlockChange, BlockError, BlockingReads, BlockingWrites};
+use lonewolf_storage::blocking::{
+    BlockChange, BlockDelta, BlockError, BlockingReads, BlockingWrites,
+};
 use lonewolf_storage::{Storage, StorageErrorKind};
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::stanza::{BuildError, Element, IqType, StanzaErrorCondition, StanzaType};
@@ -26,6 +28,21 @@ const UNBLOCK: &str = "unblock";
 
 #[derive(Default)]
 pub struct Blocking;
+
+pub struct BlockingPresenceChange {
+    owner: AccountKey,
+    delta: BlockDelta,
+}
+
+impl BlockingPresenceChange {
+    pub fn owner(&self) -> &AccountKey {
+        &self.owner
+    }
+
+    pub fn delta(&self) -> &BlockDelta {
+        &self.delta
+    }
+}
 
 impl<A: ChunkAllocator, S: Storage> Extension<A, S> for Blocking {
     fn name(&self) -> &'static str {
@@ -146,11 +163,11 @@ impl<A: ChunkAllocator, S: Storage> IqHandler<A, S> for Blocking {
         &'a self,
         request: IqRequest<'a, A>,
         transaction: &'a mut S::Write,
-        _hosts: &'a dyn HostLookup,
+        hosts: &'a dyn HostLookup,
         response: &'a mut Arena<A>,
     ) -> IqFuture<'a, A> {
         Box::pin(async move {
-            set_blocklist(request, transaction, response)
+            set_blocklist(request, transaction, hosts, response)
                 .await
                 .map_err(IqError::without_payload)
         })
@@ -186,6 +203,7 @@ async fn get_blocklist<A: ChunkAllocator>(
 async fn set_blocklist<A: ChunkAllocator>(
     request: IqRequest<'_, A>,
     transaction: &mut impl BlockingWrites,
+    hosts: &dyn HostLookup,
     response: &mut Arena<A>,
 ) -> Result<IqReply<A>, HandlerError> {
     let owner = owner(&request)?;
@@ -198,13 +216,27 @@ async fn set_blocklist<A: ChunkAllocator>(
     let mut nonce = [0; 16];
     getrandom::fill(&mut nonce).map_err(|_| StanzaErrorCondition::InternalServerError)?;
     let mut push_id = u128::from_ne_bytes(nonce);
-    transaction
+    let delta = transaction
         .change_blocklist(&owner, change)
         .await
         .map_err(|error| storage_error(error, "blocklist_write"))?;
-    let effects = Effects::new(vec![owner.clone()], move |delivery| {
+    let local = delta.inserted.iter().chain(&delta.removed).any(|rule| {
+        hosts.is_local_host(rule.domain())
+            && rule
+                .as_str()
+                .split_once('/')
+                .is_none_or(|(bare, _)| bare != rule.domain())
+    });
+    let change = (!delta.inserted.is_empty() || !delta.removed.is_empty()).then(|| {
+        Arc::new(BlockingPresenceChange {
+            owner: owner.clone(),
+            delta,
+        })
+    });
+    let local_change = if local { change.clone() } else { None };
+    let mut effects = Effects::new(vec![owner.clone()], move |delivery| {
         Box::pin(async move {
-            delivery
+            let pushed = delivery
                 .push_to_tagged(
                     &owner,
                     SessionTag::Blocklist,
@@ -214,9 +246,15 @@ async fn set_blocklist<A: ChunkAllocator>(
                         xml::build_push(to, &id, command, &items, arena)
                     }),
                 )
-                .await
+                .await;
+            if let Some(change) = change {
+                pushed.and(delivery.blocking_presence(&change).await)
+            } else {
+                pushed
+            }
         })
     });
+    effects.local_blocklist_edit = local_change;
     Ok(IqReply::new(None, effects))
 }
 

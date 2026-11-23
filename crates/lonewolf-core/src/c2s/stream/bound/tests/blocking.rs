@@ -4,32 +4,89 @@ mod addressed;
 
 use std::collections::BTreeMap;
 
-use lonewolf_extension::Extensions;
 use lonewolf_extension::blocking::{Blocking, NAME, NAMESPACE};
 use lonewolf_extension::delivery::SessionTag;
 use lonewolf_extension::iq::IqErrorPayload;
+use lonewolf_extension::policy::{PolicyFuture, PolicyHandler, PolicyRequest};
+use lonewolf_extension::roster::{Roster, RosterLimits};
+use lonewolf_extension::{Extension, Extensions, RegistrationError, Slots};
 use lonewolf_storage::blocking::{BlockChange, BlockingReads, BlockingWrites};
-use lonewolf_storage::roster::RosterJid;
+use lonewolf_storage::roster::{
+    RosterItem, RosterJid, RosterSubscription, RosterWrites, SubscriptionState,
+};
 use lonewolf_xmpp::parser::{ParserConfig, StreamEvent, XmppParser};
 use lonewolf_xmpp::stanza::STANZA_ERROR_NAMESPACE;
 
+use crate::component::{
+    credentials as component_credentials, metrics::ComponentMetrics, registry::ComponentRegistry,
+};
+use crate::config::{ComponentLimits, ComponentsConfig};
 use crate::delivery::failure_tests::fail_commit;
-use crate::delivery::{EffectsDiagnostics, EffectsIdentity, RouterDelivery, commit_and_deliver};
+use crate::delivery::{
+    EffectsDiagnostics, EffectsError, EffectsIdentity, RouterDelivery, commit_and_deliver,
+};
+use crate::order::Ticket;
+use crate::router::ServiceRoute;
 use crate::stages::ingress::iq::{IqDisposition, IqPending, prepare_get, prepare_set};
 
 use super::*;
 
 fn router() -> TestResult<Router<GlobalChunkAllocator>> {
+    blocking_router(None)
+}
+
+fn blocking_router(
+    presence_extension: Option<Arc<dyn Extension<GlobalChunkAllocator, RedbStorage>>>,
+) -> TestResult<Router<GlobalChunkAllocator>> {
     let mut extensions = Extensions::default();
     extensions.register(Arc::new(Blocking))?;
+    let mut names = vec![NAME];
+    if let Some(extension) = presence_extension {
+        names.push(extension.name());
+        extensions.register(extension)?;
+    }
     Ok(Router::new(
         Hosts::new(&Config::default().hosts, Some("localhost"))?,
         LocalRouter::new(GlobalChunkAllocator),
     )
     .with_extensions(BTreeMap::from([(
         "localhost".into(),
-        extensions.enable_host("localhost", [NAME])?,
+        extensions.enable_host("localhost", names)?,
     )])))
+}
+
+struct BlockPresenceGate(PlMutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>);
+
+impl Extension<GlobalChunkAllocator, RedbStorage> for BlockPresenceGate {
+    fn name(&self) -> &'static str {
+        "block-presence-gate"
+    }
+
+    fn register(
+        self: Arc<Self>,
+        _: &str,
+        slots: &mut Slots<'_, GlobalChunkAllocator, RedbStorage>,
+    ) -> Result<(), RegistrationError> {
+        slots.policy(self);
+        Ok(())
+    }
+}
+
+impl PolicyHandler<RedbStorage> for BlockPresenceGate {
+    fn check<'a>(&'a self, request: PolicyRequest<'a>, _: &'a RedbRead) -> PolicyFuture<'a> {
+        Box::pin(async move {
+            if request.kind == StanzaType::Presence(PresenceType::Unavailable) {
+                let gate = self.0.lock().take();
+                if let Some((entered, release)) = gate {
+                    let _ = entered.send(());
+                    release
+                        .await
+                        .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+                }
+            }
+            Ok(Verdict::Allow)
+        })
+    }
 }
 
 async fn blocklist_get(
@@ -242,21 +299,22 @@ fn blocklist_answer(
     registration: &Registration<GlobalChunkAllocator>,
     kind: IqType,
     command: &str,
-    item: Option<&str>,
+    items: &[&str],
     namespace: StanzaNamespace,
 ) -> TestResult<IqAnswer<GlobalChunkAllocator>> {
     let mut arena = Arena::try_new(ArenaConfig::default())?;
     let sender = Jid::parse_in(&registration.full_jid(), &mut arena)?;
     let target = Jid::parse_in(registration.account().as_str(), &mut arena)?;
-    let item = item
+    let items = items
+        .iter()
         .map(|jid| {
             Element::builder_in("item", NAMESPACE, &mut arena)?
                 .attribute("jid", "", jid)?
                 .build()
         })
-        .transpose()?;
+        .collect::<Result<Vec<_>, _>>()?;
     let mut payload = Element::builder_in(command, NAMESPACE, &mut arena)?;
-    if let Some(item) = item {
+    for item in items {
         payload = payload.child(item)?;
     }
     let payload = payload.build()?;
@@ -280,13 +338,16 @@ async fn pending_set(
     stage: &Stage<'_, GlobalChunkAllocator>,
     writer: &Registration<GlobalChunkAllocator>,
 ) -> TestResult<IqPending<GlobalChunkAllocator>> {
-    let set = blocklist_answer(
-        writer,
-        IqType::Set,
-        "block",
-        Some("Peer.EXAMPLE"),
-        StanzaNamespace::Client,
-    )?;
+    pending_change(stage, writer, "block", &["Peer.EXAMPLE"]).await
+}
+
+async fn pending_change(
+    stage: &Stage<'_, GlobalChunkAllocator>,
+    writer: &Registration<GlobalChunkAllocator>,
+    command: &str,
+    items: &[&str],
+) -> TestResult<IqPending<GlobalChunkAllocator>> {
+    let set = blocklist_answer(writer, IqType::Set, command, items, StanzaNamespace::Client)?;
     let IqDisposition::Ordered(pending) = prepare_set(
         stage,
         &Origin::Session(writer),
@@ -310,7 +371,7 @@ async fn pending_get(
         reader,
         IqType::Get,
         "blocklist",
-        None,
+        &[],
         StanzaNamespace::Client,
     )?;
     let IqDisposition::Ordered(pending) = prepare_get(
@@ -336,7 +397,11 @@ async fn assert_block_committed(storage: &RedbStorage, owner: &AccountKey) -> Te
     Ok(())
 }
 
-fn assert_block_push(entry: &MailboxEntry<GlobalChunkAllocator>, recipient: &str) -> TestResult {
+fn assert_block_push(
+    entry: &MailboxEntry<GlobalChunkAllocator>,
+    recipient: &str,
+    rule: &str,
+) -> TestResult {
     let push = entry.stanza.resolve()?;
     assert_eq!(push.stanza_type(), StanzaType::Iq(IqType::Set));
     assert_eq!(push.to()?.ok_or("missing recipient")?.as_str(), recipient);
@@ -350,8 +415,387 @@ fn assert_block_push(entry: &MailboxEntry<GlobalChunkAllocator>, recipient: &str
     let item = payload
         .child("item", NAMESPACE)?
         .ok_or("missing block item")?;
-    assert_eq!(item.attribute("jid", "")?, Some("peer.example"));
+    assert_eq!(item.attribute("jid", "")?, Some(rule));
     Ok(())
+}
+
+fn test_account(jid: &str) -> TestResult<AccountKey> {
+    let mut arena = Arena::try_new(ArenaConfig::default())?;
+    Ok(AccountKey::try_from(
+        Jid::parse_in(jid, &mut arena)?.resolve(&arena)?,
+    )?)
+}
+
+async fn account_turn(
+    router: &RouterHandle<GlobalChunkAllocator>,
+    accounts: &[&AccountKey],
+) -> TestResult<Ticket> {
+    let ((), ticket) = router
+        .order()
+        .fix(
+            accounts.iter().map(|account| (*account).clone()).collect(),
+            async { Ok::<_, RouterError>(()) },
+        )
+        .await?;
+    Ok(ticket)
+}
+
+async fn assert_committed_rule(
+    storage: &RedbStorage,
+    owner: &AccountKey,
+    rule: &str,
+    present: bool,
+) -> TestResult {
+    let writer = storage.begin_write().await?;
+    let rules = writer.blocklist(owner).await?;
+    assert_eq!(rules.iter().any(|item| item.as_str() == rule), present);
+    Ok(())
+}
+
+async fn assert_successful_change(pending: IqPending<GlobalChunkAllocator>) -> TestResult {
+    let done = pending
+        .finished()
+        .await
+        .ok_or("SET was cancelled")?
+        .map_err(|_| "SET did not complete")?;
+    assert!(matches!(done.answer.reply, Ok(None)));
+    Ok(())
+}
+
+#[test]
+fn reciprocal_exact_blocks_reserve_authorized_accounts_in_either_commit_order() -> TestResult {
+    const ABSENT_RESOURCE: &str = "absent@localhost/desk";
+    const UNGRANTED: &str = "carol@localhost";
+    const OTHER_RESOURCE: &str = "dave@localhost/other";
+    const DIRECTED_ADDRESS: &str = "dave@localhost/Desk/second";
+    Runtime::new()?.block_on(compio::time::timeout(Duration::from_secs(5), async {
+        for bob_first in [true, false] {
+            let fixture = Fixture::new(&[]).await?;
+            let router = blocking_router(Some(Arc::new(Roster::default())))?;
+            let handle = router.handle();
+            let bob = fixture.registration.account();
+            let alice = test_account("alice@localhost")?;
+            let ungranted = test_account(UNGRANTED)?;
+            let different_grant = test_account("dave@localhost")?;
+            let absent = test_account("absent@localhost")?;
+            let mut write = fixture.storage.begin_write().await?;
+            write
+                .create_account(NewAccount {
+                    key: alice.clone(),
+                    credentials: credentials(),
+                })
+                .await?;
+            for (owner, peer) in [(bob, &alice), (&alice, bob)] {
+                for subscriber in [peer, &absent] {
+                    write
+                        .put_roster_item(
+                            owner,
+                            &RosterItem {
+                                jid: RosterJid::from(subscriber),
+                                name: None,
+                                groups: Vec::new(),
+                                subscription: RosterSubscription {
+                                    state: SubscriptionState::From,
+                                    ..Default::default()
+                                },
+                            },
+                            RosterQuota::default(),
+                        )
+                        .await?;
+                }
+            }
+            write.commit().await?;
+            let bob = handle
+                .register(bob, Some("phone"), NonZeroUsize::MIN)
+                .await?;
+            let alice = handle
+                .register(&alice, Some("desk"), NonZeroUsize::MIN)
+                .await?;
+            for source in [&alice, &bob] {
+                let from = source.full_jid();
+                source
+                    .handle()
+                    .set_presence(
+                        Some(0),
+                        routed_presence(&from, None, PresenceType::Available)?,
+                        None,
+                    )
+                    .await?;
+                source
+                    .handle()
+                    .directed_presence(
+                        routed_presence(&from, Some(DIRECTED_ADDRESS), PresenceType::Available)?,
+                        true,
+                    )
+                    .await?;
+            }
+            let stage = Stage {
+                router: &handle,
+                storage: &fixture.storage,
+                allocator: &GlobalChunkAllocator,
+                work: &fixture.work.handle(),
+            };
+            let (first, second, first_rules, second_rules) = if bob_first {
+                (
+                    &bob,
+                    &alice,
+                    &[
+                        "alice@localhost/desk",
+                        "alice@localhost",
+                        ABSENT_RESOURCE,
+                        UNGRANTED,
+                        OTHER_RESOURCE,
+                    ][..],
+                    &["bob@localhost"][..],
+                )
+            } else {
+                (
+                    &alice,
+                    &bob,
+                    &["bob@localhost", ABSENT_RESOURCE, UNGRANTED, OTHER_RESOURCE][..],
+                    &["alice@localhost/desk"][..],
+                )
+            };
+            let mut older = account_turn(&handle, &[first.account()]).await?;
+            older.turn().await;
+            let first_change = pending_change(&stage, first, "block", first_rules).await?;
+            assert_committed_rule(&fixture.storage, first.account(), first_rules[0], true).await?;
+            let mut second_line = account_turn(&handle, &[second.account()]).await?;
+            assert!(second_line.turn().now_or_never().is_none());
+            let mut absent_line = account_turn(&handle, &[&absent]).await?;
+            assert!(absent_line.turn().now_or_never().is_none());
+            let mut independent = account_turn(&handle, &[&ungranted, &different_grant]).await?;
+            assert!(independent.turn().now_or_never().is_some());
+            drop((second_line, absent_line, independent));
+            let second_change = pending_change(&stage, second, "block", second_rules).await?;
+            assert_committed_rule(&fixture.storage, second.account(), second_rules[0], true)
+                .await?;
+            drop(older);
+            assert_successful_change(first_change).await?;
+            let completed = second_change
+                .finished()
+                .await
+                .ok_or("second SET was cancelled")?
+                .map_err(|_| "second SET did not complete")?;
+            assert!(matches!(completed.answer.reply, Ok(None)));
+            assert!(first.take_queued().is_empty());
+            let notices = completed.queued;
+            assert_eq!(notices.len(), 1);
+            let notice = notices[0].stanza.resolve()?;
+            assert_eq!(
+                notice.stanza_type(),
+                StanzaType::Presence(PresenceType::Unavailable)
+            );
+            assert_eq!(
+                notice.from()?.ok_or("missing notice sender")?.as_str(),
+                first.full_jid()
+            );
+            drop((bob, alice));
+            router.shutdown().await?;
+            fixture.finish().await?;
+        }
+        Ok(())
+    }))?
+}
+
+#[test]
+fn domain_block_orders_queued_grants_and_finishes_with_an_undrained_component() -> TestResult {
+    Runtime::new()?.block_on(compio::time::timeout(Duration::from_secs(5), async {
+        let fixture = Fixture::new(&[]).await?;
+        let component = "gateway.example.test";
+        let config: ComponentsConfig = toml::from_str(
+            "[domains.'gateway.example.test']\nsecret = 'fixture-component-secret'",
+        )?;
+        let limits = ComponentLimits {
+            max_queued_stanzas: NonZeroUsize::MIN,
+            ..ComponentLimits::default()
+        };
+        let registry = ComponentRegistry::new(
+            &config,
+            component_credentials::load(&config)?,
+            &limits,
+            ComponentMetrics::new(1, 1),
+        );
+        let (report_policy, in_policy) = oneshot::channel();
+        let (release_policy, resume_policy) = oneshot::channel();
+        let gate = BlockPresenceGate(PlMutex::new(Some((report_policy, resume_policy))));
+        let router = blocking_router(Some(Arc::new(gate)))?.with_services(BTreeMap::from([(
+            component.into(),
+            ServiceRoute::component(Arc::from(component), registry.clone()),
+        )]));
+        let handle = router.handle();
+        let owner = fixture.registration.account();
+        let peer = test_account("alice@localhost")?;
+        let unrelated = test_account("carol@localhost")?;
+        let mut write = fixture.storage.begin_write().await?;
+        write
+            .create_account(NewAccount {
+                key: peer.clone(),
+                credentials: credentials(),
+            })
+            .await?;
+        write.commit().await?;
+        let limit = NonZeroUsize::new(2).ok_or("resource limit")?;
+        let source = handle.register(owner, Some("phone"), limit).await?;
+        let editor = handle.register(owner, Some("editor"), limit).await?;
+        let observer = handle
+            .register(&peer, Some("desk"), NonZeroUsize::MIN)
+            .await?;
+        let mut link = registry.attach(component).map_err(|_| "attach component")?;
+        let mut arena = Arena::try_new(ArenaConfig::default())?;
+        let address = Jid::parse_in(component, &mut arena)?.resolve(&arena)?;
+        let from = source.full_jid();
+        let to = observer.full_jid();
+        source
+            .handle()
+            .record_service_presence(address, true)
+            .await?;
+        handle.route_to_component(routed_presence(
+            &from,
+            Some(component),
+            PresenceType::Available,
+        )?)?;
+        let stage = Stage {
+            router: &handle,
+            storage: &fixture.storage,
+            allocator: &GlobalChunkAllocator,
+            work: &fixture.work.handle(),
+        };
+        let mut older = account_turn(&handle, &[&peer]).await?;
+        older.turn().await;
+        let ((), mut grant) = handle
+            .order()
+            .fix_directed_grant(
+                owner.clone(),
+                peer.clone(),
+                Some(to.clone().into()),
+                async { Ok::<_, RouterError>(()) },
+            )
+            .await?;
+        let change = pending_change(&stage, &source, "block", &["localhost", component]).await?;
+        assert_committed_rule(&fixture.storage, owner, "localhost", true).await?;
+        drop(older);
+        grant.turn().await;
+        source
+            .handle()
+            .directed_presence(
+                routed_presence(&from, Some(&to), PresenceType::Available)?,
+                true,
+            )
+            .await?;
+        drop(grant);
+        in_policy.await?;
+        let duplicate = pending_change(&stage, &editor, "block", &["localhost", component]).await?;
+        let clear = pending_change(&stage, &editor, "unblock", &[]).await?;
+        assert_committed_rule(&fixture.storage, owner, "localhost", false).await?;
+        let mut independent = account_turn(&handle, &[&unrelated]).await?;
+        assert!(independent.turn().now_or_never().is_some());
+        let mut affected = account_turn(&handle, &[&peer]).await?;
+        assert!(affected.turn().now_or_never().is_none());
+        release_policy.send(()).map_err(|_| "policy gate dropped")?;
+        assert_successful_change(change).await?;
+        assert_successful_change(duplicate).await?;
+        assert_successful_change(clear).await?;
+        affected.turn().await;
+        drop(affected);
+        let entries = observer.take_queued();
+        assert_eq!(entries.len(), 2);
+        for (entry, kind) in entries
+            .iter()
+            .zip([PresenceType::Available, PresenceType::Unavailable])
+        {
+            let view = entry.stanza.resolve()?;
+            assert_eq!(view.stanza_type(), StanzaType::Presence(kind));
+            assert_eq!(view.from()?.ok_or("sender")?.as_str(), from);
+            assert_eq!(view.to()?.ok_or("recipient")?.as_str(), to);
+        }
+        let original = link.try_next().ok_or("missing queued presence")?;
+        assert_eq!(
+            original.resolve()?.stanza_type(),
+            StanzaType::Presence(PresenceType::Available)
+        );
+        assert!(link.try_next().is_none());
+
+        let domain_resource = pending_change(&stage, &source, "block", &["localhost/desk"]).await?;
+        assert_successful_change(domain_resource).await?;
+        assert!(observer.take_queued().is_empty());
+        drop((independent, link, source, editor, observer));
+        router.shutdown().await?;
+        fixture.finish().await
+    }))?
+}
+
+#[test]
+fn roster_quota_failure_keeps_the_committed_blocklist_push() -> TestResult {
+    Runtime::new()?.block_on(compio::time::timeout(Duration::from_secs(5), async {
+        let fixture = Fixture::new(&[]).await?;
+        let roster = Roster::new(BTreeMap::from([(
+            "localhost".into(),
+            RosterLimits {
+                max_items: NonZeroUsize::MIN,
+                ..RosterLimits::default()
+            },
+        )]));
+        let router = blocking_router(Some(Arc::new(roster)))?;
+        let handle = router.handle();
+        let owner = fixture.registration.account();
+        let mut write = fixture.storage.begin_write().await?;
+        for contact in ["alice@localhost", "carol@localhost"] {
+            write
+                .put_roster_item(
+                    owner,
+                    &RosterItem {
+                        jid: RosterJid::from(&test_account(contact)?),
+                        name: None,
+                        groups: Vec::new(),
+                        subscription: RosterSubscription {
+                            state: SubscriptionState::From,
+                            ..Default::default()
+                        },
+                    },
+                    RosterQuota::default(),
+                )
+                .await?;
+        }
+        write.commit().await?;
+        let limit = NonZeroUsize::new(2).ok_or("resource limit")?;
+        let writer = handle.register(owner, Some("writer"), limit).await?;
+        let reader = handle.register(owner, Some("reader"), limit).await?;
+        reader.handle().tag(SessionTag::Blocklist).await?;
+        writer
+            .handle()
+            .set_presence(
+                Some(0),
+                routed_presence(&writer.full_jid(), None, PresenceType::Available)?,
+                None,
+            )
+            .await?;
+        let stage = Stage {
+            router: &handle,
+            storage: &fixture.storage,
+            allocator: &GlobalChunkAllocator,
+            work: &fixture.work.handle(),
+        };
+
+        let pending = pending_change(&stage, &writer, "block", &["localhost"]).await?;
+        let IqPending::Set { pending, .. } = pending else {
+            return Err("block did not stage a SET".into());
+        };
+        assert!(matches!(
+            pending.finished().await,
+            Some(Err(EffectsError::Delivery(_)))
+        ));
+
+        assert_committed_rule(&fixture.storage, owner, "localhost", true).await?;
+        let pushes = reader.take_queued();
+        assert_eq!(pushes.len(), 1);
+        assert_block_push(&pushes[0], &reader.full_jid(), "localhost")?;
+        let mut next = account_turn(&handle, &[owner]).await?;
+        assert!(next.turn().now_or_never().is_some());
+        drop((next, reader, writer));
+        router.shutdown().await?;
+        fixture.finish().await
+    }))?
 }
 
 #[test]
@@ -414,7 +858,7 @@ fn get_and_set_never_lose_a_delta() -> TestResult {
             let pushes = reader.take_queued();
             assert_eq!(pushes.len(), usize::from(snapshot_first));
             if let Some(push) = pushes.first() {
-                assert_block_push(push, &reader.full_jid())?;
+                assert_block_push(push, &reader.full_jid(), "peer.example")?;
             }
             drop((writer, reader));
             router.shutdown().await?;
@@ -468,7 +912,7 @@ fn disappearing_fetcher_does_not_undo_a_committed_block() -> TestResult {
         assert!(replacement.take_queued().is_empty());
         let pushes = other_reader.take_queued();
         assert_eq!(pushes.len(), 1);
-        assert_block_push(&pushes[0], &other_reader.full_jid())?;
+        assert_block_push(&pushes[0], &other_reader.full_jid(), "peer.example")?;
         assert_block_committed(&fixture.storage, owner).await?;
         drop((writer, replacement, other_reader));
         router.shutdown().await?;
@@ -492,7 +936,7 @@ fn failed_block_commit_returns_no_success_or_push() -> TestResult {
             &writer,
             IqType::Set,
             "block",
-            Some("Peer.EXAMPLE"),
+            &["Peer.EXAMPLE"],
             StanzaNamespace::Client,
         )?;
         let view = answer.request.resolve(&answer.arena)?;
@@ -587,7 +1031,7 @@ fn owner_only_mutations_reject_external_origins_at_admission() -> TestResult {
                     &fixture.registration,
                     IqType::Set,
                     command,
-                    Some("peer.example"),
+                    &["peer.example"],
                     namespace,
                 )?;
                 let view = answer.request.resolve(&answer.arena)?;

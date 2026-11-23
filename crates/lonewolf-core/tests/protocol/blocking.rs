@@ -3,6 +3,7 @@
 mod addressed;
 mod mutations;
 mod presence;
+mod transitions;
 
 use compio::runtime::Runtime;
 use lonewolf_storage::account::AccountKey;
@@ -14,7 +15,18 @@ use lonewolf_storage::{RedbStorage, Storage, WriteTransaction};
 use lonewolf_util::arena::Arena;
 use lonewolf_xmpp::jid::Jid;
 
-use crate::support::{C2sSuite, Client, PASSWORD, TestResult};
+use crate::support::{C2sSuite, Client, PASSWORD, TestResult, barrier};
+
+pub(crate) fn change_rule(client: &mut Client, command: &str, peer: &str) -> TestResult {
+    let item = if peer.is_empty() {
+        String::new()
+    } else {
+        format!("<item jid='{peer}'/>")
+    };
+    mutations::send_change(client, command, &item)?;
+    mutations::assert_result(&client.receive()?);
+    barrier(client)
+}
 
 fn expect_list(client: &mut Client, id: &str, payload: &str) -> TestResult {
     let reply = client.receive()?;

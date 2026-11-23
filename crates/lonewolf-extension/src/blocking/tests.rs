@@ -17,6 +17,12 @@ use crate::discovery::Discovery;
 
 struct UnexpectedSessions;
 
+impl HostLookup for UnexpectedSessions {
+    fn is_local_host(&self, _: &str) -> bool {
+        panic!("a failed edit must not prepare an effect")
+    }
+}
+
 impl SessionLookup for UnexpectedSessions {
     fn resources<'a>(
         &'a self,
@@ -205,15 +211,27 @@ fn explicit_non_owner_and_failed_write_cannot_stage_a_push() -> Result<(), Box<d
             })
         };
         for requester in [Requester::Other, Requester::PresenceAuthorized] {
-            let Err(error) =
-                set_blocklist(request(Some(requester))?, &mut store, &mut response).await
+            let Err(error) = set_blocklist(
+                request(Some(requester))?,
+                &mut store,
+                &UnexpectedSessions,
+                &mut response,
+            )
+            .await
             else {
                 return Err("non-owner staged a push".into());
             };
             assert_eq!(error.condition(), StanzaErrorCondition::Forbidden);
         }
         assert_eq!(store.0, 0);
-        let Err(error) = set_blocklist(request(None)?, &mut store, &mut response).await else {
+        let Err(error) = set_blocklist(
+            request(None)?,
+            &mut store,
+            &UnexpectedSessions,
+            &mut response,
+        )
+        .await
+        else {
             return Err("failed write staged a push".into());
         };
         assert_eq!(error.condition(), StanzaErrorCondition::InternalServerError);

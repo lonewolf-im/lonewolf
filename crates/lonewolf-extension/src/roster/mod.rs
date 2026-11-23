@@ -390,6 +390,10 @@ where
     A: ChunkAllocator,
     S: Storage,
 {
+    fn blocklist_roster_quota(&self, owner: &AccountKey) -> Option<RosterQuota> {
+        Some(self.quota(owner))
+    }
+
     fn accepts_presence<'a>(
         &'a self,
         owner: &'a AccountKey,

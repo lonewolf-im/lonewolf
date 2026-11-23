@@ -15,7 +15,7 @@ use prometheus_client::encoding::text::encode;
 use prometheus_client::metrics::histogram::Histogram;
 use prometheus_client::registry::Registry;
 
-use super::{Order, Ticket};
+use super::{Order, Ticket, TicketKind};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -28,7 +28,7 @@ fn account(value: &str) -> TestResult<AccountKey> {
 fn admit(order: &Arc<Order>, accounts: &[&AccountKey]) -> Ticket {
     order.admit(
         accounts.iter().map(|account| (*account).clone()).collect(),
-        false,
+        TicketKind::Accounts,
     )
 }
 
@@ -139,6 +139,54 @@ fn dropping_a_waiting_ticket_gives_its_place_to_the_next() -> TestResult {
 }
 
 #[test]
+fn domain_block_scope_preserves_order_for_pending_directed_grants() -> TestResult {
+    let order = Order::new();
+    let owner = account("alice@example.com")?;
+    let target = account("bob@example.com")?;
+    let unrelated = account("carol@example.com")?;
+    let full = "bob@example.com/Desk/second";
+    let ((), mut grant) = block_on(order.fix_directed_grant(
+        owner.clone(),
+        target.clone(),
+        Some(full.into()),
+        async { Ok::<_, &str>(()) },
+    ))??;
+    let mut block = block_on(order.fix_block(
+        &owner,
+        vec![owner.clone()],
+        async { Ok::<_, &str>(()) },
+        async |pending, accounts| {
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].account, target);
+            assert_eq!(pending[0].full.as_deref(), Some(full));
+            accounts.extend(pending.into_iter().map(|grant| grant.account));
+        },
+    ))??;
+    let mut overlapping = admit(&order, &[&target]);
+    let mut free = admit(&order, &[&unrelated]);
+    let ((), mut global) = block_on(order.fix_all(async { Ok::<_, &str>(()) }))??;
+    let mut after_global = admit(&order, &[&unrelated]);
+    assert!(is_ready(&mut grant));
+    assert!(!is_ready(&mut block));
+    assert!(is_ready(&mut free));
+    drop(grant);
+    assert!(is_ready(&mut block));
+    assert!(!is_ready(&mut overlapping));
+    assert!(!is_ready(&mut global));
+    drop(free);
+    assert!(!is_ready(&mut after_global));
+    drop(block);
+    assert!(is_ready(&mut overlapping));
+    assert!(!is_ready(&mut global));
+    drop(overlapping);
+    assert!(is_ready(&mut global));
+    assert!(!is_ready(&mut after_global));
+    drop(global);
+    assert!(is_ready(&mut after_global));
+    Ok(())
+}
+
+#[test]
 fn a_dropped_turn_keeps_the_place() -> TestResult {
     let order = Order::new();
     let alice = account("alice@example.com")?;
@@ -216,7 +264,7 @@ fn global_ticket_waits_for_prior_work_and_blocks_later_accounts() -> TestResult 
     let alice = account("alice@example.com")?;
     let bob = account("bob@example.com")?;
     let older = admit(&order, &[&alice]);
-    let mut barrier = order.admit(Vec::new(), true);
+    let mut barrier = order.admit(Vec::new(), TicketKind::Global);
     let mut related = admit(&order, &[&alice]);
     let mut unrelated = admit(&order, &[&bob]);
     let mut empty = admit(&order, &[]);
@@ -239,7 +287,7 @@ fn dropped_waiting_global_ticket_releases_successors_and_failed_fix_admits_nothi
     let order = Order::new();
     let alice = account("alice@example.com")?;
     let older = admit(&order, &[&alice]);
-    let barrier = order.admit(Vec::new(), true);
+    let barrier = order.admit(Vec::new(), TicketKind::Global);
     let mut unrelated = admit(&order, &[]);
     assert!(!is_ready(&mut unrelated));
     drop(barrier);

@@ -384,7 +384,9 @@ fn handle_iq(
 ) -> Result<Vec<AccountKey>, crate::iq::IqError> {
     let mut call = IqCall::new(item_jid);
     let reply = block_on(call.handle(roster, kind, delivery))?;
-    let Effects { accounts, deliver } = reply.effects;
+    let Effects {
+        accounts, deliver, ..
+    } = reply.effects;
     block_on(deliver(delivery)).unwrap_or_else(|error| panic!("{error}"));
     Ok(accounts)
 }
@@ -511,7 +513,9 @@ fn receive_subscribe(
     delivery: &RecordingDelivery,
 ) -> Result<Vec<AccountKey>, HandlerError> {
     let call = SubscribeCall::new(sender, target);
-    let Effects { accounts, deliver } = block_on(call.receive(roster, delivery))?;
+    let Effects {
+        accounts, deliver, ..
+    } = block_on(call.receive(roster, delivery))?;
     block_on(deliver(delivery)).unwrap_or_else(|error| panic!("{error}"));
     Ok(accounts)
 }

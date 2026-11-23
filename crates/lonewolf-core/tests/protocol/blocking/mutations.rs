@@ -13,7 +13,7 @@ const BLOCKING: &str = "urn:xmpp:blocking";
 const PEER: &str = "<item jid='peer.example'/>";
 const ZOE: &str = "<item jid='zoe@example.org/Desk'/>";
 
-fn fetch(client: &mut Client, items: &str) -> TestResult {
+pub(super) fn fetch(client: &mut Client, items: &str) -> TestResult {
     client.send("<iq type='get' id='list'><blocklist xmlns='urn:xmpp:blocking'/></iq>")?;
     expect_list(
         client,
@@ -35,7 +35,7 @@ pub(super) fn assert_result(reply: &Element) {
     assert!(reply.children.is_empty(), "{reply:?}");
 }
 
-fn push_id<'a>(
+pub(super) fn push_id<'a>(
     push: &'a Element,
     resource: &str,
     command: &str,

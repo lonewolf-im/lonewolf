@@ -38,6 +38,7 @@ use crate::stages::policy::{PresencePolicy, Selection};
 use crate::stages::service::{ServicePresenceGate, ServicePresenceGates};
 pub(crate) use local::ResourceMatch;
 
+mod blocking_presence;
 pub(crate) mod iq_requests;
 pub(crate) mod local;
 pub(crate) mod metrics;
@@ -71,6 +72,12 @@ pub(crate) struct MessageTarget {
     pub(crate) session: SessionId,
     pub(crate) direct: bool,
     pub(crate) bare: bool,
+}
+
+pub(crate) struct PresenceTarget {
+    pub(crate) resource: Box<str>,
+    pub(crate) session: SessionId,
+    pub(crate) available: bool,
 }
 
 impl Admitted {
@@ -1006,11 +1013,11 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         let mut arena = Arena::try_new_in(Default::default(), self.local.allocator())
             .map_err(|_| RouterError::Unavailable)?;
         let mut allowed = Vec::with_capacity(targets.len());
-        for (resource, token) in targets {
+        for target in targets {
             let recipient = Jid::from_trusted_parts_in(
                 Some(account.username()),
                 account.domain(),
-                Some(&resource),
+                Some(&target.resource),
                 &mut arena,
             )
             .map_err(|_| RouterError::Unavailable)?;
@@ -1022,7 +1029,7 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
                 .await
                 .map_err(|_| RouterError::Unavailable)?
             {
-                allowed.push(token);
+                allowed.push(target.session);
             }
         }
         Ok(Some(allowed))

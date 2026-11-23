@@ -187,6 +187,16 @@ impl C2sSuite {
         self.wait_for_metrics(sample, |body| body.lines().any(|line| line == sample))
     }
 
+    pub fn metric_value(&self, series: &str) -> TestResult<u64> {
+        let metrics = self.scrape_metrics()?;
+        let value = metrics
+            .lines()
+            .filter_map(|line| line.split_once(' '))
+            .find_map(|(name, value)| (name == series).then_some(value))
+            .ok_or_else(|| format!("missing metric {series}"))?;
+        Ok(value.parse()?)
+    }
+
     pub fn wait_for_metrics(
         &self,
         expected: &str,

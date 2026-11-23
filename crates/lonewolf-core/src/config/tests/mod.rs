@@ -25,6 +25,10 @@ mod limits;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
+const DEFAULT_EXTENSIONS: [&str; 9] = [
+    "roster", "offline", "disco", "ping", "vcard", "carbons", "version", "private", "blocking",
+];
+
 fn config_file(contents: &str) -> io::Result<tempfile::NamedTempFile> {
     let mut file = tempfile::NamedTempFile::new()?;
     file.write_all(contents.as_bytes())?;
@@ -32,27 +36,17 @@ fn config_file(contents: &str) -> io::Result<tempfile::NamedTempFile> {
 }
 
 #[test]
-fn host_extensions_default_to_roster_offline_disco_ping_vcard_carbons_version_and_private()
--> TestResult {
-    assert_eq!(
-        HostConfig::default().extensions,
-        [
-            "roster", "offline", "disco", "ping", "vcard", "carbons", "version", "private"
-        ]
-    );
+fn host_extensions_default_to_builtin_services() -> TestResult {
+    assert_eq!(HostConfig::default().extensions, DEFAULT_EXTENSIONS);
     assert_eq!(
         Config::default().hosts["localhost"].extensions,
-        [
-            "roster", "offline", "disco", "ping", "vcard", "carbons", "version", "private"
-        ]
+        DEFAULT_EXTENSIONS
     );
     for contents in ["", "[hosts.localhost]"] {
         let file = config_file(contents)?;
         assert_eq!(
             Config::load(Some(file.path()))?.hosts["localhost"].extensions,
-            [
-                "roster", "offline", "disco", "ping", "vcard", "carbons", "version", "private"
-            ]
+            DEFAULT_EXTENSIONS
         );
     }
     Ok(())
@@ -78,6 +72,9 @@ fn configured_host_extensions_replace_the_default_list() -> TestResult {
         ("['private']", ["private"].as_slice()),
         ("['disco', 'private']", ["disco", "private"].as_slice()),
         ("['private', 'disco']", ["private", "disco"].as_slice()),
+        ("['blocking']", ["blocking"].as_slice()),
+        ("['disco', 'blocking']", ["disco", "blocking"].as_slice()),
+        ("['blocking', 'disco']", ["blocking", "disco"].as_slice()),
         ("['disco', 'carbons']", ["disco", "carbons"].as_slice()),
         ("['carbons', 'disco']", ["carbons", "disco"].as_slice()),
         ("['ping', 'disco']", ["ping", "disco"].as_slice()),
@@ -139,6 +136,14 @@ fn configured_host_extensions_replace_the_default_list() -> TestResult {
                         && expected.contains(&"carbons"),
                 );
             }
+            assert_eq!(
+                registry
+                    .discovery()
+                    .features(scope)
+                    .contains(&"urn:xmpp:blocking"),
+                matches!(scope, lonewolf_extension::discovery::DiscoScope::Server)
+                    && expected.contains(&"blocking"),
+            );
         }
     }
     Ok(())
@@ -151,12 +156,7 @@ fn no_configuration_file_enables_default_extensions() -> TestResult {
         assert!(!Path::new(super::DEFAULT_CONFIG_PATH).exists());
         let config = Config::load(None)?;
         assert_eq!(config, Config::default());
-        assert_eq!(
-            config.hosts["localhost"].extensions,
-            [
-                "roster", "offline", "disco", "ping", "vcard", "carbons", "version", "private"
-            ]
-        );
+        assert_eq!(config.hosts["localhost"].extensions, DEFAULT_EXTENSIONS);
     } else {
         let directory = tempfile::tempdir()?;
         let output = Command::new(std::env::current_exe()?)
@@ -893,16 +893,7 @@ fn reference_configuration_settings_match_documented_defaults() -> TestResult {
         "example.com".into(),
         HostConfig {
             federation: true,
-            extensions: vec![
-                "roster".into(),
-                "offline".into(),
-                "disco".into(),
-                "ping".into(),
-                "vcard".into(),
-                "carbons".into(),
-                "version".into(),
-                "private".into(),
-            ],
+            extensions: DEFAULT_EXTENSIONS.into_iter().map(String::from).collect(),
             options: BTreeMap::from([
                 (
                     "private".into(),
@@ -995,12 +986,9 @@ fn reference_configuration_extensions_enable_for_each_host() -> TestResult {
     let (uncommented, _) = documented_settings_and_examples()?;
     let file = config_file(&uncommented)?;
     let loaded = Config::load(Some(file.path()))?;
-    assert_eq!(
-        loaded.hosts["localhost"].extensions,
-        [
-            "roster", "offline", "disco", "ping", "vcard", "carbons", "version", "private"
-        ]
-    );
+    for domain in ["localhost", "example.com"] {
+        assert_eq!(loaded.hosts[domain].extensions, DEFAULT_EXTENSIONS);
+    }
     let mut extensions = Extensions::<GlobalChunkAllocator, RedbStorage>::default();
     for factory in lonewolf_extension::builtin(env!("CARGO_PKG_VERSION")) {
         extensions.register_factory(factory)?;

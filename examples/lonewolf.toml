@@ -23,11 +23,13 @@
 # Use normalized domain names or bracketed IPv6 literals without zone identifiers.
 # [hosts.localhost]
 
-# Choose extensions included in the server build for this host.
+# Choose the extensions active on this host.
 # This list replaces the default, including when it is empty.
 # Enable disco to let clients discover the features selected for this host.
 # Remove version to stop telling clients and other servers which Lonewolf release this host runs.
-# extensions = ["roster", "offline", "disco", "ping", "vcard", "carbons", "version", "private"]
+# Removing blocking disables blocklist commands and enforcement.
+# Add blocking again to enforce the stored lists.
+# extensions = ["roster", "offline", "disco", "ping", "vcard", "carbons", "version", "private", "blocking"]
 
 # Quote domain names that contain dots in TOML table headers.
 # The domain below is an example.
@@ -37,7 +39,7 @@
 # federation = true
 
 # Stored profiles are public to authenticated local users and users of federated domains.
-# extensions = ["roster", "offline", "disco", "ping", "vcard", "carbons", "version", "private"]
+# extensions = ["roster", "offline", "disco", "ping", "vcard", "carbons", "version", "private", "blocking"]
 
 # Adjust roster limits to bound stored contacts and requests awaiting approval.
 # Keep roster in this host's extension list when configuring these limits.

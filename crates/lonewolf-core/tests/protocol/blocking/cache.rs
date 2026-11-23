@@ -101,3 +101,45 @@ fn recreated_account_starts_with_an_empty_cached_list() -> TestResult {
     bob.close()?;
     suite.stop()
 }
+
+const OPENED: &str = r#"lonewolf_storage_read_snapshots_total{store="primary",outcome="opened"}"#;
+const REUSED: &str = r#"lonewolf_storage_read_snapshots_total{store="primary",outcome="reused"}"#;
+
+#[test]
+fn steady_messages_reuse_one_snapshot() -> TestResult {
+    let (mut suite, mut alice, mut bob) = connect_pair()?;
+    deliver(&mut alice, ALICE, &mut bob, BOB, "warm")?;
+    deliver(&mut bob, BOB, &mut alice, ALICE, "warm")?;
+    let opened = suite.metric_value(OPENED)?;
+    let reused = suite.metric_value(REUSED)?;
+
+    for sequence in 0..20 {
+        let id = sequence.to_string();
+        deliver(&mut alice, ALICE, &mut bob, BOB, &id)?;
+        deliver(&mut bob, BOB, &mut alice, ALICE, &id)?;
+    }
+    assert_eq!(suite.metric_value(OPENED)?, opened);
+    assert!(suite.metric_value(REUSED)? >= reused + 40);
+    alice.close()?;
+    bob.close()?;
+    suite.stop()
+}
+
+#[test]
+fn a_commit_makes_the_next_stanza_open_a_new_snapshot() -> TestResult {
+    let (mut suite, mut alice, mut bob) = connect_pair()?;
+    deliver(&mut alice, ALICE, &mut bob, BOB, "warm")?;
+    deliver(&mut bob, BOB, &mut alice, ALICE, "warm")?;
+    let opened = suite.metric_value(OPENED)?;
+    let misses = suite.metric_value(MISS)?;
+
+    send_change(&mut alice, "block", BOB_ITEM)?;
+    assert_result(&alice.receive()?);
+    bob.send("<message to='alice@localhost/desk' id='attempt'/>")?;
+    checked_error(&mut bob, "message", false)?;
+    assert!(suite.metric_value(OPENED)? > opened);
+    assert_eq!(suite.metric_value(MISS)?, misses);
+    alice.close()?;
+    bob.close()?;
+    suite.stop()
+}

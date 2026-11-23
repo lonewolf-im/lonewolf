@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod addressed;
+mod discovery;
 pub(crate) mod external;
 mod mutations;
 mod policy;
@@ -46,26 +47,24 @@ fn acknowledge_push(client: &mut Client, to: &str, command: &str, peers: &[&str]
     client.send(&format!("<iq type='result' id='{}'/>", escape(id)))
 }
 
-fn other_host_reader(suite: &C2sSuite) -> TestResult<Client> {
+fn host_reader(suite: &C2sSuite, domain: &'static str) -> TestResult<Client> {
     use crate::support::OPEN;
     use rustls::pki_types::ServerName;
     use std::sync::Arc;
 
-    let opening = OPEN.replace("to='localhost'", "to='other.localhost'");
+    let opening = OPEN.replace("to='localhost'", &format!("to='{domain}'"));
     let mut plain = suite.tcp_client()?;
     plain.open_with(&opening)?;
     plain.features()?;
-    let mut client = plain.start_tls_with_identity(
-        Arc::clone(&suite.tls),
-        ServerName::try_from("other.localhost")?,
-    )?;
+    let mut client =
+        plain.start_tls_with_identity(Arc::clone(&suite.tls), ServerName::try_from(domain)?)?;
     client.open_with(&opening)?;
     client.features()?;
     client.authenticate("alice", PASSWORD)?;
     let mut client = client.restart();
     client.open_with(&opening)?;
     client.features()?;
-    assert_eq!(client.bind(Some("desk"))?, "alice@other.localhost/desk");
+    assert_eq!(client.bind(Some("desk"))?, format!("alice@{domain}/desk"));
     Ok(client)
 }
 
@@ -80,7 +79,7 @@ fn list_push_and_restart() -> TestResult {
     suite.create_account_jid("alice@other.localhost", PASSWORD)?;
     let mut writer = suite.connect("alice", PASSWORD, "writer")?;
     let mut bob = suite.connect("bob", PASSWORD, "desk")?;
-    let mut other = other_host_reader(&suite)?;
+    let mut other = host_reader(&suite, "other.localhost")?;
     fetch(&mut other, "")?;
     send_change(&mut writer, "block", BOB)?;
     assert_result(&writer.receive()?);

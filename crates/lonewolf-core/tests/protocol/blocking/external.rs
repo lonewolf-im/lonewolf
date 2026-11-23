@@ -206,10 +206,11 @@ pub(crate) fn foreign_commands<P: ExternalStream>(
             let error = reply.child(P::NS, "error")?;
             assert_eq!(error.attribute("type"), Some("auth"));
             error.child(ERROR, "forbidden")?;
+            let normalized_reply = reply.without_attribute("from");
             if let Some(first) = &first_reply {
-                assert_eq!(first.child(P::NS, "error")?, error);
+                assert_eq!(*first, normalized_reply);
             } else {
-                first_reply = Some(reply);
+                first_reply = Some(normalized_reply);
             }
         }
     }

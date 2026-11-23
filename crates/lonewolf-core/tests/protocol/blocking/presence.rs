@@ -224,3 +224,70 @@ fn pending_presence_uses_the_stored_sender_and_the_current_policy() -> TestResul
     barrier(&mut alice)?;
     alice.close()
 }
+
+#[test]
+fn polite_transitions() -> TestResult {
+    use super::{change_rule, transitions::expect_presence};
+    let mut suite = C2sSuite::with_extensions("'roster', 'blocking', 'ping'")?;
+    for name in ["alice", "bob", "carol"] {
+        suite.create_account(name, PASSWORD)?;
+    }
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let mut bob = suite.connect("bob", PASSWORD, "desk")?;
+    let mut carol = suite.connect("carol", PASSWORD, "desk")?;
+    let source = "alice@localhost/desk";
+    subscribe(&mut bob, BOB, &mut alice, ALICE)?;
+    subscribe(&mut carol, "carol@localhost", &mut alice, ALICE)?;
+    bob.send("<presence/>")?;
+    presence(&mut bob, DESK, BOB, "")?;
+    carol.send("<presence/>")?;
+    presence(&mut carol, "carol@localhost/desk", "carol@localhost", "")?;
+    alice.send("<presence><status>available</status></presence>")?;
+    expect_presence(&mut alice, source, &[(source, Some("available"))])?;
+    expect_presence(&mut bob, DESK, &[(source, Some("available"))])?;
+    expect_presence(
+        &mut carol,
+        "carol@localhost/desk",
+        &[(source, Some("available"))],
+    )?;
+
+    change_rule(&mut alice, "block", BOB)?;
+    expect_presence(&mut bob, DESK, &[(source, None)])?;
+    bob.close()?;
+    suite.wait_for_closed("stream_end", 1)?;
+    let mut bob = suite.connect("bob", PASSWORD, "new")?;
+    bob.send("<presence/>")?;
+    presence(&mut bob, "bob@localhost/new", BOB, "")?;
+    alice.send("<presence><status>changed while blocked</status></presence>")?;
+    expect_presence(
+        &mut alice,
+        source,
+        &[(source, Some("changed while blocked"))],
+    )?;
+    expect_presence(
+        &mut carol,
+        "carol@localhost/desk",
+        &[(source, Some("changed while blocked"))],
+    )?;
+    expect_presence(&mut bob, "bob@localhost/new", &[])?;
+    change_rule(&mut alice, "unblock", "")?;
+    expect_presence(
+        &mut bob,
+        "bob@localhost/new",
+        &[(source, Some("changed while blocked"))],
+    )?;
+    bob.send("<iq type='get' id='roster'><query xmlns='jabber:iq:roster'/></iq>")?;
+    let reply = bob.receive()?;
+    reply.assert_name("jabber:client", "iq");
+    assert_eq!(reply.attribute("id"), Some("roster"));
+    assert_eq!(reply.attribute("type"), Some("result"));
+    let roster = reply.child("jabber:iq:roster", "query")?;
+    assert_eq!(roster.children.len(), 1);
+    let subscription = roster.child("jabber:iq:roster", "item")?;
+    assert_eq!(subscription.attribute("jid"), Some(ALICE));
+    assert_eq!(subscription.attribute("subscription"), Some("to"));
+    for mut client in [bob, carol, alice] {
+        client.close()?;
+    }
+    suite.stop()
+}

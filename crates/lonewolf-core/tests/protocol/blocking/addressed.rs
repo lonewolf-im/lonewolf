@@ -24,7 +24,11 @@ fn change(client: &mut Client, command: &str, items: &str) -> TestResult {
     Ok(())
 }
 
-fn checked_error(client: &mut Client, name: &str, owner_block: bool) -> TestResult<Element> {
+pub(super) fn checked_error(
+    client: &mut Client,
+    name: &str,
+    owner_block: bool,
+) -> TestResult<Element> {
     let reply = client
         .receive()
         .map_err(|error| format!("waiting for the {name} error for 'attempt': {error}"))?;
@@ -240,7 +244,7 @@ fn blocked_terminal_stanzas_are_silent_in_both_directions() -> TestResult {
     suite.stop()
 }
 
-fn send_terminal_stanzas(source: &mut Client, destination: &str) -> TestResult {
+pub(super) fn send_terminal_stanzas(source: &mut Client, destination: &str) -> TestResult {
     source.send(&format!(
         "<iq type='result' to='{destination}' id='result'/>"
     ))?;

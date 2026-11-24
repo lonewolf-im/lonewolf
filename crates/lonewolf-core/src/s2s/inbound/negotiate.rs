@@ -189,6 +189,7 @@ pub(super) async fn negotiate<A: ChunkAllocator + Clone>(
         crate::config::TlsMode::Direct => Box::default(),
         crate::config::TlsMode::StartTls => settings.hosts.default_host_name().into(),
     };
+    // Mark the header and footer sent before writing them, because a cancelled write still delivers its buffered bytes.
     let mut header_sent = false;
     let mut peer_footer = false;
     let mut footer_sent = false;
@@ -396,26 +397,21 @@ async fn run<A: ChunkAllocator + Clone>(
         let plain = connection.as_mut().ok_or(S2sError::Internal)?;
         let initial = header(expected(plain, peer_footer).await?)?;
         if !settings.services.router.federates_domain(&initial.to) {
-            plain
-                .send_header(&stream::response_header_xml(
-                    settings.hosts.default_host_name(),
-                    initial.from.as_deref(),
-                )?)
-                .await?;
+            let response = stream::response_header_xml(
+                settings.hosts.default_host_name(),
+                initial.from.as_deref(),
+            )?;
             *header_sent = true;
+            plain.send_header(&response).await?;
             return Err(reject(
                 StreamErrorCondition::HostUnknown,
                 AuthOutcome::HostUnknown,
             ));
         }
         *response_from = initial.to.clone();
-        plain
-            .send_header(&stream::response_header_xml(
-                &initial.to,
-                initial.from.as_deref(),
-            )?)
-            .await?;
+        let response = stream::response_header_xml(&initial.to, initial.from.as_deref())?;
         *header_sent = true;
+        plain.send_header(&response).await?;
         stream::limits::write_features_xml(
             &mut features_xml,
             stream::limits::FeaturePhase::StartTls,
@@ -549,9 +545,9 @@ async fn run<A: ChunkAllocator + Clone>(
             tracing::debug!(reason = reason.as_str(), direction = "inbound", tls_mode = settings.tls_mode.as_str(), local_domain = %log_domain(&local), remote_domain = %log_domain(&remote), "s2s revocation status unknown");
         }
     }
-    tls.send_header(&stream::response_header_xml(&local, Some(&remote))?)
-        .await?;
+    let response = stream::response_header_xml(&local, Some(&remote))?;
     *header_sent = true;
+    tls.send_header(&response).await?;
     stream::limits::write_features_xml(
         &mut features_xml,
         stream::limits::FeaturePhase::Sasl { bidi: offer_bidi },
@@ -619,8 +615,8 @@ async fn run<A: ChunkAllocator + Clone>(
             Err(failure) => {
                 tls.send(&stream::sasl_failure_xml(failure)).await?;
                 if attempt == 1 {
-                    tls.close(None).await?;
                     *footer_sent = true;
+                    tls.close(None).await?;
                     return Err(Failure {
                         error: S2sError::Eof,
                         outcome: match failure {
@@ -651,9 +647,9 @@ async fn run<A: ChunkAllocator + Clone>(
             AuthOutcome::InvalidFrom,
         ));
     }
-    tls.send_header(&stream::response_header_xml(&local, Some(&remote))?)
-        .await?;
+    let response = stream::response_header_xml(&local, Some(&remote))?;
     *header_sent = true;
+    tls.send_header(&response).await?;
     stream::limits::write_features_xml(
         &mut features_xml,
         stream::limits::FeaturePhase::Authenticated,

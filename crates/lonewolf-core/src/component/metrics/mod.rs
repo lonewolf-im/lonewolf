@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::metrics::encode_counter;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -446,26 +447,6 @@ impl fmt::Debug for ComponentCollector {
             .debug_struct("ComponentCollector")
             .finish_non_exhaustive()
     }
-}
-
-fn encode_counter<L: EncodeLabelSet>(
-    encoder: &mut DescriptorEncoder<'_>,
-    name: &str,
-    help: &str,
-    samples: impl IntoIterator<Item = (L, u64)>,
-) -> Result<(), fmt::Error> {
-    let mut samples = samples
-        .into_iter()
-        .filter(|(_, value)| *value != 0)
-        .peekable();
-    if samples.peek().is_none() {
-        return Ok(());
-    }
-    let mut family = encoder.encode_descriptor(name, help, None, MetricType::Counter)?;
-    for (labels, value) in samples {
-        ConstCounter::new(value).encode(family.encode_family(&labels)?)?;
-    }
-    Ok(())
 }
 
 impl Collector for ComponentCollector {

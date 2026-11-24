@@ -241,9 +241,9 @@ fn vcard_uncertain_commit_closes_without_success_or_payload_and_recovers_whole_s
         let mut outbox=fixture.outbox(GlobalChunkAllocator,ControlledWriter::default());
         outbox.liveness=registration.liveness();
         let mut session=BoundSession {
-            registration,router:fixture.router.handle(),storage:fixture.storage.clone(),allocator:GlobalChunkAllocator,work:fixture.work.handle(),service_presence:None,service_pending:None,
+            registration,router:fixture.router.handle(),storage:fixture.storage.clone(),allocator:GlobalChunkAllocator,work:fixture.work.handle(),presence:ResourcePresence::default(),
             recipients:RecipientLimiter::new(NonZeroUsize::MIN,NonZeroUsize::MIN,Instant::now(),crate::c2s::metrics::C2sWorkerMetrics::detached()),
-            available:false,priority:None,incoming,outbox,
+            incoming,outbox,
         };
         let mut arena=Arena::try_new(Default::default())?;
         let sender=Jid::parse_in("bob@localhost/committing",&mut arena)?;

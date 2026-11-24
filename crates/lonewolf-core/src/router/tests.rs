@@ -2424,7 +2424,11 @@ fn presence_eligibility_only_changes_when_a_resource_enters_nonnegative_priority
                 .handle()
                 .set_presence(new, presence("desk").await?, None)
                 .await?;
-            assert_eq!(change.became_eligible, expected, "{old:?} -> {new:?}");
+            assert_eq!(
+                change.availability.became_eligible(),
+                expected,
+                "{old:?} -> {new:?}"
+            );
             drop(registration);
         }
         router.shutdown().await?;
@@ -2452,7 +2456,7 @@ fn full_presence_mailbox_retires_recipient_and_notifies_peers() -> TestResult {
                 Some(unavailable_presence("desk").await?),
             )
             .await?;
-        assert!(became_available.became_available);
+        assert!(became_available.availability.became_available());
         assert!(became_available.siblings.is_empty());
         let became_available = phone
             .handle()
@@ -2462,7 +2466,7 @@ fn full_presence_mailbox_retires_recipient_and_notifies_peers() -> TestResult {
                 Some(unavailable_presence("phone").await?),
             )
             .await?;
-        assert!(became_available.became_available);
+        assert!(became_available.availability.became_available());
         assert_eq!(became_available.siblings.len(), 1);
         receive_routed(&desk).await?;
 
@@ -2479,7 +2483,7 @@ fn full_presence_mailbox_retires_recipient_and_notifies_peers() -> TestResult {
                 Some(unavailable_presence("desk").await?),
             )
             .await?;
-        assert!(!updated.became_available);
+        assert!(!updated.availability.became_available());
         assert!(updated.siblings.is_empty());
         let unavailable = receive_routed(&desk).await?;
         assert_eq!(
@@ -2619,7 +2623,8 @@ fn presence_snapshot_follows_queued_peer_updates() -> TestResult {
             desk.handle()
                 .set_presence(Some(0), presence("desk").await?, None)
                 .await?
-                .became_available
+                .availability
+                .became_available()
         );
         phone
             .handle()
@@ -2629,7 +2634,7 @@ fn presence_snapshot_follows_queued_peer_updates() -> TestResult {
             .handle()
             .set_presence(None, unavailable_presence("desk").await?, None)
             .await?;
-        assert!(away.became_unavailable);
+        assert!(away.availability.became_unavailable());
         assert_eq!(away.preceding.len(), 1);
         assert_eq!(away.preceding[0].stanza.resolve()?.id()?, Some("old"));
         phone
@@ -2640,7 +2645,7 @@ fn presence_snapshot_follows_queued_peer_updates() -> TestResult {
             .handle()
             .set_presence(Some(0), presence("desk").await?, None)
             .await?;
-        assert!(change.became_available);
+        assert!(change.availability.became_available());
 
         assert!(change.preceding.is_empty());
         assert_eq!(change.siblings.len(), 1);
@@ -2674,12 +2679,12 @@ fn full_unavailable_mailbox_retires_recipient() -> TestResult {
                 Some(unavailable_presence("desk").await?),
             )
             .await?;
-        assert!(became_available.became_available);
+        assert!(became_available.availability.became_available());
         let became_available = phone
             .handle()
             .set_presence(Some(0), presence("phone").await?, None)
             .await?;
-        assert!(became_available.became_available);
+        assert!(became_available.availability.became_available());
         assert_eq!(became_available.siblings.len(), 1);
         receive_routed(&desk).await?;
         for _ in 0..64 {

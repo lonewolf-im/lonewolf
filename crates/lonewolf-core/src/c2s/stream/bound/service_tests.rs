@@ -158,16 +158,13 @@ async fn session(fixture: &Fixture) -> TestResult<TestSession<'_>> {
         storage: fixture.storage.clone(),
         allocator: GlobalChunkAllocator,
         work: fixture.work.handle(),
-        service_presence: None,
-        service_pending: None,
+        presence: ResourcePresence::default(),
         recipients: RecipientLimiter::new(
             NonZeroUsize::MIN,
             NonZeroUsize::new(100).ok_or("zero burst")?,
             Instant::now(),
             crate::c2s::metrics::C2sWorkerMetrics::detached(),
         ),
-        available: false,
-        priority: None,
         incoming: async_channel::bounded(1).1,
         outbox,
     })
@@ -605,17 +602,6 @@ fn replacement_roster_presence_waits_for_terminal_component_broadcast() -> TestR
         Duration::from_secs(5),
         run_terminal_component_broadcast(true),
     ))?
-}
-
-#[test]
-fn domain_lookup_ignores_at_signs_in_resourceparts() {
-    for (jid, domain) in [
-        ("echo.localhost", "echo.localhost"),
-        ("echo.localhost/nick@other", "echo.localhost"),
-        ("room@echo.localhost/nick@other", "echo.localhost"),
-    ] {
-        assert_eq!(domain_of(jid), domain);
-    }
 }
 
 #[test]

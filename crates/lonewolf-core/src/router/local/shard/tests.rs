@@ -881,7 +881,7 @@ fn full_delivery_removes_stale_session_and_broadcasts_unavailable() -> Result<()
                 routed("<presence from='alice@localhost/desk'/>").await?,
                 Some(routed("<presence from='alice@localhost/desk' type='unavailable'/>").await?),
             )?;
-            assert!(became_available.became_available);
+            assert!(became_available.availability.became_available());
             assert!(became_available.siblings.is_empty());
             let became_available = shard.presence(
                 &account,
@@ -891,7 +891,7 @@ fn full_delivery_removes_stale_session_and_broadcasts_unavailable() -> Result<()
                 routed("<presence from='alice@localhost/phone'/>").await?,
                 None,
             )?;
-            assert!(became_available.became_available);
+            assert!(became_available.availability.became_available());
             assert_eq!(became_available.siblings.len(), 1);
             if desk.recv().await.is_none() {
                 return Err("missing peer presence".into());

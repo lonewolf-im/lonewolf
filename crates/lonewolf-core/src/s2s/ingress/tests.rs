@@ -777,6 +777,42 @@ fn iq_xml(kind: &str, target: &str, payload: &str) -> String {
 }
 
 #[test]
+fn inbound_iq_answer_admission_is_best_effort_on_full_and_stopped_routes() -> TestResult {
+    compio::runtime::Runtime::new()?.block_on(async {
+        let mut extensions = Extensions::default();
+        extensions.register(Arc::new(lonewolf_extension::ping::Ping))?;
+        let mut fixture = Fixture::new(extensions, &["ping"])?;
+        let mut registry = prometheus_client::registry::Registry::default();
+        fixture.remote.metrics().register(&mut registry);
+        let request = |id: &str| {
+            format!(
+                "<iq type='get' from='alice@remote.test/desk' to='example.com' id='{id}'><ping xmlns='urn:xmpp:ping'/></iq>"
+            )
+        };
+
+        fixture.dispatch(&request("first")).await?;
+        assert_eq!(fixture.remote.occupancy().0, 1);
+        fixture.dispatch(&request("full")).await?;
+        let reply = fixture.remote.receive()?.ok_or("first answer")?;
+        assert_eq!(reply.resolve()?.stanza_type(), StanzaType::Iq(IqType::Result));
+        assert_eq!(reply.resolve()?.id()?, Some("first"));
+        assert!(fixture.remote.receive()?.is_none());
+
+        fixture.remote.finish(Instant::now() + Duration::from_secs(5)).await?;
+        fixture.dispatch(&request("stopped")).await?;
+        assert_eq!(fixture.remote.occupancy(), (0, 0));
+
+        let mut output = String::new();
+        prometheus_client::encoding::text::encode(&mut output, &registry)?;
+        for reason in ["queue_full", "stopped"] {
+            let expected = format!("s2s_admission_rejections_total{{reason=\"{reason}\"}} 1");
+            assert!(output.lines().any(|line| line == expected), "{output}");
+        }
+        fixture.finish().await
+    })
+}
+
+#[test]
 fn inbound_iq_builtin_handlers_keep_remote_non_owner_rules() -> TestResult {
     compio::runtime::Runtime::new()?.block_on(compio::time::timeout(Duration::from_secs(10), async {
         let mut extensions = Extensions::default();

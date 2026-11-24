@@ -19,6 +19,9 @@ mod iq;
 mod message;
 mod presence;
 
+#[cfg(test)]
+mod tests;
+
 pub(crate) struct Context<A: ChunkAllocator> {
     pub(crate) router: RouterHandle<A>,
     pub(crate) storage: RedbStorage,

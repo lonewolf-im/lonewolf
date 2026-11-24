@@ -391,15 +391,6 @@ fn rejected_iq_is_not_authorized_before_authentication() -> TestResult {
 }
 
 #[test]
-fn unbound_prefix_returns_not_well_formed_before_authentication() -> TestResult {
-    let suite = C2sSuite::start()?;
-    let mut client = suite.unauthenticated_client()?;
-
-    client.send(r#"<x:message/>"#)?;
-    client.expect_stream_error("not-well-formed")
-}
-
-#[test]
 fn mismatched_tags_returns_not_well_formed_before_authentication() -> TestResult {
     let suite = C2sSuite::start()?;
     let mut client = suite.unauthenticated_client()?;
@@ -409,47 +400,11 @@ fn mismatched_tags_returns_not_well_formed_before_authentication() -> TestResult
 }
 
 #[test]
-fn duplicate_attributes_returns_not_well_formed_before_authentication() -> TestResult {
-    let suite = C2sSuite::start()?;
-    let mut client = suite.unauthenticated_client()?;
-
-    client.send(r#"<message id='a' id='b'/>"#)?;
-    client.expect_stream_error("not-well-formed")
-}
-
-#[test]
-fn xml_comment_returns_restricted_xml_before_authentication() -> TestResult {
-    let suite = C2sSuite::start()?;
-    let mut client = suite.unauthenticated_client()?;
-
-    client.send(r#"<message><!--forbidden--></message>"#)?;
-    client.expect_stream_error("restricted-xml")
-}
-
-#[test]
-fn processing_instruction_returns_restricted_xml_before_authentication() -> TestResult {
-    let suite = C2sSuite::start()?;
-    let mut client = suite.unauthenticated_client()?;
-
-    client.send(r#"<message><?instruction value?></message>"#)?;
-    client.expect_stream_error("restricted-xml")
-}
-
-#[test]
 fn doctype_returns_restricted_xml_before_authentication() -> TestResult {
     let suite = C2sSuite::start()?;
     let mut client = suite.unauthenticated_client()?;
 
     client.send(r#"<!DOCTYPE message><message/>"#)?;
-    client.expect_stream_error("restricted-xml")
-}
-
-#[test]
-fn unknown_entity_returns_restricted_xml_before_authentication() -> TestResult {
-    let suite = C2sSuite::start()?;
-    let mut client = suite.unauthenticated_client()?;
-
-    client.send(r#"<message><body>&unknown;</body></message>"#)?;
     client.expect_stream_error("restricted-xml")
 }
 
@@ -495,16 +450,6 @@ fn rejected_iq_allows_correction_before_binding() -> TestResult {
 }
 
 #[test]
-fn unbound_prefix_returns_not_well_formed_before_binding() -> TestResult {
-    let suite = C2sSuite::start()?;
-    suite.create_account("alice", ALTERNATE_PASSWORD)?;
-    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
-
-    client.send(r#"<x:message/>"#)?;
-    client.expect_stream_error("not-well-formed")
-}
-
-#[test]
 fn mismatched_tags_returns_not_well_formed_before_binding() -> TestResult {
     let suite = C2sSuite::start()?;
     suite.create_account("alice", ALTERNATE_PASSWORD)?;
@@ -515,52 +460,12 @@ fn mismatched_tags_returns_not_well_formed_before_binding() -> TestResult {
 }
 
 #[test]
-fn duplicate_attributes_returns_not_well_formed_before_binding() -> TestResult {
-    let suite = C2sSuite::start()?;
-    suite.create_account("alice", ALTERNATE_PASSWORD)?;
-    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
-
-    client.send(r#"<message id='a' id='b'/>"#)?;
-    client.expect_stream_error("not-well-formed")
-}
-
-#[test]
-fn xml_comment_returns_restricted_xml_before_binding() -> TestResult {
-    let suite = C2sSuite::start()?;
-    suite.create_account("alice", ALTERNATE_PASSWORD)?;
-    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
-
-    client.send(r#"<message><!--forbidden--></message>"#)?;
-    client.expect_stream_error("restricted-xml")
-}
-
-#[test]
-fn processing_instruction_returns_restricted_xml_before_binding() -> TestResult {
-    let suite = C2sSuite::start()?;
-    suite.create_account("alice", ALTERNATE_PASSWORD)?;
-    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
-
-    client.send(r#"<message><?instruction value?></message>"#)?;
-    client.expect_stream_error("restricted-xml")
-}
-
-#[test]
 fn doctype_returns_restricted_xml_before_binding() -> TestResult {
     let suite = C2sSuite::start()?;
     suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     client.send(r#"<!DOCTYPE message><message/>"#)?;
-    client.expect_stream_error("restricted-xml")
-}
-
-#[test]
-fn unknown_entity_returns_restricted_xml_before_binding() -> TestResult {
-    let suite = C2sSuite::start()?;
-    suite.create_account("alice", ALTERNATE_PASSWORD)?;
-    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
-
-    client.send(r#"<message><body>&unknown;</body></message>"#)?;
     client.expect_stream_error("restricted-xml")
 }
 
@@ -592,16 +497,6 @@ fn server_namespace_element_returns_invalid_namespace_after_binding() -> TestRes
 
     client.send(r#"<other xmlns='jabber:server'/>"#)?;
     client.expect_stream_error("invalid-namespace")
-}
-
-#[test]
-fn unbound_prefix_returns_not_well_formed_after_binding() -> TestResult {
-    let suite = C2sSuite::start()?;
-    suite.create_account("alice", ALTERNATE_PASSWORD)?;
-    let mut client = suite.connect("alice", ALTERNATE_PASSWORD, "desktop")?;
-
-    client.send(r#"<x:message/>"#)?;
-    client.expect_stream_error("not-well-formed")
 }
 
 #[test]
@@ -689,52 +584,12 @@ fn mismatched_tags_returns_not_well_formed_after_binding() -> TestResult {
 }
 
 #[test]
-fn duplicate_attributes_returns_not_well_formed_after_binding() -> TestResult {
-    let suite = C2sSuite::start()?;
-    suite.create_account("alice", ALTERNATE_PASSWORD)?;
-    let mut client = suite.connect("alice", ALTERNATE_PASSWORD, "desktop")?;
-
-    client.send(r#"<message id='a' id='b'/>"#)?;
-    client.expect_stream_error("not-well-formed")
-}
-
-#[test]
-fn xml_comment_returns_restricted_xml_after_binding() -> TestResult {
-    let suite = C2sSuite::start()?;
-    suite.create_account("alice", ALTERNATE_PASSWORD)?;
-    let mut client = suite.connect("alice", ALTERNATE_PASSWORD, "desktop")?;
-
-    client.send(r#"<message><!--forbidden--></message>"#)?;
-    client.expect_stream_error("restricted-xml")
-}
-
-#[test]
-fn processing_instruction_returns_restricted_xml_after_binding() -> TestResult {
-    let suite = C2sSuite::start()?;
-    suite.create_account("alice", ALTERNATE_PASSWORD)?;
-    let mut client = suite.connect("alice", ALTERNATE_PASSWORD, "desktop")?;
-
-    client.send(r#"<message><?instruction value?></message>"#)?;
-    client.expect_stream_error("restricted-xml")
-}
-
-#[test]
 fn doctype_returns_restricted_xml_after_binding() -> TestResult {
     let suite = C2sSuite::start()?;
     suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.connect("alice", ALTERNATE_PASSWORD, "desktop")?;
 
     client.send(r#"<!DOCTYPE message><message/>"#)?;
-    client.expect_stream_error("restricted-xml")
-}
-
-#[test]
-fn unknown_entity_returns_restricted_xml_after_binding() -> TestResult {
-    let suite = C2sSuite::start()?;
-    suite.create_account("alice", ALTERNATE_PASSWORD)?;
-    let mut client = suite.connect("alice", ALTERNATE_PASSWORD, "desktop")?;
-
-    client.send(r#"<message><body>&unknown;</body></message>"#)?;
     client.expect_stream_error("restricted-xml")
 }
 

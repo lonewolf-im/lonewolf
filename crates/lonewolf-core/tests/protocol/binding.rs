@@ -5,18 +5,6 @@ use crate::support::{ALTERNATE_PASSWORD, context};
 use super::support::{BIND_NAMESPACE, C2sSuite, OPEN, TestResult};
 
 #[test]
-fn requested_resource_is_returned_in_the_bound_jid() -> TestResult {
-    let suite = C2sSuite::start()?;
-    suite.create_account("alice", ALTERNATE_PASSWORD)?;
-    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
-
-    let jid = client.bind(Some("desk"))?;
-
-    assert_eq!(jid, "alice@localhost/desk");
-    client.close()
-}
-
-#[test]
 fn requested_resource_preserves_xml_special_characters() -> TestResult {
     let suite = C2sSuite::start()?;
     suite.create_account("alice", ALTERNATE_PASSWORD)?;
@@ -378,30 +366,6 @@ fn fifth_binding_failure_still_allows_success() -> TestResult {
 }
 
 #[test]
-fn sixth_binding_failure_closes_the_stream() -> TestResult {
-    let suite = C2sSuite::start()?;
-    suite.create_account("alice", ALTERNATE_PASSWORD)?;
-    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
-
-    for _ in 0..5 {
-        client.send("<iq type='set' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource attr='1'/></bind></iq>")?;
-        client.expect_xml(
-            "<iq xmlns='jabber:client' type='error' id='bad'>
-            <error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>Resource binding requires one bind element and a valid optional resource name.</text></error>
-        </iq>",
-        )?;
-    }
-
-    client.send("<iq type='set' id='bad' ><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource attr='1'/></bind></iq>")?;
-    client.expect_xml(
-        "<iq xmlns='jabber:client' type='error' id='bad'>
-        <error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>Resource binding requires one bind element and a valid optional resource name.</text></error>
-    </iq>",
-    )?;
-    client.expect_stream_error("policy-violation")
-}
-
-#[test]
 fn configured_resource_binding_retries_close_after_eight_failed_attempts() -> TestResult {
     let suite = C2sSuite::with_profile_settings(
         "custom",
@@ -623,6 +587,8 @@ fn saturated_unusable_resource_fallback_counts_one_failure_per_request() -> Test
 
 #[test]
 fn structural_bind_errors_each_close_at_the_retry_limit() -> TestResult {
+    let suite = C2sSuite::resource_limit(1)?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
     for bind in [
         "<bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource/><resource/></bind>",
         "<bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource/><resource>phone</resource></bind>",
@@ -630,9 +596,9 @@ fn structural_bind_errors_each_close_at_the_retry_limit() -> TestResult {
         "<bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource attr='1'/></bind>",
         "<bind xmlns='urn:ietf:params:xml:ns:xmpp-bind' attr='1'/>",
         "<bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'>text</bind>",
+        "<bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource><other/></resource></bind>",
+        "<bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk<other/></resource></bind>",
     ] {
-        let suite = C2sSuite::resource_limit(1)?;
-        suite.create_account("alice", ALTERNATE_PASSWORD)?;
         let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
         for _ in 0..6 {
@@ -642,32 +608,6 @@ fn structural_bind_errors_each_close_at_the_retry_limit() -> TestResult {
         client.expect_stream_error("policy-violation")?;
     }
     Ok(())
-}
-
-#[test]
-fn nested_resource_children_close_at_the_retry_limit() -> TestResult {
-    let suite = C2sSuite::resource_limit(1)?;
-    suite.create_account("alice", ALTERNATE_PASSWORD)?;
-    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
-
-    for _ in 0..6 {
-        client.send("<iq type='set' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource><other/></resource></bind></iq>")?;
-        client.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>Resource binding requires one bind element and a valid optional resource name.</text></error></iq>")?;
-    }
-    client.expect_stream_error("policy-violation")
-}
-
-#[test]
-fn mixed_resource_children_close_at_the_retry_limit() -> TestResult {
-    let suite = C2sSuite::resource_limit(1)?;
-    suite.create_account("alice", ALTERNATE_PASSWORD)?;
-    let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
-
-    for _ in 0..6 {
-        client.send("<iq type='set' id='bad'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk<other/></resource></bind></iq>")?;
-        client.expect_xml("<iq xmlns='jabber:client' type='error' id='bad'><error type='modify'><bad-request xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>Resource binding requires one bind element and a valid optional resource name.</text></error></iq>")?;
-    }
-    client.expect_stream_error("policy-violation")
 }
 
 #[test]

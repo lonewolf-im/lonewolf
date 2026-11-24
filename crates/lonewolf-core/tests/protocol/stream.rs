@@ -7,36 +7,20 @@ use std::time::{Duration, Instant};
 use super::support::{C2sSuite, OPEN, TLS_NAMESPACE, TestResult};
 
 #[test]
-fn starttls_rejects_attributes() -> TestResult {
+fn starttls_rejects_attributes_children_and_text() -> TestResult {
     let suite = C2sSuite::start()?;
-    let mut client = suite.tcp_client()?;
-    client.open()?;
-
-    client.send("<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls' extra='1'/>")?;
-    client.expect_xml("<failure xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>")?;
-    client.expect_end()
-}
-
-#[test]
-fn starttls_rejects_children() -> TestResult {
-    let suite = C2sSuite::start()?;
-    let mut client = suite.tcp_client()?;
-    client.open()?;
-
-    client.send("<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'><child/></starttls>")?;
-    client.expect_xml("<failure xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>")?;
-    client.expect_end()
-}
-
-#[test]
-fn starttls_rejects_text() -> TestResult {
-    let suite = C2sSuite::start()?;
-    let mut client = suite.tcp_client()?;
-    client.open()?;
-
-    client.send("<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'>text</starttls>")?;
-    client.expect_xml("<failure xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>")?;
-    client.expect_end()
+    for input in [
+        "<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls' extra='1'/>",
+        "<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'><child/></starttls>",
+        "<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'>text</starttls>",
+    ] {
+        let mut client = suite.tcp_client()?;
+        client.open()?;
+        client.send(input)?;
+        client.expect_xml("<failure xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>")?;
+        client.expect_end()?;
+    }
+    Ok(())
 }
 
 #[test]

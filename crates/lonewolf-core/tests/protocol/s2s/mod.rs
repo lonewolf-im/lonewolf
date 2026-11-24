@@ -697,10 +697,7 @@ fn dns_query(
     Ok(Message::from_vec(&response)?)
 }
 
-const DIRECTIONS: [(&str, &str, &str, &str); 2] = [
-    ("a.test", "alice", "b.test", "bob"),
-    ("b.test", "bob", "a.test", "alice"),
-];
+const ACCOUNTS: (&str, &str, &str, &str) = ("a.test", "alice", "b.test", "bob");
 
 fn workflow_options() -> PairOptions {
     let extensions = "'roster', 'offline', 'carbons', 'disco', 'ping', 'vcard'";

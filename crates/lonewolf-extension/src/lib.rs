@@ -13,6 +13,7 @@ use std::sync::Arc;
 use lonewolf_storage::Storage;
 use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::ChunkAllocator;
+use serde::de::DeserializeOwned;
 
 pub mod account;
 pub mod archive;
@@ -106,6 +107,19 @@ pub trait Extension<A: ChunkAllocator, S: Storage>: Send + Sync {
 pub struct HostOptions<'a> {
     pub domain: &'a str,
     pub options: Option<&'a toml::Table>,
+}
+
+impl HostOptions<'_> {
+    fn parse<T: DeserializeOwned>(&self) -> Result<Option<T>, OptionsError> {
+        self.options
+            .cloned()
+            .map(toml::Table::try_into)
+            .transpose()
+            .map_err(|error| OptionsError {
+                domain: self.domain.into(),
+                reason: error.to_string(),
+            })
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]

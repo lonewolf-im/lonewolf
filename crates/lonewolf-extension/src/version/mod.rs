@@ -44,17 +44,9 @@ impl<A: ChunkAllocator, S: Storage> ExtensionFactory<A, S> for VersionFactory {
     fn build(&self, hosts: &[HostOptions<'_>]) -> Result<Arc<dyn Extension<A, S>>, OptionsError> {
         let mut os_hosts = BTreeSet::<Box<str>>::new();
         for host in hosts {
-            let Some(table) = host.options else {
-                continue;
-            };
-            let options = table
-                .clone()
-                .try_into::<VersionOptions>()
-                .map_err(|error| OptionsError {
-                    domain: host.domain.into(),
-                    reason: error.to_string(),
-                })?;
-            if options.show_os {
+            if let Some(options) = host.parse::<VersionOptions>()?
+                && options.show_os
+            {
                 os_hosts.insert(host.domain.into());
             }
         }

@@ -50,15 +50,7 @@ impl<A: ChunkAllocator, S: Storage> ExtensionFactory<A, S> for VCardFactory {
     fn build(&self, hosts: &[HostOptions<'_>]) -> Result<Arc<dyn Extension<A, S>>, OptionsError> {
         let mut limits = BTreeMap::new();
         for host in hosts {
-            if let Some(table) = host.options {
-                let options =
-                    table
-                        .clone()
-                        .try_into::<VCardOptions>()
-                        .map_err(|error| OptionsError {
-                            domain: host.domain.into(),
-                            reason: error.to_string(),
-                        })?;
+            if let Some(options) = host.parse::<VCardOptions>()? {
                 if options.max_bytes.get() > MAX_VCARD_BYTES {
                     return Err(OptionsError {
                         domain: host.domain.into(),

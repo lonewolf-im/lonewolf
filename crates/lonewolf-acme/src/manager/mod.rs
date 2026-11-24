@@ -5,11 +5,13 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::pin;
 use std::sync::Arc;
-use std::time::{Duration, Instant, UNIX_EPOCH};
+#[cfg(test)]
+use std::time::UNIX_EPOCH;
+use std::time::{Duration, Instant};
 
+#[cfg(test)]
 use futures_util::FutureExt;
-use futures_util::future::{AbortHandle, Abortable, Either, LocalBoxFuture, join, select};
-use futures_util::stream::{FuturesUnordered, StreamExt};
+use futures_util::future::{Either, join, select};
 use parking_lot::Mutex as PlMutex;
 
 use crate::issuer::RenewalWindow;
@@ -236,7 +238,7 @@ impl<I: Installer> Manager<I> {
         self.status.clone()
     }
 
-    /// Runs once; fatal errors leave resources owned until an explicit drain.
+    /// Runs once. After a fatal error, the caller must drain the resources.
     pub async fn run(
         &mut self,
         shutdown: impl Future<Output = Instant>,
@@ -251,18 +253,16 @@ impl<I: Installer> Manager<I> {
             installer: self.installer.clone(),
             time: self.time.clone(),
         };
-        let result = until_shutdown(
-            drive(
-                &self.store,
-                &production,
-                &self.time,
-                std::mem::take(&mut self.hosts),
-                &self.status,
-                self.profile.as_deref(),
-            ),
-            shutdown,
-        )
-        .await;
+        // Keep the scheduler future off the server thread stack.
+        let scheduler = Box::pin(drive(
+            &self.store,
+            &production,
+            &self.time,
+            std::mem::take(&mut self.hosts),
+            &self.status,
+            self.profile.as_deref(),
+        ));
+        let result = until_shutdown(scheduler, shutdown).await;
         drop(cleanup);
         let deadline = result?;
         self.drain(deadline).await
@@ -441,19 +441,6 @@ impl<I: Installer> Engine for Production<I> {
     }
 }
 
-enum Outcome {
-    Account(Result<(), AttemptFailure>),
-    Cancelled,
-    Issue(Result<AttemptSuccess, AttemptFailure>),
-    Ari(Result<Option<RenewalWindow>, AttemptFailure>),
-}
-struct Completed {
-    index: Option<usize>,
-    generation: Option<Vec<Vec<u8>>>,
-    account_retry: Option<RetryState>,
-    outcome: Outcome,
-}
-
 type Publication = (Option<Vec<Vec<u8>>>, bool);
 
 fn housekeeping(
@@ -510,442 +497,8 @@ fn housekeeping(
     Ok(now)
 }
 
-async fn storage<T>(
-    work: impl Future<Output = Result<T, StateError>>,
-    hosts: &[StoredHost],
-    engine: &impl Engine,
-    clock: &impl Clock,
-    status: &StatusHandle,
-    published: &mut [Publication],
-    overrides: &[Option<CertificateValidity>],
-) -> Result<T, ManagerError> {
-    let mut work = pin!(work);
-    loop {
-        let now = housekeeping(hosts, engine, clock, status, published, overrides)?;
-        let mut next = now.saturating_add(60);
-        for (index, host) in hosts.iter().enumerate() {
-            let validity = overrides[index].or_else(|| {
-                host.certificate.as_ref().map(|cert| CertificateValidity {
-                    not_before_unix: cert.not_before_unix,
-                    not_after_unix: cert.not_after_unix,
-                })
-            });
-            if let Some(validity) = validity {
-                if now < validity.not_before_unix {
-                    next = next.min(validity.not_before_unix);
-                }
-                if now < validity.not_after_unix {
-                    next = next.min(validity.not_after_unix);
-                }
-            }
-        }
-        let timer = pin!(clock.sleep(Duration::from_secs(next.saturating_sub(now).clamp(1, 60))));
-        if let Either::Left((result, _)) = select(work.as_mut(), timer).await {
-            return result.map_err(Into::into);
-        }
-    }
-}
-
-async fn drive(
-    store: &impl Storage,
-    engine: &impl Engine,
-    clock: &impl Clock,
-    mut hosts: Vec<StoredHost>,
-    status: &StatusHandle,
-    profile: Option<&str>,
-) -> Result<(), ManagerError> {
-    let mut jobs: FuturesUnordered<LocalBoxFuture<'_, Completed>> = FuturesUnordered::new();
-    let mut busy = vec![false; hosts.len()];
-    let mut ari_aborts: Vec<Option<AbortHandle>> = vec![None; hosts.len()];
-    let mut account_ready = false;
-    let mut account_busy = false;
-    let mut published: Vec<_> = hosts
-        .iter()
-        .enumerate()
-        .map(|(index, host)| {
-            (
-                host.certificate
-                    .as_ref()
-                    .map(|cert| cert.material.chain.clone()),
-                status.inner.lock()[index].1.generation > 0,
-            )
-        })
-        .collect();
-    let mut overrides = vec![None; hosts.len()];
-    loop {
-        let account = storage(
-            store.account(),
-            &hosts,
-            engine,
-            clock,
-            status,
-            &mut published,
-            &overrides,
-        )
-        .await?;
-        let now = housekeeping(&hosts, engine, clock, status, &mut published, &overrides)?;
-        let account_floor = account
-            .as_ref()
-            .map_or(0, |account| account.retry.not_before_unix);
-        {
-            let mut snapshots = status.inner.lock();
-            for (index, host) in hosts.iter().enumerate() {
-                let snapshot = &mut snapshots[index].1;
-                let next_attempt = issue_due(host, now, profile).max(account_floor);
-                if snapshot.next_attempt_unix != Some(next_attempt) {
-                    tracing::debug!(host = %host.host.xmpp_domain, phase = "schedule", retry_seconds = next_attempt.saturating_sub(now), "ACME attempt scheduled");
-                }
-                snapshot.next_attempt_unix = Some(next_attempt);
-            }
-        }
-        let mut next = now.saturating_add(60);
-        let mut candidates = Vec::with_capacity(hosts.len());
-        for (index, host) in hosts.iter().enumerate() {
-            if !published[index].1
-                && let Some(cert) = host
-                    .certificate
-                    .as_ref()
-                    .filter(|cert| now < cert.not_before_unix)
-            {
-                next = next.min(cert.not_before_unix);
-            }
-            let issuance = issue_due(host, now, profile).max(account_floor);
-            if let Some(abort) = &ari_aborts[index] {
-                next = next.min(issuance.max(now));
-                if issuance <= now {
-                    abort.abort();
-                }
-            }
-            if busy[index] {
-                continue;
-            }
-            let ari = host
-                .certificate
-                .as_ref()
-                .filter(|cert| now < cert.not_after_unix)
-                .map(|cert| cert.ari_check_at_unix.max(account_floor));
-            let (due, is_ari) = match ari {
-                Some(ari) if ari < issuance && now < issuance => (ari, true),
-                _ => (issuance, false),
-            };
-            if account_ready || !account_busy || due > now {
-                next = next.min(due.max(now));
-            }
-            if due <= now {
-                candidates.push((due, host.host.dns_name.as_str(), index, is_ari));
-            }
-        }
-        candidates.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
-        if jobs.len() < 2 && !candidates.is_empty() && !account_ready && !account_busy {
-            account_busy = true;
-            jobs.push(
-                async {
-                    Completed {
-                        index: None,
-                        generation: None,
-                        account_retry: None,
-                        outcome: Outcome::Account(engine.ensure_account().await),
-                    }
-                }
-                .boxed_local(),
-            );
-        }
-        for (_, _, index, ari) in
-            candidates
-                .into_iter()
-                .take(if account_ready { 2 - jobs.len() } else { 0 })
-        {
-            let host = hosts[index].clone();
-            let generation = host
-                .certificate
-                .as_ref()
-                .map(|cert| cert.material.chain.clone());
-            let account_retry = account.as_ref().map(|account| account.retry);
-            busy[index] = true;
-            if !ari {
-                let mut snapshots = status.inner.lock();
-                snapshots[index].1.attempts = snapshots[index].1.attempts.saturating_add(1);
-            }
-            let registration = if ari {
-                let (abort, registration) = AbortHandle::new_pair();
-                ari_aborts[index] = Some(abort);
-                Some(registration)
-            } else {
-                None
-            };
-            jobs.push(
-                async move {
-                    let outcome = if let Some(registration) = registration {
-                        match Abortable::new(engine.ari(host), registration).await {
-                            Ok(result) => Outcome::Ari(result),
-                            Err(_) => Outcome::Cancelled,
-                        }
-                    } else {
-                        Outcome::Issue(engine.issue(host).await)
-                    };
-                    Completed {
-                        index: Some(index),
-                        generation,
-                        account_retry,
-                        outcome,
-                    }
-                }
-                .boxed_local(),
-            );
-        }
-        let wait = Duration::from_secs(next.saturating_sub(clock.now()?).clamp(1, 60));
-        let completed = if jobs.is_empty() {
-            clock.idle_sleep(wait).await;
-            continue;
-        } else {
-            let sleep = pin!(clock.sleep(wait));
-            let ready = pin!(jobs.next());
-            match select(ready, sleep).await {
-                Either::Left((Some(result), _)) => result,
-                _ => continue,
-            }
-        };
-        if let Outcome::Account(result) = completed.outcome {
-            account_busy = false;
-            match result {
-                Ok(()) => account_ready = true,
-                Err(error) if error.state_error.is_some() || error.kind == FailureKind::State => {
-                    return Err(fatal(error));
-                }
-                Err(error) => {
-                    tracing::warn!(phase = "account", outcome = ?error.kind, "ACME account will retry");
-                }
-            }
-            continue;
-        }
-        let index = completed.index.ok_or(ManagerError::Task)?;
-        match completed.outcome {
-            Outcome::Issue(Err(error)) | Outcome::Ari(Err(error))
-                if error.state_error.is_some() || error.kind == FailureKind::State =>
-            {
-                return Err(fatal(error));
-            }
-            _ => {}
-        }
-        if let Outcome::Issue(Ok(success)) = completed.outcome {
-            overrides[index] = Some(success.validity);
-            published[index] = (None, true);
-            let mut snapshots = status.inner.lock();
-            let snapshot = &mut snapshots[index].1;
-            tracing::info!(host = %hosts[index].host.xmpp_domain, phase = "issuance", outcome = if snapshot.generation == 0 { "issued" } else { "rotated" }, not_after = success.validity.not_after_unix, profile, "ACME certificate installed");
-            snapshot.successes = snapshot.successes.saturating_add(1);
-            snapshot.generation = snapshot.generation.saturating_add(1);
-            snapshot.not_after_unix = Some(success.validity.not_after_unix);
-            event(snapshot, HostEvent::Installed);
-        }
-        let mut host = storage(
-            store.host(hosts[index].host.dns_name.clone()),
-            &hosts,
-            engine,
-            clock,
-            status,
-            &mut published,
-            &overrides,
-        )
-        .await?
-        .ok_or(StateError::CorruptData)?;
-        if let Some(validity) = overrides[index] {
-            let certificate = host.certificate.as_ref().ok_or(StateError::CorruptData)?;
-            if certificate.not_before_unix != validity.not_before_unix
-                || certificate.not_after_unix != validity.not_after_unix
-            {
-                return Err(StateError::CorruptData.into());
-            }
-            hosts[index] = host.clone();
-            status.inner.lock()[index].1.profile = certificate.profile.as_deref().map(Arc::from);
-            published[index] = (Some(certificate.material.chain.clone()), true);
-            overrides[index] = None;
-        }
-        let now = clock.now()?;
-        match completed.outcome {
-            Outcome::Account(_) => return Err(ManagerError::Task),
-            Outcome::Cancelled => {}
-            Outcome::Issue(result) => {
-                match result {
-                    Ok(_) => {
-                        if let Some(mut account) = storage(
-                            store.account(),
-                            &hosts,
-                            engine,
-                            clock,
-                            status,
-                            &mut published,
-                            &overrides,
-                        )
-                        .await?
-                            && Some(account.retry) == completed.account_retry
-                            && account.retry.failures > 0
-                        {
-                            account.retry = RetryState {
-                                failures: 0,
-                                not_before_unix: 0,
-                            };
-                            storage(
-                                store.save_account(account),
-                                &hosts,
-                                engine,
-                                clock,
-                                status,
-                                &mut published,
-                                &overrides,
-                            )
-                            .await?;
-                        }
-                    }
-                    Err(error) => {
-                        if error.kind == FailureKind::ProfileNotOffered {
-                            tracing::error!(host = %host.host.xmpp_domain, phase = "issuance", outcome = "profile_not_offered", profile, retry_seconds = host.retry.not_before_unix.saturating_sub(now), "ACME certificate profile not offered");
-                        } else if error.kind != FailureKind::Deferred {
-                            tracing::warn!(host = %host.host.xmpp_domain, phase = "issuance", outcome = ?error.kind, retry_seconds = host.retry.not_before_unix.saturating_sub(now), "ACME certificate will retry");
-                        }
-                        if error.state_error.is_some() {
-                            return Err(fatal(error));
-                        }
-                        {
-                            let mut snapshots = status.inner.lock();
-                            let snapshot = &mut snapshots[index].1;
-                            if error.kind == FailureKind::Deferred {
-                                snapshot.attempts = snapshot.attempts.saturating_sub(1);
-                            } else {
-                                snapshot.failures[error.kind as usize] =
-                                    snapshot.failures[error.kind as usize].saturating_add(1);
-                            }
-                            event(snapshot, HostEvent::NextRetry);
-                        }
-                        if error.kind == FailureKind::Account {
-                            let mut account = storage(
-                                store.account(),
-                                &hosts,
-                                engine,
-                                clock,
-                                status,
-                                &mut published,
-                                &overrides,
-                            )
-                            .await?
-                            .ok_or(StateError::CorruptData)?;
-                            account.retry.failures = account.retry.failures.saturating_add(1);
-                            let lifetime = hosts
-                                .iter()
-                                .filter_map(|host| host.certificate.as_ref())
-                                .map(StoredCertificate::lifetime)
-                                .min();
-                            let delay = schedule::retry_delay(
-                                account.retry.failures,
-                                lifetime,
-                                |maximum| clock.uniform(maximum),
-                            )?;
-                            account.retry.not_before_unix = account
-                                .retry
-                                .not_before_unix
-                                .max(schedule::add(now, delay)?);
-                            if let Some(hint) = error.retry_not_before {
-                                let duration = hint
-                                    .duration_since(UNIX_EPOCH)
-                                    .map_err(|_| StateError::InvalidData)?;
-                                account.retry.not_before_unix =
-                                    account.retry.not_before_unix.max(schedule::add(
-                                        duration.as_secs(),
-                                        u64::from(duration.subsec_nanos() != 0),
-                                    )?);
-                            }
-                            storage(
-                                store.save_account(account),
-                                &hosts,
-                                engine,
-                                clock,
-                                status,
-                                &mut published,
-                                &overrides,
-                            )
-                            .await?;
-                            account_ready = false;
-                        }
-                    }
-                }
-                event(&mut status.inner.lock()[index].1, HostEvent::AttemptOutcome);
-            }
-            Outcome::Ari(result) => {
-                if let Err(error) = result
-                    && (error.state_error.is_some() || error.kind == FailureKind::State)
-                {
-                    return Err(fatal(error));
-                }
-                if let Some(certificate) = host.certificate.as_mut().filter(|cert| {
-                    completed.generation.as_ref() == Some(&cert.material.chain)
-                        && now < cert.not_after_unix
-                }) {
-                    let delay = match result {
-                        Ok(Some(window)) => {
-                            certificate.ari_failures = 0;
-                            let valid = match (window.start, window.end) {
-                                (Some(start), Some(end)) => {
-                                    schedule::apply_window(certificate, start, end, |maximum| {
-                                        clock.uniform(maximum)
-                                    })?
-                                }
-                                _ => false,
-                            };
-                            if !valid {
-                                certificate.ari_window = None;
-                                certificate.renew_at_unix = certificate.fallback_at_unix;
-                            }
-                            if valid { window.delay.max(60) } else { 43_200 }
-                        }
-                        Ok(None) => 43_200,
-                        Err(error) => {
-                            tracing::warn!(host = %host.host.xmpp_domain, phase = "renewal_info", outcome = ?error.kind, "ACME renewal information will retry");
-                            if error.state_error.is_some() {
-                                return Err(fatal(error));
-                            }
-                            certificate.ari_failures = certificate.ari_failures.saturating_add(1);
-                            let delay = schedule::ari_delay(
-                                certificate.ari_failures,
-                                matches!(
-                                    error.kind,
-                                    FailureKind::Network
-                                        | FailureKind::Timeout
-                                        | FailureKind::RateLimited
-                                ),
-                            );
-                            if let Some(hint) = error.retry_not_before {
-                                let duration = hint
-                                    .duration_since(UNIX_EPOCH)
-                                    .map_err(|_| StateError::InvalidData)?;
-                                let hint = schedule::add(
-                                    duration.as_secs(),
-                                    u64::from(duration.subsec_nanos() != 0),
-                                )?;
-                                delay.max(hint.saturating_sub(now))
-                            } else {
-                                delay
-                            }
-                        }
-                    };
-                    certificate.ari_check_at_unix = schedule::add(now, delay)?;
-                    storage(
-                        store.save_host(host.clone()),
-                        &hosts,
-                        engine,
-                        clock,
-                        status,
-                        &mut published,
-                        &overrides,
-                    )
-                    .await?;
-                }
-            }
-        }
-        hosts[index] = host;
-        busy[index] = false;
-        ari_aborts[index] = None;
-    }
-}
+mod scheduler;
+use scheduler::drive;
 
 #[cfg(test)]
 mod tests;

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::metrics::encode_counter;
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -422,8 +423,29 @@ fn sum(workers: &[C2sWorkerMetrics], counter: impl Fn(&C2sCounters) -> &AtomicU6
 
 impl Collector for C2sCollector {
     fn encode(&self, mut encoder: DescriptorEncoder) -> Result<(), fmt::Error> {
-        let metrics = &self.0;
-        let mut bound = metrics
+        self.0.encode_bound_listeners(&mut encoder)?;
+        self.0.encode_connections(&mut encoder)?;
+        self.0.encode_accepted(&mut encoder)?;
+        self.0.encode_rejected(&mut encoder)?;
+        self.0.encode_closed(&mut encoder)?;
+        self.0.encode_panics(&mut encoder)?;
+        self.0.encode_authentications(&mut encoder)?;
+        self.0.encode_bindings(&mut encoder)?;
+        self.0.encode_stanzas(&mut encoder)?;
+        self.0.encode_bytes(&mut encoder)?;
+        self.0.encode_limits(&mut encoder)?;
+        self.0.encode_replay_pages(&mut encoder)?;
+        self.0.encode_replay_records(&mut encoder)?;
+        self.0.encode_durations(&mut encoder)
+    }
+}
+
+impl C2sMetrics {
+    fn encode_bound_listeners(
+        &self,
+        encoder: &mut DescriptorEncoder<'_>,
+    ) -> Result<(), fmt::Error> {
+        let mut bound = self
             .listeners
             .iter()
             .enumerate()
@@ -450,19 +472,23 @@ impl Collector for C2sCollector {
                 ConstGauge::new(1u64).encode(family.encode_family(&labels)?)?;
             }
         }
-        if !metrics.listeners.is_empty() {
+        Ok(())
+    }
+
+    fn encode_connections(&self, encoder: &mut DescriptorEncoder<'_>) -> Result<(), fmt::Error> {
+        if !self.listeners.is_empty() {
             let mut family = encoder.encode_descriptor(
                 "c2s_connections",
                 "Client connections currently open, by listener.",
                 None,
                 MetricType::Gauge,
             )?;
-            for (listener, workers) in metrics.listeners.iter().enumerate() {
+            for (listener, workers) in self.listeners.iter().enumerate() {
                 ConstGauge::new(sum(workers, |c| &c.connections))
                     .encode(family.encode_family(&ListenerLabels { listener })?)?;
             }
         }
-        ConstGauge::new(metrics.unauthenticated.active_count() as u64).encode(
+        ConstGauge::new(self.unauthenticated.active_count() as u64).encode(
             encoder.encode_descriptor(
                 "c2s_unauthenticated_connections",
                 "Client connections that have not completed authentication.",
@@ -470,196 +496,161 @@ impl Collector for C2sCollector {
                 MetricType::Gauge,
             )?,
         )?;
-        ConstGauge::new(metrics.unauthenticated.limit() as u64).encode(
-            encoder.encode_descriptor(
-                "c2s_unauthenticated_connections_limit",
-                "Maximum number of unauthenticated client connections.",
-                None,
-                MetricType::Gauge,
-            )?,
-        )?;
-        if !metrics.listeners.is_empty() {
+        ConstGauge::new(self.unauthenticated.limit() as u64).encode(encoder.encode_descriptor(
+            "c2s_unauthenticated_connections_limit",
+            "Maximum number of unauthenticated client connections.",
+            None,
+            MetricType::Gauge,
+        )?)
+    }
+
+    fn encode_accepted(&self, encoder: &mut DescriptorEncoder<'_>) -> Result<(), fmt::Error> {
+        if !self.listeners.is_empty() {
             let mut family = encoder.encode_descriptor(
                 "c2s_connections_accepted",
                 "Client connections admitted, by listener.",
                 None,
                 MetricType::Counter,
             )?;
-            for (listener, workers) in metrics.listeners.iter().enumerate() {
+            for (listener, workers) in self.listeners.iter().enumerate() {
                 ConstCounter::new(sum(workers, |c| &c.accepted))
                     .encode(family.encode_family(&ListenerLabels { listener })?)?;
             }
         }
-        if metrics
-            .listeners
-            .iter()
-            .flat_map(|workers| workers.iter())
-            .any(|worker| {
-                worker
-                    .0
-                    .counters
-                    .rejected
-                    .iter()
-                    .any(|counter| counter.load(Ordering::Relaxed) != 0)
-            })
-        {
-            let mut family = encoder.encode_descriptor(
-                "c2s_connections_rejected",
-                "Client connections refused by an admission limit, by listener and reason.",
-                None,
-                MetricType::Counter,
-            )?;
-            for (listener, workers) in metrics.listeners.iter().enumerate() {
-                for reason in RejectReason::ALL {
-                    let value = sum(workers, |c| &c.rejected[reason as usize]);
-                    if value != 0 {
-                        ConstCounter::new(value).encode(family.encode_family(
-                            &RejectedLabels {
+        Ok(())
+    }
+
+    fn encode_rejected(&self, encoder: &mut DescriptorEncoder<'_>) -> Result<(), fmt::Error> {
+        encode_counter(
+            encoder,
+            "c2s_connections_rejected",
+            "Client connections refused by an admission limit, by listener and reason.",
+            self.listeners
+                .iter()
+                .enumerate()
+                .flat_map(|(listener, workers)| {
+                    RejectReason::ALL.map(move |reason| {
+                        (
+                            RejectedLabels {
                                 listener,
                                 reason: reason.as_str(),
                             },
-                        )?)?;
-                    }
-                }
-            }
-        }
-        if metrics
-            .listeners
-            .iter()
-            .flat_map(|workers| workers.iter())
-            .any(|worker| {
-                worker
-                    .0
-                    .counters
-                    .closed
-                    .iter()
-                    .flatten()
-                    .any(|counter| counter.load(Ordering::Relaxed) != 0)
-            })
-        {
-            let mut family = encoder.encode_descriptor(
-                "c2s_connections_closed",
-                "Admitted client connections that closed, by listener, stream phase and outcome.",
-                None,
-                MetricType::Counter,
-            )?;
-            for (listener, workers) in metrics.listeners.iter().enumerate() {
-                for phase in StreamPhase::ALL {
-                    for index in 0..=CloseOutcome::COUNT {
-                        let value = sum(workers, |c| &c.closed[phase as usize][index]);
-                        if value != 0 {
-                            let outcome = CloseOutcome::ALL
-                                .get(index)
-                                .map_or("cancelled", |outcome| outcome.as_str());
-                            ConstCounter::new(value).encode(family.encode_family(
-                                &ClosedLabels {
-                                    listener,
-                                    phase: phase.as_str(),
-                                    outcome,
-                                },
-                            )?)?;
-                        }
-                    }
-                }
-            }
-        }
-        if !metrics.listeners.is_empty() {
+                            sum(workers, |c| &c.rejected[reason as usize]),
+                        )
+                    })
+                }),
+        )
+    }
+
+    fn encode_closed(&self, encoder: &mut DescriptorEncoder<'_>) -> Result<(), fmt::Error> {
+        encode_counter(
+            encoder,
+            "c2s_connections_closed",
+            "Admitted client connections that closed, by listener, stream phase and outcome.",
+            self.listeners
+                .iter()
+                .enumerate()
+                .flat_map(|(listener, workers)| {
+                    StreamPhase::ALL.into_iter().flat_map(move |phase| {
+                        CloseOutcome::ALL
+                            .iter()
+                            .map(|outcome| outcome.as_str())
+                            .chain(std::iter::once("cancelled"))
+                            .enumerate()
+                            .map(move |(index, outcome)| {
+                                (
+                                    ClosedLabels {
+                                        listener,
+                                        phase: phase.as_str(),
+                                        outcome,
+                                    },
+                                    sum(workers, |c| &c.closed[phase as usize][index]),
+                                )
+                            })
+                    })
+                }),
+        )
+    }
+
+    fn encode_panics(&self, encoder: &mut DescriptorEncoder<'_>) -> Result<(), fmt::Error> {
+        if !self.listeners.is_empty() {
             let mut family = encoder.encode_descriptor(
                 "c2s_connection_panics",
                 "Client connection tasks that ended with a panic, by listener.",
                 None,
                 MetricType::Counter,
             )?;
-            for (listener, workers) in metrics.listeners.iter().enumerate() {
+            for (listener, workers) in self.listeners.iter().enumerate() {
                 ConstCounter::new(sum(workers, |c| &c.panics))
                     .encode(family.encode_family(&ListenerLabels { listener })?)?;
             }
         }
-        if metrics
-            .listeners
-            .iter()
-            .flat_map(|workers| workers.iter())
-            .any(|worker| {
-                worker
-                    .0
-                    .counters
-                    .authentications
-                    .iter()
-                    .flatten()
-                    .any(|counter| counter.load(Ordering::Relaxed) != 0)
-            })
-        {
-            let mut family = encoder.encode_descriptor(
-                "c2s_authentications",
-                "SASL authentication results, by listener, mechanism and outcome.",
-                None,
-                MetricType::Counter,
-            )?;
-            for (listener, workers) in metrics.listeners.iter().enumerate() {
-                for mechanism in MECHANISMS {
-                    for index in 0..=SaslFailure::ALL.len() {
-                        let value = sum(workers, |c| {
-                            &c.authentications[mechanism_index(mechanism)][index]
-                        });
-                        if value != 0 {
-                            let outcome = if index == 0 {
-                                "success"
-                            } else {
-                                SaslFailure::ALL[index - 1].as_str()
-                            };
-                            ConstCounter::new(value).encode(family.encode_family(
-                                &AuthenticationLabels {
-                                    listener,
-                                    mechanism: mechanism_label(mechanism),
-                                    outcome,
-                                },
-                            )?)?;
-                        }
-                    }
-                }
-            }
-        }
-        if metrics
-            .listeners
-            .iter()
-            .flat_map(|workers| workers.iter())
-            .any(|worker| {
-                worker
-                    .0
-                    .counters
-                    .bindings
-                    .iter()
-                    .any(|counter| counter.load(Ordering::Relaxed) != 0)
-            })
-        {
-            let mut family = encoder.encode_descriptor(
-                "c2s_resource_bindings",
-                "Resource binding results, by listener and outcome.",
-                None,
-                MetricType::Counter,
-            )?;
-            for (listener, workers) in metrics.listeners.iter().enumerate() {
-                for index in 0..=BindRejection::ALL.len() {
-                    let value = sum(workers, |c| &c.bindings[index]);
-                    if value != 0 {
-                        let outcome = if index == 0 {
-                            "success"
-                        } else {
-                            BindRejection::ALL[index - 1].as_str()
-                        };
-                        ConstCounter::new(value)
-                            .encode(family.encode_family(&BindingLabels { listener, outcome })?)?;
-                    }
-                }
-            }
-        }
+        Ok(())
+    }
+
+    fn encode_authentications(
+        &self,
+        encoder: &mut DescriptorEncoder<'_>,
+    ) -> Result<(), fmt::Error> {
+        encode_counter(
+            encoder,
+            "c2s_authentications",
+            "SASL authentication results, by listener, mechanism and outcome.",
+            self.listeners
+                .iter()
+                .enumerate()
+                .flat_map(|(listener, workers)| {
+                    MECHANISMS.into_iter().flat_map(move |mechanism| {
+                        std::iter::once("success")
+                            .chain(SaslFailure::ALL.iter().map(|failure| failure.as_str()))
+                            .enumerate()
+                            .map(move |(index, outcome)| {
+                                (
+                                    AuthenticationLabels {
+                                        listener,
+                                        mechanism: mechanism_label(mechanism),
+                                        outcome,
+                                    },
+                                    sum(workers, |c| {
+                                        &c.authentications[mechanism_index(mechanism)][index]
+                                    }),
+                                )
+                            })
+                    })
+                }),
+        )
+    }
+
+    fn encode_bindings(&self, encoder: &mut DescriptorEncoder<'_>) -> Result<(), fmt::Error> {
+        encode_counter(
+            encoder,
+            "c2s_resource_bindings",
+            "Resource binding results, by listener and outcome.",
+            self.listeners
+                .iter()
+                .enumerate()
+                .flat_map(|(listener, workers)| {
+                    std::iter::once("success")
+                        .chain(BindRejection::ALL.iter().map(|reason| reason.as_str()))
+                        .enumerate()
+                        .map(move |(index, outcome)| {
+                            (
+                                BindingLabels { listener, outcome },
+                                sum(workers, |c| &c.bindings[index]),
+                            )
+                        })
+                }),
+        )
+    }
+
+    fn encode_stanzas(&self, encoder: &mut DescriptorEncoder<'_>) -> Result<(), fmt::Error> {
         let mut family = encoder.encode_descriptor(
             "c2s_stanzas_received",
             "Stanzas parsed from client streams, by listener and kind.",
             None,
             MetricType::Counter,
         )?;
-        for (listener, workers) in metrics.listeners.iter().enumerate() {
+        for (listener, workers) in self.listeners.iter().enumerate() {
             for kind in KINDS {
                 ConstCounter::new(sum(workers, |c| &c.stanzas_received[kind_index(kind)])).encode(
                     family.encode_family(&KindLabels {
@@ -675,7 +666,7 @@ impl Collector for C2sCollector {
             None,
             MetricType::Counter,
         )?;
-        for (listener, workers) in metrics.listeners.iter().enumerate() {
+        for (listener, workers) in self.listeners.iter().enumerate() {
             for kind in KINDS {
                 ConstCounter::new(sum(workers, |c| &c.stanzas_sent[kind_index(kind)])).encode(
                     family.encode_family(&KindLabels {
@@ -685,33 +676,41 @@ impl Collector for C2sCollector {
                 )?;
             }
         }
+        Ok(())
+    }
+
+    fn encode_bytes(&self, encoder: &mut DescriptorEncoder<'_>) -> Result<(), fmt::Error> {
         let mut family = encoder.encode_descriptor(
-            "c2s_received",
-            "Reported TLS socket read completions, including handshake and record overhead; cancellation or teardown may omit completions.",
-            Some(&Unit::Bytes),
-            MetricType::Counter,
-        )?;
-        for (listener, workers) in metrics.listeners.iter().enumerate() {
+    "c2s_received",
+    "Reported TLS socket read completions, including handshake and record overhead; cancellation or teardown may omit completions.",
+    Some(&Unit::Bytes),
+    MetricType::Counter,
+)?;
+        for (listener, workers) in self.listeners.iter().enumerate() {
             ConstCounter::new(sum(workers, |c| &c.received_bytes))
                 .encode(family.encode_family(&ListenerLabels { listener })?)?;
         }
         let mut family = encoder.encode_descriptor(
-            "c2s_sent",
-            "Reported TLS socket write completions, including handshake and record overhead; cancellation or teardown may omit completions.",
-            Some(&Unit::Bytes),
-            MetricType::Counter,
-        )?;
-        for (listener, workers) in metrics.listeners.iter().enumerate() {
+    "c2s_sent",
+    "Reported TLS socket write completions, including handshake and record overhead; cancellation or teardown may omit completions.",
+    Some(&Unit::Bytes),
+    MetricType::Counter,
+)?;
+        for (listener, workers) in self.listeners.iter().enumerate() {
             ConstCounter::new(sum(workers, |c| &c.sent_bytes))
                 .encode(family.encode_family(&ListenerLabels { listener })?)?;
         }
+        Ok(())
+    }
+
+    fn encode_limits(&self, encoder: &mut DescriptorEncoder<'_>) -> Result<(), fmt::Error> {
         let mut family = encoder.encode_descriptor(
             "c2s_rate_limited",
             "Stanzas delayed or rejected by a per-connection rate limit, by listener and limit.",
             None,
             MetricType::Counter,
         )?;
-        for (listener, workers) in metrics.listeners.iter().enumerate() {
+        for (listener, workers) in self.listeners.iter().enumerate() {
             for limit in RateLimit::ALL {
                 ConstCounter::new(sum(workers, |c| &c.rate_limited[limit as usize])).encode(
                     family.encode_family(&LimitLabels {
@@ -721,13 +720,17 @@ impl Collector for C2sCollector {
                 )?;
             }
         }
+        Ok(())
+    }
+
+    fn encode_replay_pages(&self, encoder: &mut DescriptorEncoder<'_>) -> Result<(), fmt::Error> {
         let mut family = encoder.encode_descriptor(
             "c2s_replay_pages",
             "Stored-record pages read for client replay, by listener and record kind.",
             None,
             MetricType::Counter,
         )?;
-        for (listener, workers) in metrics.listeners.iter().enumerate() {
+        for (listener, workers) in self.listeners.iter().enumerate() {
             for kind in ReplayKind::ALL {
                 ConstCounter::new(sum(workers, |c| &c.replay_pages[kind as usize])).encode(
                     family.encode_family(&ReplayLabels {
@@ -743,7 +746,7 @@ impl Collector for C2sCollector {
             Some(&Unit::Bytes),
             MetricType::Counter,
         )?;
-        for (listener, workers) in metrics.listeners.iter().enumerate() {
+        for (listener, workers) in self.listeners.iter().enumerate() {
             for kind in ReplayKind::ALL {
                 ConstCounter::new(sum(workers, |c| &c.replay_bytes[kind as usize])).encode(
                     family.encode_family(&ReplayLabels {
@@ -753,13 +756,17 @@ impl Collector for C2sCollector {
                 )?;
             }
         }
+        Ok(())
+    }
+
+    fn encode_replay_records(&self, encoder: &mut DescriptorEncoder<'_>) -> Result<(), fmt::Error> {
         let mut family = encoder.encode_descriptor(
-            "c2s_replay_records",
-            "Stored records written or dropped during client replay, by listener, record kind and outcome.",
-            None,
-            MetricType::Counter,
-        )?;
-        for (listener, workers) in metrics.listeners.iter().enumerate() {
+    "c2s_replay_records",
+    "Stored records written or dropped during client replay, by listener, record kind and outcome.",
+    None,
+    MetricType::Counter,
+)?;
+        for (listener, workers) in self.listeners.iter().enumerate() {
             for (index, (kind, outcome)) in REPLAY_RECORDS.into_iter().enumerate() {
                 ConstCounter::new(sum(workers, |c| &c.replay_records[index])).encode(
                     family.encode_family(&ReplayRecordLabels {
@@ -770,18 +777,22 @@ impl Collector for C2sCollector {
                 )?;
             }
         }
+        Ok(())
+    }
+
+    fn encode_durations(&self, encoder: &mut DescriptorEncoder<'_>) -> Result<(), fmt::Error> {
         let mut family = encoder.encode_descriptor(
             "c2s_phase_duration",
             "Time to complete each stream negotiation phase.",
             Some(&Unit::Seconds),
             MetricType::Histogram,
         )?;
-        for (phase, histogram) in NEGOTIATION_PHASES.into_iter().zip(&metrics.phase_durations) {
+        for (phase, histogram) in NEGOTIATION_PHASES.into_iter().zip(&self.phase_durations) {
             histogram.encode(family.encode_family(&PhaseLabels {
                 phase: phase.as_str(),
             })?)?;
         }
-        metrics.session_duration.encode(encoder.encode_descriptor(
+        self.session_duration.encode(encoder.encode_descriptor(
             "c2s_session_duration",
             "Lifetime of bound client sessions, from resource binding to close.",
             Some(&Unit::Seconds),

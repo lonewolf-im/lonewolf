@@ -34,9 +34,9 @@ use lonewolf_extension::observer::{
 use lonewolf_extension::policy::{Direction, Verdict};
 #[cfg(test)]
 use lonewolf_extension::presence::{PresenceAudience, PresenceUpdate};
-use lonewolf_extension::presence::{
-    PresenceHandler, PresenceRequest, PresenceRequestType, PresenceSend,
-};
+use lonewolf_extension::presence::{PresenceHandler, PresenceRequestType};
+#[cfg(test)]
+use lonewolf_extension::presence::{PresenceRequest, PresenceSend};
 use lonewolf_storage::account::{AccountError, AccountKey, AccountReads};
 use lonewolf_storage::offline::OfflineSequence;
 use lonewolf_storage::roster::{PendingPage, RosterJid};
@@ -60,9 +60,11 @@ use crate::c2s::iq;
 use crate::c2s::metrics::{C2sWorkerMetrics, ReplayKind, ReplayOutcome};
 #[cfg(test)]
 use crate::delivery::after_turn;
+#[cfg(test)]
+use crate::delivery::{EffectsDiagnostics, commit_and_deliver};
 use crate::delivery::{
-    EffectsDiagnostics, Pending, RouterDelivery, WorkGroup, WorkHandle, commit_and_deliver,
-    report_failure, report_handler_failure, storage_failure,
+    Pending, RouterDelivery, WorkGroup, WorkHandle, report_failure, report_handler_failure,
+    storage_failure,
 };
 use crate::order::Ticket;
 use crate::router::local::SessionLiveness;
@@ -86,6 +88,7 @@ mod link;
 mod output;
 mod presence;
 mod replay;
+mod subscription;
 mod transport;
 
 use link::{Incoming, LinkWriter};
@@ -159,13 +162,6 @@ enum Output<A: ChunkAllocator> {
         handler: Arc<dyn MessageHandler<A, RedbStorage>>,
         policy: Option<ReplayPolicy<A>>,
     },
-}
-
-enum SubscriptionPreparation<T> {
-    Done,
-    OutboundBlocked,
-    Rejected(HandlerError),
-    Commit(T),
 }
 
 enum ServiceAdmission<A: ChunkAllocator> {
@@ -1150,7 +1146,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                     let routed = self.stamp(parsed)?;
                     self.outbox
                         .drain_until(&self.registration, async {
-                            let (verdict, admission) = Self::explicit_presence_policy(
+                            let (verdict, admission) = explicit_presence_policy(
                                 &self.router,
                                 &self.storage,
                                 &self.registration,
@@ -1202,43 +1198,6 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         }
     }
 
-    async fn explicit_presence_policy(
-        router: &RouterHandle<A>,
-        storage: &RedbStorage,
-        registration: &Registration<A>,
-        stanza: &RoutedStanza<A>,
-    ) -> Result<(Verdict, Option<(RedbRead, Ticket)>), CloseOutcome> {
-        let view = stanza.resolve()?;
-        let to = view.to()?.ok_or(CloseOutcome::InternalError)?;
-        let sender = Some(registration.account());
-        let parties = ingress::checks::parties_for(router, sender, to, view.kind())?;
-        let Some((snapshot, mut ticket)) = ingress::checks::fix_explicit_snapshot(
-            router,
-            storage,
-            sender,
-            parties.recipient.as_ref(),
-        )
-        .await?
-        else {
-            return Ok((Verdict::Allow, None));
-        };
-        let verdict = ingress::checks::check_selected(
-            (router, storage),
-            sender,
-            parties.recipient.as_ref(),
-            &view,
-            None,
-            ingress::checks::Snapshot::Ordered(&snapshot),
-            policy::Selection::Explicit,
-        )
-        .await?;
-        if verdict != Verdict::Allow {
-            return Ok((verdict, None));
-        }
-        ticket.turn().await;
-        Ok((verdict, Some((snapshot, ticket))))
-    }
-
     async fn directed_presence_fallback(
         &mut self,
         routed: &RoutedStanza<A>,
@@ -1247,14 +1206,9 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         let verdict = self
             .outbox
             .drain_until(&self.registration, async {
-                Self::explicit_presence_policy(
-                    &self.router,
-                    &self.storage,
-                    &self.registration,
-                    routed,
-                )
-                .await
-                .map(|(verdict, _admission)| verdict)
+                explicit_presence_policy(&self.router, &self.storage, &self.registration, routed)
+                    .await
+                    .map(|(verdict, _admission)| verdict)
             })
             .await??;
         match verdict {
@@ -1511,392 +1465,6 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                 text,
             } => self.reply_rejection_with_text(&stanza, condition, application, text),
         }
-    }
-
-    async fn handle_subscription(
-        &mut self,
-        parsed: Parsed<Stanza, A>,
-        kind: PresenceRequestType,
-    ) -> Result<(), CloseOutcome> {
-        let (remote, component) = {
-            let stanza = parsed.value().resolve(parsed.arena())?;
-            let target = stanza.to()?.ok_or(CloseOutcome::InternalError)?;
-            (
-                self.router.destination(target) == Destination::Remote,
-                self.router.is_component_domain(target.domainpart()),
-            )
-        };
-        let federated = remote
-            && self
-                .router
-                .federates_domain(self.registration.account().domain());
-        let (source, mut arena) = parsed.into_parts();
-        let (source, sender, _) = self.stamp_in(source, &mut arena, false)?;
-        let routed = source
-            .derive_in(&mut arena)?
-            .from(Some(sender.bare()))?
-            .bare_to()
-            .build()?;
-        let (source, routed) = RoutedStanza::from_parts_pair(source, routed, arena);
-        if !self.admit_routed(&source)? {
-            return Ok(());
-        }
-        let sender_host = self
-            .router
-            .presence_handlers(self.registration.account().domain())
-            .and_then(|handlers| handlers.find(kind));
-        let (policy_sender, policy_target) = presence_addresses(&routed)?;
-        let account = self.registration.account();
-        let same_account = policy_target.as_str() == account.as_str();
-        let outbound_policy =
-            !same_account && policy::Selection::Standard.configured(&self.router, account.domain());
-        let inbound_domain = (!same_account
-            && self.router.destination(policy_target) == Destination::Account)
-            .then_some(policy_target.domainpart());
-        let inbound_policy = inbound_domain
-            .is_some_and(|domain| policy::Selection::Standard.configured(&self.router, domain));
-        let explicit_policy = !same_account
-            && (policy::Selection::Explicit.configured(&self.router, account.domain())
-                || inbound_domain.is_some_and(|domain| {
-                    policy::Selection::Explicit.configured(&self.router, domain)
-                }));
-        if sender_host.is_none() && !remote && !explicit_policy {
-            return Ok(());
-        }
-        let policy_snapshot = if outbound_policy || inbound_policy {
-            let read = async {
-                self.storage.begin_read().await.map_err(|error| {
-                    close_storage_failure(error, "presence_subscription_begin_read", account)
-                })
-            };
-            Some(self.outbox.drain_until(&self.registration, read).await??)
-        } else {
-            None
-        };
-        if outbound_policy && let Some(snapshot) = policy_snapshot.as_ref() {
-            let checks = [policy::Check {
-                account,
-                direction: Direction::Outbound,
-                peer: policy_target,
-            }];
-            let verdict = self
-                .outbox
-                .drain_until(
-                    &self.registration,
-                    policy::evaluate_selected_in(
-                        &self.router,
-                        snapshot,
-                        routed.resolve()?.stanza_type(),
-                        &checks,
-                        policy::Selection::Standard,
-                    ),
-                )
-                .await??;
-            match verdict {
-                Verdict::Allow => {}
-                Verdict::OutboundBlocked => return self.reply_outbound_blocked(&source),
-                Verdict::Drop | Verdict::Reject { .. } => return Ok(()),
-            }
-        }
-        if let Some(sender_host) = sender_host {
-            let authorized = {
-                let (sender, target) = presence_addresses(&source)?;
-                let account = self.registration.account();
-                let authorize = async {
-                    let result = sender_host
-                        .authorize(PresenceRequest {
-                            kind,
-                            sender,
-                            target,
-                            stanza: &source,
-                        })
-                        .await;
-                    if let Err(error) = &result {
-                        report_handler_failure(error, account);
-                    }
-                    result
-                };
-                self.outbox
-                    .drain_until(&self.registration, authorize)
-                    .await?
-            };
-            if let Err(error) = authorized {
-                return self.reply_rejection_with_text(
-                    &source,
-                    error.condition(),
-                    None,
-                    error.text(),
-                );
-            }
-        }
-        if sender_host.is_none() {
-            drop(policy_snapshot);
-            let (verdict, condition) = self
-                .outbox
-                .drain_until(&self.registration, async {
-                    let (verdict, _admission) = Self::explicit_presence_policy(
-                        &self.router,
-                        &self.storage,
-                        &self.registration,
-                        &source,
-                    )
-                    .await?;
-                    let condition = if verdict != Verdict::Allow
-                        || !remote
-                        || !self.registration.liveness().is_alive()
-                    {
-                        None
-                    } else if federated {
-                        Self::subscription_admission(self.router.route_remote(routed))?
-                    } else {
-                        Some(StanzaErrorCondition::RemoteServerNotFound)
-                    };
-                    Ok::<_, CloseOutcome>((verdict, condition))
-                })
-                .await??;
-            match verdict {
-                Verdict::Allow => {}
-                Verdict::OutboundBlocked => return self.reply_outbound_blocked(&source),
-                Verdict::Drop | Verdict::Reject { .. } => return Ok(()),
-            }
-            return match condition {
-                Some(condition) => self.reply_error(&source, condition),
-                None => Ok(()),
-            };
-        }
-        let registration = &self.registration;
-        let storage = &self.storage;
-        let router = &self.router;
-        let work = self.outbox.work;
-        let delivery = self.delivery();
-        let prepare = async {
-            let (sender, target) = presence_addresses(&routed)?;
-            let mut transaction = storage.begin_write().await.map_err(|error| {
-                close_storage_failure(
-                    error,
-                    "presence_subscription_begin_write",
-                    registration.account(),
-                )
-            })?;
-            let read_policy = || async {
-                storage.begin_read().await.map_err(|error| {
-                    close_storage_failure(
-                        error,
-                        "presence_subscription_policy_begin_read",
-                        registration.account(),
-                    )
-                })
-            };
-            let mut presence_snapshot = if explicit_policy {
-                Some(read_policy().await?)
-            } else {
-                None
-            };
-            if explicit_policy && let Some(snapshot) = presence_snapshot.as_ref() {
-                let view = source.resolve()?;
-                let recipient = inbound_domain
-                    .map(|_| AccountKey::try_from(policy_target))
-                    .transpose()?;
-                let verdict = ingress::checks::check_selected(
-                    (router, storage),
-                    Some(registration.account()),
-                    recipient.as_ref(),
-                    &view,
-                    None,
-                    ingress::checks::Snapshot::Ordered(snapshot),
-                    policy::Selection::Explicit,
-                )
-                .await?;
-                match verdict {
-                    Verdict::Allow => {}
-                    Verdict::OutboundBlocked => {
-                        return Ok(SubscriptionPreparation::OutboundBlocked);
-                    }
-                    Verdict::Drop | Verdict::Reject { .. } => {
-                        return Ok(SubscriptionPreparation::Done);
-                    }
-                }
-            }
-            if !registration.liveness().is_alive() {
-                return Ok(SubscriptionPreparation::Done);
-            }
-            let sent = match sender_host {
-                Some(sender_host) => {
-                    let (sender, target) = presence_addresses(&source)?;
-                    sender_host
-                        .send(
-                            PresenceRequest {
-                                kind,
-                                sender,
-                                target,
-                                stanza: &source,
-                            },
-                            &mut transaction,
-                            &delivery,
-                        )
-                        .await
-                }
-                None => Ok(PresenceSend::Continue),
-            };
-            let effects = match sent {
-                Ok(PresenceSend::Handled(effects)) => {
-                    drop(policy_snapshot);
-                    Ok(effects)
-                }
-                Ok(PresenceSend::Continue) => {
-                    if inbound_policy && let Some(snapshot) = policy_snapshot.as_ref() {
-                        let recipient = AccountKey::try_from(policy_target)?;
-                        let checks = [policy::Check {
-                            account: &recipient,
-                            direction: Direction::Inbound,
-                            peer: policy_sender,
-                        }];
-                        if policy::evaluate_selected_in(
-                            router,
-                            snapshot,
-                            routed.resolve()?.stanza_type(),
-                            &checks,
-                            policy::Selection::Standard,
-                        )
-                        .await?
-                            != Verdict::Allow
-                        {
-                            return Ok(SubscriptionPreparation::Done);
-                        }
-                    }
-                    drop(policy_snapshot);
-                    if !registration.liveness().is_alive() {
-                        return Ok(SubscriptionPreparation::Done);
-                    }
-                    if component {
-                        drop(transaction);
-                        router
-                            .route_to_component_or_bounce(routed.clone())
-                            .await
-                            .map_err(|_| CloseOutcome::InternalError)?;
-                        return Ok(SubscriptionPreparation::Done);
-                    }
-                    if remote {
-                        if federated {
-                            return Ok(Self::subscription_admission(
-                                router.route_remote(routed.clone()),
-                            )?
-                            .map_or(SubscriptionPreparation::Done, |condition| {
-                                SubscriptionPreparation::Rejected(condition.into())
-                            }));
-                        }
-                        return Ok(SubscriptionPreparation::Rejected(
-                            StanzaErrorCondition::RemoteServerNotFound.into(),
-                        ));
-                    }
-                    let (_, original_target) = presence_addresses(&source)?;
-                    if kind != PresenceRequestType::Subscribe
-                        && router.is_local_host(original_target.domainpart())
-                        && original_target.resourcepart().is_some()
-                        && subscription_target(router, &transaction, original_target)
-                            .await?
-                            .is_none()
-                    {
-                        return Ok(SubscriptionPreparation::Done);
-                    }
-                    match router
-                        .presence_handlers(target.domainpart())
-                        .and_then(|handlers| handlers.find(kind))
-                    {
-                        Some(target_host) => {
-                            target_host
-                                .receive(
-                                    PresenceRequest {
-                                        kind,
-                                        sender,
-                                        target,
-                                        stanza: &routed,
-                                    },
-                                    &mut transaction,
-                                    &delivery,
-                                )
-                                .await
-                        }
-                        None => Err(HandlerError::Stanza(
-                            StanzaErrorCondition::ServiceUnavailable,
-                        )),
-                    }
-                }
-                Err(error) => {
-                    drop(policy_snapshot);
-                    Err(error)
-                }
-            };
-            if !registration.liveness().is_alive() {
-                return Ok(SubscriptionPreparation::Done);
-            }
-            Ok::<_, CloseOutcome>(match effects {
-                Ok(effects) => {
-                    if presence_snapshot.is_none()
-                        && router.presence_effects_need_snapshot(&effects.accounts)
-                    {
-                        presence_snapshot = Some(read_policy().await?);
-                        if !registration.liveness().is_alive() {
-                            return Ok(SubscriptionPreparation::Done);
-                        }
-                    }
-                    SubscriptionPreparation::Commit(commit_and_deliver(
-                        work.start(),
-                        Arc::clone(router.order()),
-                        transaction,
-                        effects,
-                        delivery.with_presence_snapshot(presence_snapshot.map(Arc::new)),
-                        Some(registration.mailbox()),
-                        EffectsDiagnostics {
-                            identity: crate::delivery::EffectsIdentity::Account(
-                                registration.account().clone(),
-                            ),
-                            commit_operation: "presence_subscription_commit",
-                            delivery_operation: "presence_subscription_effects",
-                        },
-                    ))
-                }
-                Err(error) => {
-                    drop(transaction);
-                    report_handler_failure(&error, registration.account());
-                    SubscriptionPreparation::Rejected(error)
-                }
-            })
-        };
-        match self.outbox.drain_until(registration, prepare).await?? {
-            SubscriptionPreparation::Done => Ok(()),
-            SubscriptionPreparation::OutboundBlocked => self.reply_outbound_blocked(&source),
-            SubscriptionPreparation::Commit(mut committed) => {
-                self.outbox
-                    .drain_until(registration, committed.turned())
-                    .await?;
-                let queued = committed
-                    .finished()
-                    .await
-                    .ok_or(CloseOutcome::InternalError)?
-                    .map_err(|_| CloseOutcome::InternalError)?;
-                self.outbox.delivered(queued);
-                Ok(())
-            }
-            SubscriptionPreparation::Rejected(error) => {
-                self.reply_rejection_with_text(&source, error.condition(), None, error.text())
-            }
-        }
-    }
-
-    fn subscription_admission(
-        result: Result<(), RouterError>,
-    ) -> Result<Option<StanzaErrorCondition>, CloseOutcome> {
-        Ok(match result {
-            Ok(()) => None,
-            Err(RouterError::Busy) => Some(StanzaErrorCondition::ResourceConstraint),
-            Err(RouterError::RemoteNotFound | RouterError::RemoteUnsupported) => {
-                Some(StanzaErrorCondition::RemoteServerNotFound)
-            }
-            Err(RouterError::RemoteTimeout) => Some(StanzaErrorCondition::RemoteServerTimeout),
-            Err(RouterError::Stopped) => return Err(CloseOutcome::InternalError),
-            Err(_) => return Err(CloseOutcome::InternalError),
-        })
     }
 
     fn reply_error(
@@ -2686,6 +2254,39 @@ impl<A: ChunkAllocator + Clone> DirectedServiceWork<A> {
         let _ = self.completion.send(());
         result
     }
+}
+
+async fn explicit_presence_policy<A: ChunkAllocator + Clone>(
+    router: &RouterHandle<A>,
+    storage: &RedbStorage,
+    registration: &Registration<A>,
+    stanza: &RoutedStanza<A>,
+) -> Result<(Verdict, Option<(RedbRead, Ticket)>), CloseOutcome> {
+    let view = stanza.resolve()?;
+    let to = view.to()?.ok_or(CloseOutcome::InternalError)?;
+    let sender = Some(registration.account());
+    let parties = ingress::checks::parties_for(router, sender, to, view.kind())?;
+    let Some((snapshot, mut ticket)) =
+        ingress::checks::fix_explicit_snapshot(router, storage, sender, parties.recipient.as_ref())
+            .await?
+    else {
+        return Ok((Verdict::Allow, None));
+    };
+    let verdict = ingress::checks::check_selected(
+        (router, storage),
+        sender,
+        parties.recipient.as_ref(),
+        &view,
+        None,
+        ingress::checks::Snapshot::Ordered(&snapshot),
+        policy::Selection::Explicit,
+    )
+    .await?;
+    if verdict != Verdict::Allow {
+        return Ok((verdict, None));
+    }
+    ticket.turn().await;
+    Ok((verdict, Some((snapshot, ticket))))
 }
 
 fn presence_addresses<A: ChunkAllocator>(

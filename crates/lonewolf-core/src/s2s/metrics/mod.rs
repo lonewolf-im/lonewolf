@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::metrics::encode_counter;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -927,30 +928,29 @@ impl fmt::Debug for S2sCollector {
     }
 }
 
-fn encode_counter<L: EncodeLabelSet>(
-    encoder: &mut DescriptorEncoder<'_>,
-    name: &str,
-    help: &str,
-    samples: impl IntoIterator<Item = (L, u64)>,
-) -> Result<(), fmt::Error> {
-    let mut samples = samples
-        .into_iter()
-        .filter(|(_, value)| *value != 0)
-        .peekable();
-    if samples.peek().is_none() {
-        return Ok(());
-    }
-    let mut family = encoder.encode_descriptor(name, help, None, MetricType::Counter)?;
-    for (labels, value) in samples {
-        ConstCounter::new(value).encode(family.encode_family(&labels)?)?;
-    }
-    Ok(())
-}
-
 impl Collector for S2sCollector {
     fn encode(&self, mut encoder: DescriptorEncoder) -> Result<(), fmt::Error> {
-        let metrics = &self.0;
-        let mut bound = metrics
+        self.0.encode_listeners(&mut encoder)?;
+        self.0.encode_transport(&mut encoder)?;
+        self.0.encode_crl_file(&mut encoder)?;
+        self.0.encode_crl_fetches(&mut encoder)?;
+        self.0.encode_crl_cache(&mut encoder)?;
+        self.0.encode_stream_gauges(&mut encoder)?;
+        self.0.encode_inbound_connections(&mut encoder)?;
+        self.0.encode_authentication(&mut encoder)?;
+        self.0.encode_revocation_checks(&mut encoder)?;
+        self.0.encode_stream_outcomes(&mut encoder)?;
+        self.0.encode_stanzas(&mut encoder)?;
+        self.0.encode_bytes(&mut encoder)?;
+        self.0.encode_routing_limits(&mut encoder)?;
+        self.0.encode_delivery_outcomes(&mut encoder)?;
+        self.0.encode_outbound_links(&mut encoder)
+    }
+}
+
+impl S2sMetrics {
+    fn encode_listeners(&self, encoder: &mut DescriptorEncoder<'_>) -> Result<(), fmt::Error> {
+        let mut bound = self
             .listeners
             .iter()
             .enumerate()
@@ -976,6 +976,10 @@ impl Collector for S2sCollector {
                 ConstGauge::new(1u64).encode(family.encode_family(&labels)?)?;
             }
         }
+        Ok(())
+    }
+
+    fn encode_transport(&self, encoder: &mut DescriptorEncoder<'_>) -> Result<(), fmt::Error> {
         let mut family = encoder.encode_descriptor(
             "s2s_transport_connections",
             "Open admitted S2S TCP connections by transport.",
@@ -985,7 +989,7 @@ impl Collector for S2sCollector {
         for direction in Direction::ALL {
             for mode in TlsMode::ALL {
                 ConstGauge::new(
-                    metrics.transport_connections[direction as usize][mode as usize]
+                    self.transport_connections[direction as usize][mode as usize]
                         .load(Ordering::Relaxed),
                 )
                 .encode(family.encode_family(&[
@@ -995,7 +999,7 @@ impl Collector for S2sCollector {
             }
         }
         encode_counter(
-            &mut encoder,
+            encoder,
             "s2s_transport_attempts",
             "S2S endpoint negotiation results by transport.",
             Direction::ALL.into_iter().flat_map(|direction| {
@@ -1012,26 +1016,28 @@ impl Collector for S2sCollector {
                                     ("tls_mode", mode.as_str()),
                                     ("outcome", outcome.map_or("cancelled", AuthOutcome::as_str)),
                                 ],
-                                metrics.transport_attempts[direction as usize][mode as usize]
-                                    [index]
+                                self.transport_attempts[direction as usize][mode as usize][index]
                                     .load(Ordering::Relaxed),
                             )
                         })
                 })
             }),
-        )?;
+        )
+    }
+
+    fn encode_crl_file(&self, encoder: &mut DescriptorEncoder<'_>) -> Result<(), fmt::Error> {
         encode_counter(
-            &mut encoder,
+            encoder,
             "s2s_crl_file_load_failures",
             "S2S CRL file loads that failed.",
             CrlLoadError::ALL.map(|reason| {
                 (
                     [("reason", reason.as_str())],
-                    metrics.crl_file_load_failures[reason as usize].load(Ordering::Relaxed),
+                    self.crl_file_load_failures[reason as usize].load(Ordering::Relaxed),
                 )
             }),
         )?;
-        let next_update = metrics.crl_file_next_update.load(Ordering::Relaxed);
+        let next_update = self.crl_file_next_update.load(Ordering::Relaxed);
         if next_update != 0 {
             ConstGauge::new(next_update).encode(encoder.encode_descriptor(
                 "s2s_crl_file_next_update_seconds",
@@ -1040,42 +1046,48 @@ impl Collector for S2sCollector {
                 MetricType::Gauge,
             )?)?;
         }
+        Ok(())
+    }
+
+    fn encode_crl_fetches(&self, encoder: &mut DescriptorEncoder<'_>) -> Result<(), fmt::Error> {
         encode_counter(
-            &mut encoder,
+            encoder,
             "s2s_crl_fetches",
             "S2S CRL download attempts by result.",
             CrlFetchOutcome::ALL.map(|outcome| {
                 (
                     [("outcome", outcome.as_str())],
-                    metrics.crl_fetches[outcome as usize].load(Ordering::Relaxed),
+                    self.crl_fetches[outcome as usize].load(Ordering::Relaxed),
                 )
             }),
         )?;
-        if metrics
+        if self
             .crl_fetches
             .iter()
             .any(|count| count.load(Ordering::Relaxed) != 0)
         {
-            metrics
-                .crl_fetch_duration
-                .encode(encoder.encode_descriptor(
-                    "s2s_crl_fetch_duration",
-                    "S2S CRL download time.",
-                    Some(&Unit::Seconds),
-                    MetricType::Histogram,
-                )?)?;
+            self.crl_fetch_duration.encode(encoder.encode_descriptor(
+                "s2s_crl_fetch_duration",
+                "S2S CRL download time.",
+                Some(&Unit::Seconds),
+                MetricType::Histogram,
+            )?)?;
         }
-        if metrics.crl_cache_active.load(Ordering::Acquire) {
+        Ok(())
+    }
+
+    fn encode_crl_cache(&self, encoder: &mut DescriptorEncoder<'_>) -> Result<(), fmt::Error> {
+        if self.crl_cache_active.load(Ordering::Acquire) {
             for (name, help, counter) in [
                 (
                     "s2s_crl_cache_entries",
                     "URLs tracked by the S2S CRL cache.",
-                    &metrics.crl_cache_entries,
+                    &self.crl_cache_entries,
                 ),
                 (
                     "s2s_crl_cache_bytes",
                     "Estimated memory of CRLs held by the S2S CRL cache.",
-                    &metrics.crl_cache_bytes,
+                    &self.crl_cache_bytes,
                 ),
             ] {
                 ConstGauge::new(counter.load(Ordering::Relaxed))
@@ -1083,31 +1095,30 @@ impl Collector for S2sCollector {
             }
         }
         encode_counter(
-            &mut encoder,
+            encoder,
             "s2s_crl_cache_evictions",
             "S2S CRL cache entries removed, by reason.",
             CrlEviction::ALL.map(|reason| {
                 (
                     [("reason", reason.as_str())],
-                    metrics.crl_cache_evictions[reason as usize].load(Ordering::Relaxed),
+                    self.crl_cache_evictions[reason as usize].load(Ordering::Relaxed),
                 )
             }),
-        )?;
+        )
+    }
+
+    fn encode_stream_gauges(&self, encoder: &mut DescriptorEncoder<'_>) -> Result<(), fmt::Error> {
         for (name, help, counters) in [
             (
                 "s2s_connections",
                 "Open S2S TCP connections.",
-                &metrics.connections,
+                &self.connections,
             ),
-            (
-                "s2s_streams",
-                "Authenticated S2S streams.",
-                &metrics.streams,
-            ),
+            ("s2s_streams", "Authenticated S2S streams.", &self.streams),
             (
                 "s2s_bidi_streams",
                 "Authenticated S2S streams that carry stanzas in both directions.",
-                &metrics.bidi_streams,
+                &self.bidi_streams,
             ),
         ] {
             let mut family = encoder.encode_descriptor(name, help, None, MetricType::Gauge)?;
@@ -1116,12 +1127,18 @@ impl Collector for S2sCollector {
                     .encode(family.encode_family(&[("direction", direction.as_str())])?)?;
             }
         }
+        Ok(())
+    }
+
+    fn encode_inbound_connections(
+        &self,
+        encoder: &mut DescriptorEncoder<'_>,
+    ) -> Result<(), fmt::Error> {
         encode_counter(
-            &mut encoder,
+            encoder,
             "s2s_connections_accepted",
             "Inbound sockets admitted.",
-            metrics
-                .listeners
+            self.listeners
                 .iter()
                 .enumerate()
                 .map(|(listener, counters)| {
@@ -1132,11 +1149,10 @@ impl Collector for S2sCollector {
                 }),
         )?;
         encode_counter(
-            &mut encoder,
+            encoder,
             "s2s_connections_rejected",
             "Inbound sockets refused by admission.",
-            metrics
-                .listeners
+            self.listeners
                 .iter()
                 .enumerate()
                 .flat_map(|(listener, counters)| {
@@ -1150,9 +1166,12 @@ impl Collector for S2sCollector {
                         )
                     })
                 }),
-        )?;
+        )
+    }
+
+    fn encode_authentication(&self, encoder: &mut DescriptorEncoder<'_>) -> Result<(), fmt::Error> {
         encode_counter(
-            &mut encoder,
+            encoder,
             "s2s_authentications",
             "S2S negotiation results.",
             Direction::ALL.into_iter().flat_map(|direction| {
@@ -1162,14 +1181,14 @@ impl Collector for S2sCollector {
                             ("direction", direction.as_str()),
                             ("outcome", outcome.as_str()),
                         ],
-                        metrics.authentications[direction as usize][outcome as usize]
+                        self.authentications[direction as usize][outcome as usize]
                             .load(Ordering::Relaxed),
                     )
                 })
             }),
         )?;
         encode_counter(
-            &mut encoder,
+            encoder,
             "s2s_bidi_negotiations",
             "Authenticated S2S streams by bidirectional negotiation outcome.",
             Direction::ALL.into_iter().flat_map(|direction| {
@@ -1179,14 +1198,20 @@ impl Collector for S2sCollector {
                             ("direction", direction.as_str()),
                             ("outcome", outcome.as_str()),
                         ],
-                        metrics.bidi_negotiations[direction as usize][outcome as usize]
+                        self.bidi_negotiations[direction as usize][outcome as usize]
                             .load(Ordering::Relaxed),
                     )
                 })
             }),
-        )?;
+        )
+    }
+
+    fn encode_revocation_checks(
+        &self,
+        encoder: &mut DescriptorEncoder<'_>,
+    ) -> Result<(), fmt::Error> {
         encode_counter(
-            &mut encoder,
+            encoder,
             "s2s_revocation_checks",
             "S2S peer certificate revocation checks.",
             Direction::ALL.into_iter().flat_map(|direction| {
@@ -1201,7 +1226,7 @@ impl Collector for S2sCollector {
                                     ("status", status.as_str()),
                                     ("reason", status.reason()),
                                 ],
-                                metrics.revocation_checks[direction as usize][source as usize]
+                                self.revocation_checks[direction as usize][source as usize]
                                     [phase as usize][status.index()]
                                 .load(Ordering::Relaxed),
                             )
@@ -1209,7 +1234,13 @@ impl Collector for S2sCollector {
                     })
                 })
             }),
-        )?;
+        )
+    }
+
+    fn encode_stream_outcomes(
+        &self,
+        encoder: &mut DescriptorEncoder<'_>,
+    ) -> Result<(), fmt::Error> {
         let mut family = encoder.encode_descriptor(
             "s2s_negotiation_duration",
             "Active S2S establishment time, excluding DNS and failure cleanup.",
@@ -1217,11 +1248,11 @@ impl Collector for S2sCollector {
             MetricType::Histogram,
         )?;
         for direction in Direction::ALL {
-            metrics.negotiation_duration[direction as usize]
+            self.negotiation_duration[direction as usize]
                 .encode(family.encode_family(&[("direction", direction.as_str())])?)?;
         }
         encode_counter(
-            &mut encoder,
+            encoder,
             "s2s_streams_closed",
             "Authenticated S2S streams by close cause.",
             Direction::ALL.into_iter().flat_map(|direction| {
@@ -1231,36 +1262,39 @@ impl Collector for S2sCollector {
                             ("direction", direction.as_str()),
                             ("outcome", outcome.as_str()),
                         ],
-                        metrics.streams_closed[direction as usize][outcome as usize]
+                        self.streams_closed[direction as usize][outcome as usize]
                             .load(Ordering::Relaxed),
                     )
                 })
             }),
-        )?;
+        )
+    }
+
+    fn encode_stanzas(&self, encoder: &mut DescriptorEncoder<'_>) -> Result<(), fmt::Error> {
         for (name, help, counters) in [
             (
                 "s2s_stanzas_received",
                 "Stanzas accepted from remote servers after address validation.",
-                &metrics.stanzas_received,
+                &self.stanzas_received,
             ),
             (
                 "s2s_stanzas_sent",
                 "Stanzas written to remote servers.",
-                &metrics.stanzas_sent,
+                &self.stanzas_sent,
             ),
             (
                 "s2s_bidi_stanzas_sent",
                 "Stanzas sent on inbound bidirectional streams.",
-                &metrics.bidi_stanzas_sent,
+                &self.bidi_stanzas_sent,
             ),
             (
                 "s2s_bidi_stanzas_received",
                 "Stanzas received on outbound bidirectional links.",
-                &metrics.bidi_stanzas_received,
+                &self.bidi_stanzas_received,
             ),
         ] {
             encode_counter(
-                &mut encoder,
+                encoder,
                 name,
                 help,
                 KINDS.map(|kind| {
@@ -1271,20 +1305,24 @@ impl Collector for S2sCollector {
                 }),
             )?;
         }
+        Ok(())
+    }
+
+    fn encode_bytes(&self, encoder: &mut DescriptorEncoder<'_>) -> Result<(), fmt::Error> {
         for (name, help, counters) in [
             (
                 "s2s_received_bytes",
                 "Reported TLS socket read completions, including handshake and record overhead; cancellation or teardown may omit completions.",
-                &metrics.received_bytes,
+                &self.received_bytes,
             ),
             (
                 "s2s_sent_bytes",
                 "Reported TLS socket write completions, including handshake and record overhead; cancellation or teardown may omit completions.",
-                &metrics.sent_bytes,
+                &self.sent_bytes,
             ),
         ] {
             encode_counter(
-                &mut encoder,
+                encoder,
                 name,
                 help,
                 Direction::ALL.map(|direction| {
@@ -1295,40 +1333,44 @@ impl Collector for S2sCollector {
                 }),
             )?;
         }
+        Ok(())
+    }
+
+    fn encode_routing_limits(&self, encoder: &mut DescriptorEncoder<'_>) -> Result<(), fmt::Error> {
         encode_counter(
-            &mut encoder,
+            encoder,
             "s2s_rate_limited",
             "Inbound waits caused by traffic limits.",
             InboundLimit::ALL.map(|value| {
                 (
                     [("limit", value.as_str())],
-                    metrics.rate_limited[value as usize].load(Ordering::Relaxed),
+                    self.rate_limited[value as usize].load(Ordering::Relaxed),
                 )
             }),
         )?;
         encode_counter(
-            &mut encoder,
+            encoder,
             "s2s_dns_resolutions",
             "Outbound endpoint resolution results.",
             DnsOutcome::ALL.map(|value| {
                 (
                     [("outcome", value.as_str())],
-                    metrics.dns[value as usize].load(Ordering::Relaxed),
+                    self.dns[value as usize].load(Ordering::Relaxed),
                 )
             }),
         )?;
         encode_counter(
-            &mut encoder,
+            encoder,
             "s2s_admission_rejections",
             "Remote routing admissions refused synchronously.",
             AdmissionReason::ALL.map(|value| {
                 (
                     [("reason", value.as_str())],
-                    metrics.admission_rejected[value as usize].load(Ordering::Relaxed),
+                    self.admission_rejected[value as usize].load(Ordering::Relaxed),
                 )
             }),
         )?;
-        let rejected = metrics.peer_size_rejections.load(Ordering::Relaxed);
+        let rejected = self.peer_size_rejections.load(Ordering::Relaxed);
         if rejected != 0 {
             ConstCounter::new(rejected).encode(encoder.encode_descriptor(
                 "s2s_peer_size_rejections",
@@ -1337,40 +1379,50 @@ impl Collector for S2sCollector {
                 MetricType::Counter,
             )?)?;
         }
+        Ok(())
+    }
+
+    fn encode_delivery_outcomes(
+        &self,
+        encoder: &mut DescriptorEncoder<'_>,
+    ) -> Result<(), fmt::Error> {
         encode_counter(
-            &mut encoder,
+            encoder,
             "s2s_bounces",
             "Error replies generated for undeliverable remote stanzas.",
             BounceCondition::ALL.map(|value| {
                 (
                     [("condition", value.as_str())],
-                    metrics.bounces[value as usize].load(Ordering::Relaxed),
+                    self.bounces[value as usize].load(Ordering::Relaxed),
                 )
             }),
         )?;
         encode_counter(
-            &mut encoder,
+            encoder,
             "s2s_bidi_handoffs",
             "Outbound link queues moved to an inbound bidirectional stream or to a new dialed link.",
             BidiHandoff::ALL.map(|target| {
                 (
                     [("target", target.as_str())],
-                    metrics.bidi_handoffs[target as usize].load(Ordering::Relaxed),
+                    self.bidi_handoffs[target as usize].load(Ordering::Relaxed),
                 )
             }),
         )?;
         encode_counter(
-            &mut encoder,
+            encoder,
             "s2s_dropped_stanzas",
             "Stanzas discarded without a bounce.",
             DropReason::ALL.map(|value| {
                 (
                     [("reason", value.as_str())],
-                    metrics.dropped[value as usize].load(Ordering::Relaxed),
+                    self.dropped[value as usize].load(Ordering::Relaxed),
                 )
             }),
-        )?;
-        let source = metrics.link_source.read().as_ref().and_then(Weak::upgrade);
+        )
+    }
+
+    fn encode_outbound_links(&self, encoder: &mut DescriptorEncoder<'_>) -> Result<(), fmt::Error> {
+        let source = self.link_source.read().as_ref().and_then(Weak::upgrade);
         let snapshot = source.map_or_else(LinkSnapshot::default, |source| source.snapshot());
         let mut family = encoder.encode_descriptor(
             "s2s_outbound_links",

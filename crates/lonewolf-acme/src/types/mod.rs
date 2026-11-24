@@ -359,10 +359,10 @@ pub(crate) fn validate_url(value: &str) -> Result<(), StateError> {
     Ok(())
 }
 
-pub(crate) fn validate_dns(value: &str) -> Result<(), StateError> {
-    let ascii = idna::domain_to_ascii_strict(value).map_err(|_| StateError::InvalidData)?;
-    if ascii != value
-        || ascii.parse::<IpAddr>().is_ok()
+/// Returns the ASCII form of a DNS name eligible for a managed certificate.
+pub fn canonical_managed_dns_name(domain: &str) -> Option<String> {
+    let ascii = idna::domain_to_ascii_strict(domain).ok()?;
+    if ascii.parse::<IpAddr>().is_ok()
         || ascii.len() > 253
         || !ascii.contains('.')
         || ascii.ends_with(".localhost")
@@ -376,9 +376,17 @@ pub(crate) fn validate_dns(value: &str) -> Result<(), StateError> {
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
         })
     {
-        return Err(StateError::InvalidData);
+        return None;
     }
-    Ok(())
+    Some(ascii)
+}
+
+pub(crate) fn validate_dns(value: &str) -> Result<(), StateError> {
+    if canonical_managed_dns_name(value).as_deref() == Some(value) {
+        Ok(())
+    } else {
+        Err(StateError::InvalidData)
+    }
 }
 
 fn timestamp(value: u64) -> Result<(), StateError> {

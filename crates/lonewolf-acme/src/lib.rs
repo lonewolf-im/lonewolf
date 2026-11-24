@@ -31,5 +31,5 @@ pub use types::{
     AcmeError, AcmeErrorKind, AriWindow, AttemptFailure, AttemptSuccess, CertificateMaterial,
     CertificateValidity, FailureKind, InstallError, Installer, IoCause, ManagedHost, PendingOrder,
     PreparedInstall, RetryState, StateError, StoredAccount, StoredCertificate, StoredHost,
-    is_valid_profile_name,
+    canonical_managed_dns_name, is_valid_profile_name,
 };

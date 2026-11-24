@@ -3,7 +3,6 @@
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use nix::sys::signal::Signal;
 
@@ -593,48 +592,62 @@ fn decimal_sample(body: &str, name: &str) -> Result<f64> {
 #[test]
 fn silent_endpoints_have_separate_deadlines_and_cleanup_is_bounded_and_excluded_from_auth_elapsed()
 -> Result {
-    let fixture = Fixture::new()?;
-    let first = out::listener()?;
-    let second = out::listener()?;
-    let timeout = Duration::from_secs(3);
-    let (mut server, mut initiator) = out::start(
-        &fixture,
-        &[first.local_addr()?, second.local_addr()?],
-        &format!(
-            "[limits.s2s]\nnegotiation_timeout_secs={}\n",
-            timeout.as_secs()
-        ),
-    )?;
-    out::trigger(&mut initiator, "silent")?;
-    let started = Instant::now();
-    let mut first_peer = out::accept(&first)?;
-    out::header(&mut first_peer)?;
-    stream_error(&mut first_peer, "connection-timeout")?;
-    let first_deadline = started.elapsed();
-    assert!(first_deadline >= timeout && first_deadline < timeout + Duration::from_secs(3));
-    assert_eq!(first_peer.read(&mut [0; 1])?, 0);
-    assert!(started.elapsed() >= first_deadline + Duration::from_secs(4));
-    assert!(started.elapsed() < first_deadline + Duration::from_secs(7));
-    let mut second_peer = out::accept(&second)?;
-    out::header(&mut second_peer)?;
-    let second_started = Instant::now();
-    stream_error(&mut second_peer, "connection-timeout")?;
-    assert!(second_started.elapsed() >= timeout - Duration::from_millis(100));
-    second_peer.write_all(FOOTER.as_bytes())?;
-    assert_eq!(second_peer.read(&mut [0; 1])?, 0);
-    out::failure(&server, "timeout")?;
-    let body = metrics(&server)?;
-    let measured = decimal_sample(
-        &body,
-        "lonewolf_s2s_negotiation_duration_seconds_sum{direction=\"outbound\"}",
-    )?;
-    let attempts = 2.0 * timeout.as_secs_f64();
-    assert!(
-        (attempts..attempts + 3.0).contains(&measured),
-        "{measured}: {body}"
-    );
-    close(&mut initiator)?;
-    server.stop(Signal::SIGTERM)?;
+    use super::process::clock::{Clock, with_clock};
+
+    for controlled in [false, true] {
+        let fixture = Fixture::new()?;
+        let first = out::listener()?;
+        let second = out::listener()?;
+        let endpoints = [first.local_addr()?, second.local_addr()?];
+        let start = || {
+            out::start(
+                &fixture,
+                &endpoints,
+                "[limits.s2s]\nnegotiation_timeout_secs=3\n",
+            )
+        };
+        let (mut server, mut initiator) = if controlled {
+            with_clock(start)?
+        } else {
+            start()?
+        };
+        let clock = controlled.then(|| Clock::at(server.directory.path()));
+        out::trigger(&mut initiator, "silent")?;
+        let mut first_peer = out::accept(&first)?;
+        out::header(&mut first_peer)?;
+        if let Some(clock) = &clock {
+            clock.expire_ms(3000)?;
+        }
+        stream_error(&mut first_peer, "connection-timeout")?;
+        if let Some(clock) = &clock {
+            clock.expire_ms(5000)?;
+        }
+        assert_eq!(first_peer.read(&mut [0; 1])?, 0);
+
+        let mut second_peer = out::accept(&second)?;
+        out::header(&mut second_peer)?;
+        if let Some(clock) = &clock {
+            clock.expire_ms(3000)?;
+        }
+        stream_error(&mut second_peer, "connection-timeout")?;
+        if controlled {
+            second_peer.write_all(FOOTER.as_bytes())?;
+        }
+        assert_eq!(second_peer.read(&mut [0; 1])?, 0);
+        out::failure(&server, "timeout")?;
+        let body = metrics(&server)?;
+        let measured = decimal_sample(
+            &body,
+            "lonewolf_s2s_negotiation_duration_seconds_sum{direction=\"outbound\"}",
+        )?;
+        if controlled {
+            assert_eq!(measured, 6.0, "{body}");
+        } else {
+            assert!(measured >= 6.0, "{body}");
+        }
+        close(&mut initiator)?;
+        server.stop(Signal::SIGTERM)?;
+    }
     Ok(())
 }
 

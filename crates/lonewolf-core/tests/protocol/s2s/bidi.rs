@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::support::clock::{Clock, with_clock};
+
 use std::net::Ipv4Addr;
 
 use super::super::support::federation::{
@@ -406,7 +408,8 @@ fn reverse_stanza_from_another_domain_closes_the_link_with_invalid_from() -> Tes
 
 #[test]
 fn bidi_link_stays_open_while_the_peer_sends() -> TestResult {
-    let mut fixture = SingleServer::start_bidirectional("[limits.s2s]\nidle_timeout_secs = 2")?;
+    let mut fixture =
+        with_clock(|| SingleServer::start_bidirectional("[limits.s2s]\nidle_timeout_secs = 2"))?;
     let (listener, config) = outbound_listener(&fixture)?;
     let listener = listener.expecting_limits(524288, 2);
     fixture.suite.create_account("alice", PASSWORD)?;
@@ -415,18 +418,14 @@ fn bidi_link_stays_open_while_the_peer_sends() -> TestResult {
     let (mut peer, requested) = listener.accept_offering_bidi("b.test", "a.test", config)?;
     assert!(requested);
     peer.receive()?.assert_name("jabber:server", "message");
-    let started = std::time::Instant::now();
-    for second in 1..=4 {
-        std::thread::sleep(
-            (started + std::time::Duration::from_secs(second))
-                .saturating_duration_since(std::time::Instant::now()),
-        );
+    let clock = Clock::at(fixture.suite.fixture_path());
+    for _ in 0..4 {
+        clock.advance_ms(1000)?;
         peer.send("<message from='bob@b.test/phone' to='alice@a.test/desk' type='chat'><body>active peer</body></message>")?;
         alice.expect_xml("<message xmlns='jabber:client' from='bob@b.test/phone' to='alice@a.test/desk' type='chat'><body>active peer</body></message>")?;
     }
-    let silent = std::time::Instant::now();
+    clock.advance_ms(2000)?;
     peer.answer_close()?;
-    assert!(silent.elapsed() <= std::time::Duration::from_secs(3));
     super::negotiation::closed(&fixture.suite, "outbound", "idle", 1)?;
     alice.close()?;
     fixture.stop()

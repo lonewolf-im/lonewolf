@@ -3,9 +3,7 @@
 use std::error::Error;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, TcpListener};
-use std::sync::mpsc;
 use std::thread;
-use std::time::Instant;
 
 use compio::runtime::Runtime;
 use rcgen::{
@@ -271,25 +269,24 @@ fn fetch_deadline_bounds_a_peer_that_never_answers_and_closed_ports_fail() -> Te
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
     let url =
         CrlUrl::parse(&format!("http://{}/", listener.local_addr()?)).map_err(|_| "invalid URL")?;
-    let (release, gate) = mpsc::channel();
-    let server = thread::spawn(move || -> io::Result<()> {
-        let (_stream, _) = listener.accept()?;
-        gate.recv_timeout(Duration::from_secs(10))
-            .map_err(io::Error::other)?;
-        Ok(())
-    });
+    listener.set_nonblocking(true)?;
     let limits = FetchLimits {
         total_timeout: Duration::from_millis(300),
         ..FetchLimits::DEFAULT
     };
-    let started = Instant::now();
-    let result = Runtime::new()?
-        .block_on(fetcher(AddressPolicy::Any, limits)?.fetch(&url, SystemTime::now()));
-    let elapsed = started.elapsed();
-    release.send(())?;
-    server.join().map_err(|_| "HTTP server panicked")??;
-    assert!(matches!(result, Err(FetchFailure::Timeout)));
-    assert!(elapsed < Duration::from_secs(5));
+    Runtime::new()?.block_on(async move {
+        let fetcher = fetcher(AddressPolicy::Any, limits)?;
+        let result = compio::time::timeout(
+            Duration::from_secs(5),
+            fetcher.fetch(&url, SystemTime::now()),
+        )
+        .await?;
+        assert!(matches!(result, Err(FetchFailure::Timeout)));
+        listener.accept()?;
+        Ok::<_, Box<dyn Error>>(())
+    })?;
+    let refused = crate::s2s::test_endpoint::RefusedEndpoint::reserve()?;
+    let url = CrlUrl::parse(&format!("http://{}/", refused.address)).map_err(|_| "invalid URL")?;
     assert!(matches!(
         Runtime::new()?.block_on(
             fetcher(AddressPolicy::Any, FetchLimits::DEFAULT)?.fetch(&url, SystemTime::now())

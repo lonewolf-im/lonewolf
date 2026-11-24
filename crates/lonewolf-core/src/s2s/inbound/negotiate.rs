@@ -16,7 +16,7 @@ use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::parser::{Parsed, StreamEvent};
 use lonewolf_xmpp::stanza::Element;
 use lonewolf_xmpp::stream::StreamErrorCondition;
-use rustls::pki_types::{CertificateDer, UnixTime};
+use rustls::pki_types::CertificateDer;
 use tokio::io::BufReader;
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt as _};
 
@@ -134,7 +134,8 @@ impl Drop for Accounting {
         self.metrics.authentication(
             Direction::Inbound,
             self.outcome,
-            self.elapsed.unwrap_or_else(|| self.started.elapsed()),
+            self.elapsed
+                .unwrap_or_else(|| crate::clock::now().saturating_duration_since(self.started)),
         );
     }
 }
@@ -169,7 +170,7 @@ pub(super) async fn negotiate<A: ChunkAllocator + Clone>(
 ) -> Result<Authenticated<A>, S2sError> {
     let mut accounting = Accounting {
         metrics: Arc::clone(&settings.metrics),
-        started: Instant::now(),
+        started: crate::clock::now(),
         outcome: AuthOutcome::Protocol,
         elapsed: None,
     };
@@ -189,6 +190,7 @@ pub(super) async fn negotiate<A: ChunkAllocator + Clone>(
         crate::config::TlsMode::Direct => Box::default(),
         crate::config::TlsMode::StartTls => settings.hosts.default_host_name().into(),
     };
+    // Mark the header and footer sent before writing them, because a cancelled write still delivers its buffered bytes.
     let mut header_sent = false;
     let mut peer_footer = false;
     let mut footer_sent = false;
@@ -207,7 +209,7 @@ pub(super) async fn negotiate<A: ChunkAllocator + Clone>(
         ));
         match select(
             pin!(shutdown),
-            pin!(compio::time::timeout_at(deadline, flow)),
+            pin!(crate::clock::timeout_at(deadline, flow)),
         )
         .await
         {
@@ -226,7 +228,7 @@ pub(super) async fn negotiate<A: ChunkAllocator + Clone>(
             )),
         }
     };
-    accounting.elapsed = Some(accounting.started.elapsed());
+    accounting.elapsed = Some(crate::clock::now().saturating_duration_since(accounting.started));
     match &result {
         Ok(_) => attempt.complete(AuthOutcome::Success),
         Err(_) if cancelled => attempt.cancel(),
@@ -272,8 +274,8 @@ pub(super) async fn negotiate<A: ChunkAllocator + Clone>(
             accounting.outcome = failure.outcome;
             if let Some(connection) = &mut connection {
                 let deadline = close_deadline
-                    .unwrap_or_else(|| Instant::now() + CLOSE_GRACE + Duration::from_secs(1));
-                let _ = compio::time::timeout_at(deadline, async {
+                    .unwrap_or_else(|| crate::clock::now() + CLOSE_GRACE + Duration::from_secs(1));
+                let _ = crate::clock::timeout_at(deadline, async {
                     if !header_sent {
                         connection
                             .send_header(&stream::response_header_xml(&response_from, None)?)
@@ -287,8 +289,8 @@ pub(super) async fn negotiate<A: ChunkAllocator + Clone>(
                         connection.close(condition).await?;
                     }
                     if !peer_footer {
-                        let _ = compio::time::timeout_at(
-                            deadline.min(Instant::now() + CLOSE_GRACE),
+                        let _ = crate::clock::timeout_at(
+                            deadline.min(crate::clock::now() + CLOSE_GRACE),
                             async {
                                 while let Ok(Some(event)) = connection.next().await {
                                     if matches!(event, StreamEvent::StreamEnd) {
@@ -396,26 +398,21 @@ async fn run<A: ChunkAllocator + Clone>(
         let plain = connection.as_mut().ok_or(S2sError::Internal)?;
         let initial = header(expected(plain, peer_footer).await?)?;
         if !settings.services.router.federates_domain(&initial.to) {
-            plain
-                .send_header(&stream::response_header_xml(
-                    settings.hosts.default_host_name(),
-                    initial.from.as_deref(),
-                )?)
-                .await?;
+            let response = stream::response_header_xml(
+                settings.hosts.default_host_name(),
+                initial.from.as_deref(),
+            )?;
             *header_sent = true;
+            plain.send_header(&response).await?;
             return Err(reject(
                 StreamErrorCondition::HostUnknown,
                 AuthOutcome::HostUnknown,
             ));
         }
         *response_from = initial.to.clone();
-        plain
-            .send_header(&stream::response_header_xml(
-                &initial.to,
-                initial.from.as_deref(),
-            )?)
-            .await?;
+        let response = stream::response_header_xml(&initial.to, initial.from.as_deref())?;
         *header_sent = true;
+        plain.send_header(&response).await?;
         stream::limits::write_features_xml(
             &mut features_xml,
             stream::limits::FeaturePhase::StartTls,
@@ -479,12 +476,12 @@ async fn run<A: ChunkAllocator + Clone>(
                     .collect::<Arc<[_]>>(),
                 settings
                     .trust
-                    .verify_chain(chain, UnixTime::now())
+                    .verify_chain(chain, crate::clock::unix_now())
                     .map(|validity| validity.valid_until),
             )
         })
     });
-    let counted = ObservedIo::new(tls, ConnectionActivity::new(Instant::now()));
+    let counted = ObservedIo::new(tls, ConnectionActivity::new(crate::clock::now()));
     let activity = counted.observer().clone();
     let (input, output) = counted.split();
     let reader = match state {
@@ -506,6 +503,10 @@ async fn run<A: ChunkAllocator + Clone>(
     *connection = Some(Connection::Tls(reader, S2sWriter::new(output)));
     *header_sent = false;
     let tls = connection.as_mut().ok_or(S2sError::Internal)?;
+    #[cfg(feature = "test-support")]
+    crate::test_support::ManualClock::record(
+        crate::test_support::ClockEvent::ReadingProtectedHeader,
+    );
     let restarted = header(expected(tls, peer_footer).await?)?;
     if restarted.to != local {
         return Err(reject(
@@ -549,9 +550,9 @@ async fn run<A: ChunkAllocator + Clone>(
             tracing::debug!(reason = reason.as_str(), direction = "inbound", tls_mode = settings.tls_mode.as_str(), local_domain = %log_domain(&local), remote_domain = %log_domain(&remote), "s2s revocation status unknown");
         }
     }
-    tls.send_header(&stream::response_header_xml(&local, Some(&remote))?)
-        .await?;
+    let response = stream::response_header_xml(&local, Some(&remote))?;
     *header_sent = true;
+    tls.send_header(&response).await?;
     stream::limits::write_features_xml(
         &mut features_xml,
         stream::limits::FeaturePhase::Sasl { bidi: offer_bidi },
@@ -619,8 +620,8 @@ async fn run<A: ChunkAllocator + Clone>(
             Err(failure) => {
                 tls.send(&stream::sasl_failure_xml(failure)).await?;
                 if attempt == 1 {
-                    tls.close(None).await?;
                     *footer_sent = true;
+                    tls.close(None).await?;
                     return Err(Failure {
                         error: S2sError::Eof,
                         outcome: match failure {
@@ -651,9 +652,9 @@ async fn run<A: ChunkAllocator + Clone>(
             AuthOutcome::InvalidFrom,
         ));
     }
-    tls.send_header(&stream::response_header_xml(&local, Some(&remote))?)
-        .await?;
+    let response = stream::response_header_xml(&local, Some(&remote))?;
     *header_sent = true;
+    tls.send_header(&response).await?;
     stream::limits::write_features_xml(
         &mut features_xml,
         stream::limits::FeaturePhase::Authenticated,

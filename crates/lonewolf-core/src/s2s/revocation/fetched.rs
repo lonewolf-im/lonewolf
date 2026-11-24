@@ -329,7 +329,11 @@ pub(super) async fn check(
         })
         && !batch.pending.is_empty()
     {
-        let _ = compio::time::timeout(wait, join_all(batch.pending.iter().cloned())).await;
+        let _ = crate::clock::timeout_at(
+            crate::clock::now() + wait,
+            join_all(batch.pending.iter().cloned()),
+        )
+        .await;
         batch = lookups(cache, &prepared, now, phase);
     }
     finish_snapshot(trust, executor, prepared, batch, unix).await

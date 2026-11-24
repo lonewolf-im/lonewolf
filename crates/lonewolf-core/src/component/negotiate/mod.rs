@@ -413,8 +413,9 @@ async fn run<A: ChunkAllocator + Clone>(
         }
     }
     let (response, id) = stream::response_header_xml(progress.domain.as_deref())?;
-    writer.send(&response).await?;
+    // A buffered header still reaches the peer after a cancelled send, so never write a second one.
     progress.header_sent = true;
+    writer.send(&response).await?;
     if content_namespace != NAMESPACE {
         return Err(reject(
             StreamErrorCondition::InvalidNamespace,

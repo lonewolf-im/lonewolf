@@ -17,10 +17,10 @@ pub(in crate::s2s) trait IdleClock {
 pub(in crate::s2s) struct SystemIdleClock;
 impl IdleClock for SystemIdleClock {
     fn now(&self) -> Instant {
-        Instant::now()
+        crate::clock::now()
     }
     async fn sleep_until(&self, deadline: Instant) {
-        compio::time::sleep_until(deadline).await;
+        crate::clock::sleep_until(deadline).await;
     }
 }
 
@@ -64,12 +64,12 @@ impl TrafficObserver for ConnectionActivity {
 
     fn received(&self, bytes: usize) {
         if bytes > 0 {
-            self.record(Instant::now());
+            self.record(crate::clock::now());
         }
     }
     fn sent(&self, bytes: usize) {
         if bytes > 0 {
-            self.record(Instant::now());
+            self.record(crate::clock::now());
         }
     }
 }
@@ -99,7 +99,7 @@ pub(in crate::s2s) mod test_support {
     impl Clock {
         pub(in crate::s2s) fn new() -> Self {
             Self {
-                now: Cell::new(Instant::now()),
+                now: Cell::new(crate::clock::now()),
                 deadline: Cell::new(None),
                 waker: RefCell::new(None),
             }

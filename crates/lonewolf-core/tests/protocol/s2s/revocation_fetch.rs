@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::support::clock::{Clock, with_clock};
+
 use lonewolf_core::config::TlsMode;
 
 use rustls::pki_types::pem::PemObject;
@@ -436,7 +438,7 @@ fn crl_arriving_after_the_handshake_wait_closes_the_revoked_link_transport(
     mode: TlsMode,
 ) -> TestResult {
     let mut http = CrlServer::start()?;
-    let mut server = SingleServer::start("")?;
+    let mut server = with_clock(|| SingleServer::start(""))?;
     server.set_transport(mode)?;
     server.dns.a("crl.test", Ipv4Addr::LOCALHOST);
     let key = server.ca.server_with_crl_urls(
@@ -446,73 +448,73 @@ fn crl_arriving_after_the_handshake_wait_closes_the_revoked_link_transport(
         &[crl_url(&http, mode, "late.crl")],
     )?;
     let now = OffsetDateTime::now_utc();
-    http.serve(
+    let release = http.hold(
         "late.crl",
-        CrlResponse::Delayed(
-            Wait::from_secs(4),
-            Box::new(CrlResponse::Body(server.ca.crl(
-                &[(key.cert[0].clone(), None)],
-                now - Duration::minutes(1),
-                now + Duration::days(1),
-                1,
-            )?)),
-        ),
+        CrlResponse::Body(server.ca.crl(
+            &[(key.cert[0].clone(), None)],
+            now - Duration::minutes(1),
+            now + Duration::days(1),
+            1,
+        )?),
     );
     let client = peer::client_config(&server.ca, key)?;
-    let started = Instant::now();
-    let mut inbound = peer::RawS2sPeer::protected(
-        mode,
-        server.suite.s2s_addresses()?[0],
-        "b.test",
-        "a.test",
-        Arc::clone(&client),
-        Some("b.test"),
-    )?;
-    inbound.expect_external_offered()?;
-    inbound.auth_external(Some("b.test"))?;
-    inbound.expect_sasl_success()?;
-    let mut inbound = inbound.restart("b.test", "a.test")?;
-    assert!(started.elapsed() >= Wait::from_secs(1));
-    authentication(&server.suite, "inbound", "success", 1)?;
-    checked(
-        &server.suite,
-        "inbound",
-        "handshake",
-        "unknown",
-        "pending",
-        1,
-    )?;
-    assert!(
-        !server
-            .suite
-            .fixture_path()
-            .join("s2s-revalidation-interval-ms")
-            .exists()
-    );
-    let waiting = Instant::now();
-    inbound.expect_stream_error("reset")?;
-    assert!(waiting.elapsed() < Wait::from_secs(5));
-    closed(&server.suite, "inbound", "certificate_revoked", 1)?;
-    checked(&server.suite, "inbound", "recheck", "revoked", "none", 1)?;
-    let mut retry = peer::RawS2sPeer::protected(
-        mode,
-        server.suite.s2s_addresses()?[0],
-        "b.test",
-        "a.test",
-        client,
-        None,
-    )?;
-    retry.expect_stream_error("not-authorized")?;
-    server.suite.wait_for_metric("lonewolf_s2s_authentications_total{direction=\"inbound\",outcome=\"certificate_revoked\"} 1")?;
-    server.suite.wait_for_metric(
-        "lonewolf_s2s_negotiation_duration_seconds_count{direction=\"inbound\"} 2",
-    )?;
-    checked(&server.suite, "inbound", "handshake", "revoked", "none", 1)?;
-    assert_eq!(http.requests("late.crl"), 1);
-    assert_crl_host_dns(&server.dns, mode)?;
-    server.stop()?;
-    http.stop()?;
-    Ok(())
+    let clock = Clock::at(server.suite.fixture_path());
+    std::thread::scope(|scope| -> TestResult {
+        let elapsed = scope.spawn(|| clock.expire_ms(2000));
+        let mut inbound = peer::RawS2sPeer::protected(
+            mode,
+            server.suite.s2s_addresses()?[0],
+            "b.test",
+            "a.test",
+            Arc::clone(&client),
+            Some("b.test"),
+        )?;
+        inbound.expect_external_offered()?;
+        inbound.auth_external(Some("b.test"))?;
+        inbound.expect_sasl_success()?;
+        let mut inbound = inbound.restart("b.test", "a.test")?;
+        elapsed.join().map_err(|_| "clock driver panicked")??;
+        authentication(&server.suite, "inbound", "success", 1)?;
+        checked(
+            &server.suite,
+            "inbound",
+            "handshake",
+            "unknown",
+            "pending",
+            1,
+        )?;
+        assert!(
+            !server
+                .suite
+                .fixture_path()
+                .join("s2s-revalidation-interval-ms")
+                .exists()
+        );
+        release.send(())?;
+        inbound.expect_stream_error("reset")?;
+
+        closed(&server.suite, "inbound", "certificate_revoked", 1)?;
+        checked(&server.suite, "inbound", "recheck", "revoked", "none", 1)?;
+        let mut retry = peer::RawS2sPeer::protected(
+            mode,
+            server.suite.s2s_addresses()?[0],
+            "b.test",
+            "a.test",
+            client,
+            None,
+        )?;
+        retry.expect_stream_error("not-authorized")?;
+        server.suite.wait_for_metric("lonewolf_s2s_authentications_total{direction=\"inbound\",outcome=\"certificate_revoked\"} 1")?;
+        server.suite.wait_for_metric(
+            "lonewolf_s2s_negotiation_duration_seconds_count{direction=\"inbound\"} 2",
+        )?;
+        checked(&server.suite, "inbound", "handshake", "revoked", "none", 1)?;
+        assert_eq!(http.requests("late.crl"), 1);
+        assert_crl_host_dns(&server.dns, mode)?;
+        server.stop()?;
+        http.stop()?;
+        Ok(())
+    })
 }
 
 #[test]
@@ -819,13 +821,11 @@ fn direct_tls_failing_crl_urls_back_off_and_share_one_fetch() -> TestResult {
 
 fn failing_crl_urls_back_off_and_share_one_fetch_transport(mode: TlsMode) -> TestResult {
     let mut http = CrlServer::start()?;
-    let mut server = SingleServer::start("")?;
+    let mut server = with_clock(|| SingleServer::start(""))?;
     server.set_transport(mode)?;
     server.dns.a("crl.test", Ipv4Addr::LOCALHOST);
-    http.serve(
-        "failure.crl",
-        CrlResponse::Delayed(Wait::from_secs(1), Box::new(CrlResponse::Status(500))),
-    );
+    let release = http.hold("failure.crl", CrlResponse::Status(500));
+    let clock = Clock::at(server.suite.fixture_path());
     let address = server.suite.s2s_addresses()?[0];
     let mut configs = Vec::new();
     for domain in ["one.test", "two.test", "three.test", "four.test"] {
@@ -862,6 +862,10 @@ fn failing_crl_urls_back_off_and_share_one_fetch_transport(mode: TlsMode) -> Tes
                 run().map_err(|error| error.to_string())
             }));
         }
+        clock
+            .wait_timers(2000, 3)
+            .map_err(|error| error.to_string())?;
+        release.send(()).map_err(|error| error.to_string())?;
         handles
             .into_iter()
             .map(|handle| {

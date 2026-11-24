@@ -13,6 +13,8 @@ pub(crate) mod metrics;
 pub(crate) mod outbound;
 pub(crate) mod revocation;
 pub(crate) mod stream;
+#[cfg(test)]
+mod test_endpoint;
 mod validity;
 
 fn log_domain(domain: &str) -> Cow<'_, str> {

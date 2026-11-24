@@ -1,42 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::support::ALTERNATE_PASSWORD;
+use crate::support::clock::{Clock, with_clock};
 
-use std::time::{Duration, Instant};
+use crate::support::ALTERNATE_PASSWORD;
 
 use super::support::{C2sSuite, OPEN, TLS_NAMESPACE, TestResult};
 
 #[test]
-fn starttls_rejects_attributes() -> TestResult {
+fn starttls_rejects_attributes_children_and_text() -> TestResult {
     let suite = C2sSuite::start()?;
-    let mut client = suite.tcp_client()?;
-    client.open()?;
-
-    client.send("<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls' extra='1'/>")?;
-    client.expect_xml("<failure xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>")?;
-    client.expect_end()
-}
-
-#[test]
-fn starttls_rejects_children() -> TestResult {
-    let suite = C2sSuite::start()?;
-    let mut client = suite.tcp_client()?;
-    client.open()?;
-
-    client.send("<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'><child/></starttls>")?;
-    client.expect_xml("<failure xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>")?;
-    client.expect_end()
-}
-
-#[test]
-fn starttls_rejects_text() -> TestResult {
-    let suite = C2sSuite::start()?;
-    let mut client = suite.tcp_client()?;
-    client.open()?;
-
-    client.send("<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'>text</starttls>")?;
-    client.expect_xml("<failure xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>")?;
-    client.expect_end()
+    for input in [
+        "<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls' extra='1'/>",
+        "<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'><child/></starttls>",
+        "<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'>text</starttls>",
+    ] {
+        let mut client = suite.tcp_client()?;
+        client.open()?;
+        client.send(input)?;
+        client.expect_xml("<failure xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>")?;
+        client.expect_end()?;
+    }
+    Ok(())
 }
 
 #[test]
@@ -177,21 +161,22 @@ fn stream_footer_closes_the_connection_after_binding() -> TestResult {
 
 #[test]
 fn idle_connection_establishment_closes_at_the_configured_deadline() -> TestResult {
-    let suite = C2sSuite::with_limits("connection_establishment_timeout_secs = 1")?;
-    let started = Instant::now();
+    let suite = with_clock(|| C2sSuite::with_limits("connection_establishment_timeout_secs = 1"))?;
+    let clock = Clock::at(suite.fixture_path());
     let mut client = suite.tcp_client()?;
 
+    clock.expire_ms(1000)?;
     client.expect_eof()?;
-    assert!((Duration::from_secs(1)..Duration::from_secs(4)).contains(&started.elapsed()));
     Ok(())
 }
 
 #[test]
 fn idle_authentication_closes_at_the_configured_deadline() -> TestResult {
-    let suite = C2sSuite::with_limits("authentication_timeout_secs = 1")?;
-    let started = Instant::now();
+    let suite = with_clock(|| C2sSuite::with_limits("authentication_timeout_secs = 1"))?;
+    let clock = Clock::at(suite.fixture_path());
     let mut client = suite.unauthenticated_client()?;
 
+    clock.expire_ms(1000)?;
     client
         .receive()?
         .child("urn:ietf:params:xml:ns:xmpp-streams", "policy-violation")?;
@@ -202,17 +187,17 @@ fn idle_authentication_closes_at_the_configured_deadline() -> TestResult {
     client.send_tls_close()?;
     client.expect_tcp_eof()?;
     suite.wait_for_closed("authentication_timeout", 1)?;
-    assert!((Duration::from_secs(1)..Duration::from_secs(7)).contains(&started.elapsed()));
     Ok(())
 }
 
 #[test]
 fn idle_resource_binding_closes_at_the_configured_deadline() -> TestResult {
-    let suite = C2sSuite::with_limits("resource_binding_timeout_secs = 3")?;
+    let suite = with_clock(|| C2sSuite::with_limits("resource_binding_timeout_secs = 3"))?;
+    let clock = Clock::at(suite.fixture_path());
     suite.create_account("alice", ALTERNATE_PASSWORD)?;
-    let started = Instant::now();
     let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
+    clock.expire_ms(3000)?;
     client
         .receive()?
         .child("urn:ietf:params:xml:ns:xmpp-streams", "policy-violation")?;
@@ -223,90 +208,94 @@ fn idle_resource_binding_closes_at_the_configured_deadline() -> TestResult {
     client.send_tls_close()?;
     client.expect_tcp_eof()?;
     suite.wait_for_closed("binding_timeout", 1)?;
-    assert!((Duration::from_secs(3)..Duration::from_secs(9)).contains(&started.elapsed()));
     Ok(())
 }
 
 #[test]
 fn idle_plaintext_after_features_closes_with_policy_violation() -> TestResult {
-    let suite = C2sSuite::with_limits("connection_establishment_timeout_secs = 3")?;
-    let started = Instant::now();
+    let suite = with_clock(|| C2sSuite::with_limits("connection_establishment_timeout_secs = 3"))?;
+    let clock = Clock::at(suite.fixture_path());
     let mut client = suite.tcp_client()?;
     client.open()?;
+    clock.expire_ms(3000)?;
     client.expect_stream_error("policy-violation")?;
-    assert!((Duration::from_secs(3)..Duration::from_secs(9)).contains(&started.elapsed()));
     Ok(())
 }
 
 #[test]
 fn completed_tls_without_a_restart_header_closes_tls_without_synthetic_xml() -> TestResult {
-    let suite = C2sSuite::with_limits("connection_establishment_timeout_secs = 3")?;
-    let started = Instant::now();
+    let suite = with_clock(|| C2sSuite::with_limits("connection_establishment_timeout_secs = 3"))?;
+    let clock = Clock::at(suite.fixture_path());
     let mut client = suite.tls_client()?;
+    let transport = client.transport();
+    while transport.conn.is_handshaking() {
+        transport.conn.complete_io(&mut transport.sock)?;
+    }
+    clock.wait_protected_headers(1)?;
+    clock.expire_ms(3000)?;
     client.expect_tls_close()?;
     client.expect_tcp_open()?;
     client.send_tls_close()?;
     client.expect_tcp_eof()?;
     suite.wait_for_closed("establishment_timeout", 1)?;
-    assert!((Duration::from_secs(3)..Duration::from_secs(9)).contains(&started.elapsed()));
     Ok(())
 }
 
 #[test]
 fn sasl_success_without_a_restart_header_closes_tls_without_synthetic_xml() -> TestResult {
-    let suite = C2sSuite::with_limits("resource_binding_timeout_secs = 1")?;
+    let suite = with_clock(|| C2sSuite::with_limits("resource_binding_timeout_secs = 1"))?;
+    let clock = Clock::at(suite.fixture_path());
     suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.unauthenticated_client()?;
     client.authenticate("alice", ALTERNATE_PASSWORD)?;
-    let started = Instant::now();
+    clock.expire_ms(1000)?;
     client.expect_tls_close()?;
     client.expect_tcp_open()?;
     client.send_tls_close()?;
     client.expect_tcp_eof()?;
     suite.wait_for_closed("binding_timeout", 1)?;
-    assert!((Duration::from_secs(1)..Duration::from_secs(7)).contains(&started.elapsed()));
     Ok(())
 }
 
 #[test]
 fn incomplete_tls_negotiation_times_out_without_appending_plaintext_xml() -> TestResult {
-    let suite = C2sSuite::with_limits("connection_establishment_timeout_secs = 3")?;
-    let started = Instant::now();
+    let suite = with_clock(|| C2sSuite::with_limits("connection_establishment_timeout_secs = 3"))?;
+    let clock = Clock::at(suite.fixture_path());
     let mut client = suite.tcp_client()?;
     client.open()?;
     client.send("<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>")?;
     client.receive()?.assert_name(TLS_NAMESPACE, "proceed");
+    clock.expire_ms(3000)?;
     client.expect_eof()?;
     suite.wait_for_closed("establishment_timeout", 1)?;
-    assert!((Duration::from_secs(3)..Duration::from_secs(6)).contains(&started.elapsed()));
     Ok(())
 }
 
 #[test]
 fn nonreading_timeout_peer_releases_connection_capacity_within_one_grace_budget() -> TestResult {
-    let mut suite = C2sSuite::with_limits(
-        "connection_establishment_timeout_secs = 3\nmax_connections_per_ip = 1",
-    )?;
-    let started = Instant::now();
+    let suite = with_clock(|| {
+        C2sSuite::with_limits(
+            "connection_establishment_timeout_secs = 3\nmax_connections_per_ip = 1",
+        )
+    })?;
+    let clock = Clock::at(suite.fixture_path());
     let mut silent = suite.tcp_client()?;
     silent.open()?;
+    clock.expire_ms(3000)?;
+    clock.wait_timers(5000, 1)?;
+    let mut rejected = suite.tcp_client()?;
+    rejected.expect_eof()?;
+    clock.wait_flushed_close_footers(1)?;
+    clock.advance_ms(5000)?;
     suite.wait_for_closed("establishment_timeout", 1)?;
-    assert!((Duration::from_secs(7)..Duration::from_secs(11)).contains(&started.elapsed()));
     let mut replacement = suite.tcp_client()?;
     replacement.open()?;
     replacement.close()?;
-    drop(silent);
-    let logs = suite.stop_with_logs()?;
-    let failures: Vec<_> = logs
-        .lines()
-        .filter(|line| line.contains("phase timeout close failed"))
-        .collect();
-    assert_eq!(failures.len(), 1, "{logs}");
-    assert!(
-        failures[0].contains("close_outcome=\"closing_timeout\""),
-        "{logs}"
-    );
-    assert!(failures[0].contains("close_stage=\"xml\""), "{logs}");
+    silent
+        .receive()?
+        .child(super::support::STREAM_ERRORS, "policy-violation")?;
+    silent.expect_footer()?;
+    silent.expect_eof()?;
     Ok(())
 }
 

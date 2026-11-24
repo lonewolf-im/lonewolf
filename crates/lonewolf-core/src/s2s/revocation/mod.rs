@@ -144,7 +144,7 @@ impl PeerRevocation {
         direction: Direction,
         phase: CheckPhase,
     ) -> Option<RevocationVerdict> {
-        self.check_at(chain, direction, phase, SystemTime::now())
+        self.check_at(chain, direction, phase, crate::clock::wall_now())
             .await
     }
 

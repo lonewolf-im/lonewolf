@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::support::clock::{Clock, with_clock};
+
 use super::*;
 use crate::support::federation::peer::RawS2sPeer;
 use lonewolf_core::config::TlsMode;
@@ -19,19 +21,22 @@ fn direct_tls_intermediate_expiry_resets_inbound_and_outbound_bidi_and_releases_
 
 fn expiry(intermediate: bool) -> TestResult {
     for inbound in [true, false] {
-        let mut fixture = SingleServer::start_bidirectional("")?;
+        let mut fixture = with_clock(|| SingleServer::start_bidirectional(""))?;
         fixture.set_transport(TlsMode::Direct)?;
         fixture.suite.create_account("alice", PASSWORD)?;
         let mut alice = fixture.suite.connect("alice", PASSWORD, "desk")?;
+        let expires = time::OffsetDateTime::now_utc() + time::Duration::days(1);
+        let clock = Clock::at(fixture.suite.fixture_path());
+        clock.set_wall_before_handshake((expires - time::Duration::seconds(6)).into())?;
         let key = if intermediate {
-            fixture.ca.intermediate_until(
-                "b.test",
-                time::OffsetDateTime::now_utc() + time::Duration::seconds(6),
-            )?
+            fixture.ca.intermediate_until("b.test", expires)?
         } else {
-            fixture
-                .ca
-                .short_lived(fixture.directory.path(), "b.test", 6)?
+            fixture.ca.server_until(
+                fixture.directory.path(),
+                "short-lived",
+                &["b.test"],
+                expires,
+            )?
         };
         let listener = RawS2sListener::bind()?.direct_tls();
         fixture.dns.direct_srv(
@@ -81,6 +86,10 @@ fn expiry(intermediate: bool) -> TestResult {
         alice.expect_xml("<message xmlns='jabber:client' from='bob@b.test/phone' to='alice@a.test/desk' type='chat' id='bidi-live'><body>Bidi is live</body></message>")?;
         alice.send("<message to='bob@b.test/phone' type='chat' id='bidi-reply'><body>Reverse link</body></message>")?;
         remote.receive()?.assert_xml("<message xmlns='jabber:server' from='alice@a.test/desk' to='bob@b.test/phone' type='chat' id='bidi-reply'><body>Reverse link</body></message>")?;
+        // Relaying one more inbound stanza lets the server finish writing the reply, so expiry finds an idle link.
+        remote.send("<message from='bob@b.test/phone' to='alice@a.test/desk' type='chat' id='bidi-idle'><body>Idle link</body></message>")?;
+        alice.expect_xml("<message xmlns='jabber:client' from='bob@b.test/phone' to='alice@a.test/desk' type='chat' id='bidi-idle'><body>Idle link</body></message>")?;
+        clock.advance_ms(6000)?;
         remote.expect_stream_error("reset")?;
         closed(&fixture.suite, direction, "certificate_expired", 1)?;
         transport_connections(&fixture.suite, direction, 0, 0)?;

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use rustls::pki_types::UnixTime;
 use std::error::Error;
 
 use lonewolf_util::arena::{ArenaConfig, GlobalChunkAllocator};

@@ -274,6 +274,14 @@ impl<A: ChunkAllocator + Clone, R: AsyncBufRead + Unpin + 'static> Reader<A, R> 
         self.inner.is_failed()
     }
 
+    #[cfg(test)]
+    pub(super) async fn take_remaining_stanza_tokens(&mut self) -> Result<usize, ParseError> {
+        self.inner
+            .take_parts()
+            .await
+            .map(|(_, limiter, _)| limiter.available())
+    }
+
     pub(super) fn closing(&mut self) {
         self.closing.set(ReadMode::Closing);
     }

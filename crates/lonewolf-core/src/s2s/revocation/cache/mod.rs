@@ -302,7 +302,7 @@ impl CrlCache {
         now: SystemTime,
         phase: CheckPhase,
     ) -> Lookup {
-        self.lookup_with_clock(url, now, phase, Instant::now)
+        self.lookup_with_clock(url, now, phase, crate::clock::now)
     }
 
     fn lookup_with_clock<N: Fn() -> Instant + 'static>(

@@ -23,10 +23,8 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 type TestReader = Reader<GlobalChunkAllocator, std::io::Cursor<Vec<u8>>>;
 const HEADER: &str =
     "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client'>";
-// A loaded runner can delay a test's first poll past a deadline of a few milliseconds.
-const FIRST_POLL_MARGIN: Duration = Duration::from_millis(500);
 
-fn reader(xml: String) -> TestResult<TestReader> {
+fn reader(xml: String, burst: NonZeroUsize) -> TestResult<TestReader> {
     Ok(Reader::new(
         XmppParser::new(
             Cursor::new(xml.into_bytes()),
@@ -36,7 +34,7 @@ fn reader(xml: String) -> TestResult<TestReader> {
             },
             GlobalChunkAllocator,
         ),
-        StanzaLimiter::new(NonZeroUsize::MIN, NonZeroUsize::MIN),
+        StanzaLimiter::new(NonZeroUsize::MIN, burst),
     ))
 }
 
@@ -51,40 +49,43 @@ fn header() -> ClientHeader {
 #[test]
 fn local_close_discards_complete_stanzas_without_spending_stanza_tokens() -> TestResult {
     Runtime::new()?.block_on(async {
-        let mut reader = reader(format!(
-            "{HEADER}<message/><message/><message/></stream:stream>"
-        ))?;
-        reader
-            .next_event()
-            .await
-            .map_err(|outcome| format!("{outcome:?}"))?;
-        let mut writer = Writer::new(
-            Vec::new(),
-            "localhost".into(),
-            crate::c2s::metrics::C2sWorkerMetrics::detached(),
-        );
-        writer
-            .send_header(&header())
-            .await
-            .map_err(|outcome| format!("{outcome:?}"))?;
-        compio::time::timeout(
-            Duration::from_secs(5),
-            xml(
+        let _clock = FrozenClock::start();
+        for burst in [const { NonZeroUsize::new(3).unwrap() }, NonZeroUsize::MIN] {
+            let mut reader = reader(
+                format!("{HEADER}<message/><message/><message/></stream:stream>"),
+                burst,
+            )?;
+            reader
+                .next_event()
+                .await
+                .map_err(|outcome| format!("{outcome:?}"))?;
+            let mut writer = Writer::new(
+                Vec::new(),
+                "localhost".into(),
+                crate::c2s::metrics::C2sWorkerMetrics::detached(),
+            );
+            writer
+                .send_header(&header())
+                .await
+                .map_err(|outcome| format!("{outcome:?}"))?;
+            let close = xml(
                 &mut reader,
                 &mut writer,
                 CloseReason::Local(CloseOutcome::InternalError),
-            ),
-        )
-        .await?
-        .map_err(|outcome| format!("{outcome:?}"))?;
-        let output = String::from_utf8(
-            writer
-                .take_output()
-                .map_err(|outcome| format!("{outcome:?}"))?,
-        )?;
-        assert_eq!(output.matches("</stream:stream>").count(), 1);
-        assert_eq!(output.matches("<stream:error>").count(), 1);
-        assert!(!output.contains("<message"));
+            );
+            compio::time::timeout(Duration::from_secs(5), close)
+                .await?
+                .map_err(|outcome| format!("{outcome:?}"))?;
+            assert_eq!(reader.take_remaining_stanza_tokens().await?, burst.get());
+            let output = String::from_utf8(
+                writer
+                    .take_output()
+                    .map_err(|outcome| format!("{outcome:?}"))?,
+            )?;
+            assert_eq!(output.matches("</stream:stream>").count(), 1);
+            assert_eq!(output.matches("<stream:error>").count(), 1);
+            assert!(!output.contains("<message"));
+        }
         Ok(())
     })
 }
@@ -359,12 +360,17 @@ fn blocked_phase_writes_cancel_before_timeout_close_discards_application_bufferi
             allowance.set(64);
             let clock = FrozenClock::start();
             let deadline = clock.now() + Duration::from_millis(20);
-            assert_eq!(
-                crate::c2s::stream::run_phase(Some(deadline), outcome, pin!(writer.send(&stanza)))
-                    .await,
-                Err(outcome)
-            );
-            clock.advance(Duration::from_millis(20));
+            {
+                let operation = pin!(writer.send(&stanza));
+                let mut phase = pin!(crate::c2s::stream::run_phase(
+                    Some(deadline),
+                    outcome,
+                    operation
+                ));
+                assert!(poll!(phase.as_mut()).is_pending());
+                clock.advance(Duration::from_millis(20));
+                assert_eq!(phase.await, Err(outcome));
+            }
             assert!(!writer.is_intact());
             let accepted = bytes.borrow().len();
             allowance.set(usize::MAX);
@@ -413,16 +419,18 @@ fn timeout_during_starttls_proceed_flush_never_appends_plaintext_after_proceed()
         allowance.set(1);
         let clock = FrozenClock::start();
         let deadline = clock.now() + Duration::from_millis(20);
-        assert_eq!(
-            crate::c2s::stream::run_phase(
+        {
+            let operation =
+                pin!(writer.send_protocol_switch(crate::c2s::stream::establish::STARTTLS_PROCEED));
+            let mut phase = pin!(crate::c2s::stream::run_phase(
                 Some(deadline),
                 CloseOutcome::EstablishmentTimeout,
-                pin!(writer.send_protocol_switch(crate::c2s::stream::establish::STARTTLS_PROCEED))
-            )
-            .await,
-            Err(CloseOutcome::EstablishmentTimeout)
-        );
-        clock.advance(Duration::from_millis(20));
+                operation
+            ));
+            assert!(poll!(phase.as_mut()).is_pending());
+            clock.advance(Duration::from_millis(20));
+            assert_eq!(phase.await, Err(CloseOutcome::EstablishmentTimeout));
+        }
         assert_eq!(bytes.borrow().len(), header_bytes + 1);
         let accepted = bytes.borrow().len();
         allowance.set(usize::MAX);
@@ -889,14 +897,27 @@ fn failed_plaintext_parser_drains_raw_input_with_original_deadline_and_outcome()
                 .send_header(&header())
                 .await
                 .map_err(|error| format!("{error:?}"))?;
-            let deadline = Instant::now() + FIRST_POLL_MARGIN;
+            let clock = FrozenClock::start();
+            let remaining = Duration::from_secs(1);
+            let deadline = clock.now() + remaining;
             context.phase_deadline = Some(if outcome.is_phase_timeout() {
                 deadline - CLOSE_TIMEOUT
             } else {
                 deadline
             });
             assert_eq!(context.deadline_for(outcome), deadline);
-            let result = finish_plain(&mut input, &mut writer, outcome.into(), &context).await;
+            let mut drain = Box::pin(finish_plain(
+                &mut input,
+                &mut writer,
+                outcome.into(),
+                &context,
+            ));
+            if matches!(tail, Tail::Ready) {
+                assert!(poll!(drain.as_mut()).is_pending());
+                assert_eq!(reads.get(), 1);
+                clock.advance(remaining);
+            }
+            let result = drain.await;
             let expected = match tail {
                 Tail::Error if !outcome.is_phase_timeout() => CloseOutcome::TransportError,
                 _ => outcome,
@@ -905,8 +926,8 @@ fn failed_plaintext_parser_drains_raw_input_with_original_deadline_and_outcome()
             assert_eq!(parser_polls.get(), polls);
             assert!(reads.get() > 0);
             if matches!(tail, Tail::Ready) {
-                assert!(Instant::now() >= deadline);
-                assert!(Instant::now() < deadline + Duration::from_secs(1));
+                assert_eq!(clock.now(), deadline);
+                assert_eq!(reads.get(), 1);
             }
             listener.close().await?;
         }
@@ -951,16 +972,23 @@ fn peer_footer_plaintext_drain_preserves_outcome_and_deadline() -> TestResult {
                 std::future::pending::<Instant>().boxed_local().shared(),
             )
             .await?;
-            let deadline = Instant::now() + FIRST_POLL_MARGIN;
+            let clock = FrozenClock::start();
+            let remaining = Duration::from_secs(1);
+            let deadline = clock.now() + remaining;
             context.phase_deadline = Some(deadline);
             assert_eq!(context.deadline_for(CloseOutcome::StreamEnd), deadline);
-            let result = finish_plain(
+            let mut drain = Box::pin(finish_plain(
                 &mut input,
                 &mut writer,
                 CloseOutcome::StreamEnd.into(),
                 &context,
-            )
-            .await;
+            ));
+            if matches!(tail, Tail::Ready) {
+                assert!(poll!(drain.as_mut()).is_pending());
+                assert_eq!(reads.get(), 1);
+                clock.advance(remaining);
+            }
+            let result = drain.await;
             let expected = match tail {
                 Tail::Eof => CloseOutcome::StreamEnd,
                 Tail::Error => CloseOutcome::TransportError,
@@ -975,8 +1003,8 @@ fn peer_footer_plaintext_drain_preserves_outcome_and_deadline() -> TestResult {
             assert_eq!(output.matches("</stream:stream>").count(), 1);
             assert!(!output.contains("<stream:error"));
             if matches!(tail, Tail::Ready) {
-                assert!(Instant::now() >= deadline);
-                assert!(Instant::now() < deadline + Duration::from_secs(1));
+                assert_eq!(clock.now(), deadline);
+                assert_eq!(reads.get(), 1);
             }
             listener.close().await?;
         }

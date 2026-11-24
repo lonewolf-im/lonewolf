@@ -25,6 +25,23 @@ use process::{Server, TIMEOUT};
 use support::*;
 
 #[test]
+#[ignore = "subprocess entry point for deadline tests"]
+fn clocked_server() -> Result {
+    if std::path::Path::new("manual-clock").try_exists()? {
+        process::clock::serve()?;
+        lonewolf_core::run(
+            None,
+            lonewolf_core::BuildInfo {
+                version: "test",
+                branch: "test",
+                commit: "test",
+            },
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
 fn inbound_external_success_orders_elements_and_rotates_stream_ids() -> Result {
     let fixture = Fixture::new()?;
     let (mut server, address) = fixture.server("")?;

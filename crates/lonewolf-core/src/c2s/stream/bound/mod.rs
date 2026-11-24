@@ -8,11 +8,11 @@ use std::num::NonZeroUsize;
 use std::pin::pin;
 use std::rc::Rc;
 use std::sync::Arc;
+#[cfg(test)]
 use std::time::Instant;
 
 use futures_channel::oneshot;
-use futures_util::FutureExt;
-use futures_util::future::{Either, Shared, join, select};
+use futures_util::future::{Either, join, select};
 #[cfg(test)]
 use lonewolf_extension::Effects;
 use lonewolf_extension::delivery::HandlerError;
@@ -32,9 +32,10 @@ use lonewolf_extension::observer::{
     MessageEvent, MessageOutcome, MessageRole, SessionChange, SessionEvent,
 };
 use lonewolf_extension::policy::{Direction, Verdict};
+#[cfg(test)]
+use lonewolf_extension::presence::{PresenceAudience, PresenceUpdate};
 use lonewolf_extension::presence::{
-    PresenceAudience, PresenceHandler, PresenceRequest, PresenceRequestType, PresenceSend,
-    PresenceTransition, PresenceUpdate,
+    PresenceHandler, PresenceRequest, PresenceRequestType, PresenceSend,
 };
 use lonewolf_storage::account::{AccountError, AccountKey, AccountReads};
 use lonewolf_storage::offline::OfflineSequence;
@@ -44,10 +45,12 @@ use lonewolf_util::arena::{Arena, ArenaConfig, ArenaRead, ChunkAllocator, Handle
 use lonewolf_xmpp::jid::{Jid, JidError, JidRef};
 use lonewolf_xmpp::parser::{ParseError, Parsed, ParserConfig, StreamEvent, XmppParser};
 use lonewolf_xmpp::stanza::{
-    ApplicationCondition, BuildError, CLIENT_NAMESPACE, Element, IqType, MessageType, PresenceType,
-    RejectedStanza, Stanza, StanzaErrorCondition, StanzaNamespace, StanzaRef, StanzaType,
-    XML_NAMESPACE,
+    ApplicationCondition, BuildError, Element, IqType, MessageType, PresenceType, RejectedStanza,
+    Stanza, StanzaErrorCondition, StanzaNamespace, StanzaRef, StanzaType, XML_NAMESPACE,
 };
+
+#[cfg(test)]
+use lonewolf_xmpp::stanza::CLIENT_NAMESPACE;
 
 use super::bind::Bound;
 use super::outcome::CloseOutcome;
@@ -55,12 +58,14 @@ use super::recipient_rate::RecipientLimiter;
 use super::session::{Session, Writer};
 use crate::c2s::iq;
 use crate::c2s::metrics::{C2sWorkerMetrics, ReplayKind, ReplayOutcome};
+#[cfg(test)]
+use crate::delivery::after_turn;
 use crate::delivery::{
-    EffectsDiagnostics, Pending, RouterDelivery, WorkGroup, WorkHandle, after_turn,
-    commit_and_deliver, report_failure, report_handler_failure, storage_failure,
+    EffectsDiagnostics, Pending, RouterDelivery, WorkGroup, WorkHandle, commit_and_deliver,
+    report_failure, report_handler_failure, storage_failure,
 };
 use crate::order::Ticket;
-use crate::router::local::{DirectedWithdrawal, PresenceChange, SessionLiveness};
+use crate::router::local::SessionLiveness;
 use crate::router::{
     Destination, MailboxEntry, Registration, ResourceMatch, RoutedStanza, RouterError,
     RouterHandle, ServiceRoute, SessionHandle,
@@ -79,11 +84,15 @@ use crate::stages::{Stage, archive, ingress, observe, policy};
 
 mod link;
 mod output;
+mod presence;
 mod replay;
 mod transport;
 
 use link::{Incoming, LinkWriter};
 use output::{Outgoing, OutputSequence, Release};
+use presence::ResourcePresence;
+#[cfg(test)]
+use presence::{PresenceContext, PresenceWork};
 use replay::ReplayPolicy;
 use transport::Transport;
 
@@ -96,11 +105,8 @@ struct BoundSession<'w, A: ChunkAllocator, W = Writer> {
     storage: RedbStorage,
     allocator: A,
     work: WorkHandle,
-    service_presence: Option<Arc<ServicePresenceLease>>,
-    service_pending: Option<Shared<oneshot::Receiver<()>>>,
+    presence: ResourcePresence,
     recipients: RecipientLimiter,
-    available: bool,
-    priority: Option<i8>,
     incoming: async_channel::Receiver<Incoming<A>>,
     outbox: Outbox<'w, A, W>,
 }
@@ -295,11 +301,8 @@ pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(
                 storage,
                 allocator,
                 work: work.handle(),
-                service_presence: None,
-                service_pending: None,
+                presence: ResourcePresence::default(),
                 recipients,
-                available: false,
-                priority: None,
                 incoming,
                 outbox,
             };
@@ -449,21 +452,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
     }
 
     async fn end(&mut self) -> Result<(), CloseOutcome> {
-        let work = TerminalPresenceWork {
-            session: self.registration.handle(),
-            router: self.router.clone(),
-            storage: self.storage.clone(),
-            allocator: self.allocator.clone(),
-            work: self.work.clone(),
-            service_presence: self.service_presence.take(),
-            service_pending: self.service_pending.take(),
-            account: self.registration.account().clone(),
-            fallback: self.unavailable_notice()?,
-        };
-        Pending::spawn(self.outbox.work.start(), work.run())
-            .finished()
-            .await
-            .ok_or(CloseOutcome::InternalError)??;
+        self.end_presence().await?;
         let account = self.registration.account();
         if !self.router.session_observers(account.domain()).is_empty() {
             let mut arena = Arena::try_new_in(Default::default(), self.allocator.clone())?;
@@ -491,25 +480,6 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             .await;
         }
         Ok(())
-    }
-
-    fn unavailable_notice(&self) -> Result<RoutedStanza<A>, CloseOutcome> {
-        let mut arena = Arena::try_new_in(Default::default(), self.allocator.clone())?;
-        let account = self.registration.account();
-        let from = Jid::from_trusted_parts_in(
-            Some(account.username()),
-            account.domain(),
-            Some(self.registration.resource()),
-            &mut arena,
-        )?;
-        let stanza = Stanza::builder_in(
-            StanzaType::Presence(PresenceType::Unavailable),
-            StanzaNamespace::Client,
-            &mut arena,
-        )
-        .from(Some(from))?
-        .build()?;
-        Ok(RoutedStanza::from_parts(stanza, arena))
     }
 
     fn handle_rejected(&mut self, parsed: Parsed<RejectedStanza, A>) -> Result<(), CloseOutcome> {
@@ -731,23 +701,20 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         let policy_account = policy::Selection::Explicit
             .configured(&self.router, account.domain())
             .then(|| account.clone());
-        if self.service_presence.is_none() {
-            let from = routed
-                .resolve()?
-                .from()?
-                .ok_or(CloseOutcome::InternalError)?;
-            let gate = self
-                .router
-                .service_presence_gate(from.as_str())
-                .ok_or(CloseOutcome::InternalError)?;
-            let lease = self
-                .outbox
-                .drain_until(&self.registration, gate.acquire())
-                .await?;
-            self.service_presence = Some(Arc::new(lease));
-        }
-        let (completion, completed) = oneshot::channel();
-        self.service_pending = Some(completed.shared());
+        let from = routed
+            .resolve()?
+            .from()?
+            .ok_or(CloseOutcome::InternalError)?;
+        let (lease, completion) = self
+            .presence
+            .start_service(
+                from.as_str(),
+                &self.router,
+                &self.registration,
+                &mut self.outbox,
+            )
+            .await?
+            .ok_or(CloseOutcome::InternalError)?;
         let work = DirectedServiceWork {
             session: self.registration.handle(),
             liveness,
@@ -756,11 +723,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             storage: self.storage.clone(),
             allocator: self.allocator.clone(),
             work: self.work.clone(),
-            lease: self
-                .service_presence
-                .as_ref()
-                .cloned()
-                .ok_or(CloseOutcome::InternalError)?,
+            lease,
             completion,
             stanza: routed.clone(),
             route,
@@ -1550,335 +1513,6 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         }
     }
 
-    async fn handle_availability(
-        &mut self,
-        parsed: Parsed<Stanza, A>,
-        available: bool,
-    ) -> Result<(), CloseOutcome> {
-        let priority = if available {
-            let stanza = parsed.value().resolve(parsed.arena())?;
-            match presence_priority(&stanza) {
-                Ok(priority) => Some(priority),
-                Err(condition) => {
-                    let routed = self.stamp(parsed)?;
-                    return self.reply_error(&routed, condition);
-                }
-            }
-        } else {
-            None
-        };
-        let (source, mut arena) = parsed.into_parts();
-        let (mut stamped, from, to) = self.stamp_in(source, &mut arena, true)?;
-        if self.service_presence.is_none()
-            && let Some(gate) = self
-                .router
-                .service_presence_gate(from.resolve(&arena)?.as_str())
-        {
-            let lease = self
-                .outbox
-                .drain_until(&self.registration, gate.acquire())
-                .await?;
-            self.service_presence = Some(Arc::new(lease));
-        }
-        let completion = self.service_presence.as_ref().map(|_| {
-            let (completion, completed) = oneshot::channel();
-            self.service_pending = Some(completed.shared());
-            completion
-        });
-        let unavailable = if available {
-            Some(
-                Stanza::builder_in(
-                    StanzaType::Presence(PresenceType::Unavailable),
-                    StanzaNamespace::Client,
-                    &mut arena,
-                )
-                .from(Some(from))?
-                .to(to)?
-                .build()?,
-            )
-        } else {
-            None
-        };
-        let (kind, transition) = match (available, self.available) {
-            (true, false) => (PresenceRequestType::Available, PresenceTransition::Initial),
-            (true, true) => (PresenceRequestType::Available, PresenceTransition::Update),
-            (false, _) => (
-                PresenceRequestType::Unavailable,
-                PresenceTransition::Unavailable,
-            ),
-        };
-        let candidate = priority.is_some_and(|priority| priority >= 0)
-            && self.priority.is_none_or(|priority| priority < 0);
-        let presence_handler = self
-            .router
-            .presence_handlers(self.registration.account().domain())
-            .and_then(|handlers| handlers.find_shared(kind));
-        let message_handler = self
-            .router
-            .message_handler(self.registration.account().domain())
-            .cloned();
-        let decorations = self
-            .router
-            .presence_decorations(self.registration.account().domain());
-        let decorate = available && !decorations.is_empty();
-        let backlog_reader = message_handler.as_deref().filter(|_| candidate);
-        let metrics = self.outbox.metrics.clone();
-        let registration = &self.registration;
-        let router = &self.router;
-        let storage = &self.storage;
-        let work_group = self.outbox.work;
-        let explicit = router.has_explicit_policy();
-        let needs_snapshot = presence_handler.is_some()
-            || backlog_reader.is_some()
-            || decorate
-            || (!available && explicit);
-        let prepare = async {
-            let (result, ticket, snapshot) = if needs_snapshot {
-                let owner = registration.account();
-                let (transaction, ticket) = Arc::clone(router.order())
-                    .fix(vec![owner.clone()], storage.begin_read())
-                    .await
-                    .map_err(|error| {
-                        close_storage_failure(error, "presence_snapshot_begin_read", owner)
-                    })?;
-                let sender = from.resolve(&arena)?;
-                let mut result = async {
-                    let audience = match presence_handler.as_deref() {
-                        Some(handler) => {
-                            handler
-                                .audience(PresenceUpdate { sender, transition }, &transaction)
-                                .await?
-                        }
-                        None => None,
-                    };
-                    if let Some(page) = audience
-                        .as_ref()
-                        .and_then(|audience| audience.pending.as_ref())
-                    {
-                        metrics.replay_page_read(ReplayKind::SubscriptionRequest, page.byte_len());
-                    }
-                    let backlog = match backlog_reader {
-                        Some(handler) => {
-                            handler
-                                .backlog(owner, &transaction)
-                                .await?
-                                .inspect(|backlog| {
-                                    metrics.replay_page_read(
-                                        ReplayKind::OfflineMessage,
-                                        backlog.page.byte_len(),
-                                    );
-                                })
-                        }
-                        None => None,
-                    };
-                    Ok((audience, backlog))
-                }
-                .await;
-                if let Ok((Some(audience), _)) = &mut result {
-                    let sender = from.resolve(&arena)?;
-                    policy::filter_audience(
-                        router,
-                        &transaction,
-                        &self.allocator,
-                        owner,
-                        sender,
-                        StanzaType::Presence(if available {
-                            PresenceType::Available
-                        } else {
-                            PresenceType::Unavailable
-                        }),
-                        audience,
-                    )
-                    .await
-                    .map_err(|_| CloseOutcome::InternalError)?;
-                    if let Some(page) = &audience.pending {
-                        metrics.replay_records(
-                            ReplayKind::SubscriptionRequest,
-                            ReplayOutcome::Blocked,
-                            page.read_len() - page.len(),
-                        );
-                    }
-                }
-                if decorate {
-                    let mut children = Vec::with_capacity(decorations.len());
-                    for (extension, name, namespace, handler) in decorations {
-                        match handler.decorate(owner, &transaction, &mut arena).await {
-                            Ok(Some(element)) => {
-                                let child = element.resolve(&arena)?;
-                                if child.name() == *name && child.namespace() == *namespace {
-                                    children.push((*name, *namespace, element));
-                                } else {
-                                    tracing::error!(
-                                        extension,
-                                        operation = "presence_decoration",
-                                        outcome = "misnamed",
-                                        "internal operation failed"
-                                    );
-                                }
-                            }
-                            Ok(None) => {}
-                            Err(error) => report_handler_failure(&error, owner),
-                        }
-                    }
-                    if !children.is_empty() {
-                        let mut builder = stamped.derive_in(&mut arena)?;
-                        for (name, namespace, element) in children {
-                            builder = builder.remove_children(name, namespace)?.child(element)?;
-                        }
-                        stamped = builder.build()?;
-                    }
-                }
-                (result, ticket, explicit.then_some(transaction))
-            } else {
-                let ((), ticket) = router
-                    .order()
-                    .fix(vec![registration.account().clone()], async {
-                        Ok::<_, CloseOutcome>(())
-                    })
-                    .await?;
-                (Ok((None, None)), ticket, None)
-            };
-            let (audience, backlog) = match result {
-                Ok(result) => result,
-                Err(error) => {
-                    drop(ticket);
-                    report_handler_failure(&error, registration.account());
-                    return Ok::<_, CloseOutcome>(Err((
-                        RoutedStanza::from_parts(stamped, arena),
-                        error,
-                    )));
-                }
-            };
-            let (routed, unavailable) = match unavailable {
-                Some(unavailable) => {
-                    let (routed, unavailable) =
-                        RoutedStanza::from_parts_pair(stamped, unavailable, arena);
-                    (routed, Some(unavailable))
-                }
-                None => (RoutedStanza::from_parts(stamped, arena), None),
-            };
-            let work = PresenceWork {
-                session: registration.handle(),
-                router: router.clone(),
-                storage: storage.clone(),
-                allocator: self.allocator.clone(),
-                work: self.work.clone(),
-                service_presence: self.service_presence.clone(),
-                completion,
-                account: registration.account().clone(),
-                priority,
-                available,
-                routed,
-                unavailable,
-                audience,
-                backlog,
-                snapshot,
-            };
-            Ok(Ok(after_turn(
-                work_group.start(),
-                ticket,
-                None,
-                move |_: Vec<MailboxEntry<A>>, ticket| work.run(ticket),
-            )))
-        };
-        let mut pending = match self.outbox.drain_until(registration, prepare).await?? {
-            Ok(pending) => pending,
-            Err((routed, error)) => {
-                return self.reply_rejection_with_text(
-                    &routed,
-                    error.condition(),
-                    None,
-                    error.text(),
-                );
-            }
-        };
-        #[cfg(feature = "test-support")]
-        if !available {
-            crate::test_support::stream_event(
-                &registration.full_jid(),
-                crate::test_support::StreamProbeEvent::UnavailablePresenceAdmitted,
-            );
-        }
-        self.outbox
-            .drain_until(&self.registration, pending.turned())
-            .await?;
-        let outcome = pending
-            .finished()
-            .await
-            .ok_or(CloseOutcome::InternalError)??;
-        self.available = priority.is_some();
-        self.priority = priority;
-        // The router's mailbox cut keeps earlier sibling updates ahead of this echo.
-        self.outbox.delivered(outcome.change.preceding);
-        self.outbox.routed(outcome.change.siblings);
-        let echo = (!self
-            .router
-            .session_observers(self.registration.account().domain())
-            .is_empty())
-        .then(|| outcome.echo.clone());
-        self.outbox.push(Output::Routed(outcome.echo));
-        self.outbox
-            .queue
-            .extend(outcome.replay.into_iter().map(Output::Presence));
-        if let (Some(page), Some(handler)) = (outcome.requests, presence_handler)
-            && (!page.is_empty() || !page.is_complete())
-        {
-            self.outbox.push(Output::Requests {
-                page,
-                resource: self.registration.resource().into(),
-                handler,
-                router: self.router.clone(),
-            });
-        }
-        if let Some(backlog) = outcome.backlog
-            && let Some(handler) = message_handler
-        {
-            let policy = self.router.has_explicit_policy().then(|| ReplayPolicy {
-                router: self.router.clone(),
-                resource: self.registration.resource().into(),
-            });
-            self.outbox.push(Output::Offline {
-                backlog,
-                handler,
-                policy,
-            });
-        }
-        if let Some(echo) = echo {
-            let account = self.registration.account();
-            let mut arena = Arena::try_new_in(Default::default(), self.allocator.clone())?;
-            let session = Jid::from_trusted_parts_in(
-                Some(account.username()),
-                account.domain(),
-                Some(self.registration.resource()),
-                &mut arena,
-            )?;
-            let stage = Stage {
-                router: &self.router,
-                storage: &self.storage,
-                allocator: &self.allocator,
-                work: &self.work,
-            };
-            let delivery = self.delivery();
-            self.outbox
-                .drain_until(
-                    &self.registration,
-                    observe::session(
-                        &stage,
-                        &delivery,
-                        SessionChange {
-                            session: session.resolve(&arena)?,
-                            event: SessionEvent::Presence {
-                                transition,
-                                stanza: &echo,
-                            },
-                        },
-                    ),
-                )
-                .await?;
-        }
-        Ok(())
-    }
-
     async fn handle_subscription(
         &mut self,
         parsed: Parsed<Stanza, A>,
@@ -2344,7 +1978,9 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             destination,
             Destination::Server | Destination::ServerResource | Destination::Service
         ) || to.bare().as_str() == self.registration.account().as_str()
-            || self.recipients.admit(to.bare().as_str(), Instant::now())
+            || self
+                .recipients
+                .admit(to.bare().as_str(), crate::clock::now())
         {
             return Ok(true);
         }
@@ -3052,452 +2688,6 @@ impl<A: ChunkAllocator + Clone> DirectedServiceWork<A> {
     }
 }
 
-struct TerminalPresenceWork<A: ChunkAllocator> {
-    session: SessionHandle<A>,
-    router: RouterHandle<A>,
-    storage: RedbStorage,
-    allocator: A,
-    work: WorkHandle,
-    service_presence: Option<Arc<ServicePresenceLease>>,
-    service_pending: Option<Shared<oneshot::Receiver<()>>>,
-    account: AccountKey,
-    fallback: RoutedStanza<A>,
-}
-
-impl<A: ChunkAllocator + Clone> TerminalPresenceWork<A> {
-    async fn run(self) -> Result<(), CloseOutcome> {
-        let stage = Stage {
-            router: &self.router,
-            storage: &self.storage,
-            allocator: &self.allocator,
-            work: &self.work,
-        };
-        let withdrawal = self
-            .session
-            .end_presence()
-            .await
-            .map_err(|_| CloseOutcome::InternalError)?;
-        let notice = withdrawal.unavailable.as_ref().unwrap_or(&self.fallback);
-        let mut broadcast_components = false;
-        let mut covered = Vec::new();
-        let mut ticket = None;
-        let mut snapshot = None;
-        let explicit = self.router.has_explicit_policy();
-        let needs_directed_policy = explicit && !withdrawal.directed.recipients.is_empty();
-        let broadcast = if withdrawal.unavailable.is_some() || needs_directed_policy {
-            async {
-                let handler = withdrawal.unavailable.as_ref().and_then(|_| {
-                    self.router
-                        .presence_handlers(self.account.domain())
-                        .and_then(|handlers| handlers.find(PresenceRequestType::Unavailable))
-                });
-                let (transaction, admitted) = self
-                    .router
-                    .order()
-                    .fix(vec![self.account.clone()], async {
-                        if handler.is_some() || needs_directed_policy {
-                            self.storage.begin_read().await.map(Some).map_err(|error| {
-                                close_storage_failure(
-                                    error,
-                                    "presence_terminal_begin_read",
-                                    &self.account,
-                                )
-                            })
-                        } else {
-                            Ok(None)
-                        }
-                    })
-                    .await?;
-                ticket = Some(admitted);
-                snapshot = transaction;
-                let mut audience = match (handler, snapshot.as_ref()) {
-                    (Some(handler), Some(transaction)) => {
-                        let view = notice.resolve()?;
-                        let sender = view.from()?.ok_or(CloseOutcome::InternalError)?;
-                        handler
-                            .audience(
-                                PresenceUpdate {
-                                    sender,
-                                    transition: PresenceTransition::Unavailable,
-                                },
-                                transaction,
-                            )
-                            .await
-                            .map_err(|error| {
-                                report_handler_failure(&error, &self.account);
-                                CloseOutcome::InternalError
-                            })?
-                    }
-                    _ => None,
-                };
-                if let (Some(audience), Some(transaction)) = (audience.as_mut(), snapshot.as_ref())
-                {
-                    let view = notice.resolve()?;
-                    let sender = view.from()?.ok_or(CloseOutcome::InternalError)?;
-                    policy::filter_audience(
-                        &self.router,
-                        transaction,
-                        &self.allocator,
-                        &self.account,
-                        sender,
-                        StanzaType::Presence(PresenceType::Unavailable),
-                        audience,
-                    )
-                    .await
-                    .map_err(|_| CloseOutcome::InternalError)?;
-                }
-                if let Some(ticket) = ticket.as_mut() {
-                    ticket.turn().await;
-                }
-                if let Some(audience) = audience {
-                    if !self
-                        .session
-                        .replacement_is_available()
-                        .await
-                        .map_err(|_| CloseOutcome::InternalError)?
-                    {
-                        self.router
-                            .broadcast_presence(
-                                notice,
-                                &audience.subscribers,
-                                snapshot.as_ref(),
-                                None,
-                            )
-                            .await
-                            .map_err(|_| CloseOutcome::InternalError)?;
-                        broadcast_components = true;
-                    }
-                    covered = audience.subscribers;
-                }
-                Ok(())
-            }
-            .await
-        } else {
-            Ok(())
-        };
-        if let Some(ticket) = ticket.as_mut() {
-            ticket.turn().await;
-        }
-        let local = if needs_directed_policy && snapshot.is_none() {
-            Ok(())
-        } else {
-            send_local_withdrawal(
-                &stage,
-                notice,
-                &withdrawal.directed,
-                &covered,
-                snapshot.as_ref(),
-            )
-            .await
-        };
-        let finished = self
-            .session
-            .finish_presence(withdrawal.directed.source_token)
-            .await
-            .map_err(|_| CloseOutcome::InternalError);
-        drop(ticket);
-        if let Some(pending) = self.service_pending {
-            let _ = pending.await;
-        }
-        let components = if broadcast_components {
-            self.router
-                .broadcast_component_presence(notice, &covered, None)
-                .map_err(|_| CloseOutcome::InternalError)
-        } else {
-            Ok(())
-        };
-        let services = if needs_directed_policy && snapshot.is_none() {
-            Ok(())
-        } else {
-            send_service_withdrawal(
-                &stage,
-                notice,
-                &withdrawal.directed,
-                &covered,
-                snapshot.as_ref(),
-            )
-            .await
-        };
-        drop(self.service_presence);
-        broadcast
-            .and(local)
-            .and(finished)
-            .and(components)
-            .and(services)
-    }
-}
-
-fn withdrawal_recipients<'a>(
-    withdrawal: &'a DirectedWithdrawal,
-    covered: &'a [RosterJid],
-) -> impl Iterator<Item = &'a str> + Clone {
-    withdrawal
-        .recipients
-        .iter()
-        .map(|recipient| recipient.as_str())
-        .filter(|recipient| {
-            !covered
-                .iter()
-                .any(|subscriber| subscriber.as_str() == *recipient)
-        })
-}
-
-async fn send_local_withdrawal<A: ChunkAllocator + Clone>(
-    stage: &Stage<'_, A>,
-    notice: &RoutedStanza<A>,
-    withdrawal: &DirectedWithdrawal,
-    covered: &[RosterJid],
-    snapshot: Option<&RedbRead>,
-) -> Result<(), CloseOutcome> {
-    stage
-        .router
-        .send_directed(
-            notice,
-            withdrawal_recipients(withdrawal, covered)
-                .filter(|recipient| stage.router.service(domain_of(recipient)).is_none()),
-            snapshot,
-        )
-        .await
-        .map_err(|_| CloseOutcome::InternalError)
-}
-
-async fn send_service_withdrawal<A: ChunkAllocator + Clone>(
-    stage: &Stage<'_, A>,
-    notice: &RoutedStanza<A>,
-    withdrawal: &DirectedWithdrawal,
-    covered: &[RosterJid],
-    snapshot: Option<&RedbRead>,
-) -> Result<(), CloseOutcome> {
-    for recipient in withdrawal_recipients(withdrawal, covered) {
-        if let Some(route) = stage.router.service(domain_of(recipient)) {
-            let mut arena = Arena::try_new_in(Default::default(), stage.allocator.clone())?;
-            let target = Jid::parse_in(recipient, &mut arena)?;
-            let stanza = notice
-                .resolve()?
-                .to_builder_in(&mut arena)?
-                .to(Some(target))?
-                .build()?;
-            let stanza = RoutedStanza::from_parts(stanza, arena);
-            if stage
-                .router
-                .presence_allowed(snapshot, &stanza)
-                .await
-                .map_err(|_| CloseOutcome::InternalError)?
-            {
-                service::dispatch(stage, route, stanza).await?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn domain_of(jid: &str) -> &str {
-    let bare = jid.split_once('/').map_or(jid, |(bare, _)| bare);
-    bare.split_once('@').map_or(bare, |(_, domain)| domain)
-}
-
-struct PresenceWork<A: ChunkAllocator> {
-    session: SessionHandle<A>,
-    router: RouterHandle<A>,
-    storage: RedbStorage,
-    allocator: A,
-    work: WorkHandle,
-    service_presence: Option<Arc<ServicePresenceLease>>,
-    completion: Option<oneshot::Sender<()>>,
-    account: AccountKey,
-    priority: Option<i8>,
-    available: bool,
-    routed: RoutedStanza<A>,
-    unavailable: Option<RoutedStanza<A>>,
-    audience: Option<PresenceAudience>,
-    backlog: Option<Backlog>,
-    snapshot: Option<RedbRead>,
-}
-
-struct PresenceOutcome<A: ChunkAllocator> {
-    change: PresenceChange<A>,
-    echo: RoutedStanza<A>,
-    replay: Vec<crate::router::PresenceDelivery<A>>,
-    requests: Option<PendingPage>,
-    backlog: Option<Backlog>,
-}
-
-impl<A: ChunkAllocator + Clone> PresenceWork<A> {
-    async fn run(self, ticket: Ticket) -> Result<PresenceOutcome<A>, CloseOutcome> {
-        let PresenceWork {
-            session,
-            router,
-            storage,
-            allocator,
-            work,
-            service_presence,
-            completion,
-            account,
-            priority,
-            available,
-            routed,
-            unavailable,
-            mut audience,
-            backlog,
-            snapshot,
-        } = self;
-        let mut change = session
-            .set_presence(priority, routed.clone(), unavailable)
-            .await
-            .map_err(|_| CloseOutcome::InternalError)?;
-        let backlog = if change.became_eligible {
-            backlog
-        } else {
-            None
-        };
-        let mut replay = Vec::new();
-        let mut requests = None;
-        if change.became_available
-            && let Some(audience) = audience.as_mut()
-        {
-            // The ticket keeps subscription revocation behind these deliveries.
-            let observer = routed
-                .resolve()?
-                .from()?
-                .ok_or(CloseOutcome::InternalError)?;
-            for contact in &audience.contacts {
-                let presence = router
-                    .current_presence(contact, observer, snapshot.as_ref())
-                    .await
-                    .map_err(|_| CloseOutcome::InternalError)?;
-                replay.extend(presence);
-            }
-            requests = audience.pending.take();
-            tracing::info!(
-                contact_count = audience.contacts.len(),
-                replay_count = replay.len(),
-                pending_page_count = requests.as_ref().map_or(0, PendingPage::len),
-                subscriber_count = audience.subscribers.len(),
-                owner_jid = ?account.as_str(),
-                "initial presence prepared"
-            );
-        }
-        let probes = if change.became_available {
-            audience
-                .as_mut()
-                .map(|audience| mem::take(&mut audience.probes))
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        let mut covered = Vec::new();
-        let broadcast = if let Some(audience) = audience
-            && (available || change.became_unavailable)
-            && !audience.subscribers.is_empty()
-        {
-            async {
-                router
-                    .broadcast_presence(
-                        &routed,
-                        &audience.subscribers,
-                        snapshot.as_ref(),
-                        available.then_some(session.liveness()),
-                    )
-                    .await?;
-                covered = audience.subscribers;
-                router.broadcast_component_presence(
-                    &routed,
-                    &covered,
-                    available.then_some(session.liveness()),
-                )
-            }
-            .await
-            .map_err(|_| CloseOutcome::InternalError)
-        } else {
-            Ok(())
-        };
-        let probing = if broadcast.is_ok() {
-            async {
-                let federated = router.federation_enabled();
-                for contact in probes {
-                    if !session.liveness().is_alive() {
-                        break;
-                    }
-                    if router.is_local_host(contact.domain()) {
-                        continue;
-                    }
-                    let component = router.is_component_domain(contact.domain());
-                    if !component && !federated {
-                        continue;
-                    }
-                    let mut arena = Arena::try_new_in(Default::default(), allocator.clone())?;
-                    let to = Jid::parse_in(contact.as_str(), &mut arena)?;
-                    let from = Jid::parse_in(account.as_str(), &mut arena)?;
-                    let stanza = Stanza::builder_in(
-                        StanzaType::Presence(PresenceType::Probe),
-                        StanzaNamespace::Client,
-                        &mut arena,
-                    )
-                    .from(Some(from))?
-                    .to(Some(to))?
-                    .build()?;
-                    let stanza = RoutedStanza::from_parts(stanza, arena);
-                    if component {
-                        match router.route_to_component(stanza) {
-                            Ok(()) | Err(RouterError::Offline | RouterError::Busy) => {}
-                            Err(_) => return Err(CloseOutcome::InternalError),
-                        }
-                    } else if let Err(RouterError::Stopped) = router.route_remote_or_bounce(stanza)
-                    {
-                        return Err(CloseOutcome::InternalError);
-                    }
-                }
-                Ok(())
-            }
-            .await
-        } else {
-            Ok(())
-        };
-        let stage = Stage {
-            router: &router,
-            storage: &storage,
-            allocator: &allocator,
-            work: &work,
-        };
-        let local = if !available {
-            send_local_withdrawal(
-                &stage,
-                &routed,
-                &change.directed,
-                &covered,
-                snapshot.as_ref(),
-            )
-            .await
-        } else {
-            Ok(())
-        };
-        drop(ticket);
-        let services = if !available {
-            send_service_withdrawal(
-                &stage,
-                &routed,
-                &change.directed,
-                &covered,
-                snapshot.as_ref(),
-            )
-            .await
-        } else {
-            Ok(())
-        };
-        change.directed.recipients.clear();
-        drop(service_presence);
-        drop(completion);
-        broadcast.and(probing).and(local).and(services)?;
-        Ok(PresenceOutcome {
-            change,
-            echo: routed,
-            replay,
-            requests,
-            backlog,
-        })
-    }
-}
-
 fn presence_addresses<A: ChunkAllocator>(
     stanza: &RoutedStanza<A>,
 ) -> Result<(JidRef<'_>, JidRef<'_>), CloseOutcome> {
@@ -3505,40 +2695,6 @@ fn presence_addresses<A: ChunkAllocator>(
     let sender = view.from()?.ok_or(CloseOutcome::InternalError)?;
     let target = view.to()?.ok_or(CloseOutcome::InternalError)?;
     Ok((sender, target))
-}
-
-fn presence_priority<R: ArenaRead>(stanza: &StanzaRef<'_, R>) -> Result<i8, StanzaErrorCondition> {
-    let mut priority = None;
-    for child in stanza
-        .children()
-        .map_err(|_| StanzaErrorCondition::InternalServerError)?
-    {
-        let child = child.map_err(|_| StanzaErrorCondition::InternalServerError)?;
-        if child.name() != "priority" || child.namespace() != CLIENT_NAMESPACE {
-            continue;
-        }
-        if priority.is_some()
-            || child
-                .attributes()
-                .map_err(|_| StanzaErrorCondition::InternalServerError)?
-                .next()
-                .transpose()
-                .map_err(|_| StanzaErrorCondition::InternalServerError)?
-                .is_some()
-        {
-            return Err(StanzaErrorCondition::BadRequest);
-        }
-        let text = child
-            .text()
-            .map_err(|_| StanzaErrorCondition::InternalServerError)?
-            .ok_or(StanzaErrorCondition::BadRequest)?;
-        priority = Some(
-            text.trim()
-                .parse::<i8>()
-                .map_err(|_| StanzaErrorCondition::BadRequest)?,
-        );
-    }
-    Ok(priority.unwrap_or(0))
 }
 
 async fn subscription_target<A: ChunkAllocator + Clone>(

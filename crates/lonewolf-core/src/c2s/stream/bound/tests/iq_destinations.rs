@@ -223,11 +223,8 @@ async fn setup<'a>(
         storage: fixture.storage.clone(),
         allocator: GlobalChunkAllocator,
         work: fixture.work.handle(),
-        service_presence: None,
-        service_pending: None,
+        presence: ResourcePresence::default(),
         recipients: recipients_without_refill(NonZeroUsize::new(100).ok_or("burst")?),
-        available: false,
-        priority: None,
         incoming,
         outbox,
     };

@@ -904,16 +904,16 @@ fn initial_remote_probes_follow_broadcast_fifo_and_original_policy_snapshot() ->
                     drop(transaction);
                     ticket.turn().await;
                     let outcome = PresenceWork {
-                        session: registration.handle(),
-                        router: handle.clone(),
-                        storage: fixture.storage.clone(),
-                        allocator: GlobalChunkAllocator,
-                        work: fixture.work.handle(),
+                        context: PresenceContext {
+                            session: registration.handle(),
+                            router: handle.clone(),
+                            storage: fixture.storage.clone(),
+                            allocator: GlobalChunkAllocator,
+                            work: fixture.work.handle(),
+                        },
                         service_presence: None,
                         completion: None,
-                        account: owner.clone(),
                         priority: Some(0),
-                        available: true,
                         routed,
                         unavailable: Some(routed_presence(
                             "alice@example.com/desk",
@@ -927,7 +927,7 @@ fn initial_remote_probes_follow_broadcast_fifo_and_original_policy_snapshot() ->
                     .run(ticket)
                     .await
                     .map_err(|error| format!("{error:?}"))?;
-                    assert_eq!(outcome.change.became_available, initial);
+                    assert_eq!(outcome.availability.became_available(), initial);
                     assert_eq!(outcome.replay.len(), usize::from(initial));
                     assert_eq!(
                         outcome.echo.resolve()?.from()?.ok_or("echo from")?.as_str(),
@@ -1133,22 +1133,17 @@ fn remote_directed_limits_explicit_and_terminal_withdrawals_use_real_queue() -> 
                 "dave@remote.test"
             );
             if terminal {
-                TerminalPresenceWork {
+                PresenceContext {
                     session: session.registration.handle(),
                     router: handle.clone(),
                     storage: fixture.storage.clone(),
                     allocator: GlobalChunkAllocator,
                     work: fixture.work.handle(),
-                    service_presence: None,
-                    service_pending: None,
-                    account: owner,
-                    fallback: routed_presence(
-                        "alice@example.com/desk",
-                        None,
-                        PresenceType::Unavailable,
-                    )?,
                 }
-                .run()
+                .end(
+                    ResourcePresence::default(),
+                    routed_presence("alice@example.com/desk", None, PresenceType::Unavailable)?,
+                )
                 .await
                 .map_err(|error| format!("{error:?}"))?;
             } else {
@@ -1281,16 +1276,16 @@ fn stopped_initial_broadcast_or_probe_releases_ticket_and_completion() -> TestRe
             let (completion, completed) = oneshot::channel();
             remote.remote().stop();
             let result = PresenceWork {
-                session: session.registration.handle(),
-                router: handle.clone(),
-                storage: fixture.storage.clone(),
-                allocator: GlobalChunkAllocator,
-                work: fixture.work.handle(),
+                context: PresenceContext {
+                    session: session.registration.handle(),
+                    router: handle.clone(),
+                    storage: fixture.storage.clone(),
+                    allocator: GlobalChunkAllocator,
+                    work: fixture.work.handle(),
+                },
                 service_presence: None,
                 completion: Some(completion),
-                account: session.registration.account().clone(),
                 priority: Some(0),
-                available: true,
                 routed: routed_presence("alice@example.com/desk", None, PresenceType::Available)?,
                 unavailable: Some(routed_presence(
                     "alice@example.com/desk",

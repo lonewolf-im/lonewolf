@@ -20,6 +20,7 @@ use lonewolf_xmpp::jid::{JidError, JidRef};
 use lonewolf_xmpp::stanza::{PresenceType, StanzaType};
 use parking_lot::Mutex as PlMutex;
 
+use super::AvailabilityChange;
 use super::shard::DirectedRecipient;
 use super::shards::{LocalRouterHandle, PendingCleanup};
 use crate::router::{PresenceDelivery, RoutedStanza, RouterError};
@@ -69,9 +70,7 @@ pub(super) struct Links<A: ChunkAllocator> {
 }
 
 pub(crate) struct PresenceChange<A: ChunkAllocator> {
-    pub(crate) became_available: bool,
-    pub(crate) became_eligible: bool,
-    pub(crate) became_unavailable: bool,
+    pub(crate) availability: AvailabilityChange,
     /// Write these deliveries before the update's echo to preserve mailbox order.
     pub(crate) preceding: Vec<MailboxEntry<A>>,
     /// Includes sibling presence only when this resource becomes available.

@@ -17,6 +17,7 @@ use lonewolf_xmpp::jid::JidRef;
 use lonewolf_xmpp::stanza::{IqType, MessageType, PresenceType, StanzaType};
 use parking_lot::Mutex as PlMutex;
 
+use super::AvailabilityChange;
 #[cfg(test)]
 use super::registration::SessionHandle;
 use super::registration::{
@@ -351,7 +352,7 @@ impl<A: ChunkAllocator> Shard<A> {
         unavailable: Option<RoutedStanza<A>>,
     ) -> Result<PresenceChange<A>, RouterError> {
         let had_available = self.has_available(account.as_str());
-        let (change, siblings) = {
+        let (availability, preceding, siblings) = {
             let sessions = self
                 .accounts
                 .get(account.as_str())
@@ -360,12 +361,9 @@ impl<A: ChunkAllocator> Shard<A> {
             if source.token != token || !source.alive.load(Ordering::Acquire) {
                 return Err(RouterError::NotFound);
             }
-            let became_available = priority.is_some() && source.priority.is_none();
-            let became_eligible = priority.is_some_and(|priority| priority >= 0)
-                && source.priority.is_none_or(|priority| priority < 0);
-            let became_unavailable = priority.is_none() && source.priority.is_some();
+            let availability = AvailabilityChange::between(source.priority, priority);
             let preceding = take_queued(&source.inbound);
-            let siblings = if became_available {
+            let siblings = if availability.became_available() {
                 sessions
                     .values()
                     .filter(|session| session.token != token)
@@ -375,15 +373,7 @@ impl<A: ChunkAllocator> Shard<A> {
             } else {
                 Vec::new()
             };
-            (
-                (
-                    became_available,
-                    became_eligible,
-                    became_unavailable,
-                    preceding,
-                ),
-                siblings,
-            )
+            (availability, preceding, siblings)
         };
 
         let mut failed = Vec::new();
@@ -428,11 +418,8 @@ impl<A: ChunkAllocator> Shard<A> {
         } else if had_available && !self.has_available(account.as_str()) {
             self.record_last_unavailable(account.as_str());
         }
-        let (became_available, became_eligible, became_unavailable, preceding) = change;
         Ok(PresenceChange {
-            became_available,
-            became_eligible,
-            became_unavailable,
+            availability,
             preceding,
             siblings,
             directed,

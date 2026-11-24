@@ -259,16 +259,13 @@ impl Fixture {
             storage: self.storage.clone(),
             allocator,
             work: self.work.handle(),
-            service_presence: None,
-            service_pending: None,
+            presence: ResourcePresence::default(),
             recipients: RecipientLimiter::new(
                 NonZeroUsize::MIN,
                 NonZeroUsize::new(100).ok_or("burst")?,
                 Instant::now(),
                 crate::c2s::metrics::C2sWorkerMetrics::detached(),
             ),
-            available: false,
-            priority: None,
             incoming,
         })
     }
@@ -341,8 +338,7 @@ fn remote_presence_without_roster_rejects_before_writer_admission_and_keeps_stat
                 assert!(matches!(parser.next_event().await?, Some(StreamEvent::StreamStart { .. })));
                 let Some(StreamEvent::Stanza(parsed)) = parser.next_event().await? else { return Err("expected presence stanza".into()); };
                 session.handle_stanza(parsed).await.map_err(|error| format!("{error:?}"))?;
-                assert!(!session.available);
-                assert_eq!(session.priority, None);
+                assert_eq!(session.presence.priority, None);
                 session.outbox.flush().await.map_err(|error| format!("{error:?}"))?;
                 let reply = session.outbox.writer.written.pop().ok_or("missing remote error")?;
                 assert!(reply.contains("remote-server-not-found"), "{reply}");
@@ -1473,18 +1469,17 @@ fn cancelled_terminal_owner_keeps_directed_withdrawal_and_replacement_grants() -
         blocker.turn().await;
         let pending = Pending::spawn(
             fixture.work.start(),
-            TerminalPresenceWork {
+            PresenceContext {
                 session: fixture.registration.handle(),
                 router: handle.clone(),
                 storage: fixture.storage.clone(),
                 allocator: GlobalChunkAllocator,
                 work: fixture.work.handle(),
-                service_presence: None,
-                service_pending: None,
-                account: fixture.registration.account().clone(),
-                fallback: routed_presence("bob@localhost/phone", None, PresenceType::Unavailable)?,
             }
-            .run(),
+            .end(
+                ResourcePresence::default(),
+                routed_presence("bob@localhost/phone", None, PresenceType::Unavailable)?,
+            ),
         );
         assert!(fixture.registration.recv().await.is_none());
         drop(pending);
@@ -1564,16 +1559,16 @@ fn cancelled_global_unavailable_keeps_directed_delivery_inside_ticket_owner() ->
             })
             .await?;
         let work = PresenceWork {
-            session: fixture.registration.handle(),
-            router: handle.clone(),
-            storage: fixture.storage.clone(),
-            allocator: GlobalChunkAllocator,
-            work: fixture.work.handle(),
+            context: PresenceContext {
+                session: fixture.registration.handle(),
+                router: handle.clone(),
+                storage: fixture.storage.clone(),
+                allocator: GlobalChunkAllocator,
+                work: fixture.work.handle(),
+            },
             service_presence: None,
             completion: None,
-            account: fixture.registration.account().clone(),
             priority: None,
-            available: false,
             routed: routed_presence("bob@localhost/phone", None, PresenceType::Unavailable)?,
             unavailable: None,
             audience: None,
@@ -1601,18 +1596,17 @@ fn cancelled_global_unavailable_keeps_directed_delivery_inside_ticket_owner() ->
         );
         Pending::spawn(
             fixture.work.start(),
-            TerminalPresenceWork {
+            PresenceContext {
                 session: fixture.registration.handle(),
                 router: handle,
                 storage: fixture.storage.clone(),
                 allocator: GlobalChunkAllocator,
                 work: fixture.work.handle(),
-                service_presence: None,
-                service_pending: None,
-                account: fixture.registration.account().clone(),
-                fallback: routed_presence("bob@localhost/phone", None, PresenceType::Unavailable)?,
             }
-            .run(),
+            .end(
+                ResourcePresence::default(),
+                routed_presence("bob@localhost/phone", None, PresenceType::Unavailable)?,
+            ),
         )
         .finished()
         .await
@@ -1662,16 +1656,16 @@ fn terminal_claim_prevents_pending_global_unavailable_from_withdrawing_twice() -
             })
             .await?;
         let work = PresenceWork {
-            session: fixture.registration.handle(),
-            router: handle.clone(),
-            storage: fixture.storage.clone(),
-            allocator: GlobalChunkAllocator,
-            work: fixture.work.handle(),
+            context: PresenceContext {
+                session: fixture.registration.handle(),
+                router: handle.clone(),
+                storage: fixture.storage.clone(),
+                allocator: GlobalChunkAllocator,
+                work: fixture.work.handle(),
+            },
             service_presence: None,
             completion: None,
-            account: fixture.registration.account().clone(),
             priority: None,
-            available: false,
             routed: routed_presence("bob@localhost/phone", None, PresenceType::Unavailable)?,
             unavailable: None,
             audience: None,
@@ -1686,18 +1680,17 @@ fn terminal_claim_prevents_pending_global_unavailable_from_withdrawing_twice() -
         ));
         Pending::spawn(
             fixture.work.start(),
-            TerminalPresenceWork {
+            PresenceContext {
                 session: fixture.registration.handle(),
                 router: handle,
                 storage: fixture.storage.clone(),
                 allocator: GlobalChunkAllocator,
                 work: fixture.work.handle(),
-                service_presence: None,
-                service_pending: None,
-                account: fixture.registration.account().clone(),
-                fallback: routed_presence("bob@localhost/phone", None, PresenceType::Unavailable)?,
             }
-            .run(),
+            .end(
+                ResourcePresence::default(),
+                routed_presence("bob@localhost/phone", None, PresenceType::Unavailable)?,
+            ),
         )
         .finished()
         .await

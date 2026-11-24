@@ -31,12 +31,13 @@ impl StanzaLimiter {
 
     pub(crate) async fn acquire(&mut self, mode: &Cell<ReadMode>, observer: &impl ReadObserver) {
         let mut reported = false;
-        loop {
-            if mode.get() != ReadMode::Open || self.try_acquire(crate::clock::now()) {
+        while mode.get() == ReadMode::Open {
+            let now = crate::clock::now();
+            if self.try_acquire(now) {
                 break;
             }
-            let mut wait = std::pin::pin!(compio::time::sleep(
-                self.bucket.refill_delay(self.per_second)
+            let mut wait = std::pin::pin!(crate::clock::sleep_until(
+                now + self.bucket.refill_delay(self.per_second)
             ));
             poll_fn(|cx| {
                 if mode.get() != ReadMode::Open {

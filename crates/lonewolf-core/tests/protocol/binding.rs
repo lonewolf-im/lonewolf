@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::support::clock::{Clock, with_clock};
+
 use crate::support::{ALTERNATE_PASSWORD, context};
 
 use super::support::{BIND_NAMESPACE, C2sSuite, OPEN, TestResult};
@@ -806,16 +808,19 @@ fn unsupported_malformed_and_resource_limit_failures_share_the_pre_bind_budget()
 
 #[test]
 fn ignored_pre_bind_responses_do_not_extend_the_shaped_binding_deadline() -> TestResult {
-    let suite = C2sSuite::with_limits(
-        "incoming_stanzas_per_connection = { per_second = 1, burst = 1 }\nresource_binding_timeout_secs = 1",
-    )?;
+    let suite = with_clock(|| {
+        C2sSuite::with_limits(
+            "incoming_stanzas_per_connection = { per_second = 1, burst = 1 }\nresource_binding_timeout_secs = 1",
+        )
+    })?;
+    let clock = Clock::at(suite.fixture_path());
     suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
-    let started = std::time::Instant::now();
 
     client.send("<iq type='result' id='reply'/><iq type='result'/><iq type='set' id='bind'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>desk</resource></bind></iq>")?;
+    suite.wait_for_metric("lonewolf_c2s_rate_limited_total{listener=\"0\",limit=\"incoming_stanzas_per_connection\"} 1")?;
+    clock.expire_ms(1000)?;
     client.expect_stream_error("policy-violation")?;
-    assert!(started.elapsed() < std::time::Duration::from_secs(2));
     suite.wait_for_closed("binding_timeout", 1)?;
     let mut replacement = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
     replacement.close()

@@ -70,7 +70,7 @@ impl From<CloseOutcome> for CloseReason {
 
 impl CloseContext {
     pub(super) fn deadline(&self) -> Instant {
-        let deadline = Instant::now() + CLOSE_TIMEOUT;
+        let deadline = crate::clock::now() + CLOSE_TIMEOUT;
         self.phase_deadline
             .map_or(deadline, |phase| deadline.min(phase))
     }
@@ -79,7 +79,7 @@ impl CloseContext {
         if outcome.is_phase_timeout() {
             self.phase_deadline
                 .and_then(|deadline| deadline.checked_add(CLOSE_TIMEOUT))
-                .unwrap_or_else(|| Instant::now() + CLOSE_TIMEOUT)
+                .unwrap_or_else(|| crate::clock::now() + CLOSE_TIMEOUT)
         } else {
             self.deadline()
         }
@@ -259,8 +259,8 @@ pub(super) async fn before_deadline<T>(
     deadline: Instant,
     mut future: std::pin::Pin<&mut impl Future<Output = T>>,
 ) -> Result<T, ()> {
-    compio::time::timeout(
-        deadline.saturating_duration_since(crate::clock::now()),
+    crate::clock::timeout_at(
+        deadline,
         poll_fn(|context| {
             if crate::clock::now() >= deadline {
                 Poll::Ready(Err(()))
@@ -269,8 +269,7 @@ pub(super) async fn before_deadline<T>(
             }
         }),
     )
-    .await
-    .map_err(|_| ())?
+    .await?
 }
 
 fn completed(

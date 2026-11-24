@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::support::clock::{Clock, with_clock};
+
 use crate::support::ALTERNATE_PASSWORD;
 
 use super::support::{C2sSuite, TestResult};
 use std::io::Read as _;
 use std::net::Shutdown;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[test]
 fn adjacent_attributes_return_not_well_formed_before_authentication() -> TestResult {
@@ -74,10 +76,10 @@ fn plaintext_parser_failure_half_closes_and_holds_capacity_until_peer_eof() -> T
 
 #[test]
 fn silent_plaintext_drain_peer_releases_capacity_at_the_original_deadline() -> TestResult {
-    let suite = C2sSuite::with_limits("max_connections_per_ip = 1")?;
+    let suite = with_clock(|| C2sSuite::with_limits("max_connections_per_ip = 1"))?;
+    let clock = Clock::at(suite.fixture_path());
     let mut client = suite.tcp_client()?;
     client.open()?;
-    let started = Instant::now();
     client.send("<message><body></message>")?;
     client
         .receive()?
@@ -88,8 +90,8 @@ fn silent_plaintext_drain_peer_releases_capacity_at_the_original_deadline() -> T
     let mut rejected = suite.tcp_client()?;
     rejected.expect_eof()?;
     suite.wait_for_metric("lonewolf_c2s_connections_rejected_total{listener=\"0\",reason=\"max_connections_per_ip\"} 1")?;
+    clock.expire_ms(5000)?;
     suite.wait_for_closed("not_well_formed", 1)?;
-    assert!((Duration::from_secs(5)..Duration::from_secs(7)).contains(&started.elapsed()));
     let mut replacement = suite.tcp_client()?;
     replacement.open()?;
     replacement.close()

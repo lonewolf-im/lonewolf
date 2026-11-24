@@ -15,6 +15,10 @@ use nix::unistd::Pid;
 #[path = "../../support/readiness.rs"]
 mod readiness;
 
+#[allow(dead_code)]
+#[path = "../../support/clock.rs"]
+pub(super) mod clock;
+
 use readiness::{Readiness, ReadinessSocket};
 
 pub(super) const TIMEOUT: Duration = Duration::from_secs(10);
@@ -35,7 +39,13 @@ impl Server {
             format!("[xmpp]\nstanza_pool_size_mib = 8\n{config}"),
         )?;
         let readiness = ReadinessSocket::bind()?;
-        let mut command = Command::new(env!("CARGO_BIN_EXE_lonewolf"));
+        let mut command = if clock::prepare(directory.path())? {
+            let mut child = Command::new(std::env::current_exe()?);
+            child.args(["--exact", "clocked_server", "--ignored", "--nocapture"]);
+            child
+        } else {
+            Command::new(env!("CARGO_BIN_EXE_lonewolf"))
+        };
         readiness
             .configure(&mut command)
             .current_dir(directory.path())

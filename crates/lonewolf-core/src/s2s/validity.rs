@@ -79,7 +79,7 @@ impl LinkValidity {
     }
 
     pub(super) async fn wait(&self) -> StreamClose {
-        self.wait_with(SystemTime::now).await
+        self.wait_with(crate::clock::wall_now).await
     }
 
     async fn wait_with(&self, now: impl FnOnce() -> SystemTime) -> StreamClose {
@@ -211,7 +211,7 @@ async fn pending_download(signals: &[FetchSignal]) {
 
 impl ValidityMonitor {
     pub(super) async fn run(self, log: MonitorLog<'_>, timeout: Duration) {
-        self.run_with(log, timeout, SystemTime::now, compio::time::sleep)
+        self.run_with(log, timeout, crate::clock::wall_now, crate::clock::sleep)
             .await;
     }
 

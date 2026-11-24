@@ -14,7 +14,7 @@ use super::super::TestResult;
 pub enum CrlResponse {
     Body(Vec<u8>),
     Status(u16),
-    Delayed(Duration, Box<CrlResponse>),
+    Held(PlMutex<std::sync::mpsc::Receiver<()>>, Box<CrlResponse>),
     Hang,
 }
 #[derive(Default)]
@@ -32,20 +32,9 @@ impl Stop {
         *self.stopped.lock()
     }
 
-    fn wait(&self, duration: Option<Duration>) -> bool {
-        let deadline = duration.map(|duration| Instant::now() + duration);
-        let mut stopped = self.stopped.lock();
-        while !*stopped {
-            if let Some(deadline) = deadline {
-                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                    break;
-                };
-                self.changed.wait_for(&mut stopped, remaining);
-            } else {
-                self.changed.wait(&mut stopped);
-            }
-        }
-        *stopped
+    fn wait(&self) {
+        self.changed
+            .wait_while(&mut self.stopped.lock(), |stopped| !*stopped);
     }
 
     fn stop(&self) {
@@ -139,6 +128,14 @@ impl CrlServer {
             .responses
             .insert(path.trim_start_matches('/').into(), Arc::new(response));
     }
+    pub fn hold(&self, path: &str, response: CrlResponse) -> std::sync::mpsc::Sender<()> {
+        let (release, held) = std::sync::mpsc::channel();
+        self.serve(
+            path,
+            CrlResponse::Held(PlMutex::new(held), Box::new(response)),
+        );
+        release
+    }
     pub fn requests(&self, path: &str) -> usize {
         self.state
             .lock()
@@ -210,14 +207,14 @@ fn respond(stream: &mut TcpStream, state: &PlMutex<State>, stop: &Stop) -> io::R
         match response {
             Some(CrlResponse::Body(body)) => break (200, body.as_slice()),
             Some(CrlResponse::Status(status)) => break (*status, &[][..]),
-            Some(CrlResponse::Delayed(delay, next)) => {
-                if stop.wait(Some(*delay)) {
+            Some(CrlResponse::Held(held, next)) => {
+                if held.lock().recv_timeout(Duration::from_secs(10)).is_err() {
                     return Ok(());
                 }
                 response = Some(next);
             }
             Some(CrlResponse::Hang) => {
-                stop.wait(None);
+                stop.wait();
                 return Ok(());
             }
             None => break (404, &[][..]),

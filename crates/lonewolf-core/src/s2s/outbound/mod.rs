@@ -420,7 +420,7 @@ impl<A: ChunkAllocator + Clone> RemoteRouter<A> {
         let failures = match state.retry_count(
             local,
             remote,
-            Instant::now(),
+            crate::clock::now(),
             self.inner.limits.max_outbound_links.get(),
         ) {
             Ok(failures) => failures,

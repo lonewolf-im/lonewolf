@@ -107,6 +107,7 @@ the file's directory. Unknown keys are rejected.
 | `server_binary` | required | Server executable. `--server-binary` overrides it. |
 | `server_workers` | `2` | Server worker threads. |
 | `stanza_pool_size_mib` | `256` | Server stanza pool size. Must be a power of two and at least 8. |
+| `extensions` | `["roster", "offline"]` | Extensions enabled on the local host. List 1 to 16 distinct names using lowercase ASCII letters, digits, underscores, or hyphens. |
 
 ### `[target]` for a remote server
 

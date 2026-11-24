@@ -31,6 +31,8 @@ pub enum TargetConfig {
         server_workers: u16,
         #[serde(default = "pool_size")]
         stanza_pool_size_mib: u64,
+        #[serde(default = "default_extensions")]
+        extensions: Vec<String>,
     },
     Remote {
         connect_host: String,
@@ -130,6 +132,11 @@ fn two() -> u16 {
 fn pool_size() -> u64 {
     256
 }
+
+fn default_extensions() -> Vec<String> {
+    vec!["roster".into(), "offline".into()]
+}
+
 fn connections() -> usize {
     100
 }
@@ -356,6 +363,7 @@ impl RunConfig {
                 server_binary,
                 server_workers,
                 stanza_pool_size_mib,
+                extensions,
             } => {
                 require(
                     !server_binary.as_os_str().is_empty(),
@@ -374,6 +382,25 @@ impl RunConfig {
                             .is_some(),
                     "invalid stanza pool size",
                 )?;
+                require(
+                    (1..=16).contains(&extensions.len()),
+                    "server extension count is out of bounds",
+                )?;
+                for (index, extension) in extensions.iter().enumerate() {
+                    require(
+                        !extension.is_empty()
+                            && extension.bytes().all(|byte| {
+                                byte.is_ascii_lowercase()
+                                    || byte.is_ascii_digit()
+                                    || matches!(byte, b'_' | b'-')
+                            }),
+                        "invalid server extension name",
+                    )?;
+                    require(
+                        !extensions[..index].contains(extension),
+                        "duplicate server extension",
+                    )?;
+                }
             }
             TargetConfig::Remote {
                 connect_host,

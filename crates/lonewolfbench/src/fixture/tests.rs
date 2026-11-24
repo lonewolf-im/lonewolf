@@ -15,6 +15,22 @@ fn config() -> BenchResult<RunConfig> {
     Ok(config)
 }
 
+#[test]
+fn server_config_preserves_explicit_extensions() -> TestResult {
+    let extensions = ["roster", "offline", "blocking"];
+    let configured = extensions.map(String::from);
+    let config: toml::Value = toml::from_str(&server_config(64, &configured))?;
+    let actual = config["hosts"]["localhost"]["extensions"]
+        .as_array()
+        .ok_or("missing extensions")?
+        .iter()
+        .map(toml::Value::as_str)
+        .collect::<Option<Vec<_>>>()
+        .ok_or("invalid extension")?;
+    assert_eq!(actual, extensions);
+    Ok(())
+}
+
 #[tokio::test]
 async fn fixture_seeds_exactly_requested_accounts_and_releases_storage() -> TestResult {
     let cpu = CpuPool::new(NonZeroUsize::MIN);

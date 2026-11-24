@@ -86,6 +86,7 @@ fn vcard_corrupt_records_fail_on_both_transaction_handles_without_changing_bytes
             .open_table(VCARDS)?
             .insert(owner.as_str(), bytes.as_slice())?;
         transaction.commit()?;
+        storage.forget_shared_snapshot();
         block_on(async {
             let reader = storage.begin_read().await?;
             let writer = storage.begin_write().await?;
@@ -127,6 +128,7 @@ fn vcard_reads_preserve_backend_error_kinds() -> TestResult {
     let transaction = storage.as_ref().begin_write()?;
     transaction.delete_table(VCARDS)?;
     transaction.commit()?;
+    storage.forget_shared_snapshot();
     block_on(async {
         let mut writer = storage.begin_write().await?;
         writer

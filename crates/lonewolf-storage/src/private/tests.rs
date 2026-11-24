@@ -102,6 +102,7 @@ fn private_xml_corrupt_records_fail_on_both_transaction_handles_without_changing
             .open_table(ELEMENTS)?
             .insert((owner.as_str(), "urn:a", "a"), bytes.as_slice())?;
         transaction.commit()?;
+        storage.forget_shared_snapshot();
         block_on(async {
             let reader = storage.begin_read().await?;
             let writer = storage.begin_write().await?;
@@ -160,6 +161,7 @@ fn private_xml_reads_preserve_backend_error_kinds() -> TestResult {
     let transaction = storage.as_ref().begin_write()?;
     transaction.delete_table(ELEMENTS)?;
     transaction.commit()?;
+    storage.forget_shared_snapshot();
     block_on(async {
         let transaction = storage.begin_read().await?;
         let error = transaction

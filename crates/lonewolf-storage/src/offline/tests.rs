@@ -181,6 +181,7 @@ fn truncated_timestamps_fail_reads_without_changing_records() -> TestResult {
             .open_table(MESSAGES)?
             .insert((owner.as_str(), 1), bytes)?;
         transaction.commit()?;
+        storage.forget_shared_snapshot();
         block_on(async {
             assert_storage_error(
                 read(&storage, async |tx| tx.offline_messages(&owner).await).await,

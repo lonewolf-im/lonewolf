@@ -22,6 +22,7 @@ fn insert_record(storage: &RedbStorage, key: &str, bytes: &[u8]) -> TestResult {
     let transaction = storage.as_ref().begin_write()?;
     transaction.open_table(ACCOUNTS)?.insert(key, bytes)?;
     transaction.commit()?;
+    storage.forget_shared_snapshot();
     Ok(())
 }
 
@@ -29,6 +30,7 @@ fn remove_record(storage: &RedbStorage, key: &str) -> TestResult {
     let transaction = storage.as_ref().begin_write()?;
     transaction.open_table(ACCOUNTS)?.remove(key)?;
     transaction.commit()?;
+    storage.forget_shared_snapshot();
     Ok(())
 }
 
@@ -323,6 +325,7 @@ fn paging_through_many_long_keys_preserves_order_and_count() -> TestResult {
         }
     }
     transaction.commit()?;
+    storage.forget_shared_snapshot();
 
     block_on(async {
         let reader = storage.begin_read().await?;

@@ -96,9 +96,15 @@ impl CachedStorage<RedbBackend> {
     pub fn metrics(&self) -> &StoreMetrics {
         self.backend.metrics()
     }
+
+    #[cfg(test)]
+    pub(crate) fn forget_shared_snapshot(&self) {
+        self.backend.forget_shared_snapshot();
+    }
 }
 
 /// Direct database access can block the caller and permanently disables blocklist caching.
+/// An existing shared snapshot hides raw writes until a commit through the storage traits.
 impl AsRef<Database> for CachedStorage<RedbBackend> {
     fn as_ref(&self) -> &Database {
         self.blocklists.disable();

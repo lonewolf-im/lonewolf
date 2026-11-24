@@ -32,6 +32,53 @@ fn all_scenarios_and_target_defaults() -> BenchResult<()> {
 }
 
 #[test]
+fn local_target_defaults_to_roster_and_offline_extensions() -> BenchResult<()> {
+    assert!(matches!(
+        parse(&local("messages"))?.target,
+        TargetConfig::Local { extensions, .. } if extensions == ["roster", "offline"]
+    ));
+    Ok(())
+}
+
+fn local_with_extensions(extensions: &str) -> String {
+    local("messages").replace(
+        "[scenario]",
+        &format!("extensions = {extensions}\n[scenario]"),
+    )
+}
+
+#[test]
+fn local_target_preserves_explicit_extensions() -> BenchResult<()> {
+    assert!(matches!(
+        parse(&local_with_extensions("['offline', 'blocking', 'extension_1-a']"))?.target,
+        TargetConfig::Local { extensions, .. } if extensions == ["offline", "blocking", "extension_1-a"]
+    ));
+    Ok(())
+}
+
+#[test]
+fn local_target_rejects_duplicate_extensions() {
+    assert!(parse(&local_with_extensions("['blocking', 'blocking']")).is_err());
+}
+
+#[test]
+fn local_target_rejects_invalid_extensions() {
+    for extensions in [
+        "[]",
+        "['']",
+        "['bad.name']",
+        "['Uppercase']",
+        "['quoted\"name']",
+        "['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q']",
+    ] {
+        assert!(
+            parse(&local_with_extensions(extensions)).is_err(),
+            "{extensions}"
+        );
+    }
+}
+
+#[test]
 fn strict_missing_unknown_and_irrelevant_fields() {
     let text = local("idle");
     for changed in [

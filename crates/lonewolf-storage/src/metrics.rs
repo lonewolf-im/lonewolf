@@ -30,11 +30,29 @@ impl StoreOperation {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReadSnapshot {
+    Reused,
+    Opened,
+}
+
+impl ReadSnapshot {
+    pub const ALL: [Self; 2] = [Self::Reused, Self::Opened];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Reused => "reused",
+            Self::Opened => "opened",
+        }
+    }
+}
+
 /// Counts only operations made through the storage traits.
 pub struct StoreMetrics {
     commit_duration: Histogram,
     write_wait_duration: Histogram,
     failures: [[AtomicU64; StorageErrorKind::ALL.len()]; StoreOperation::ALL.len()],
+    read_snapshots: [AtomicU64; ReadSnapshot::ALL.len()],
 }
 
 impl StoreMetrics {
@@ -43,6 +61,7 @@ impl StoreMetrics {
             commit_duration: Histogram::new(DURATION_BUCKETS),
             write_wait_duration: Histogram::new(DURATION_BUCKETS),
             failures: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
+            read_snapshots: Default::default(),
         }
     }
 
@@ -65,8 +84,21 @@ impl StoreMetrics {
         })
     }
 
+    pub fn read_snapshots(&self) -> impl Iterator<Item = (ReadSnapshot, u64)> + '_ {
+        ReadSnapshot::ALL.into_iter().map(|outcome| {
+            (
+                outcome,
+                self.read_snapshots[outcome as usize].load(Ordering::Relaxed),
+            )
+        })
+    }
+
     pub(crate) fn record_failure(&self, operation: StoreOperation, kind: StorageErrorKind) {
         self.failures[operation as usize][kind as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_read_snapshot(&self, outcome: ReadSnapshot) {
+        self.read_snapshots[outcome as usize].fetch_add(1, Ordering::Relaxed);
     }
 }
 

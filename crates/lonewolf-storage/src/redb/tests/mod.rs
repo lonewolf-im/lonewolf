@@ -3,6 +3,7 @@
 use crate::roster::RosterQuota;
 
 mod backend;
+mod snapshots;
 
 use std::error::Error;
 use std::fs;
@@ -245,6 +246,7 @@ fn missing_decoy_table_with_accounts_is_rejected() -> TestResult {
     let transaction = storage.as_ref().begin_write()?;
     transaction.delete_table(DECOY_SECRET)?;
     transaction.commit()?;
+    storage.forget_shared_snapshot();
 
     assert_storage_error(initialize(storage.as_ref()), StorageErrorKind::CorruptData);
     let transaction = storage.as_ref().begin_read()?;

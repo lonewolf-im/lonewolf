@@ -432,26 +432,9 @@ impl LetsEncryptConfig {
 }
 
 pub(crate) fn managed_dns_name(domain: &str) -> Result<String, String> {
-    let invalid =
-        || "letsencrypt requires a DNS name with at least two labels, excluding localhost".into();
-    let ascii = idna::domain_to_ascii_strict(domain).map_err(|_| invalid())?;
-    if ascii.parse::<IpAddr>().is_ok()
-        || ascii.len() > 253
-        || !ascii.contains('.')
-        || ascii.ends_with(".localhost")
-        || ascii.split('.').any(|label| {
-            label.is_empty()
-                || label.len() > 63
-                || !label.as_bytes()[0].is_ascii_alphanumeric()
-                || !label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
-                || !label
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        })
-    {
-        return Err(invalid());
-    }
-    Ok(ascii)
+    lonewolf_acme::canonical_managed_dns_name(domain).ok_or_else(|| {
+        "letsencrypt requires a DNS name with at least two labels, excluding localhost".into()
+    })
 }
 
 fn validate_directory_url(value: &str) -> Result<(), String> {

@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::cell::Cell;
 use std::fmt;
-use std::future::{Future, pending};
+use std::future::{Future, pending, poll_fn};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::pin;
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use compio::net::{TcpListener, TcpSocket, TcpStream};
@@ -12,6 +14,7 @@ use futures_channel::oneshot;
 use futures_util::FutureExt as _;
 use futures_util::future::{BoxFuture, Either, LocalBoxFuture, Shared, select};
 use futures_util::stream::{FuturesUnordered, StreamExt as _};
+use futures_util::task::AtomicWaker;
 use lonewolf_util::core_dispatcher::{DispatchHandle, Task, WorkerContext};
 use nix::errno::Errno;
 use socket2::SockRef;
@@ -23,6 +26,36 @@ const BACKLOG: i32 = 128;
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_secs(1);
 type Stop = Shared<BoxFuture<'static, Instant>>;
 pub(crate) type ShutdownSignal = Shared<LocalBoxFuture<'static, Instant>>;
+
+/// Only one task may wait for this request at a time.
+#[derive(Default)]
+pub(crate) struct StopRequest {
+    requested: Cell<bool>,
+    waker: AtomicWaker,
+}
+
+impl StopRequest {
+    pub(crate) fn request(&self) {
+        self.requested.set(true);
+        self.waker.wake();
+    }
+
+    pub(crate) fn is_requested(&self) -> bool {
+        self.requested.get()
+    }
+
+    pub(crate) async fn wait(&self) {
+        poll_fn(|cx| {
+            self.waker.register(cx.waker());
+            if self.is_requested() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+    }
+}
 
 pub(crate) struct ListenerControl {
     pub(crate) stop: Stop,

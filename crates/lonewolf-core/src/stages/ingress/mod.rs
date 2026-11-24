@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use lonewolf_extension::delivery::Failure;
+use lonewolf_extension::presence::PresenceRequestType;
 use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::stanza::{
-    ApplicationCondition, BuildError, RoutedStanza, Stanza, StanzaBuilder, StanzaErrorClass,
-    StanzaErrorCondition, StanzaErrorText,
+    ApplicationCondition, BuildError, IqType, MessageType, RoutedStanza, Stanza, StanzaBuilder,
+    StanzaErrorClass, StanzaErrorCondition, StanzaErrorText, StanzaType,
 };
 
 use super::StageFailure;
@@ -74,6 +75,25 @@ pub(crate) fn rejection_reply<A: ChunkAllocator + Clone>(
         .error_reply_described_in(&mut arena, condition, application, text)?
         .build()?;
     Ok(RoutedStanza::from_parts(reply, arena))
+}
+
+pub(crate) fn peer_rejection_reply<A: ChunkAllocator + Clone>(
+    allocator: &A,
+    source: &RoutedStanza<A>,
+    condition: StanzaErrorCondition,
+    application: Option<ApplicationCondition>,
+    text: StanzaErrorText,
+) -> Result<Option<RoutedStanza<A>>, StageFailure> {
+    let eligible = match source.resolve()?.stanza_type() {
+        StanzaType::Message(kind) => kind != MessageType::Error,
+        StanzaType::Iq(kind) => matches!(kind, IqType::Get | IqType::Set),
+        StanzaType::Presence(kind) => PresenceRequestType::from_subscription_stanza(kind).is_some(),
+    };
+    if eligible {
+        rejection_reply(allocator, source, condition, application, text).map(Some)
+    } else {
+        Ok(None)
+    }
 }
 
 pub(crate) fn outbound_blocked_reply_in<'a, A: ChunkAllocator>(

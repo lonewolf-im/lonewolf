@@ -16,10 +16,10 @@ use lonewolf_extension::{Extension, Extensions, RegistrationError, Slots};
 use lonewolf_storage::account::{AccountKey, AccountWrites, NewAccount};
 use lonewolf_storage::offline::OfflineReads;
 use lonewolf_storage::{RedbRead, RedbWrite, Storage, WriteTransaction};
-use lonewolf_util::arena::{ArenaConfig, GlobalChunkAllocator};
+use lonewolf_util::arena::{Arena, ArenaConfig, GlobalChunkAllocator};
 use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::parser::{ParserConfig, StreamEvent, XmppParser};
-use lonewolf_xmpp::stanza::{PresenceType, StanzaNamespace};
+use lonewolf_xmpp::stanza::{IqType, PresenceType, StanzaNamespace};
 use parking_lot::Mutex as PlMutex;
 
 use super::*;

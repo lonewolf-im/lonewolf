@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use lonewolf_storage::RedbStorage;
-use lonewolf_util::arena::{Arena, ChunkAllocator};
+use lonewolf_util::arena::ChunkAllocator;
 use lonewolf_xmpp::stanza::{
-    ApplicationCondition, IqType, MessageType, PresenceType, StanzaErrorCondition, StanzaErrorText,
-    StanzaType,
+    ApplicationCondition, StanzaErrorCondition, StanzaErrorText, StanzaType,
 };
 
 use crate::delivery::WorkHandle;
 use crate::router::{RoutedStanza, RouterHandle};
+use crate::stages::ingress::peer_rejection_reply;
 use crate::stages::{
     Stage, StageFailure,
     service::{self, ServiceOutcome},
@@ -55,32 +55,11 @@ pub(crate) fn reply_error<A: ChunkAllocator + Clone + 'static>(
     application: Option<ApplicationCondition>,
     text: StanzaErrorText,
 ) -> Result<(), IngressFailure> {
-    let source = original.resolve().map_err(|_| IngressFailure)?;
-    if !matches!(source.stanza_type(), StanzaType::Message(kind) if kind != MessageType::Error)
-        && !matches!(
-            source.stanza_type(),
-            StanzaType::Iq(IqType::Get | IqType::Set)
-                | StanzaType::Presence(
-                    PresenceType::Subscribe
-                        | PresenceType::Subscribed
-                        | PresenceType::Unsubscribe
-                        | PresenceType::Unsubscribed
-                )
-        )
+    if let Some(reply) =
+        peer_rejection_reply(&context.allocator, original, condition, application, text)?
     {
-        return Ok(());
+        let _ = context.router.route_remote(reply);
     }
-    let mut arena = Arena::try_new_in(Default::default(), context.allocator.clone())
-        .map_err(|_| IngressFailure)?;
-    let source = source.clone_in(&mut arena).map_err(|_| IngressFailure)?;
-    let reply = source
-        .error_reply_described_in(&mut arena, condition, application, text)
-        .map_err(|_| IngressFailure)?
-        .build()
-        .map_err(|_| IngressFailure)?;
-    let _ = context
-        .router
-        .route_remote(RoutedStanza::from_parts(reply, arena));
     Ok(())
 }
 

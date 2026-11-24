@@ -2,6 +2,9 @@
 
 use super::*;
 use lonewolf_storage::{account::AccountReads, offline::OfflineReads, roster::RosterReads};
+use std::io::{Read, Write};
+use std::os::fd::{AsFd, OwnedFd};
+use std::os::unix::net::UnixStream;
 use std::{num::NonZeroUsize, os::unix::fs::PermissionsExt};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -144,21 +147,23 @@ async fn exit_after_closing_stderr_is_reported_as_a_startup_exit() -> TestResult
 #[test]
 #[ignore = "subprocess entry point for the owned-child force-kill fixture"]
 fn owned_child_helper() -> TestResult {
-    let Some(ready) = std::env::var_os("LONEWOLF_BENCH_TEST_READY") else {
+    if std::env::var_os("LONEWOLF_BENCH_TEST_CHILD").is_none() {
         return Ok(());
-    };
+    }
     // This helper must ignore SIGTERM to exercise the owner's force-kill path.
     unsafe {
         nix::libc::signal(nix::libc::SIGTERM, nix::libc::SIG_IGN);
     }
-    std::fs::write(ready, b"ready")?;
-    std::thread::sleep(Duration::from_secs(5));
+    let mut parent = UnixStream::from(std::io::stdin().as_fd().try_clone_to_owned()?);
+    parent.write_all(&[1])?;
+    std::io::copy(&mut parent, &mut std::io::sink())?;
     Ok(())
 }
 
-async fn attach_ignoring_child(fixture: &mut LocalFixture) -> TestResult {
-    let directory = fixture.directory.as_ref().ok_or("directory")?;
-    let ready = directory.path().join("helper-ready");
+fn attach_ignoring_child(
+    fixture: &mut LocalFixture,
+) -> Result<UnixStream, Box<dyn std::error::Error>> {
+    let (mut parent, child_socket) = UnixStream::pair()?;
     let mut child = Command::new(std::env::current_exe()?)
         .args([
             "--exact",
@@ -166,43 +171,47 @@ async fn attach_ignoring_child(fixture: &mut LocalFixture) -> TestResult {
             "--ignored",
             "--nocapture",
         ])
-        .env("LONEWOLF_BENCH_TEST_READY", &ready)
-        .stdin(Stdio::null())
+        .env("LONEWOLF_BENCH_TEST_CHILD", "1")
+        .stdin(Stdio::from(OwnedFd::from(child_socket)))
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()?;
     let stderr = child.stderr.take().ok_or("stderr")?;
     fixture.child = Some(child);
     fixture.collector = Some(Collector::start(stderr)?);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !ready.exists() {
-        if Instant::now() >= deadline {
-            return Err("helper readiness deadline".into());
-        }
-        sleep(Duration::from_millis(5)).await;
+    parent.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let mut ready = [0];
+    parent.read_exact(&mut ready)?;
+    assert_eq!(ready, [1]);
+    Ok(parent)
+}
+
+fn cancel_pending_stop(fixture: &mut LocalFixture) {
+    {
+        use std::future::Future as _;
+        let mut stop = std::pin::pin!(fixture.stop(Duration::from_secs(2)));
+        assert!(
+            stop.as_mut()
+                .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+                .is_pending()
+        );
     }
-    Ok(())
+    assert!(fixture.stop_requested);
 }
 
 #[tokio::test]
 async fn cancelled_stop_keeps_owners_for_resumed_force_kill_and_reap() -> TestResult {
     let cpu = CpuPool::new(NonZeroUsize::MIN);
     let mut fixture = LocalFixture::prepare(&config()?, &cpu).await?;
-    attach_ignoring_child(&mut fixture).await?;
+    let _parent = attach_ignoring_child(&mut fixture)?;
+    tokio::time::pause();
     let directory = fixture
         .directory
         .as_ref()
         .ok_or("directory")?
         .path()
         .to_owned();
-    assert!(
-        tokio::time::timeout(
-            Duration::from_millis(10),
-            fixture.stop(Duration::from_secs(2))
-        )
-        .await
-        .is_err()
-    );
+    cancel_pending_stop(&mut fixture);
     assert!(fixture.child.is_some());
     assert!(fixture.collector.is_some());
     assert_eq!(
@@ -223,7 +232,8 @@ async fn cancelled_stop_keeps_owners_for_resumed_force_kill_and_reap() -> TestRe
 async fn drop_kills_and_reaps_after_cancelled_stop() -> TestResult {
     let cpu = CpuPool::new(NonZeroUsize::MIN);
     let mut fixture = LocalFixture::prepare(&config()?, &cpu).await?;
-    attach_ignoring_child(&mut fixture).await?;
+    let _parent = attach_ignoring_child(&mut fixture)?;
+    tokio::time::pause();
     let directory = fixture
         .directory
         .as_ref()
@@ -231,14 +241,7 @@ async fn drop_kills_and_reaps_after_cancelled_stop() -> TestResult {
         .path()
         .to_owned();
     let pid = i32::try_from(fixture.child.as_ref().ok_or("child")?.id())?;
-    assert!(
-        tokio::time::timeout(
-            Duration::from_millis(10),
-            fixture.stop(Duration::from_secs(2))
-        )
-        .await
-        .is_err()
-    );
+    cancel_pending_stop(&mut fixture);
     drop(fixture);
     assert!(!directory.exists());
     let mut status = 0;

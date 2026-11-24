@@ -31,6 +31,7 @@ use tokio_util::compat::FuturesAsyncReadCompatExt;
 
 use crate::Challenges;
 use crate::challenge::valid_token;
+use crate::time::Time;
 
 const MAX_CONNECTIONS: usize = 32;
 const MAX_BUFFER: usize = 16 * 1024;
@@ -85,14 +86,24 @@ impl Http01Server {
 
     /// Shutdown clears challenges and bounds connection drain by the supplied absolute deadline.
     /// Dropping the server or this future also clears challenges.
-    pub async fn run(mut self, shutdown: impl Future<Output = Instant>) -> io::Result<()> {
+    pub async fn run(self, shutdown: impl Future<Output = Instant>) -> io::Result<()> {
+        self.run_with(shutdown, Time::default()).await
+    }
+
+    async fn run_with(
+        mut self,
+        shutdown: impl Future<Output = Instant>,
+        time: Time,
+    ) -> io::Result<()> {
         let (mut connections, deadline) = {
             let listeners = self.listeners.as_deref().unwrap_or_default();
             accept_connections(
                 listeners.len(),
                 |index, retry| wait_endpoint(index, &listeners[index], retry),
-                |index| accept_nonblocking(&listeners[index]),
-                |stream, deadline| serve_connection(stream, self.challenges.clone(), deadline),
+                |index| accept_nonblocking(&listeners[index], &time),
+                |stream, deadline| {
+                    serve_connection(stream, self.challenges.clone(), deadline, &time)
+                },
                 shutdown,
                 CONNECTION_TIMEOUT,
             )
@@ -100,7 +111,7 @@ impl Http01Server {
         };
         self.challenges.clear();
         self.listeners.take();
-        until_deadline(deadline, async {
+        until_deadline(&time, deadline, async {
             while connections.next().await.is_some() {}
         })
         .await;
@@ -130,16 +141,17 @@ struct Accepted<T> {
     accepted_at: Instant,
 }
 
-fn accept_nonblocking(listener: &TcpListener) -> io::Result<Accepted<TcpStream>> {
-    accept_with(listener, TcpStream::from_std)
+fn accept_nonblocking(listener: &TcpListener, time: &Time) -> io::Result<Accepted<TcpStream>> {
+    accept_with(listener, time, TcpStream::from_std)
 }
 
 fn accept_with<T>(
     listener: &TcpListener,
+    time: &Time,
     convert: impl FnOnce(std::net::TcpStream) -> io::Result<T>,
 ) -> io::Result<Accepted<T>> {
     let (socket, _) = SockRef::from(listener).accept()?;
-    let accepted_at = Instant::now();
+    let accepted_at = time.monotonic();
     // Compio sets the mode for its backend when it attaches the stream.
     socket.set_nonblocking(false)?;
     let stream: std::net::TcpStream = socket.into();
@@ -369,11 +381,17 @@ fn host(headers: &HeaderMap) -> Option<&str> {
     Some(name)
 }
 
-async fn serve_connection(stream: TcpStream, challenges: Challenges, deadline: Instant) {
+async fn serve_connection(
+    stream: TcpStream,
+    challenges: Challenges,
+    deadline: Instant,
+    time: &Time,
+) {
     serve_http(
         Box::pin(AsyncStream::with_limits(4096, MAX_BUFFER, stream)),
         challenges,
         deadline,
+        time,
     )
     .await;
 }
@@ -382,6 +400,7 @@ async fn serve_http<T: AsyncRead + AsyncWrite + Unpin>(
     stream: T,
     challenges: Challenges,
     deadline: Instant,
+    time: &Time,
 ) {
     let fragment = Rc::new(Cell::new(false));
     let observer = RequestLineObserver {
@@ -404,7 +423,7 @@ async fn serve_http<T: AsyncRead + AsyncWrite + Unpin>(
             &challenges,
         )))
     });
-    match until_deadline(deadline, builder.serve_connection(io, service)).await {
+    match until_deadline(time, deadline, builder.serve_connection(io, service)).await {
         Some(Ok(())) => {}
         Some(Err(_)) => tracing::debug!(outcome = "connection_failed", "HTTP-01 connection closed"),
         None => tracing::debug!(outcome = "timeout", "HTTP-01 connection closed"),
@@ -462,11 +481,11 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for RequestLineObserver<T> {
     }
 }
 
-async fn until_deadline<F: Future>(deadline: Instant, future: F) -> Option<F::Output> {
+async fn until_deadline<F: Future>(time: &Time, deadline: Instant, future: F) -> Option<F::Output> {
     let mut future = pin!(future);
-    let mut timer = pin!(sleep_until(deadline));
+    let mut timer = pin!(time.sleep_until(deadline));
     poll_fn(|context| {
-        if Instant::now() >= deadline || timer.as_mut().poll(context).is_ready() {
+        if time.monotonic() >= deadline || timer.as_mut().poll(context).is_ready() {
             Poll::Ready(None)
         } else {
             future.as_mut().poll(context).map(Some)

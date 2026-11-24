@@ -3,7 +3,9 @@
 use std::borrow::Cow;
 use std::future::{Future, poll_fn};
 use std::pin::pin;
-use std::time::{Duration, Instant, SystemTime};
+#[cfg(test)]
+use std::time::SystemTime;
+use std::time::{Duration, Instant};
 
 use futures_util::future::{Either, select};
 use futures_util::io::AsyncWrite;
@@ -83,7 +85,7 @@ fn discard<A: ChunkAllocator>(
     if state.stopped {
         return Err(StreamClose::Shutdown);
     }
-    if let Err(reason) = validity.check(SystemTime::now()) {
+    if let Err(reason) = validity.check(crate::clock::wall_now()) {
         return Err(validity.record_invalidation(reason));
     }
     drop(queued.reservation.take());
@@ -119,7 +121,7 @@ pub(super) async fn write<A: ChunkAllocator + Clone, W: AsyncWrite + Unpin>(
                 if state.stopped {
                     return Err(StreamClose::Shutdown);
                 }
-                if let Err(reason) = validity.check(SystemTime::now()) {
+                if let Err(reason) = validity.check(crate::clock::wall_now()) {
                     return Err(validity.record_invalidation(reason));
                 }
                 drop(queued.reservation.take());
@@ -164,7 +166,7 @@ pub(super) async fn write<A: ChunkAllocator + Clone, W: AsyncWrite + Unpin>(
         }
         return Err(reason);
     }
-    let written_at = Instant::now();
+    let written_at = crate::clock::now();
     inner.metrics.stanza_sent(kind);
     queued.write_outcome_recorded = true;
     *buffered = true;
@@ -631,14 +633,15 @@ async fn run<A: ChunkAllocator + Clone + 'static>(
                     }
                     _ => RemoteFailure::Timeout,
                 };
-                queue = match inner.failed(queue, failures, condition, Instant::now(), jitter()) {
-                    FailureDisposition::HandedOff => return,
-                    FailureDisposition::Bounce(queue) => queue,
-                    FailureDisposition::Shutdown(returned) => {
-                        queue = returned;
-                        break;
-                    }
-                };
+                queue =
+                    match inner.failed(queue, failures, condition, crate::clock::now(), jitter()) {
+                        FailureDisposition::HandedOff => return,
+                        FailureDisposition::Bounce(queue) => queue,
+                        FailureDisposition::Shutdown(returned) => {
+                            queue = returned;
+                            break;
+                        }
+                    };
                 queue.receiver.close();
                 while let Some(queued) = queue
                     .current

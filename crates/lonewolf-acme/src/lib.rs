@@ -11,7 +11,7 @@ pub mod manager;
 mod resolver;
 mod schedule;
 pub mod store;
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 mod time;
 pub mod transport;

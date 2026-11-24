@@ -164,7 +164,7 @@ impl<A: ChunkAllocator> StreamSettings<A> {
 
 impl ConnectionLifecycle {
     fn established(&mut self, host: &str) {
-        let elapsed = self.accepted_at.elapsed();
+        let elapsed = crate::clock::now().saturating_duration_since(self.accepted_at);
         self.metrics
             .phase_completed(StreamPhase::Establishing, elapsed);
         tracing::info!(
@@ -180,7 +180,7 @@ impl ConnectionLifecycle {
     }
 
     fn authenticated(&mut self, host: &str, mechanism: SaslMechanism, started_at: Instant) {
-        let elapsed = started_at.elapsed();
+        let elapsed = crate::clock::now().saturating_duration_since(started_at);
         self.metrics
             .phase_completed(StreamPhase::Authenticating, elapsed);
         tracing::info!(
@@ -197,7 +197,7 @@ impl ConnectionLifecycle {
     }
 
     fn bound(&mut self, resource_requested: bool, started_at: Instant) {
-        let now = Instant::now();
+        let now = crate::clock::now();
         let elapsed = now.saturating_duration_since(started_at);
         self.metrics.phase_completed(StreamPhase::Binding, elapsed);
         self.phase = StreamPhase::Bound;
@@ -235,7 +235,7 @@ impl StreamAdmission {
                 connection_id: NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed),
                 listener_id,
                 worker_id,
-                accepted_at: Instant::now(),
+                accepted_at: crate::clock::now(),
                 phase: StreamPhase::Establishing,
                 bound_at: None,
                 metrics,
@@ -255,12 +255,15 @@ impl Drop for ConnectionLifecycle {
             worker_id = self.worker_id,
             stream_phase = self.phase.as_str(),
             outcome = self.outcome.map_or("cancelled", |outcome| outcome.as_str()),
-            duration_ms = self.accepted_at.elapsed().as_millis(),
+            duration_ms = crate::clock::now()
+                .saturating_duration_since(self.accepted_at)
+                .as_millis(),
             "stream disconnected"
         );
         self.metrics.connection_closed(self.phase, self.outcome);
         if let Some(bound_at) = self.bound_at {
-            self.metrics.session_ended(bound_at.elapsed());
+            self.metrics
+                .session_ended(crate::clock::now().saturating_duration_since(bound_at));
         }
     }
 }
@@ -344,7 +347,7 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
             );
             lifecycle.phase = StreamPhase::Binding;
             unauthenticated_permit.take();
-            let binding_started_at = Instant::now();
+            let binding_started_at = crate::clock::now();
             context.phase_deadline = binding_started_at.checked_add(settings.binding_timeout);
             established.session.close = context.clone();
             let mut bound = bind_resource(
@@ -362,7 +365,7 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
             let recipients = recipient_rate::RecipientLimiter::new(
                 settings.recipients_per_second,
                 settings.recipient_burst,
-                Instant::now(),
+                crate::clock::now(),
                 settings.metrics.clone(),
             );
             Ok(bound_stream(bound, &mut work, recipients, settings.metrics.clone()).await)
@@ -401,7 +404,7 @@ async fn run_phase<T>(
     timeout_outcome: CloseOutcome,
     phase: Pin<&mut impl Future<Output = Result<T, CloseOutcome>>>,
 ) -> Result<T, CloseOutcome> {
-    match close::before_deadline(deadline.unwrap_or_else(Instant::now), phase).await {
+    match close::before_deadline(deadline.unwrap_or_else(crate::clock::now), phase).await {
         Ok(result) => result,
         Err(_) => Err(timeout_outcome),
     }

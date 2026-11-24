@@ -5,6 +5,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 mod client;
+pub mod clock;
 pub mod component;
 #[allow(dead_code)]
 pub mod crl_gate;

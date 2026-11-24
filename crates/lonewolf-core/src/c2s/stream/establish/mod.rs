@@ -346,6 +346,10 @@ async fn complete_tls<A: ChunkAllocator + Clone>(
         context.phase_deadline,
         CloseOutcome::EstablishmentTimeout,
         pin!(context.interrupt(async {
+            #[cfg(feature = "test-support")]
+            crate::test_support::ManualClock::record(
+                crate::test_support::ClockEvent::ReadingProtectedHeader,
+            );
             let header = session.read_header(hosts).await?;
             if header.host != session.host() {
                 return Err(session
@@ -388,7 +392,7 @@ async fn complete_tls<A: ChunkAllocator + Clone>(
             exporter,
             server_end_point,
         },
-        auth_started_at: Instant::now(),
+        auth_started_at: crate::clock::now(),
     })
 }
 

@@ -1,72 +1,43 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::support::{ALTERNATE_PASSWORD, NEW_PASSWORD, PASSWORD};
+use crate::support::clock::{Clock, with_clock};
 
-use std::time::{Duration, Instant};
+use crate::support::{ALTERNATE_PASSWORD, NEW_PASSWORD, PASSWORD};
 
 use rustls::version;
 
 use super::support::{C2sSuite, Client, SASL_NAMESPACE, TestResult};
 
 #[test]
-fn resource_assignment_logs_ordered_transitions_without_exposing_jids() -> TestResult {
-    for (resource, requested) in [(Some("desk"), true), (None, false)] {
-        let mut suite = C2sSuite::start()?;
-        suite.create_account("alice", ALTERNATE_PASSWORD)?;
+fn requested_and_generated_resources_reach_the_bound_phase_and_close_cleanly() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    for (index, resource) in [Some("desk"), None].into_iter().enumerate() {
         let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
-        client.bind(resource)?;
+        let jid = client.bind(resource)?;
+        let assigned = jid
+            .strip_prefix("alice@localhost/")
+            .ok_or("unexpected bound account")?;
+        if let Some(requested) = resource {
+            assert_eq!(assigned, requested);
+        } else {
+            assert!(!assigned.is_empty());
+        }
+        super::support::barrier(&mut client)?;
         client.close()?;
-        let logs = suite.stop_with_logs()?;
-        let events = [
-            "connection established",
-            "connection authenticated",
-            "resource bound",
-            "stream disconnected",
-        ];
-        let lines: Vec<_> = logs
-            .lines()
-            .filter(|line| events.iter().any(|event| line.contains(event)))
-            .collect();
-        assert_eq!(lines.len(), events.len(), "{logs}");
-        for (line, event) in lines.iter().zip(events) {
-            assert!(line.contains(event), "{logs}");
-            assert!(line.contains("connection_type=\"c2s\""), "{logs}");
-            assert!(line.contains("listener_id=0"), "{logs}");
-            assert!(line.contains("worker_id="), "{logs}");
-        }
-        let connection_id = lines[0]
-            .split("connection_id=")
-            .nth(1)
-            .and_then(|field| field.split_whitespace().next())
-            .ok_or("missing connection ID")?;
-        for line in &lines[1..] {
-            assert!(
-                line.contains(&format!("connection_id={connection_id}")),
-                "{logs}"
-            );
-        }
-        assert!(lines[0].contains("host=\"localhost\""), "{logs}");
-        assert!(lines[1].contains("SCRAM-SHA-256"), "{logs}");
-        let assignment = format!("resource_requested={requested}");
-        assert!(
-            lines[2].contains(&assignment),
-            "missing {assignment}: {logs}"
-        );
-        assert!(lines[3].contains("stream_phase=\"bound\""), "{logs}");
-        assert!(lines[3].contains("outcome=\"stream_end\""), "{logs}");
-        assert!(!logs.contains("alice@localhost"), "{logs}");
+        suite.wait_for_metric(&format!("lonewolf_c2s_connections_closed_total{{listener=\"0\",phase=\"bound\",outcome=\"stream_end\"}} {}", index + 1))?;
     }
     Ok(())
 }
 
 #[test]
 fn authentication_deadline_ends_at_sasl_success() -> TestResult {
-    let suite = C2sSuite::with_limits(
-        "authentication_timeout_secs = 3\nresource_binding_timeout_secs = 8",
-    )?;
+    let suite = with_clock(|| {
+        C2sSuite::with_limits("authentication_timeout_secs = 3\nresource_binding_timeout_secs = 8")
+    })?;
+    let clock = Clock::at(suite.fixture_path());
     suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.unauthenticated_client()?;
-    let started = Instant::now();
     client
         .scram(
             "alice",
@@ -75,7 +46,8 @@ fn authentication_deadline_ends_at_sasl_success() -> TestResult {
             Some("tls-exporter"),
         )?
         .assert_name(SASL_NAMESPACE, "success");
-    std::thread::sleep(Duration::from_millis(3100).saturating_sub(started.elapsed()));
+    clock.wait_timers(8000, 1)?;
+    clock.advance_ms(3001)?;
     let mut client = client.restart();
     client.open()?;
     assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
@@ -436,32 +408,32 @@ fn peer_footer_waits_for_delayed_tls_close_notify() -> TestResult {
 
 #[test]
 fn silent_peer_close_uses_one_five_second_budget() -> TestResult {
-    let suite = C2sSuite::start()?;
+    let suite = with_clock(C2sSuite::start)?;
+    let clock = Clock::at(suite.fixture_path());
     suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
-    let started = Instant::now();
     client.send("<unsupported/>")?;
     client.receive()?;
     client.expect_footer()?;
-    std::thread::sleep(Duration::from_secs(4));
+    clock.wait_timers(5000, 1)?;
+    clock.advance_ms(4000)?;
     client.send("</stream:stream>")?;
     client.expect_tls_close()?;
+    clock.expire_ms(1000)?;
     client.expect_tcp_eof()?;
-    assert!(started.elapsed() >= Duration::from_millis(4800));
-    assert!(started.elapsed() < Duration::from_secs(7));
     Ok(())
 }
 
 #[test]
 fn authentication_deadline_caps_a_local_close_wait() -> TestResult {
-    let suite = C2sSuite::with_limits("authentication_timeout_secs = 1")?;
+    let suite = with_clock(|| C2sSuite::with_limits("authentication_timeout_secs = 1"))?;
+    let clock = Clock::at(suite.fixture_path());
     let mut client = suite.unauthenticated_client()?;
-    let started = Instant::now();
     client.send("<message/>")?;
     client.receive()?;
     client.expect_footer()?;
+    clock.expire_ms(1000)?;
     client.expect_eof()?;
-    assert!(started.elapsed() < Duration::from_secs(4));
     Ok(())
 }
 

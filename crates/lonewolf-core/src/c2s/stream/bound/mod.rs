@@ -8,6 +8,7 @@ use std::num::NonZeroUsize;
 use std::pin::pin;
 use std::rc::Rc;
 use std::sync::Arc;
+#[cfg(test)]
 use std::time::Instant;
 
 use futures_channel::oneshot;
@@ -2344,7 +2345,9 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             destination,
             Destination::Server | Destination::ServerResource | Destination::Service
         ) || to.bare().as_str() == self.registration.account().as_str()
-            || self.recipients.admit(to.bare().as_str(), Instant::now())
+            || self
+                .recipients
+                .admit(to.bare().as_str(), crate::clock::now())
         {
             return Ok(true);
         }

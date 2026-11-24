@@ -15,7 +15,7 @@ use lonewolf_util::arena::{ChunkAllocator, HandleError};
 use lonewolf_xmpp::parser::{Parsed, StreamEvent};
 use lonewolf_xmpp::stanza::{Element, NodeRef, StanzaErrorCondition};
 use lonewolf_xmpp::stream::StreamErrorCondition;
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{CertificateError, ClientConfig};
 use tokio::io::BufReader;
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt as _};
@@ -418,7 +418,7 @@ impl Accounting {
 
 impl Drop for Accounting {
     fn drop(&mut self) {
-        self.record(Instant::now());
+        self.record(crate::clock::now());
     }
 }
 
@@ -564,19 +564,21 @@ impl<A: ChunkAllocator + Clone> Negotiation<A> {
             return;
         };
         let deadline = selected_at + CLOSE_BUDGET;
-        let _ = compio::time::timeout_at(deadline, async {
+        let _ = crate::clock::timeout_at(deadline, async {
             connection.close(failure.condition).await?;
             if !self.peer_footer {
-                let _ =
-                    compio::time::timeout_at(footer_deadline(deadline, Instant::now()), async {
+                let _ = crate::clock::timeout_at(
+                    footer_deadline(deadline, crate::clock::now()),
+                    async {
                         while let Ok(Some(event)) = connection.next().await {
                             if matches!(event, StreamEvent::StreamEnd) {
                                 self.peer_footer = true;
                                 break;
                             }
                         }
-                    })
-                    .await;
+                    },
+                )
+                .await;
             }
             connection.shutdown(self.peer_footer).await
         })
@@ -654,7 +656,7 @@ async fn negotiate<A: ChunkAllocator + Clone>(
         return Err(EstablishError::Tls("alpn").into());
     }
     let certificates = tls.get_ref().1.peer_certificates().map(<[_]>::to_vec);
-    let counted = ObservedIo::new(tls, ConnectionActivity::new(Instant::now()));
+    let counted = ObservedIo::new(tls, ConnectionActivity::new(crate::clock::now()));
     let activity = counted.observer().clone();
     let (input, output) = counted.split();
     let reader = match state {
@@ -700,9 +702,12 @@ async fn negotiate<A: ChunkAllocator + Clone>(
     flow.update_peer_limits(offered.limits)?;
     let validity = context
         .trust
-        .verify_chain(certificates.as_deref().unwrap_or(&[]), UnixTime::now())
+        .verify_chain(
+            certificates.as_deref().unwrap_or(&[]),
+            crate::clock::unix_now(),
+        )
         .map_err(|error| Failure::from(EstablishError::Tls(tls_reason(&error))))?;
-    let valid_until = unexpired_validity(validity.valid_until, SystemTime::now())?;
+    let valid_until = unexpired_validity(validity.valid_until, crate::clock::wall_now())?;
     let chain: Arc<[CertificateDer<'static>]> = Arc::from(certificates.ok_or_else(protocol)?);
     let revocation = context
         .revocation
@@ -765,7 +770,7 @@ where
     let (outcome, resolved) = dns_result(context.resolver.resolve(remote).await);
     context.metrics.dns(outcome);
     let resolved = resolved?;
-    let mut accounting = Accounting::new(Arc::clone(&context.metrics), Instant::now());
+    let mut accounting = Accounting::new(Arc::clone(&context.metrics), crate::clock::now());
     let mut setups = [None, None];
     for (index, tls_mode) in [TlsMode::StartTls, TlsMode::Direct].into_iter().enumerate() {
         if resolved
@@ -789,8 +794,8 @@ where
         let mut attempt = context
             .metrics
             .transport_attempt(Direction::Outbound, endpoint.tls_mode);
-        let tcp = match compio::time::timeout_at(
-            deadline(Instant::now(), context.limits.connect_timeout_secs),
+        let tcp = match crate::clock::timeout_at(
+            deadline(crate::clock::now(), context.limits.connect_timeout_secs),
             connect(endpoint.address),
         )
         .await
@@ -821,15 +826,15 @@ where
             peer_footer: false,
         };
         let negotiated = if socket.0.set_nodelay(true).is_err() {
-            (Err(protocol()), Instant::now())
+            (Err(protocol()), crate::clock::now())
         } else {
             let Some(setup) = setups[usize::from(endpoint.tls_mode == TlsMode::Direct)].as_ref()
             else {
                 attempt.complete(AuthOutcome::Protocol);
                 return Err(EstablishError::Negotiation(NegotiationFailure::Protocol));
             };
-            let deadline = deadline(Instant::now(), context.limits.negotiation_timeout_secs);
-            match compio::time::timeout_at(
+            let deadline = deadline(crate::clock::now(), context.limits.negotiation_timeout_secs);
+            match crate::clock::timeout_at(
                 deadline,
                 negotiate(
                     &mut flow,
@@ -843,7 +848,7 @@ where
             )
             .await
             {
-                Ok(result) => (result, Instant::now()),
+                Ok(result) => (result, crate::clock::now()),
                 Err(_) => (
                     Err(Failure {
                         error: EstablishError::Timeout,
@@ -914,7 +919,7 @@ where
                 drop(flow);
                 drop(gauge);
                 if index + 1 < resolved.endpoints.len() {
-                    accounting.resume(Instant::now());
+                    accounting.resume(crate::clock::now());
                 }
             }
         }
@@ -925,7 +930,7 @@ where
             .error
             .authentication()
             .unwrap_or(AuthOutcome::Protocol),
-        Instant::now(),
+        crate::clock::now(),
     );
     Err(failure.error)
 }

@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime};
 const MAX_WAIT: Duration = Duration::from_secs(i32::MAX as u64);
 
 pub(super) async fn wait(until: SystemTime) {
-    wait_with(until, SystemTime::now, compio::time::sleep).await;
+    wait_with(until, crate::clock::wall_now, crate::clock::sleep).await;
 }
 
 pub(super) async fn wait_with<N, S, F>(until: SystemTime, mut now: N, mut sleep: S)

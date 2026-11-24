@@ -262,7 +262,12 @@ async fn memory_request(challenges: Challenges, request: String, chunk: usize) -
     };
     timeout(
         Duration::from_secs(2),
-        serve_http(stream, challenges, Instant::now() + CONNECTION_TIMEOUT),
+        serve_http(
+            stream,
+            challenges,
+            Instant::now() + CONNECTION_TIMEOUT,
+            &Time::default(),
+        ),
     )
     .await
     .unwrap();
@@ -438,7 +443,12 @@ fn slow_readers_and_incomplete_request_lines_obey_absolute_deadline() -> TestRes
             let started = Instant::now();
             timeout(
                 Duration::from_secs(1),
-                serve_http(stream, challenges, started + Duration::from_millis(30)),
+                serve_http(
+                    stream,
+                    challenges,
+                    started + Duration::from_millis(30),
+                    &Time::default(),
+                ),
             )
             .await
             .unwrap();
@@ -639,12 +649,32 @@ fn real_slowloris_is_closed_at_five_second_deadline() -> TestResult {
         let server = Http01Server::bind(&["127.0.0.1:0".parse()?], challenges).await?;
         let address = server.local_addrs()?[0];
         let (stop, stopped) = oneshot::channel();
-        let task = compio::runtime::spawn(server.run(async { stopped.await.unwrap() }));
-        let started = Instant::now();
-        let response = request(address, "GET /incomplete".into()).await?;
-        assert!(response.is_empty());
-        assert!(started.elapsed() >= CONNECTION_TIMEOUT);
-        assert!(started.elapsed() < Duration::from_secs(7));
+        use crate::test_support::{ClockMode, TestClock};
+        let start = std::time::SystemTime::now();
+        let clock = TestClock::new(start, ClockMode::Frozen)?;
+        let time = Time::controlled(clock.clone());
+        let task = compio::runtime::spawn(server.run_with(async { stopped.await.unwrap() }, time));
+        let mut incomplete = StdStream::connect(address)?;
+        incomplete.write_all(b"GET /incomplete")?;
+        let fence = || {
+            request(
+                address,
+                get(&format!("{PATH_PREFIX}{TOKEN}"), "Host: one.example\r\n"),
+            )
+        };
+        assert!(fence().await?.starts_with("HTTP/1.1 200"));
+        let deadline = start + Duration::from_secs(5);
+        assert!(clock.has_timer_at(deadline));
+        clock.advance_to(deadline - Duration::from_nanos(1))?;
+        assert!(fence().await?.starts_with("HTTP/1.1 200"));
+        assert!(clock.has_timer_at(deadline));
+        clock.advance_to(deadline)?;
+        blocking::unblock(move || -> io::Result<()> {
+            incomplete.set_read_timeout(Some(Duration::from_secs(5)))?;
+            assert_eq!(incomplete.read(&mut [0])?, 0);
+            Ok(())
+        })
+        .await?;
         stop.send(Instant::now()).unwrap();
         timeout(Duration::from_secs(2), task).await???;
         Ok(())
@@ -932,6 +962,7 @@ fn expired_deadlines_do_not_poll_io_or_accepts() -> TestResult {
         let deadline = Instant::now();
         assert!(
             until_deadline(
+                &Time::default(),
                 deadline,
                 poll_fn(|_| -> Poll<()> {
                     panic!("polled IO after deadline");
@@ -1070,7 +1101,7 @@ fn two_loopback_listeners_do_not_accept_beyond_global_capacity() -> TestResult {
                 }
             },
             |index| {
-                let connection = accept_nonblocking(&listeners[index])?;
+                let connection = accept_nonblocking(&listeners[index], &Time::default())?;
                 accepted.borrow_mut().push(index);
                 Ok(connection)
             },
@@ -1121,7 +1152,7 @@ fn real_conversion_failure_closes_socket_before_releasing_permit() -> TestResult
         listener.accept_ready().await?;
         let admission = Admission::default();
         let permit = admission.acquire().unwrap();
-        let result = accept_with::<()>(listener, |stream| {
+        let result = accept_with::<()>(listener, &Time::default(), |stream| {
             assert_eq!(admission.0.get(), 1);
             drop(stream);
             assert_eq!(admission.0.get(), 1);

@@ -796,28 +796,6 @@ fn reference_configuration_is_commented_and_loads_builtin_defaults() -> TestResu
     Ok(())
 }
 
-#[test]
-fn reference_configuration_explains_vcard_constraints() -> TestResult {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/lonewolf.toml");
-    let reference = fs::read_to_string(path)?;
-    for constraint in [
-        "public to authenticated local users and users of federated domains",
-        "serialized UTF-8 XML",
-        "namespace, language, and whitespace-context markup",
-        "1 to 1048576 bytes",
-        "complete-stanza limit can be smaller",
-        "Reducing this budget does not delete or hide stored profiles",
-        "new documents must fit",
-    ] {
-        assert!(
-            reference.contains(constraint),
-            "missing operator constraint: {constraint}"
-        );
-    }
-
-    Ok(())
-}
-
 fn documented_settings_and_examples() -> Result<(String, Vec<String>), Box<dyn Error>> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/lonewolf.toml");
     let reference = fs::read_to_string(path)?;

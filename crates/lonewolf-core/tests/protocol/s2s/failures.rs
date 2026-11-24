@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::support::clock::{Clock, with_clock};
+
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
@@ -292,9 +294,11 @@ fn receiving_peer_with_self_signed_ca_leaf_bounces_remote_server_timeout() -> Te
 fn backoff_answers_without_new_attempts() -> TestResult {
     let refused = refused_endpoint()?;
     let address = refused.address();
-    let mut fixture = SingleServer::start(
-        "[limits.s2s]\nfailure_backoff_initial_secs=5\nfailure_backoff_max_secs=5\nconnect_timeout_secs=1",
-    )?;
+    let mut fixture = with_clock(|| {
+        SingleServer::start(
+            "[limits.s2s]\nfailure_backoff_initial_secs=5\nfailure_backoff_max_secs=5\nconnect_timeout_secs=1",
+        )
+    })?;
     fixture
         .dns
         .srv("b.test", &[(0, 0, address.port(), "server.b.test")]);
@@ -303,10 +307,10 @@ fn backoff_answers_without_new_attempts() -> TestResult {
     let mut alice = fixture.suite.connect("alice", PASSWORD, "desk")?;
     alice.send("<message to='bob@b.test/phone' type='chat' id='first'><body>first attempt</body></message>")?;
     expect_bounce(&mut alice, "first", "remote-server-timeout")?;
-    let failed_at = Instant::now();
+    let clock = Clock::at(fixture.suite.fixture_path());
+    clock.advance_ms(1000)?;
     alice.send("<message to='bob@b.test/phone' type='chat' id='cached'><body>cached failure</body></message>")?;
     expect_bounce(&mut alice, "cached", "remote-server-timeout")?;
-    assert!(failed_at.elapsed() < Duration::from_secs(4));
     authentication(&fixture.suite, "outbound", "unreachable", 1)?;
     fixture
         .suite
@@ -317,9 +321,7 @@ fn backoff_answers_without_new_attempts() -> TestResult {
             .query_count("_xmpp-server._tcp.b.test", RecordType::SRV),
         1
     );
-    if let Some(remaining) = Duration::from_secs(5).checked_sub(failed_at.elapsed()) {
-        std::thread::sleep(remaining);
-    }
+    clock.advance_ms(4000)?;
     alice.send("<message to='bob@b.test/phone' type='chat' id='after-backoff'><body>new attempt</body></message>")?;
     expect_bounce(&mut alice, "after-backoff", "remote-server-timeout")?;
     authentication(&fixture.suite, "outbound", "unreachable", 2)?;

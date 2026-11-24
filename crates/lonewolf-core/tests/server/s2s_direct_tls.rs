@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use super::process::clock::{Clock, with_clock};
 use super::*;
 use rustls::pki_types::ServerName;
-use std::io;
 use std::net::{Ipv6Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
 
 #[path = "../support/ports.rs"]
 #[allow(dead_code)]
@@ -191,6 +190,34 @@ fn direct_tls_disabled_federation_keeps_c2s_and_omits_all_s2s_registration() -> 
     Ok(())
 }
 
+fn fragmented_handshake(
+    fixture: &Fixture,
+    address: SocketAddr,
+    role: &[u8],
+    certificate: bool,
+    admitted: impl FnOnce() -> Result,
+) -> Result<Peer> {
+    let mut client_config = (*fixture.client(certificate.then_some("peer.test"), false)?).clone();
+    client_config.alpn_protocols = vec![role.to_vec()];
+    let mut connection = rustls::ClientConnection::new(
+        Arc::new(client_config),
+        ServerName::try_from("local.test")?,
+    )?;
+    let mut hello = Vec::new();
+    connection.write_tls(&mut hello)?;
+    assert!(hello.len() > 10);
+    let mut socket = connect(address)?;
+    socket.write_all(&hello[..10])?;
+    admitted()?;
+    socket.write_all(&hello[10..])?;
+    let mut peer = rustls::StreamOwned::new(connection, socket);
+    while peer.conn.is_handshaking() {
+        peer.conn.complete_io(&mut peer.sock)?;
+    }
+    assert_eq!(peer.conn.alpn_protocol(), Some(role));
+    Ok(peer)
+}
+
 #[test]
 fn direct_tls_fragmented_hello_and_protected_header_share_the_original_deadline_upper_bound()
 -> Result {
@@ -199,7 +226,8 @@ fn direct_tls_fragmented_hello_and_protected_header_share_the_original_deadline_
         "{}[limits.c2s.profiles.default]\nconnection_establishment_timeout_secs=5\n[limits.s2s]\nnegotiation_timeout_secs=5\n",
         direct_config(&fixture)
     );
-    let mut server = Server::start(&config, 2)?;
+    let mut server = with_clock(|| Server::start(&config, 2))?;
+    let clock = Clock::at(server.directory.path());
     let (c2s, s2s) = server.ready_with(|r| (r.c2s, r.s2s))?;
     for (address, role, certificate) in [
         (c2s[0], b"xmpp-client".as_slice(), false),
@@ -209,60 +237,25 @@ fn direct_tls_fragmented_hello_and_protected_header_share_the_original_deadline_
             true,
         ),
     ] {
-        let mut client_config =
-            (*fixture.client(certificate.then_some("peer.test"), false)?).clone();
-        client_config.alpn_protocols = vec![role.to_vec()];
-        let mut connection = rustls::ClientConnection::new(
-            Arc::new(client_config),
-            ServerName::try_from("local.test")?,
-        )?;
-        let mut hello = Vec::new();
-        connection.write_tls(&mut hello)?;
-        assert!(hello.len() > 10);
-        let mut socket = connect(address)?;
-        socket.write_all(&hello[..10])?;
-        wait_sample(
-            &server,
-            if certificate {
-                "lonewolf_s2s_transport_connections{direction=\"inbound\",tls_mode=\"direct\"}"
-            } else {
-                "lonewolf_c2s_connections{listener=\"0\"}"
-            },
-            1,
-        )?;
-        let original_deadline_upper_bound = Instant::now() + Duration::from_secs(5);
-        socket.set_read_timeout(Some(Duration::from_secs(2)))?;
-        let error = socket
-            .read(&mut [0; 1])
-            .expect_err("partial ClientHello produced server bytes");
-        assert!(
-            matches!(
-                error.kind(),
-                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-            ),
-            "{error}"
-        );
-        assert!(
-            Instant::now() < original_deadline_upper_bound,
-            "partial handshake outlived its staging budget"
-        );
-        socket.set_read_timeout(Some(TIMEOUT))?;
-        socket.write_all(&hello[10..])?;
-        let mut peer = rustls::StreamOwned::new(connection, socket);
-        while peer.conn.is_handshaking() {
-            peer.conn.complete_io(&mut peer.sock)?;
-        }
-        assert!(
-            Instant::now() < original_deadline_upper_bound,
-            "TLS did not progress before the original deadline"
-        );
+        let mut peer = fragmented_handshake(&fixture, address, role, certificate, || {
+            wait_sample(
+                &server,
+                if certificate {
+                    "lonewolf_s2s_transport_connections{direction=\"inbound\",tls_mode=\"direct\"}"
+                } else {
+                    "lonewolf_c2s_connections{listener=\"0\"}"
+                },
+                1,
+            )?;
+            clock.wait_timers(5000, 1)?;
+            clock.advance_ms(2000)?;
+            Ok(())
+        })?;
+        clock.wait_protected_headers(if certificate { 2 } else { 1 })?;
+        clock.expire_ms(3000)?;
         if certificate {
             let response = until(&mut peer, FOOTER)?;
             assert!(response.contains("connection-timeout"), "{response}");
-            assert!(
-                Instant::now() < original_deadline_upper_bound + Duration::from_secs(1),
-                "first-header phase received a fresh timeout"
-            );
             peer.write_all(FOOTER.as_bytes())?;
             peer.conn.send_close_notify();
             peer.flush()?;
@@ -271,10 +264,6 @@ fn direct_tls_fragmented_hello_and_protected_header_share_the_original_deadline_
             let mut response = Vec::new();
             assert_eq!(peer.read_to_end(&mut response)?, 0);
             assert!(response.is_empty());
-            assert!(
-                Instant::now() < original_deadline_upper_bound + Duration::from_secs(1),
-                "first-header phase received a fresh timeout"
-            );
         }
     }
     wait_sample(
@@ -294,6 +283,29 @@ fn direct_tls_fragmented_hello_and_protected_header_share_the_original_deadline_
     until(&mut valid, "</stream:features>")?;
     close(&mut valid)?;
     server.stop(Signal::SIGTERM)?;
+
+    let mut binary = Server::start(&direct_config(&fixture), 2)?;
+    let (c2s, s2s) = binary.ready_with(|r| (r.c2s, r.s2s))?;
+    for (address, role, certificate, header) in [
+        (
+            c2s[0],
+            b"xmpp-client".as_slice(),
+            false,
+            c2s_outbound::HEADER,
+        ),
+        (
+            s2s.ok_or("missing S2S")?[0],
+            b"xmpp-server".as_slice(),
+            true,
+            HEADER,
+        ),
+    ] {
+        let mut peer = fragmented_handshake(&fixture, address, role, certificate, || Ok(()))?;
+        peer.write_all(header.as_bytes())?;
+        until(&mut peer, "</stream:features>")?;
+        close(&mut peer)?;
+    }
+    binary.stop(Signal::SIGTERM)?;
     Ok(())
 }
 

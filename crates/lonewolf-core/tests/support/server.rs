@@ -98,6 +98,7 @@ impl C2sSuitePermit {
 }
 
 fn spawn_process(directory: &Path, readiness: &ReadinessSocket) -> TestResult<Child> {
+    super::clock::prepare(directory)?;
     super::federation::remove_shutdown_receipt(directory)?;
     match fs::remove_file(directory.join(STARTUP_FAILURE)) {
         Ok(()) => {}
@@ -884,6 +885,7 @@ fn server_process() -> TestResult {
     if std::env::var_os("LONEWOLF_PROTOCOL_TEST_SERVER").is_none() {
         return Ok(());
     }
+    super::clock::serve()?;
     match fs::read_to_string("s2s-revalidation-interval-ms") {
         Ok(marker) => {
             if marker.is_empty() || !marker.bytes().all(|byte| byte.is_ascii_digit()) {

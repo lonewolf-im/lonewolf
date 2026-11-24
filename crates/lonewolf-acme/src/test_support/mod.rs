@@ -189,6 +189,16 @@ impl TestClock {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_timer_at(&self, deadline: SystemTime) -> bool {
+        self.shared
+            .state
+            .lock()
+            .timers
+            .iter()
+            .any(|timer| timer.deadline == deadline)
+    }
+
     pub fn cancel_waits(&self) {
         let mut state = self.shared.state.lock();
         state.cancelled = true;
@@ -206,9 +216,18 @@ impl TestClock {
     }
 
     pub(crate) fn sleep(&self, delay: Duration, idle: bool) -> impl Future<Output = ()> + '_ {
+        self.timer(self.now() + delay, idle)
+    }
+
+    pub(crate) fn sleep_until(&self, deadline: Instant) -> impl Future<Output = ()> + '_ {
+        let (now, monotonic) = self.shared.state.lock().current();
+        self.timer(now + deadline.saturating_duration_since(monotonic), false)
+    }
+
+    fn timer(&self, deadline: SystemTime, idle: bool) -> Timer<'_> {
         Timer {
             clock: self,
-            deadline: self.now() + delay,
+            deadline,
             id: None,
             generation: None,
             real: None,

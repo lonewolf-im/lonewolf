@@ -529,193 +529,64 @@ fn ipv6_zone_stream_identities_are_terminal_before_and_after_tls() -> TestResult
     Ok(())
 }
 
-#[test]
-fn duplicate_attribute_is_rejected_before_tls() -> TestResult {
-    let suite = C2sSuite::start()?;
-    let mut client = suite.tcp_client()?;
-
-    client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='1.0' to='localhost'>"#)?;
-    client.expect_stream_error("not-well-formed")
-}
-
-#[test]
-fn server_content_namespace_is_rejected_before_tls() -> TestResult {
-    let suite = C2sSuite::start()?;
-    let mut client = suite.tcp_client()?;
-
-    client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:server' to='localhost' version='1.0'>"#)?;
-    client.expect_stream_error("invalid-namespace")
-}
-
-#[test]
-fn wrong_stream_namespace_is_rejected_before_tls() -> TestResult {
-    let suite = C2sSuite::start()?;
-    let mut client = suite.tcp_client()?;
-
-    client.open_with(r#"<stream:stream xmlns:stream='urn:invalid:stream' xmlns='jabber:client' to='localhost' version='1.0'>"#)?;
-    client.expect_stream_error("invalid-namespace")
-}
-
-#[test]
-fn xml_version_1_1_is_accepted_before_tls() -> TestResult {
-    let suite = C2sSuite::start()?;
-    let mut client = suite.tcp_client()?;
-
-    let opening = format!("<?xml version='1.1'?>{OPEN}");
-    let header = client.open_with(&opening)?;
+fn check_stream_openings<R: super::support::xml::CloseTransport>(
+    mut connect: impl FnMut() -> TestResult<super::support::xml::XmlStream<R>>,
+) -> TestResult {
+    for (opening, condition) in [
+        (
+            r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='1.0' to='localhost'>"#,
+            "not-well-formed",
+        ),
+        (
+            r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:server' to='localhost' version='1.0'>"#,
+            "invalid-namespace",
+        ),
+        (
+            r#"<stream:stream xmlns:stream='urn:invalid:stream' xmlns='jabber:client' to='localhost' version='1.0'>"#,
+            "invalid-namespace",
+        ),
+        (
+            r#"<?xml version='1.0' encoding='ISO-8859-1'?>"#,
+            "unsupported-encoding",
+        ),
+        ("!", "not-well-formed"),
+    ] {
+        let mut client = connect()?;
+        client
+            .open_with(opening)
+            .map_err(|error| format!("{opening}: {error}"))?;
+        client
+            .expect_stream_error(condition)
+            .map_err(|error| format!("{opening}: {error}"))?;
+    }
+    let mut client = connect()?;
+    let header = client.open_with(&format!("<?xml version='1.1'?>{OPEN}"))?;
     assert_eq!(header.attribute("version"), Some("1.0"));
     client.features()?;
     client.close()
 }
 
 #[test]
-fn non_utf8_declaration_is_rejected_before_tls() -> TestResult {
+fn stream_opening_validation_before_tls() -> TestResult {
     let suite = C2sSuite::start()?;
-    let mut client = suite.tcp_client()?;
-
-    client.open_with(r#"<?xml version='1.0' encoding='ISO-8859-1'?>"#)?;
-    client.expect_stream_error("unsupported-encoding")
+    check_stream_openings(|| suite.tcp_client())
 }
 
 #[test]
-fn non_xml_opening_is_rejected_before_tls() -> TestResult {
+fn stream_opening_validation_after_tls() -> TestResult {
     let suite = C2sSuite::start()?;
-    let mut client = suite.tcp_client()?;
-
-    client.open_with("!")?;
-    client.expect_stream_error("not-well-formed")
+    check_stream_openings(|| suite.tls_client())
 }
 
 #[test]
-fn duplicate_attribute_is_rejected_after_tls() -> TestResult {
-    let suite = C2sSuite::start()?;
-    let mut client = suite.tls_client()?;
-
-    client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='1.0' to='localhost'>"#)?;
-    client.expect_stream_error("not-well-formed")
-}
-
-#[test]
-fn server_content_namespace_is_rejected_after_tls() -> TestResult {
-    let suite = C2sSuite::start()?;
-    let mut client = suite.tls_client()?;
-
-    client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:server' to='localhost' version='1.0'>"#)?;
-    client.expect_stream_error("invalid-namespace")
-}
-
-#[test]
-fn wrong_stream_namespace_is_rejected_after_tls() -> TestResult {
-    let suite = C2sSuite::start()?;
-    let mut client = suite.tls_client()?;
-
-    client.open_with(r#"<stream:stream xmlns:stream='urn:invalid:stream' xmlns='jabber:client' to='localhost' version='1.0'>"#)?;
-    client.expect_stream_error("invalid-namespace")
-}
-
-#[test]
-fn xml_version_1_1_is_accepted_after_tls() -> TestResult {
-    let suite = C2sSuite::start()?;
-    let mut client = suite.tls_client()?;
-
-    let opening = format!("<?xml version='1.1'?>{OPEN}");
-    let header = client.open_with(&opening)?;
-    assert_eq!(header.attribute("version"), Some("1.0"));
-    client.features()?;
-    client.close()
-}
-
-#[test]
-fn non_utf8_declaration_is_rejected_after_tls() -> TestResult {
-    let suite = C2sSuite::start()?;
-    let mut client = suite.tls_client()?;
-
-    client.open_with(r#"<?xml version='1.0' encoding='ISO-8859-1'?>"#)?;
-    client.expect_stream_error("unsupported-encoding")
-}
-
-#[test]
-fn non_xml_opening_is_rejected_after_tls() -> TestResult {
-    let suite = C2sSuite::start()?;
-    let mut client = suite.tls_client()?;
-
-    client.open_with("!")?;
-    client.expect_stream_error("not-well-formed")
-}
-
-#[test]
-fn duplicate_attribute_is_rejected_after_authentication() -> TestResult {
+fn stream_opening_validation_after_authentication() -> TestResult {
     let suite = C2sSuite::start()?;
     suite.create_account("alice", ALTERNATE_PASSWORD)?;
-    let mut client = suite.unauthenticated_client()?;
-    client.authenticate("alice", ALTERNATE_PASSWORD)?;
-    let mut client = client.restart();
-
-    client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' to='localhost' version='1.0' to='localhost'>"#)?;
-    client.expect_stream_error("not-well-formed")
-}
-
-#[test]
-fn server_content_namespace_is_rejected_after_authentication() -> TestResult {
-    let suite = C2sSuite::start()?;
-    suite.create_account("alice", ALTERNATE_PASSWORD)?;
-    let mut client = suite.unauthenticated_client()?;
-    client.authenticate("alice", ALTERNATE_PASSWORD)?;
-    let mut client = client.restart();
-
-    client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:server' to='localhost' version='1.0'>"#)?;
-    client.expect_stream_error("invalid-namespace")
-}
-
-#[test]
-fn wrong_stream_namespace_is_rejected_after_authentication() -> TestResult {
-    let suite = C2sSuite::start()?;
-    suite.create_account("alice", ALTERNATE_PASSWORD)?;
-    let mut client = suite.unauthenticated_client()?;
-    client.authenticate("alice", ALTERNATE_PASSWORD)?;
-    let mut client = client.restart();
-
-    client.open_with(r#"<stream:stream xmlns:stream='urn:invalid:stream' xmlns='jabber:client' to='localhost' version='1.0'>"#)?;
-    client.expect_stream_error("invalid-namespace")
-}
-
-#[test]
-fn xml_version_1_1_is_accepted_after_authentication() -> TestResult {
-    let suite = C2sSuite::start()?;
-    suite.create_account("alice", ALTERNATE_PASSWORD)?;
-    let mut client = suite.unauthenticated_client()?;
-    client.authenticate("alice", ALTERNATE_PASSWORD)?;
-    let mut client = client.restart();
-
-    let opening = format!("<?xml version='1.1'?>{OPEN}");
-    let header = client.open_with(&opening)?;
-    assert_eq!(header.attribute("version"), Some("1.0"));
-    client.features()?;
-    client.close()
-}
-
-#[test]
-fn non_utf8_declaration_is_rejected_after_authentication() -> TestResult {
-    let suite = C2sSuite::start()?;
-    suite.create_account("alice", ALTERNATE_PASSWORD)?;
-    let mut client = suite.unauthenticated_client()?;
-    client.authenticate("alice", ALTERNATE_PASSWORD)?;
-    let mut client = client.restart();
-
-    client.open_with(r#"<?xml version='1.0' encoding='ISO-8859-1'?>"#)?;
-    client.expect_stream_error("unsupported-encoding")
-}
-
-#[test]
-fn non_xml_opening_is_rejected_after_authentication() -> TestResult {
-    let suite = C2sSuite::start()?;
-    suite.create_account("alice", ALTERNATE_PASSWORD)?;
-    let mut client = suite.unauthenticated_client()?;
-    client.authenticate("alice", ALTERNATE_PASSWORD)?;
-    let mut client = client.restart();
-
-    client.open_with("!")?;
-    client.expect_stream_error("not-well-formed")
+    check_stream_openings(|| {
+        let mut client = suite.unauthenticated_client()?;
+        client.authenticate("alice", ALTERNATE_PASSWORD)?;
+        Ok(client.restart())
+    })
 }
 
 #[test]

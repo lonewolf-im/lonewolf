@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use lonewolf_extension::policy::Verdict;
 use lonewolf_extension::presence::PresenceRequestType;
 use lonewolf_storage::Storage;
 use lonewolf_storage::account::AccountKey;
@@ -10,13 +9,12 @@ use lonewolf_xmpp::stanza::PresenceType;
 use super::{Context, IngressFailure, apply_subscription_receipt};
 use crate::component::metrics::DropReason;
 use crate::delivery::{report_failure, report_handler_failure, storage_failure};
-use crate::router::{Destination, RoutedStanza, RouterError};
+use crate::router::{Destination, RoutedStanza};
 use crate::stages::Stage;
 use crate::stages::ingress::{
-    checks::{Snapshot, check_selected, fix_explicit_snapshot},
-    presence::{ProbeAuthorization, SubscriptionIngress, authorize_probe, receive_subscription},
+    peer::{PeerReply, presence as peer_presence},
+    presence::{SubscriptionIngress, receive_subscription},
 };
-use crate::stages::policy::Selection;
 
 #[cfg(test)]
 mod tests;
@@ -61,55 +59,21 @@ pub(super) async fn handle<A: ChunkAllocator + Clone + 'static>(
     }
     let account = AccountKey::try_from(target.bare()).map_err(|_| IngressFailure)?;
     if kind == PresenceType::Probe {
-        let ProbeAuthorization::Granted(grant) = authorize_probe(
-            context.router.clone(),
-            context.storage.clone(),
-            None,
-            Some(account),
-            &routed,
-            true,
-        )
-        .await?
-        else {
-            return Ok(());
-        };
-        let replies = context
-            .router
-            .probe_remote(&routed, grant.subscribed, grant.snapshot.as_ref())
-            .await
-            .map_err(|_| IngressFailure)?;
-        for reply in replies.into_iter().filter(|reply| reply.is_current()) {
-            let _ = context
-                .registry
-                .reply(domain, context.connection_id, reply.stanza);
+        if let Some(replies) = peer_presence::probe(stage, account, &routed).await? {
+            let peer = PeerReply::Component {
+                registry: &context.registry,
+                domain,
+                connection_id: &context.connection_id,
+            };
+            for reply in replies {
+                peer.send(reply.stanza);
+            }
         }
-        drop(grant.ticket);
         return Ok(());
     }
-    let selection = if kind == PresenceType::Error {
-        Selection::Explicit
-    } else {
-        Selection::All
+    let Some(admission) = peer_presence::admit(stage, &account, &view, kind).await? else {
+        return Ok(());
     };
-    let ordered =
-        fix_explicit_snapshot(&context.router, &context.storage, None, Some(&account)).await?;
-    let snapshot = ordered
-        .as_ref()
-        .map_or(Snapshot::Fresh, |(read, _)| Snapshot::Ordered(read));
-    if check_selected(
-        (&context.router, &context.storage),
-        None,
-        Some(&account),
-        &view,
-        None,
-        snapshot,
-        selection,
-    )
-    .await?
-        != Verdict::Allow
-    {
-        return Ok(());
-    }
     if kind == PresenceType::Available
         && destination == Destination::Account
         && let Some(handler) = context
@@ -123,7 +87,7 @@ pub(super) async fn handle<A: ChunkAllocator + Clone + 'static>(
             .ok_or(IngressFailure)?
             .bare();
         let fresh;
-        let transaction = if let Some((transaction, _)) = &ordered {
+        let transaction = if let Some(transaction) = admission.read() {
             transaction
         } else {
             fresh = match context.storage.begin_read().await {
@@ -162,22 +126,14 @@ pub(super) async fn handle<A: ChunkAllocator + Clone + 'static>(
             }
         }
     }
-    let mut admission = ordered.map(|(_, ticket)| ticket);
-    if let Some(ticket) = &mut admission {
-        ticket.turn().await;
-    }
-    let result = if kind == PresenceType::Error {
-        context.router.route_presence_error(routed).await
-    } else if subscription.is_some() {
-        context.router.route_subscription_presence(routed).await
-    } else if destination == Destination::Resource {
-        context.router.route_full(routed).await
-    } else {
-        context.router.route_presence(routed).await
-    };
-    match result {
-        Ok(()) | Err(RouterError::NotFound | RouterError::Busy) => Ok(()),
-        Err(RouterError::InvalidTarget) if kind == PresenceType::Error => Ok(()),
-        Err(_) => Err(IngressFailure),
-    }
+    admission
+        .deliver(kind, async {
+            if subscription.is_some() {
+                context.router.route_subscription_presence(routed).await
+            } else {
+                peer_presence::route(&context.router, routed, destination, kind).await
+            }
+        })
+        .await
+        .map_err(Into::into)
 }

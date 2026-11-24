@@ -45,9 +45,16 @@ impl Fixture {
         extensions: Extensions<GlobalChunkAllocator, RedbStorage>,
         names: &[&str],
     ) -> TestResult<Self> {
+        Self::with_remote(extensions, names, RemoteFixture::new(AdmissionState::Link)?)
+    }
+
+    fn with_remote(
+        extensions: Extensions<GlobalChunkAllocator, RedbStorage>,
+        names: &[&str],
+        remote: RemoteFixture,
+    ) -> TestResult<Self> {
         let directory = tempfile::tempdir()?;
         let storage = RedbStorage::open(directory.path().join("lonewolf.dat"))?;
-        let remote = RemoteFixture::new(AdmissionState::Link)?;
         let router = Router::new(remote.hosts(), LocalRouter::new(GlobalChunkAllocator))
             .with_remote(remote.remote())
             .with_extensions(BTreeMap::from([(
@@ -1646,6 +1653,123 @@ fn inbound_presence_policy_drops_before_delivery_and_probe_admission() -> TestRe
         }
         Ok(())
     })
+}
+
+struct ProbeReplyPolicy(PlMutex<Option<Gate>>);
+
+impl Extension<GlobalChunkAllocator, RedbStorage> for ProbeReplyPolicy {
+    fn name(&self) -> &'static str {
+        "probe-reply-policy"
+    }
+
+    fn register(
+        self: Arc<Self>,
+        _: &str,
+        slots: &mut Slots<'_, GlobalChunkAllocator, RedbStorage>,
+    ) -> Result<(), RegistrationError> {
+        slots.policy(self.clone());
+        slots.presence(PresenceRequestType::Probe, self)
+    }
+}
+
+impl PolicyHandler<RedbStorage> for ProbeReplyPolicy {
+    fn checks_explicit_addresses(&self) -> bool {
+        true
+    }
+
+    fn check<'a>(&'a self, request: PolicyRequest<'a>, _: &'a RedbRead) -> PolicyFuture<'a> {
+        Box::pin(async move {
+            if request.direction == Direction::Outbound {
+                assert_eq!(request.kind, StanzaType::Presence(PresenceType::Available));
+                let gate = self.0.lock().take();
+                if let Some((entered, release)) = gate {
+                    let _ = entered.send(());
+                    release
+                        .await
+                        .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+                }
+            }
+            Ok(Verdict::Allow)
+        })
+    }
+}
+
+impl PresenceHandler<GlobalChunkAllocator, RedbStorage> for ProbeReplyPolicy {
+    fn visibility<'a>(
+        &'a self,
+        _: &'a AccountKey,
+        _: lonewolf_xmpp::jid::JidRef<'a>,
+        _: &'a RedbRead,
+    ) -> PresenceFuture<'a, bool> {
+        Box::pin(async { Ok(true) })
+    }
+}
+
+#[test]
+fn inbound_probe_skips_a_reply_whose_resource_retires_after_candidate_selection() -> TestResult {
+    compio::runtime::Runtime::new()?.block_on(compio::time::timeout(
+        Duration::from_secs(5),
+        async {
+            let (entered, reached) = oneshot::channel();
+            let (release, resume) = oneshot::channel();
+            let mut extensions = Extensions::default();
+            extensions.register(Arc::new(ProbeReplyPolicy(PlMutex::new(Some((
+                entered, resume,
+            ))))))?;
+            let limit = NonZeroUsize::new(2).ok_or("resource limit")?;
+            let remote = RemoteFixture::with_capacity(AdmissionState::Link, limit)?;
+            let fixture = Fixture::with_remote(extensions, &["probe-reply-policy"], remote)?;
+            create_iq_account(&fixture).await?;
+            let owner = account()?;
+            let desk = fixture
+                .context
+                .router
+                .register(&owner, Some("desk"), limit)
+                .await?;
+            let phone = fixture
+                .context
+                .router
+                .register(&owner, Some("phone"), limit)
+                .await?;
+            for (registration, resource) in [(&desk, "desk"), (&phone, "phone")] {
+                registration
+                    .handle()
+                    .set_presence(
+                        Some(0),
+                        parsed(&format!("<presence from='bob@example.com/{resource}'/>")).await?,
+                        None,
+                    )
+                    .await?;
+            }
+            let mut dispatch = Box::pin(fixture.dispatch(
+                "<presence type='probe' from='alice@remote.test/desk' to='bob@example.com'/>",
+            ));
+            match futures_util::future::select(reached, dispatch.as_mut()).await {
+                futures_util::future::Either::Left((entered, _)) => entered?,
+                futures_util::future::Either::Right(_) => {
+                    return Err("dispatch finished before outbound probe policy".into());
+                }
+            }
+            drop(desk);
+            release.send(()).map_err(|_| "probe policy cancelled")?;
+            dispatch.await?;
+            assert_eq!(fixture.remote.occupancy().0, 1);
+            let reply = fixture.remote.receive()?.ok_or("live probe reply")?;
+            let reply = reply.resolve()?;
+            assert_eq!(
+                reply.stanza_type(),
+                StanzaType::Presence(PresenceType::Available)
+            );
+            assert_eq!(
+                reply.from()?.ok_or("from")?.as_str(),
+                "bob@example.com/phone"
+            );
+            assert_eq!(reply.to()?.ok_or("to")?.as_str(), "alice@remote.test/desk");
+            assert!(fixture.remote.receive()?.is_none());
+            drop(phone);
+            fixture.finish().await
+        },
+    ))?
 }
 
 #[test]

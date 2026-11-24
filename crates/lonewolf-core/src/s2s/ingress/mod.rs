@@ -95,7 +95,7 @@ pub(crate) async fn dispatch<A: ChunkAllocator + Clone + 'static>(
             let destination = context.router.destination(target);
             peer::complete_iq(&stage, &origin, &reply, stanza, destination, kind).await
         }
-        StanzaType::Presence(kind) => return presence::handle(context, peer, stanza, kind).await,
+        StanzaType::Presence(kind) => return presence::handle(&stage, stanza, kind).await,
     };
     outcome.map_err(Into::into)
 }

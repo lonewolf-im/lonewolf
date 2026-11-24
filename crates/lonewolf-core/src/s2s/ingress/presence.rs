@@ -6,11 +6,12 @@ use lonewolf_storage::account::AccountKey;
 use lonewolf_util::arena::ChunkAllocator;
 use lonewolf_xmpp::stanza::{PresenceType, StanzaErrorCondition};
 
-use super::{InboundPeer, IngressContext, IngressFailure, reply_error};
+use super::{InboundPeer, IngressContext, IngressFailure};
 use crate::router::{Destination, RoutedStanza, RouterError};
 use crate::stages::Stage;
 use crate::stages::ingress::{
     checks::{Snapshot, check_selected, fix_explicit_snapshot},
+    peer::PeerReply,
     presence::{
         ProbeAuthorization, SubscriptionIngress, SubscriptionReceipt, authorize_probe,
         receive_subscription,
@@ -120,17 +121,26 @@ async fn subscription<A: ChunkAllocator + Clone + 'static>(
         allocator: &context.allocator,
         work: &context.work,
     };
-    match receive_subscription(&stage, routed, kind, SubscriptionIngress::Federated).await? {
-        SubscriptionReceipt::Done => Ok(()),
-        SubscriptionReceipt::NoHandler { stanza } => {
-            let condition = StanzaErrorCondition::ServiceUnavailable;
-            reply_error(context, &stanza, condition, None, condition.default_text())
-        }
-        SubscriptionReceipt::Rejected {
-            stanza,
-            condition,
-            text,
-        } => reply_error(context, &stanza, condition, None, text),
-        SubscriptionReceipt::Failed { .. } => Err(IngressFailure),
-    }
+    let reply = PeerReply::Federation(&context.router);
+    let outcome =
+        match receive_subscription(&stage, routed, kind, SubscriptionIngress::Federated).await? {
+            SubscriptionReceipt::Done => Ok(()),
+            SubscriptionReceipt::NoHandler { stanza } => {
+                let condition = StanzaErrorCondition::ServiceUnavailable;
+                reply.reject(
+                    &context.allocator,
+                    &stanza,
+                    condition,
+                    None,
+                    condition.default_text(),
+                )
+            }
+            SubscriptionReceipt::Rejected {
+                stanza,
+                condition,
+                text,
+            } => reply.reject(&context.allocator, &stanza, condition, None, text),
+            SubscriptionReceipt::Failed { .. } => return Err(IngressFailure),
+        };
+    outcome.map_err(Into::into)
 }

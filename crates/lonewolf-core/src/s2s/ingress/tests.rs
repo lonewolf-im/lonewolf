@@ -19,7 +19,10 @@ use lonewolf_storage::{RedbRead, RedbWrite, Storage, WriteTransaction};
 use lonewolf_util::arena::{Arena, ArenaConfig, GlobalChunkAllocator};
 use lonewolf_xmpp::jid::Jid;
 use lonewolf_xmpp::parser::{ParserConfig, StreamEvent, XmppParser};
-use lonewolf_xmpp::stanza::{IqType, PresenceType, StanzaNamespace};
+use lonewolf_xmpp::stanza::{
+    ApplicationCondition, IqType, PresenceType, StanzaErrorCondition, StanzaErrorText,
+    StanzaNamespace,
+};
 use parking_lot::Mutex as PlMutex;
 
 use super::*;
@@ -162,6 +165,7 @@ fn error_reply(
 fn reply_eligibility_preserves_addresses_ids_and_payload() -> TestResult {
     compio::runtime::Runtime::new()?.block_on(async {
         let fixture = Fixture::new(Extensions::default(), &[])?;
+        let reply = PeerReply::Federation(&fixture.context.router);
         for (xml, bounceable) in [
             ("<message type='chat'><body>body</body></message>", true),
             ("<message/>", true),
@@ -185,7 +189,7 @@ fn reply_eligibility_preserves_addresses_ids_and_payload() -> TestResult {
             let ending = if prefix.ends_with('/') { "/>" } else { ">" };
             let stanza = parsed(&format!("{insertion} from='alice@remote.test/desk' to='bob@example.com/phone' id='reply'{ending}{tail}")).await?;
             let condition = StanzaErrorCondition::ServiceUnavailable;
-            reply_error(&fixture.context, &stanza, condition, None, condition.default_text()).map_err(|_| "reply")?;
+            reply.reject(&fixture.context.allocator, &stanza, condition, None, condition.default_text()).map_err(|_| "reply")?;
             assert_eq!(fixture.remote.occupancy().0, usize::from(bounceable));
             if bounceable {
                 let response = error_reply(&fixture, "bob@example.com/phone", "reply", "service-unavailable", default_text(condition))?;
@@ -202,11 +206,12 @@ fn reply_eligibility_preserves_addresses_ids_and_payload() -> TestResult {
 fn reply_admission_failures_do_not_fail_completed_ingress() -> TestResult {
     compio::runtime::Runtime::new()?.block_on(async {
         let mut fixture = Fixture::new(Extensions::default(), &[])?;
+        let reply = PeerReply::Federation(&fixture.context.router);
         let condition = StanzaErrorCondition::ServiceUnavailable;
         for xml in ["<iq type='get' from='alice@remote.test/desk' to='example.com' id='admission'><query xmlns='urn:test'/></iq>", "<presence type='subscribe' from='alice@remote.test/desk' to='example.com' id='admission'/>", "<presence type='subscribed' from='alice@remote.test/desk' to='example.com' id='admission'/>", "<presence type='unsubscribe' from='alice@remote.test/desk' to='example.com' id='admission'/>", "<presence type='unsubscribed' from='alice@remote.test/desk' to='example.com' id='admission'/>"] {
             let stanza = parsed(xml).await?;
             for _ in 0..2 {
-                reply_error(&fixture.context, &stanza, condition, None, condition.default_text()).map_err(|_| "reply failed on full queue")?;
+                reply.reject(&fixture.context.allocator, &stanza, condition, None, condition.default_text()).map_err(|_| "reply failed on full queue")?;
             }
             error_reply(&fixture, "example.com", "admission", "service-unavailable", default_text(condition))?;
         }
@@ -214,7 +219,7 @@ fn reply_admission_failures_do_not_fail_completed_ingress() -> TestResult {
         for kind in ["iq", "subscribe", "subscribed", "unsubscribe", "unsubscribed"] {
             let xml = if kind=="iq" { "<iq type='get' from='alice@remote.test/desk' to='example.com' id='admission'><query xmlns='urn:test'/></iq>".into() } else { format!("<presence type='{kind}' from='alice@remote.test/desk' to='example.com'/>") };
             let stanza=parsed(&xml).await?;
-            reply_error(&fixture.context, &stanza, condition, None, condition.default_text()).map_err(|_| "reply failed after stop")?;
+            reply.reject(&fixture.context.allocator, &stanza, condition, None, condition.default_text()).map_err(|_| "reply failed after stop")?;
         }
         assert_eq!(fixture.remote.occupancy(), (0, 0));
         fixture.finish().await
@@ -774,6 +779,42 @@ fn iq_xml(kind: &str, target: &str, payload: &str) -> String {
     format!(
         "<iq type='{kind}' from='alice@remote.test/desk' to='{target}' id='iq' xml:lang='fr'>{payload}</iq>"
     )
+}
+
+#[test]
+fn inbound_iq_answer_admission_is_best_effort_on_full_and_stopped_routes() -> TestResult {
+    compio::runtime::Runtime::new()?.block_on(async {
+        let mut extensions = Extensions::default();
+        extensions.register(Arc::new(lonewolf_extension::ping::Ping))?;
+        let mut fixture = Fixture::new(extensions, &["ping"])?;
+        let mut registry = prometheus_client::registry::Registry::default();
+        fixture.remote.metrics().register(&mut registry);
+        let request = |id: &str| {
+            format!(
+                "<iq type='get' from='alice@remote.test/desk' to='example.com' id='{id}'><ping xmlns='urn:xmpp:ping'/></iq>"
+            )
+        };
+
+        fixture.dispatch(&request("first")).await?;
+        assert_eq!(fixture.remote.occupancy().0, 1);
+        fixture.dispatch(&request("full")).await?;
+        let reply = fixture.remote.receive()?.ok_or("first answer")?;
+        assert_eq!(reply.resolve()?.stanza_type(), StanzaType::Iq(IqType::Result));
+        assert_eq!(reply.resolve()?.id()?, Some("first"));
+        assert!(fixture.remote.receive()?.is_none());
+
+        fixture.remote.finish(Instant::now() + Duration::from_secs(5)).await?;
+        fixture.dispatch(&request("stopped")).await?;
+        assert_eq!(fixture.remote.occupancy(), (0, 0));
+
+        let mut output = String::new();
+        prometheus_client::encoding::text::encode(&mut output, &registry)?;
+        for reason in ["queue_full", "stopped"] {
+            let expected = format!("s2s_admission_rejections_total{{reason=\"{reason}\"}} 1");
+            assert!(output.lines().any(|line| line == expected), "{output}");
+        }
+        fixture.finish().await
+    })
 }
 
 #[test]

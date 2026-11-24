@@ -15,54 +15,75 @@ use crate::router::{Router, local::LocalRouter};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
+struct Fixture {
+    settings: Settings<GlobalChunkAllocator>,
+    metrics: Arc<ComponentMetrics>,
+    _router: Router<GlobalChunkAllocator>,
+    _directory: tempfile::TempDir,
+}
+
+impl Fixture {
+    fn new(tls_mode: ComponentTlsMode) -> Result<Self, Box<dyn std::error::Error>> {
+        let config = crate::Config {
+            components: toml::from_str(
+                "[domains.'muc.localhost']\nsecret='component-test-secret-0001'",
+            )?,
+            ..crate::Config::default()
+        };
+        let hosts = Hosts::new(&config.hosts, None)?;
+        let router = Router::new(hosts.clone(), LocalRouter::new(GlobalChunkAllocator));
+        let directory = tempfile::tempdir()?;
+        let metrics = ComponentMetrics::new(1, 1);
+        let settings = Settings {
+            registry: ComponentRegistry::new(
+                &config.components,
+                credentials::load(&config.components)?,
+                &config.limits.components,
+                Arc::clone(&metrics),
+            ),
+            limits: config.limits.components,
+            hosts,
+            tls_mode,
+            timeout: Duration::from_secs(30),
+            services: ComponentServices {
+                router: router.handle(),
+                storage: lonewolf_storage::RedbStorage::open(directory.path().join("state.redb"))?,
+                allocator: GlobalChunkAllocator,
+            },
+            metrics: Arc::clone(&metrics),
+        };
+        Ok(Self {
+            settings,
+            metrics,
+            _router: router,
+            _directory: directory,
+        })
+    }
+}
+
 fn established_tls_without_application_bytes(shutdown: bool, cancel_close: bool) -> TestResult {
     compio::runtime::Runtime::new()?.block_on(compio::time::timeout(
         Duration::from_secs(5),
         async {
-            let config = crate::Config {
-                components: toml::from_str(
-                    "[domains.'muc.localhost']\nsecret='component-test-secret-0001'",
-                )?,
-                ..crate::Config::default()
-            };
-            let hosts = Hosts::new(&config.hosts, None)?;
+            let fixture = Fixture::new(ComponentTlsMode::Direct)?;
+            let Fixture {
+                settings, metrics, ..
+            } = &fixture;
             let mut roots = rustls::RootCertStore::empty();
             roots.add(
-                hosts
+                settings
+                    .hosts
                     .certified_key("localhost")
                     .ok_or("missing certificate")?
                     .cert[0]
                     .clone(),
             )?;
             let client_config =
-                rustls::ClientConfig::builder_with_provider(hosts.crypto_provider())
+                rustls::ClientConfig::builder_with_provider(settings.hosts.crypto_provider())
                     .with_safe_default_protocol_versions()?
                     .with_root_certificates(roots)
                     .with_no_client_auth();
             let connector = TlsConnector::from(Arc::new(client_config));
-            let router = Router::new(hosts.clone(), LocalRouter::new(GlobalChunkAllocator));
-            let directory = tempfile::tempdir()?;
-            let metrics = ComponentMetrics::new(1, 1);
-            let settings = Settings {
-                registry: ComponentRegistry::new(
-                    &config.components,
-                    credentials::load(&config.components)?,
-                    &config.limits.components,
-                    Arc::clone(&metrics),
-                ),
-                limits: config.limits.components,
-                hosts,
-                tls_mode: ComponentTlsMode::Direct,
-                timeout: Duration::from_secs(30),
-                services: ComponentServices {
-                    router: router.handle(),
-                    storage: lonewolf_storage::RedbStorage::open(
-                        directory.path().join("state.redb"),
-                    )?,
-                    allocator: GlobalChunkAllocator,
-                },
-                metrics: Arc::clone(&metrics),
-            };
             let listener = crate::connection::bind(([127, 0, 0, 1], 0).into()).await?;
             let peer = TcpStream::connect(listener.local_addr()?).await?;
             let (socket, _) = listener.accept().await?;
@@ -71,9 +92,9 @@ fn established_tls_without_application_bytes(shutdown: bool, cancel_close: bool)
                 .reserve(Instant::now())
                 .map_err(|_| "admission rejected")?;
             let gauge = metrics.connection_opened();
-            let accounting = Accounting::new(Arc::clone(&metrics));
+            let accounting = Accounting::new(Arc::clone(metrics));
             let (server, client) = join(
-                transport(&socket, &settings),
+                transport(&socket, settings),
                 connector.connect(
                     "localhost".try_into()?,
                     Box::pin(AsyncStream::new(peer.clone())),
@@ -101,7 +122,7 @@ fn established_tls_without_application_bytes(shutdown: bool, cancel_close: bool)
             };
             let result = {
                 let (reader, writer) = state.connection.as_mut().ok_or("missing connection")?;
-                let mut xml = Box::pin(run(reader, writer, &settings, &mut state.progress));
+                let mut xml = Box::pin(run(reader, writer, settings, &mut state.progress));
                 assert!(poll!(xml.as_mut()).is_pending());
                 let (result, deadline) =
                     select_terminal(xml, signal.clone(), accounting.started).await;
@@ -128,7 +149,7 @@ fn established_tls_without_application_bytes(shutdown: bool, cancel_close: bool)
                     let _permit = permit;
                     let _gauge = gauge;
                     assert!(
-                        finish(&socket, &settings, signal, 1, accounting, state, result)
+                        finish(&socket, settings, signal, 1, accounting, state, result)
                             .await
                             .is_err()
                     );
@@ -234,4 +255,91 @@ fn cancelled_post_tls_close_preserves_timeout_and_releases_admission() -> TestRe
 #[test]
 fn cancelled_post_tls_close_preserves_shutdown_and_releases_admission() -> TestResult {
     established_tls_without_application_bytes(true, true)
+}
+
+#[test]
+fn shutdown_during_a_held_header_write_finishes_that_header_without_opening_another() -> TestResult
+{
+    compio::runtime::Runtime::new()?.block_on(compio::time::timeout(
+        Duration::from_secs(5),
+        async {
+            let fixture = Fixture::new(ComponentTlsMode::None)?;
+            let settings = &fixture.settings;
+            let listener = crate::connection::bind(([127, 0, 0, 1], 0).into()).await?;
+            let client = TcpStream::connect(listener.local_addr()?).await?;
+            let (socket, peer) = listener.accept().await?;
+            let mut client = Box::pin(AsyncStream::new(client));
+            client
+                .write_all(b"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:component:accept' to='muc.localhost'>")
+                .await?;
+            client.flush().await?;
+            let probe = crate::test_support::install_component_write_probe(peer)?;
+            probe.hold_after_bytes(10)?;
+            let mut connection = transport(&socket, settings)
+                .await
+                .map_err(|failure| format!("transport failed: {:?}", failure.error))?;
+            connection.1.bind_write_probe(peer);
+            let mut state = Negotiation {
+                connection: Some(connection),
+                progress: Progress {
+                    domain: None,
+                    header_sent: false,
+                    peer_footer: false,
+                },
+                shutdown_deadline: None,
+            };
+            let held = probe.next_event();
+            let signal = async move {
+                assert!(held.await.is_ok());
+                Instant::now() + Duration::from_secs(4)
+            }
+            .boxed_local()
+            .shared();
+            let accounting = Accounting::new(Arc::clone(&fixture.metrics));
+            let result = {
+                let (reader, writer) = state.connection.as_mut().ok_or("missing connection")?;
+                let xml = Box::pin(run(reader, writer, settings, &mut state.progress));
+                let (result, deadline) = select_terminal(
+                    xml,
+                    signal.clone(),
+                    accounting.started + settings.timeout,
+                )
+                .await;
+                state.shutdown_deadline = deadline;
+                result
+            };
+            assert_eq!(
+                result
+                    .as_ref()
+                    .err()
+                    .ok_or("unexpected authentication")?
+                    .outcome
+                    .as_str(),
+                AuthOutcome::Shutdown.as_str()
+            );
+            probe.release_write()?;
+            let close = async {
+                let mut xml = Vec::new();
+                let mut byte = [0];
+                while !xml.ends_with(b"</stream:stream>") {
+                    assert_eq!(client.read(&mut byte).await?, 1);
+                    xml.push(byte[0]);
+                }
+                let xml = std::str::from_utf8(&xml)?;
+                assert_eq!(xml.matches("<?xml").count(), 1, "{xml}");
+                assert_eq!(xml.matches("<stream:stream").count(), 1, "{xml}");
+                assert!(xml.starts_with("<?xml version='1.0'?><stream:stream"), "{xml}");
+                assert!(xml.contains("<system-shutdown"), "{xml}");
+                client.write_all(b"</stream:stream>").await?;
+                client.flush().await?;
+                Ok::<(), Box<dyn std::error::Error>>(())
+            };
+            let finished = finish(&socket, settings, signal, 1, accounting, state, result);
+            let (closed, finished) = join(close, finished).await;
+            closed?;
+            assert!(finished.is_err());
+            listener.close().await?;
+            Ok(())
+        },
+    ))?
 }

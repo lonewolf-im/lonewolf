@@ -86,6 +86,7 @@ fn peer_certificate_expiry_resets_stream() -> TestResult {
         let mut peer = listener.accept("b.test", "a.test", config, true)?;
         peer.receive()?.assert_xml("<message xmlns='jabber:server' from='alice@a.test/desk' to='bob@b.test/phone' type='chat'><body>before expiry</body></message>")?;
         authentication(&fixture.suite, "outbound", "success", 1)?;
+        wait_for_idle_link(&clock)?;
         clock.advance_ms(6000)?;
         peer.expect_stream_error("reset")?;
         closed(&fixture.suite, "outbound", "certificate_expired", 1)?;
@@ -114,6 +115,7 @@ fn peer_certificate_expiry_resets_stream() -> TestResult {
     bob.expect_xml("<message xmlns='jabber:client' xml:lang='en' from='alice@a.test/desk' to='bob@b.test/phone' type='chat'><body>short certificate</body></message>")?;
     authentication(&pair.a, "outbound", "success", 1)?;
     authentication(&pair.b, "inbound", "success", 1)?;
+    wait_for_idle_link(&clock)?;
     clock.advance_ms(8000)?;
     closed(&pair.a, "outbound", "certificate_expired", 1)?;
     closed(&pair.b, "inbound", "peer_error", 1)?;
@@ -142,6 +144,11 @@ fn peer_certificate_expiry_resets_stream() -> TestResult {
     alice.close()?;
     bob.close()?;
     pair.stop()
+}
+
+fn wait_for_idle_link(clock: &Clock) -> std::io::Result<()> {
+    // The outbound link re-arms its default 600 second idle timer only after it finishes a write.
+    clock.wait_timers(600_000, 1)
 }
 
 #[test]

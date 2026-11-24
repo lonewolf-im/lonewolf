@@ -58,14 +58,7 @@ impl<A: ChunkAllocator, S: Storage> ExtensionFactory<A, S> for PrivateFactory {
     fn build(&self, hosts: &[HostOptions<'_>]) -> Result<Arc<dyn Extension<A, S>>, OptionsError> {
         let mut quotas = BTreeMap::new();
         for host in hosts {
-            if let Some(table) = host.options {
-                let options = table
-                    .clone()
-                    .try_into::<PrivateOptions>()
-                    .map_err(|error| OptionsError {
-                        domain: host.domain.into(),
-                        reason: error.to_string(),
-                    })?;
+            if let Some(options) = host.parse::<PrivateOptions>()? {
                 quotas.insert(
                     host.domain.into(),
                     PrivateXmlQuota {

@@ -8,12 +8,12 @@ use std::time::{Duration, Instant};
 
 use futures_util::future::{Either, select};
 use futures_util::io::AsyncWrite;
-use futures_util::task::AtomicWaker;
 use lonewolf_xmpp::parser::StreamEvent;
 use lonewolf_xmpp::stream::StreamErrorCondition;
 use tokio::io::AsyncBufRead;
 
 use super::*;
+use crate::connection::StopRequest;
 use crate::s2s::ingress::{InboundPeer, IngressContext, IngressFailure, receive};
 use crate::s2s::metrics::StreamClose;
 use crate::s2s::stream::S2sError;
@@ -74,29 +74,6 @@ struct Activity {
     receiving: Cell<bool>,
     sending: Cell<bool>,
     stop: StopRequest,
-}
-
-#[derive(Default)]
-struct StopRequest {
-    requested: Cell<bool>,
-    waker: AtomicWaker,
-}
-impl StopRequest {
-    fn request(&self) {
-        self.requested.set(true);
-        self.waker.wake();
-    }
-    async fn wait(&self) {
-        poll_fn(|cx| {
-            self.waker.register(cx.waker());
-            if self.requested.get() {
-                Poll::Ready(())
-            } else {
-                Poll::Pending
-            }
-        })
-        .await;
-    }
 }
 
 enum QueueSource<'a, A: ChunkAllocator + Clone + 'static> {
@@ -325,7 +302,7 @@ where
                 }
             }
         }
-        if activity.stop.requested.get() {
+        if activity.stop.is_requested() {
             return SendEnd::Stopped;
         }
         let Some(head) = queue.current.as_mut() else {

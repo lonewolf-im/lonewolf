@@ -10,7 +10,6 @@ use compio::net::TcpStream;
 use futures_util::FutureExt as _;
 use futures_util::future::{Either, select};
 use futures_util::io::AsyncWrite;
-use futures_util::task::AtomicWaker;
 use lonewolf_util::arena::ChunkAllocator;
 use lonewolf_xmpp::parser::StreamEvent;
 use lonewolf_xmpp::stanza::{RoutedStanza, StanzaNamespace};
@@ -24,7 +23,7 @@ use super::negotiate::Authenticated;
 use super::registry::ComponentLink;
 use super::stream::{ComponentError, ComponentReader, ComponentWriter, WriteProgress};
 use super::{ComponentServices, Settings};
-use crate::connection::ShutdownSignal;
+use crate::connection::{ShutdownSignal, StopRequest};
 use crate::delivery::WorkGroup;
 
 trait Clock {
@@ -41,28 +40,6 @@ impl Clock for SystemClock {
     }
 }
 
-#[derive(Default)]
-struct StopRequest {
-    requested: Cell<bool>,
-    waker: AtomicWaker,
-}
-impl StopRequest {
-    fn request(&self) {
-        self.requested.set(true);
-        self.waker.wake();
-    }
-    async fn wait(&self) {
-        poll_fn(|cx| {
-            self.waker.register(cx.waker());
-            if self.requested.get() {
-                Poll::Ready(())
-            } else {
-                Poll::Pending
-            }
-        })
-        .await;
-    }
-}
 async fn cooperate() {
     let mut yielded = false;
     poll_fn(|cx| {
@@ -125,7 +102,7 @@ async fn sending<A: ChunkAllocator + Clone + 'static, W: AsyncWrite + Unpin>(
     let progress = writer.progress();
     let mut buffered = false;
     loop {
-        if stop.requested.get() {
+        if stop.is_requested() {
             return Ok(());
         }
         let stanza = match link.try_next() {

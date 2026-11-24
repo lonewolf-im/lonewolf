@@ -82,14 +82,22 @@ fn component_iq_answers_keep_attachment_selection_on_busy_detached_and_stopped_r
             extensions.enable_host("localhost", [NAME])?,
         )]));
         let mut work = WorkGroup::new();
-        let context = Context {
+        let mut context = Context {
             router: router.handle(),
             storage,
             allocator: GlobalChunkAllocator,
             work: work.handle(),
             registry: registry.clone(),
-            connection_id: requesting.id(),
+            connection_id: survivor.id(),
         };
+
+        dispatch(&context, DOMAIN, ping("survivor")?)
+            .await
+            .map_err(|_| "survivor dispatch")?;
+        let reply = survivor.try_next().ok_or("survivor answer")?;
+        assert_eq!(reply.resolve()?.id()?, Some("survivor"));
+        assert!(requesting.try_next().is_none());
+        context.connection_id = requesting.id();
 
         dispatch(&context, DOMAIN, ping("first")?)
             .await

@@ -52,7 +52,6 @@ fn failure(context: &'static str) -> BenchError {
 pub enum StopOutcome {
     NotStarted,
     Graceful,
-    /// The server exited before the driver asked it to stop.
     Exited,
     Forced,
 }
@@ -208,7 +207,7 @@ impl PreparationControl<'_> {
         self.wait(job).await
     }
 
-    /// Runs every job concurrently on the pool and returns their results in order.
+    /// Returns results in input order.
     async fn run_cpu_all<T: Send + 'static, F>(
         &mut self,
         cpu: &CpuPool,
@@ -291,7 +290,7 @@ impl LocalFixture {
             server_binary,
             server_workers,
             stanza_pool_size_mib,
-            ..
+            extensions,
         } = &config.target
         else {
             return Err(failure("fixture_requires_local_target"));
@@ -401,7 +400,7 @@ impl LocalFixture {
         control.check()?;
         tls::write_private(
             &config_path,
-            server_config(*stanza_pool_size_mib).as_bytes(),
+            server_config(*stanza_pool_size_mib, extensions).as_bytes(),
         )?;
         control.check()?;
         Ok(Self {
@@ -663,7 +662,8 @@ fn provision_accounts(
     Ok(batch)
 }
 
-fn server_config(stanza_pool_size_mib: u64) -> String {
+fn server_config(stanza_pool_size_mib: u64, extensions: &[String]) -> String {
+    let extensions = extensions.join("\", \"");
     format!(
         r#"[logging]
 level = "info"
@@ -671,7 +671,7 @@ level = "info"
 default_host = "localhost"
 stanza_pool_size_mib = {stanza_pool_size_mib}
 [hosts.localhost]
-extensions = ["roster", "offline"]
+extensions = ["{extensions}"]
 [hosts.localhost.tls]
 provider = "files"
 certificate_chain_path = "certificate.pem"

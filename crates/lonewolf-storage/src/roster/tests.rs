@@ -22,6 +22,7 @@ fn insert_item(storage: &RedbStorage, key: &str, bytes: &[u8]) -> TestResult {
     let transaction = storage.as_ref().begin_write()?;
     transaction.open_table(ITEMS)?.insert(key, bytes)?;
     transaction.commit()?;
+    storage.forget_shared_snapshot();
     Ok(())
 }
 
@@ -29,6 +30,7 @@ fn remove_item(storage: &RedbStorage, key: &str) -> TestResult {
     let transaction = storage.as_ref().begin_write()?;
     transaction.open_table(ITEMS)?.remove(key)?;
     transaction.commit()?;
+    storage.forget_shared_snapshot();
     Ok(())
 }
 
@@ -413,6 +415,7 @@ fn cleanup_subscription_missing_source_and_version_overflow_abort_without_commit
         .open_table(super::redb::VERSIONS)?
         .insert(owner.as_str(), u64::MAX)?;
     transaction.commit()?;
+    storage.forget_shared_snapshot();
     let original = stored_item(&storage, ITEM_KEY)?;
     block_on(async {
         let mut tx = storage.begin_write().await?;

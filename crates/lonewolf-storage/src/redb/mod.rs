@@ -6,6 +6,7 @@ use std::num::NonZeroUsize;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use ::redb::backends::FileBackend;
@@ -16,8 +17,9 @@ use ::redb::{
 use async_lock::{Mutex, MutexGuardArc};
 use lonewolf_auth::server::ScramDecoy;
 use lonewolf_util::blocking::BlockingExecutor;
+use parking_lot::Mutex as PlMutex;
 
-use crate::metrics::{StoreMetrics, StoreOperation};
+use crate::metrics::{ReadSnapshot, StoreMetrics, StoreOperation};
 use crate::storage::{CommitObserver, ReadTransaction, Storage, WriteTransaction};
 use crate::{StorageError, StorageErrorKind, account, blocking, offline, private, roster, vcard};
 
@@ -33,7 +35,10 @@ pub struct RedbBackend {
 }
 
 struct Inner {
+    // The shared transaction must drop before the database.
+    shared: PlMutex<Option<Shared>>,
     database: Database,
+    commits: AtomicU64,
     /// Snapshot openings bypass the read operation limit to avoid stalling callers that hold an ordering lock.
     openings: BlockingExecutor,
     reads: BlockingExecutor,
@@ -42,6 +47,69 @@ struct Inner {
     writer: Arc<Mutex<()>>,
     decoy: ScramDecoy,
     metrics: Arc<StoreMetrics>,
+}
+
+struct Shared {
+    generation: u64,
+    transaction: Arc<RedbReadTransaction>,
+}
+
+impl Inner {
+    fn reuse_snapshot(&self) -> Option<Arc<RedbReadTransaction>> {
+        let generation = self.commits.load(Ordering::Acquire);
+        self.shared
+            .lock()
+            .as_ref()
+            .filter(|shared| shared.generation == generation)
+            .map(|shared| Arc::clone(&shared.transaction))
+    }
+
+    fn share_snapshot(&self, transaction: &Arc<RedbReadTransaction>, before: u64, after: u64) {
+        let retired = {
+            let mut shared = self.shared.lock();
+            let generation = self.commits.load(Ordering::Acquire);
+            if can_share(
+                shared.as_ref().map(|state| state.generation),
+                generation,
+                before,
+                after,
+            ) {
+                shared.replace(Shared {
+                    generation,
+                    transaction: Arc::clone(transaction),
+                })
+            } else {
+                None
+            }
+        };
+        drop(retired);
+    }
+
+    fn retire_snapshot(&self) -> Option<Shared> {
+        let mut shared = self.shared.lock();
+        self.commits.fetch_add(1, Ordering::AcqRel);
+        shared.take()
+    }
+}
+
+fn can_share(current: Option<u64>, generation: u64, before: u64, after: u64) -> bool {
+    before == after && after == generation && current.is_none_or(|current| current < generation)
+}
+
+struct RetireSnapshot<'a>(Option<&'a Inner>);
+
+impl RetireSnapshot<'_> {
+    fn finish(mut self) -> Option<Shared> {
+        self.0.take().and_then(Inner::retire_snapshot)
+    }
+}
+
+impl Drop for RetireSnapshot<'_> {
+    fn drop(&mut self) {
+        if let Some(inner) = self.0.take() {
+            drop(inner.retire_snapshot());
+        }
+    }
 }
 
 pub struct RedbBackendRead {
@@ -72,7 +140,9 @@ impl RedbBackend {
         let decoy = initialize(&database)?;
         Ok(Self {
             inner: Arc::new(Inner {
+                shared: PlMutex::new(None),
                 database,
+                commits: AtomicU64::new(0),
                 openings: BlockingExecutor::new(const { NonZeroUsize::new(32).unwrap() }),
                 reads: BlockingExecutor::new(const { NonZeroUsize::new(32).unwrap() }),
                 writes: BlockingExecutor::new(NonZeroUsize::MIN),
@@ -85,6 +155,35 @@ impl RedbBackend {
 
     pub fn metrics(&self) -> &StoreMetrics {
         &self.inner.metrics
+    }
+
+    async fn open_snapshot(&self) -> Result<Arc<RedbReadTransaction>, StorageError> {
+        let inner = Arc::clone(&self.inner);
+        let (transaction, before, after) = self
+            .inner
+            .openings
+            .run(move || {
+                let before = inner.commits.load(Ordering::Acquire);
+                let transaction = inner.database.begin_read().map_err(storage_error)?;
+                let after = inner.commits.load(Ordering::Acquire);
+                Ok((transaction, before, after))
+            })
+            .await
+            .inspect_err(|error: &StorageError| {
+                self.inner
+                    .metrics
+                    .record_failure(StoreOperation::BeginRead, error.kind());
+            })?;
+        let transaction = Arc::new(transaction);
+        if before == after {
+            self.inner.share_snapshot(&transaction, before, after);
+        }
+        Ok(transaction)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn forget_shared_snapshot(&self) {
+        drop(self.inner.retire_snapshot());
     }
 
     /// Opens or creates the database file synchronously and initializes its tables.
@@ -112,6 +211,7 @@ impl RedbBackend {
 }
 
 /// Direct database access bypasses the admission limits and can block the caller.
+/// An existing shared snapshot hides raw writes until a commit through the storage traits.
 impl AsRef<Database> for RedbBackend {
     fn as_ref(&self) -> &Database {
         &self.inner.database
@@ -135,19 +235,13 @@ impl Storage for RedbBackend {
     type Write = RedbBackendWrite;
 
     async fn begin_read(&self) -> Result<RedbBackendRead, StorageError> {
-        let inner = Arc::clone(&self.inner);
-        let transaction = self
-            .inner
-            .openings
-            .run(move || inner.database.begin_read().map_err(storage_error))
-            .await
-            .inspect_err(|error| {
-                self.inner
-                    .metrics
-                    .record_failure(StoreOperation::BeginRead, error.kind());
-            })?;
+        let (transaction, outcome) = match self.inner.reuse_snapshot() {
+            Some(transaction) => (transaction, ReadSnapshot::Reused),
+            None => (self.open_snapshot().await?, ReadSnapshot::Opened),
+        };
+        self.inner.metrics.record_read_snapshot(outcome);
         Ok(RedbBackendRead {
-            transaction: Arc::new(transaction),
+            transaction,
             reads: self.inner.reads.clone(),
         })
     }
@@ -227,7 +321,7 @@ impl WriteTransaction for RedbBackendWrite {
             writes,
             _writer,
             metrics,
-            inner: _,
+            inner,
         } = self;
         // A canceled operation can still hold the transaction on the writer thread.
         let transaction = Arc::into_inner(transaction).ok_or_else(|| {
@@ -238,8 +332,12 @@ impl WriteTransaction for RedbBackendWrite {
         let result = writes
             .run(move || {
                 observer.before_commit();
+                let retirement = RetireSnapshot(Some(&inner));
                 let result = transaction.commit().map_err(commit_error);
+                // Retire the old snapshot before the observer makes this commit visible.
+                let retired = retirement.finish();
                 observer.after_commit(result.is_ok());
+                drop(retired);
                 result
             })
             .await;

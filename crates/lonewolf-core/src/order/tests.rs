@@ -8,7 +8,10 @@ use std::task::{Context, Poll, Waker};
 
 use compio::runtime::Runtime;
 use futures_channel::oneshot;
-use lonewolf_storage::account::AccountKey;
+use lonewolf_auth::scram::{SCRAM_POLICY_ITERATIONS, ScramCredentials, ScramIterations};
+use lonewolf_storage::account::{AccountKey, AccountReads, AccountWrites, NewAccount};
+use lonewolf_storage::metrics::ReadSnapshot;
+use lonewolf_storage::{RedbStorage, Storage, WriteTransaction};
 use lonewolf_util::arena::{Arena, ArenaConfig};
 use lonewolf_xmpp::jid::Jid;
 use prometheus_client::encoding::text::encode;
@@ -308,4 +311,61 @@ fn every_completed_fix_records_lock_wait_and_hold_even_when_it_fails() -> TestRe
     assert_count(order.wait_duration(), 2)?;
     assert_count(order.hold_duration(), 2)?;
     Ok(())
+}
+
+#[test]
+fn snapshot_fixed_after_a_locked_commit_contains_it() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let storage = RedbStorage::open(directory.path().join("store.redb"))?;
+    let order = Order::new();
+    let alice = account("alice@example.com")?;
+    block_on(async {
+        let (before, old_ticket) = order.fix(vec![alice.clone()], storage.begin_read()).await?;
+        assert!(before.account(&alice).await?.is_none());
+        drop(old_ticket);
+
+        let credentials = ScramCredentials::provision(
+            "order snapshot test password",
+            ScramIterations::new(SCRAM_POLICY_ITERATIONS.get())?,
+        )?;
+        let mut writer = storage.begin_write().await?;
+        writer
+            .create_account(NewAccount {
+                key: alice.clone(),
+                credentials,
+            })
+            .await?;
+        let ((), mut commit_ticket) = order.fix(vec![alice.clone()], writer.commit()).await?;
+        let (after, mut read_ticket) = order.fix(vec![alice.clone()], storage.begin_read()).await?;
+        assert!(after.account(&alice).await?.is_some());
+        assert!(before.account(&alice).await?.is_none());
+        assert!(is_ready(&mut commit_ticket));
+        assert!(!is_ready(&mut read_ticket));
+        drop(commit_ticket);
+        assert!(is_ready(&mut read_ticket));
+        TestResult::Ok(())
+    })?
+}
+
+#[test]
+fn snapshots_fixed_without_commits_share_one_transaction() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let storage = RedbStorage::open(directory.path().join("store.redb"))?;
+    let order = Order::new();
+    let alice = account("alice@example.com")?;
+    block_on(async {
+        let (first, first_ticket) = order.fix(vec![alice.clone()], storage.begin_read()).await?;
+        let (second, mut second_ticket) =
+            order.fix(vec![alice.clone()], storage.begin_read()).await?;
+        assert!(first.account(&alice).await?.is_none());
+        assert!(second.account(&alice).await?.is_none());
+        assert!(!is_ready(&mut second_ticket));
+        drop(first_ticket);
+        assert!(is_ready(&mut second_ticket));
+        assert_eq!(
+            storage.metrics().read_snapshots().collect::<Vec<_>>(),
+            [(ReadSnapshot::Reused, 1), (ReadSnapshot::Opened, 1)],
+        );
+        TestResult::Ok(())
+    })?
 }

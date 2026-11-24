@@ -59,6 +59,22 @@ impl Collector for StorageCollector {
                     .encode(family.encode_family(&[("store", name.as_str())])?)?;
             }
         }
+        {
+            let mut family = encoder.encode_descriptor(
+                "storage_read_snapshots",
+                "Successful read requests by snapshot outcome.",
+                None,
+                MetricType::Counter,
+            )?;
+            for (name, storage) in &self.stores {
+                for (outcome, count) in storage.metrics().read_snapshots() {
+                    ConstCounter::new(count).encode(family.encode_family(&[
+                        ("store", name.as_str()),
+                        ("outcome", outcome.as_str()),
+                    ])?)?;
+                }
+            }
+        }
         if self
             .stores
             .iter()
@@ -204,6 +220,8 @@ mod tests {
         for sample in [
             "lonewolf_storage_commit_duration_seconds_count{store=\"primary\"} 1",
             "lonewolf_storage_write_wait_duration_seconds_count{store=\"primary\"} 1",
+            "lonewolf_storage_read_snapshots_total{store=\"primary\",outcome=\"opened\"} 0",
+            "lonewolf_storage_read_snapshots_total{store=\"primary\",outcome=\"reused\"} 0",
             "lonewolf_storage_blocklist_cache_lookups_total{store=\"primary\",outcome=\"hit\"} 0",
             "lonewolf_storage_blocklist_cache_lookups_total{store=\"primary\",outcome=\"miss\"} 0",
             "lonewolf_storage_blocklist_cache_lookups_total{store=\"primary\",outcome=\"bypass\"} 0",

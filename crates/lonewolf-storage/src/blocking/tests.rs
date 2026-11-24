@@ -190,6 +190,7 @@ fn deleting_a_blocklist_also_erases_rules_that_cannot_be_decoded() -> TestResult
         items.insert((adjacent.as_str(), adjacent_rule.as_str()), ())?;
     }
     raw.commit()?;
+    storage.forget_shared_snapshot();
 
     block_on(async {
         let before = storage.begin_read().await?;

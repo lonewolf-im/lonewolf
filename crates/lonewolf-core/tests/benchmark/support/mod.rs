@@ -26,6 +26,7 @@ pub fn local_config(server: &Path, scenario: ScenarioConfig) -> RunConfig {
             server_binary: server.into(),
             server_workers: 2,
             stanza_pool_size_mib: 8,
+            extensions: vec!["roster".into(), "offline".into()],
         },
         scenario,
         measurement: MeasurementConfig {

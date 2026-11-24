@@ -1,0 +1,16 @@
+[target]
+mode = "local"
+server_binary = "../../target/release/lonewolf"
+stanza_pool_size_mib = 64
+extensions = ["roster", "offline", "blocking"]
+
+[scenario]
+kind = "messages"
+pairs = 200
+rate_per_second = 20000
+body_bytes = 256
+
+[measurement]
+warmup_ms = 10000
+duration_ms = 60000
+ramp_rate_per_second = 100

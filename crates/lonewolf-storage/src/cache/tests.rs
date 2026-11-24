@@ -353,12 +353,14 @@ fn raw_database_exposure_keeps_overlapping_snapshots_consistent_across_clones() 
         let first_write = raw.begin_write()?;
         first_write.open_table(ITEMS)?.insert((ALICE, BOB), ())?;
         first_write.commit()?;
+        storage.forget_shared_snapshot();
         let first = storage.begin_read().await?;
         assert!(is_blocked(&first, &owner, BOB).await?);
 
         let second_write = raw.begin_write()?;
         second_write.open_table(ITEMS)?.remove((ALICE, BOB))?;
         second_write.commit()?;
+        cloned.forget_shared_snapshot();
         let second = cloned.begin_read().await?;
         assert!(!is_blocked(&second, &owner, BOB).await?);
         assert_eq!(first.blocklist(&owner).await?, [jid(BOB)?]);
@@ -376,6 +378,62 @@ fn raw_database_exposure_keeps_overlapping_snapshots_consistent_across_clones() 
                 (BlocklistLookup::Bypass, 5),
             ]
         );
+        Ok(())
+    })
+}
+
+#[test]
+fn layer_stamps_reused_snapshots_correctly() -> TestResult {
+    let (_directory, storage) = file_store()?;
+    let owner = key(ALICE)?;
+    block_on(async {
+        create_cache_test_accounts(&storage).await?;
+        let first = storage.begin_read().await?;
+        let second = storage.begin_read().await?;
+        assert!(Arc::ptr_eq(
+            &first.inner().snapshot(),
+            &second.inner().snapshot()
+        ));
+        assert!(first.stamp.is_some());
+        assert_eq!(first.stamp, second.stamp);
+
+        set_block(&storage, &owner, BOB).await?;
+        let third = storage.begin_read().await?;
+        assert!(third.stamp.is_some());
+        assert_ne!(first.stamp, third.stamp);
+        assert!(is_blocked(&third, &owner, BOB).await?);
+        assert_eq!(
+            lookup_counts(&storage),
+            [
+                (BlocklistLookup::Hit, 1),
+                (BlocklistLookup::Miss, 0),
+                (BlocklistLookup::Bypass, 0)
+            ],
+        );
+
+        let mut writer = storage.begin_write().await?;
+        writer.delete_blocklist(&owner).await?;
+        writer.commit().await?;
+        let fourth = storage.begin_read().await?;
+        assert!(fourth.stamp.is_some());
+        assert_ne!(third.stamp, fourth.stamp);
+        assert!(fourth.blocklist(&owner).await?.is_empty());
+        assert_eq!(
+            lookup_counts(&storage),
+            [
+                (BlocklistLookup::Hit, 1),
+                (BlocklistLookup::Miss, 1),
+                (BlocklistLookup::Bypass, 0)
+            ],
+        );
+        assert_eq!(
+            storage
+                .cache_metrics()
+                .blocklist_fills()
+                .collect::<Vec<_>>(),
+            [(BlocklistFill::Inserted, 1), (BlocklistFill::Discarded, 0)],
+        );
+        assert_eq!(storage.cache_metrics().blocklist_entries(), 1);
         Ok(())
     })
 }

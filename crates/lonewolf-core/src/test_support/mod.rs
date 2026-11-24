@@ -15,7 +15,7 @@ use lonewolf_xmpp::jid::Jid;
 use parking_lot::Mutex as PlMutex;
 
 mod clock;
-pub use clock::ManualClock;
+pub use clock::{ClockEvent, ManualClock};
 
 pub(crate) mod component_write;
 mod process;

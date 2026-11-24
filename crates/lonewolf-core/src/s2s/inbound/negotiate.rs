@@ -508,7 +508,9 @@ async fn run<A: ChunkAllocator + Clone>(
     *header_sent = false;
     let tls = connection.as_mut().ok_or(S2sError::Internal)?;
     #[cfg(feature = "test-support")]
-    crate::test_support::ManualClock::reading_protected_header();
+    crate::test_support::ManualClock::record(
+        crate::test_support::ClockEvent::ReadingProtectedHeader,
+    );
     let restarted = header(expected(tls, peer_footer).await?)?;
     if restarted.to != local {
         return Err(reject(

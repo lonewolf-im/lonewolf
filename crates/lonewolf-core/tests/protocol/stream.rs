@@ -285,6 +285,7 @@ fn nonreading_timeout_peer_releases_connection_capacity_within_one_grace_budget(
     clock.wait_timers(5000, 1)?;
     let mut rejected = suite.tcp_client()?;
     rejected.expect_eof()?;
+    clock.wait_flushed_close_footers(1)?;
     clock.advance_ms(5000)?;
     suite.wait_for_closed("establishment_timeout", 1)?;
     let mut replacement = suite.tcp_client()?;

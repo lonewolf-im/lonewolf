@@ -7,12 +7,13 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use lonewolf_core::test_support::ManualClock;
+use lonewolf_core::test_support::{ClockEvent, ManualClock};
 
 const ADVANCE: u8 = 1;
 const WAIT_TIMERS: u8 = 2;
 const SET_WALL: u8 = 3;
 const WAIT_HEADERS: u8 = 4;
+const WAIT_FOOTERS: u8 = 5;
 
 thread_local! {
     static ENABLED: Cell<bool> = const { Cell::new(false) };
@@ -73,9 +74,16 @@ pub fn serve() -> io::Result<()> {
                         clock.set_wall_before_handshake(std::time::UNIX_EPOCH + duration);
                         Ok(())
                     }
-                    WAIT_HEADERS => {
-                        clock.wait_for_protected_headers(count, Duration::from_secs(10))
-                    }
+                    WAIT_HEADERS => clock.wait_for_event(
+                        ClockEvent::ReadingProtectedHeader,
+                        count,
+                        Duration::from_secs(10),
+                    ),
+                    WAIT_FOOTERS => clock.wait_for_event(
+                        ClockEvent::FlushedCloseFooter,
+                        count,
+                        Duration::from_secs(10),
+                    ),
                     _ => Err(io::ErrorKind::InvalidInput.into()),
                 };
                 let _ = match result {
@@ -124,6 +132,10 @@ impl Clock {
 
     pub fn wait_protected_headers(&self, count: u32) -> io::Result<()> {
         self.command(WAIT_HEADERS, 0, count)
+    }
+
+    pub fn wait_flushed_close_footers(&self, count: u32) -> io::Result<()> {
+        self.command(WAIT_FOOTERS, 0, count)
     }
 
     pub fn advance_ms(&self, millis: u64) -> io::Result<()> {

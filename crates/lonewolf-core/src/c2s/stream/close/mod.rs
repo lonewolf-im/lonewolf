@@ -338,6 +338,8 @@ where
     } else {
         writer.send(STREAM_FOOTER).await?;
     }
+    #[cfg(feature = "test-support")]
+    crate::test_support::ManualClock::record(crate::test_support::ClockEvent::FlushedCloseFooter);
     if !matches!(reason, CloseReason::PeerFooter) && !reader.is_failed() {
         loop {
             match reader.next_event().await {

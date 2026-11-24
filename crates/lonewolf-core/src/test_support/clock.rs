@@ -10,14 +10,20 @@ use tokio::sync::watch;
 
 static CLOCK: OnceLock<ManualClock> = OnceLock::new();
 
+#[derive(Clone, Copy)]
+pub enum ClockEvent {
+    ReadingProtectedHeader,
+    FlushedCloseFooter,
+}
+
 pub struct ManualClock {
     origin: Instant,
     wall_origin: PlMutex<SystemTime>,
     time: watch::Sender<Instant>,
     timers: PlMutex<BTreeMap<Instant, usize>>,
     registered: PlCondvar,
-    protected_headers: PlMutex<u32>,
-    header_read: PlCondvar,
+    observations: PlMutex<[u32; 2]>,
+    observed: PlCondvar,
 }
 
 impl ManualClock {
@@ -31,8 +37,8 @@ impl ManualClock {
                 time: watch::channel(origin).0,
                 timers: PlMutex::default(),
                 registered: PlCondvar::new(),
-                protected_headers: PlMutex::default(),
-                header_read: PlCondvar::new(),
+                observations: PlMutex::default(),
+                observed: PlCondvar::new(),
             }
         })
     }
@@ -53,18 +59,26 @@ impl ManualClock {
         *self.wall_origin.lock() = time - self.now().duration_since(self.origin);
     }
 
-    pub(crate) fn reading_protected_header() {
+    pub(crate) fn record(event: ClockEvent) {
         if let Some(clock) = Self::current() {
-            *clock.protected_headers.lock() += 1;
-            clock.header_read.notify_all();
+            clock.observations.lock()[event as usize] += 1;
+            clock.observed.notify_all();
         }
     }
 
-    pub fn wait_for_protected_headers(&self, count: u32, timeout: Duration) -> io::Result<()> {
-        let mut headers = self.protected_headers.lock();
-        self.header_read
-            .wait_while_for(&mut headers, |seen| *seen < count, timeout);
-        if *headers < count {
+    pub fn wait_for_event(
+        &self,
+        event: ClockEvent,
+        count: u32,
+        timeout: Duration,
+    ) -> io::Result<()> {
+        let mut observations = self.observations.lock();
+        self.observed.wait_while_for(
+            &mut observations,
+            |seen| seen[event as usize] < count,
+            timeout,
+        );
+        if observations[event as usize] < count {
             return Err(io::ErrorKind::TimedOut.into());
         }
         Ok(())

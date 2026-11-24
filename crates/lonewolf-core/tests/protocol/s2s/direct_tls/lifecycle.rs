@@ -86,6 +86,9 @@ fn expiry(intermediate: bool) -> TestResult {
         alice.expect_xml("<message xmlns='jabber:client' from='bob@b.test/phone' to='alice@a.test/desk' type='chat' id='bidi-live'><body>Bidi is live</body></message>")?;
         alice.send("<message to='bob@b.test/phone' type='chat' id='bidi-reply'><body>Reverse link</body></message>")?;
         remote.receive()?.assert_xml("<message xmlns='jabber:server' from='alice@a.test/desk' to='bob@b.test/phone' type='chat' id='bidi-reply'><body>Reverse link</body></message>")?;
+        // Relaying one more inbound stanza lets the server finish writing the reply, so expiry finds an idle link.
+        remote.send("<message from='bob@b.test/phone' to='alice@a.test/desk' type='chat' id='bidi-idle'><body>Idle link</body></message>")?;
+        alice.expect_xml("<message xmlns='jabber:client' from='bob@b.test/phone' to='alice@a.test/desk' type='chat' id='bidi-idle'><body>Idle link</body></message>")?;
         clock.advance_ms(6000)?;
         remote.expect_stream_error("reset")?;
         closed(&fixture.suite, direction, "certificate_expired", 1)?;

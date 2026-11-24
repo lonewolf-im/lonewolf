@@ -12,6 +12,8 @@ use crate::component::registry::ComponentRegistry;
 use crate::router::{Destination, RouterHandle};
 use crate::stages::{Stage, StageFailure};
 
+pub(crate) mod presence;
+
 pub(crate) enum PeerReply<'a, A: ChunkAllocator> {
     Federation(&'a RouterHandle<A>),
     Component {

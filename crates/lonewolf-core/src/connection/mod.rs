@@ -437,7 +437,6 @@ pub(crate) async fn run_listener<H: AcceptHandler>(
     }
 }
 
-#[expect(clippy::cognitive_complexity)]
 async fn run_listener_with_accept<H, F>(
     listener: &TcpListener,
     context: WorkerContext,
@@ -460,34 +459,8 @@ where
         listener_id,
         worker_id,
     };
-    match kind {
-        ListenerKind::C2s => tracing::debug!(
-            listener_id,
-            worker_id,
-            port = match listener.local_addr() {
-                Ok(address) => address.port(),
-                Err(error) => return ListenerOutcome::from(Err(error)),
-            },
-            "c2s TCP worker listener started"
-        ),
-        ListenerKind::S2s => tracing::debug!(
-            listener_id,
-            worker_id,
-            port = match listener.local_addr() {
-                Ok(address) => address.port(),
-                Err(error) => return ListenerOutcome::from(Err(error)),
-            },
-            "s2s TCP worker listener started"
-        ),
-        ListenerKind::Component => tracing::debug!(
-            listener_id,
-            worker_id,
-            port = match listener.local_addr() {
-                Ok(address) => address.port(),
-                Err(error) => return ListenerOutcome::from(Err(error)),
-            },
-            "component TCP worker listener started"
-        ),
+    if let Err(error) = log_listener_started(kind, listener, listener_id, worker_id) {
+        return ListenerOutcome::from(Err(error));
     }
     let shutdown = async move {
         match select(pin!(context.shutdown_requested()), pin!(stop)).await {
@@ -548,17 +521,7 @@ where
                     continue;
                 }
                 if resource_exhausted(&error) {
-                    match kind {
-                        ListenerKind::C2s => {
-                            tracing::warn!(listener_id, worker_id, error_kind = ?error.kind(), "c2s accept delayed by resource exhaustion")
-                        }
-                        ListenerKind::S2s => {
-                            tracing::warn!(listener_id, worker_id, error_kind = ?error.kind(), "s2s accept delayed by resource exhaustion")
-                        }
-                        ListenerKind::Component => {
-                            tracing::warn!(listener_id, worker_id, error_kind = ?error.kind(), "component accept delayed by resource exhaustion")
-                        }
-                    }
+                    log_accept_delayed(kind, listener_id, worker_id, &error);
                     if let Either::Left(_) = select(
                         shutdown_wait.as_mut(),
                         pin!(compio::time::sleep(ACCEPT_RETRY_DELAY)),
@@ -587,6 +550,49 @@ where
     ListenerOutcome {
         result: result.and(drained),
         drain_deadline_exceeded,
+    }
+}
+
+fn log_listener_started(
+    kind: ListenerKind,
+    listener: &TcpListener,
+    listener_id: usize,
+    worker_id: usize,
+) -> io::Result<()> {
+    match kind {
+        ListenerKind::C2s => tracing::debug!(
+            listener_id,
+            worker_id,
+            port = listener.local_addr()?.port(),
+            "c2s TCP worker listener started"
+        ),
+        ListenerKind::S2s => tracing::debug!(
+            listener_id,
+            worker_id,
+            port = listener.local_addr()?.port(),
+            "s2s TCP worker listener started"
+        ),
+        ListenerKind::Component => tracing::debug!(
+            listener_id,
+            worker_id,
+            port = listener.local_addr()?.port(),
+            "component TCP worker listener started"
+        ),
+    }
+    Ok(())
+}
+
+fn log_accept_delayed(kind: ListenerKind, listener_id: usize, worker_id: usize, error: &io::Error) {
+    match kind {
+        ListenerKind::C2s => {
+            tracing::warn!(listener_id, worker_id, error_kind = ?error.kind(), "c2s accept delayed by resource exhaustion")
+        }
+        ListenerKind::S2s => {
+            tracing::warn!(listener_id, worker_id, error_kind = ?error.kind(), "s2s accept delayed by resource exhaustion")
+        }
+        ListenerKind::Component => {
+            tracing::warn!(listener_id, worker_id, error_kind = ?error.kind(), "component accept delayed by resource exhaustion")
+        }
     }
 }
 

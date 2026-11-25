@@ -54,6 +54,13 @@ impl<A: ChunkAllocator + Clone> IqInput<A> {
         })
     }
 
+    fn id(&self) -> Result<Option<&str>, StageFailure> {
+        Ok(match self {
+            Self::Owned { request, arena, .. } => request.resolve(arena)?.id()?,
+            Self::Routed(stanza) => stanza.resolve()?.id()?,
+        })
+    }
+
     pub(crate) fn into_routed(self) -> Result<RoutedStanza<A>, StageFailure> {
         match self {
             Self::Owned {
@@ -205,11 +212,10 @@ pub(crate) enum UnavailableKind {
     Remote,
 }
 
-#[expect(clippy::cognitive_complexity)]
 pub(crate) async fn handle<A: ChunkAllocator + Clone + 'static>(
     stage: &Stage<'_, A>,
     origin: &Origin<'_, A>,
-    mut input: IqInput<A>,
+    input: IqInput<A>,
     destination: Destination,
     kind: IqType,
 ) -> Result<IqDisposition<A>, StageFailure> {
@@ -225,115 +231,16 @@ pub(crate) async fn handle<A: ChunkAllocator + Clone + 'static>(
         destination,
         origin.session().is_some() && stage.router.federation_enabled(),
     )?;
-    if destination == Destination::ServerResource
-        && let Some(source) = origin.sender()
-        && Selection::Explicit.configured(stage.router, source.domain())
-    {
-        let verdict = input
-            .check_policy(
-                stage.router,
-                stage.storage,
-                Some(source),
-                None,
-                Snapshot::Fresh,
-                Selection::Explicit,
-            )
-            .await?;
-        if verdict != Verdict::Allow {
-            return Ok(policy_disposition(input, verdict));
-        }
-    }
     if matches!(
         destination,
         Destination::Resource | Destination::ServerResource
     ) {
-        if !policies {
-            input = IqInput::Routed(input.into_routed()?);
-        }
-        let to = match &input {
-            IqInput::Owned { request, arena, .. } => request.resolve(arena)?.to()?,
-            IqInput::Routed(stanza) => stanza.resolve()?.to()?,
-        }
-        .ok_or(StageFailure)?;
-        if to.localpart().is_none() {
-            return Ok(if request_type.is_some() {
-                IqDisposition::Unavailable {
-                    input,
-                    condition: StanzaErrorCondition::ServiceUnavailable,
-                    response: None,
-                    kind: UnavailableKind::Resource,
-                }
-            } else {
-                IqDisposition::Done
-            });
-        }
-        let target = AccountKey::try_from(to.bare())?;
-        let source = origin.sender().cloned();
-        let liveness = origin.session().map(|session| session.liveness());
-        let outcome = if origin.detaches() {
-            let router = stage.router.clone();
-            let storage = stage.storage.clone();
-            Pending::spawn(stage.work.start(), async move {
-                ResourceIqWork {
-                    source,
-                    liveness,
-                    router: &router,
-                    storage: &storage,
-                    target,
-                    request: request_type.is_some(),
-                    input,
-                }
-                .run()
-                .await
-            })
-            .finished()
-            .await
-            .ok_or(StageFailure)??
-        } else {
-            ResourceIqWork {
-                source,
-                liveness,
-                router: stage.router,
-                storage: stage.storage,
-                target,
-                request: request_type.is_some(),
-                input,
-            }
-            .run()
-            .await?
-        };
-        return match outcome {
-            ResourceOutcome::Policy { input, verdict } => Ok(policy_disposition(input, verdict)),
-            ResourceOutcome::Admitted { input, result } => match result {
-                Ok(()) => Ok(IqDisposition::Done),
-                Err(error) if request_type.is_none() => {
-                    if origin.session().is_some() {
-                        tracing::debug!(stanza_kind = "iq", outcome = ?error, "IQ response delivery failed");
-                    }
-                    Ok(IqDisposition::Done)
-                }
-                Err(RouterError::Unavailable | RouterError::Stopped) => Err(StageFailure),
-                Err(error) => Ok(IqDisposition::Unavailable {
-                    input,
-                    condition: if matches!(error, RouterError::Busy | RouterError::ResourceLimit) {
-                        StanzaErrorCondition::ResourceConstraint
-                    } else {
-                        StanzaErrorCondition::ServiceUnavailable
-                    },
-                    response: None,
-                    kind: UnavailableKind::Resource,
-                }),
-            },
-        };
+        return handle_resource(stage, origin, input, destination, policies, request_type).await;
     }
     let target_account = if destination == Destination::Account
         && (matches!(&input, IqInput::Routed(_)) || policies)
     {
-        let to = match &input {
-            IqInput::Owned { request, arena, .. } => request.resolve(arena)?.to()?,
-            IqInput::Routed(stanza) => stanza.resolve()?.to()?,
-        }
-        .ok_or(StageFailure)?;
+        let to = input.addressed_to()?.ok_or(StageFailure)?;
         Some(AccountKey::try_from(to.bare())?)
     } else {
         None
@@ -408,46 +315,150 @@ pub(crate) async fn handle<A: ChunkAllocator + Clone + 'static>(
     {
         return Ok(IqDisposition::Done);
     }
+    dispose_unhandled(stage, origin, input, destination, request_type)
+}
+
+async fn handle_resource<A: ChunkAllocator + Clone + 'static>(
+    stage: &Stage<'_, A>,
+    origin: &Origin<'_, A>,
+    mut input: IqInput<A>,
+    destination: Destination,
+    policies: bool,
+    request_type: Option<IqRequestType>,
+) -> Result<IqDisposition<A>, StageFailure> {
+    if destination == Destination::ServerResource
+        && let Some(source) = origin.sender()
+        && Selection::Explicit.configured(stage.router, source.domain())
+    {
+        let verdict = input
+            .check_policy(
+                stage.router,
+                stage.storage,
+                Some(source),
+                None,
+                Snapshot::Fresh,
+                Selection::Explicit,
+            )
+            .await?;
+        if verdict != Verdict::Allow {
+            return Ok(policy_disposition(input, verdict));
+        }
+    }
+    if !policies {
+        input = IqInput::Routed(input.into_routed()?);
+    }
+    let to = input.addressed_to()?.ok_or(StageFailure)?;
+    if to.localpart().is_none() {
+        return Ok(if request_type.is_some() {
+            IqDisposition::Unavailable {
+                input,
+                condition: StanzaErrorCondition::ServiceUnavailable,
+                response: None,
+                kind: UnavailableKind::Resource,
+            }
+        } else {
+            IqDisposition::Done
+        });
+    }
+    let target = AccountKey::try_from(to.bare())?;
+    let source = origin.sender().cloned();
+    let liveness = origin.session().map(|session| session.liveness());
+    let outcome = if origin.detaches() {
+        let router = stage.router.clone();
+        let storage = stage.storage.clone();
+        Pending::spawn(stage.work.start(), async move {
+            ResourceIqWork {
+                source,
+                liveness,
+                router: &router,
+                storage: &storage,
+                target,
+                request: request_type.is_some(),
+                input,
+            }
+            .run()
+            .await
+        })
+        .finished()
+        .await
+        .ok_or(StageFailure)??
+    } else {
+        ResourceIqWork {
+            source,
+            liveness,
+            router: stage.router,
+            storage: stage.storage,
+            target,
+            request: request_type.is_some(),
+            input,
+        }
+        .run()
+        .await?
+    };
+    resource_disposition(outcome, request_type.is_some(), origin)
+}
+
+fn resource_disposition<A: ChunkAllocator>(
+    outcome: ResourceOutcome<A>,
+    request: bool,
+    origin: &Origin<'_, A>,
+) -> Result<IqDisposition<A>, StageFailure> {
+    match outcome {
+        ResourceOutcome::Policy { input, verdict } => Ok(policy_disposition(input, verdict)),
+        ResourceOutcome::Admitted { input, result } => match result {
+            Ok(()) => Ok(IqDisposition::Done),
+            Err(error) if !request => {
+                if matches!(origin, Origin::Session(_)) {
+                    tracing::debug!(stanza_kind = "iq", outcome = ?error, "IQ response delivery failed");
+                }
+                Ok(IqDisposition::Done)
+            }
+            Err(RouterError::Unavailable | RouterError::Stopped) => Err(StageFailure),
+            Err(error) => Ok(IqDisposition::Unavailable {
+                input,
+                condition: if matches!(error, RouterError::Busy | RouterError::ResourceLimit) {
+                    StanzaErrorCondition::ResourceConstraint
+                } else {
+                    StanzaErrorCondition::ServiceUnavailable
+                },
+                response: None,
+                kind: UnavailableKind::Resource,
+            }),
+        },
+    }
+}
+
+fn dispose_unhandled<A: ChunkAllocator + Clone>(
+    stage: &Stage<'_, A>,
+    origin: &Origin<'_, A>,
+    input: IqInput<A>,
+    destination: Destination,
+    request_type: Option<IqRequestType>,
+) -> Result<IqDisposition<A>, StageFailure> {
     if destination == Destination::Remote
         && !matches!(origin, Origin::Remote { .. })
         && stage.router.federation_enabled()
     {
         let stanza = input.into_routed()?;
-        let condition = match stage.router.route_remote(stanza.clone()) {
-            Ok(()) => return Ok(IqDisposition::Done),
-            Err(_) if request_type.is_none() => return Ok(IqDisposition::Done),
-            Err(
-                RouterError::Busy | RouterError::ResourceLimit | RouterError::DirectedPresenceLimit,
-            ) => StanzaErrorCondition::ResourceConstraint,
-            Err(RouterError::RemoteUnsupported | RouterError::RemoteNotFound) => {
-                StanzaErrorCondition::RemoteServerNotFound
-            }
-            Err(RouterError::RemoteTimeout) => StanzaErrorCondition::RemoteServerTimeout,
-            Err(RouterError::InvalidTarget | RouterError::InvalidResource) => {
-                StanzaErrorCondition::BadRequest
-            }
-            Err(RouterError::Stopped | RouterError::Unavailable) => {
-                StanzaErrorCondition::InternalServerError
-            }
-            Err(RouterError::NotFound | RouterError::Offline) => {
-                StanzaErrorCondition::ServiceUnavailable
-            }
+        let Err(error) = stage.router.route_remote(stanza.clone()) else {
+            return Ok(IqDisposition::Done);
         };
+        if request_type.is_none() {
+            return Ok(IqDisposition::Done);
+        }
         return Ok(IqDisposition::Unavailable {
             input: IqInput::Routed(stanza),
-            condition,
+            condition: remote_route_condition(error),
             response: None,
             kind: UnavailableKind::Remote,
         });
     }
     if request_type.is_none() {
         if origin.session().is_some() && destination == Destination::Server {
-            let id = match &input {
-                IqInput::Owned { request, arena, .. } => request.resolve(arena)?.id()?,
-                IqInput::Routed(stanza) => stanza.resolve()?.id()?,
-            }
-            .filter(|id| id.starts_with(crate::router::iq_requests::ID_PREFIX))
-            .map(Box::<str>::from);
+            let id = input
+                .id()?
+                .filter(|id| id.starts_with(crate::router::iq_requests::ID_PREFIX))
+                .map(Box::<str>::from);
             if let Some(id) = id {
                 let stanza = input.into_routed()?;
                 let sender =
@@ -478,6 +489,25 @@ pub(crate) async fn handle<A: ChunkAllocator + Clone + 'static>(
         response,
         kind: UnavailableKind::Handler,
     })
+}
+
+fn remote_route_condition(error: RouterError) -> StanzaErrorCondition {
+    match error {
+        RouterError::Busy | RouterError::ResourceLimit | RouterError::DirectedPresenceLimit => {
+            StanzaErrorCondition::ResourceConstraint
+        }
+        RouterError::RemoteUnsupported | RouterError::RemoteNotFound => {
+            StanzaErrorCondition::RemoteServerNotFound
+        }
+        RouterError::RemoteTimeout => StanzaErrorCondition::RemoteServerTimeout,
+        RouterError::InvalidTarget | RouterError::InvalidResource => {
+            StanzaErrorCondition::BadRequest
+        }
+        RouterError::Stopped | RouterError::Unavailable => {
+            StanzaErrorCondition::InternalServerError
+        }
+        RouterError::NotFound | RouterError::Offline => StanzaErrorCondition::ServiceUnavailable,
+    }
 }
 
 fn policy_needed<A: ChunkAllocator + Clone>(

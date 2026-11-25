@@ -824,21 +824,7 @@ impl<'a, R: ArenaRead> StanzaRef<'a, R> {
         prefix.write(output)?;
         output.write_str(name)?;
         namespaces.write(self.arena, output, prefix, namespace.as_str(), None, None)?;
-        if let Some(jid) = self.from()? {
-            xml::attribute(output, "from", jid.as_str())?;
-        }
-        if let Some(jid) = self.to()? {
-            xml::attribute(output, "to", jid.as_str())?;
-        }
-        if let Some(id) = self.id()? {
-            xml::attribute(output, "id", id)?;
-        }
-        if let Some(stanza_type) = self.serialized_type()? {
-            xml::attribute(output, "type", stanza_type)?;
-        }
-        if let Some(lang) = self.lang()? {
-            xml::attribute(output, "xml:lang", lang)?;
-        }
+        self.write_header_attributes(output)?;
         element::write_attributes(self.data.attributes, namespaces, prefix, self.arena, output)?;
         if self.data.children.get(self.arena)?.is_empty() {
             output.write_str("/>")?;
@@ -874,7 +860,6 @@ impl<'a, R: ArenaRead> StanzaRef<'a, R> {
     /// # Errors
     ///
     /// Access or I/O errors can leave partial XML; this method does not validate.
-    #[expect(clippy::cognitive_complexity)]
     pub async fn write_xml_async_as<W: AsyncWrite + Unpin>(
         &self,
         namespace: StanzaNamespace,
@@ -893,21 +878,7 @@ impl<'a, R: ArenaRead> StanzaRef<'a, R> {
         namespaces
             .write_async(self.arena, output, prefix, namespace.as_str(), None, None)
             .await?;
-        if let Some(jid) = self.from()? {
-            xml::attribute_async(output, "from", jid.as_str()).await?;
-        }
-        if let Some(jid) = self.to()? {
-            xml::attribute_async(output, "to", jid.as_str()).await?;
-        }
-        if let Some(id) = self.id()? {
-            xml::attribute_async(output, "id", id).await?;
-        }
-        if let Some(stanza_type) = self.serialized_type()? {
-            xml::attribute_async(output, "type", stanza_type).await?;
-        }
-        if let Some(lang) = self.lang()? {
-            xml::attribute_async(output, "xml:lang", lang).await?;
-        }
+        self.write_header_attributes_async(output).await?;
         element::write_attributes_async(
             self.data.attributes,
             namespaces,
@@ -933,6 +904,47 @@ impl<'a, R: ArenaRead> StanzaRef<'a, R> {
         prefix.write_async(output).await?;
         output.write_all(name.as_bytes()).await?;
         output.write_all(b">").await?;
+        Ok(())
+    }
+
+    fn write_header_attributes(&self, output: &mut impl fmt::Write) -> Result<(), WriteError> {
+        if let Some(jid) = self.from()? {
+            xml::attribute(output, "from", jid.as_str())?;
+        }
+        if let Some(jid) = self.to()? {
+            xml::attribute(output, "to", jid.as_str())?;
+        }
+        if let Some(id) = self.id()? {
+            xml::attribute(output, "id", id)?;
+        }
+        if let Some(stanza_type) = self.serialized_type()? {
+            xml::attribute(output, "type", stanza_type)?;
+        }
+        if let Some(lang) = self.lang()? {
+            xml::attribute(output, "xml:lang", lang)?;
+        }
+        Ok(())
+    }
+
+    async fn write_header_attributes_async<W: AsyncWrite + Unpin>(
+        &self,
+        output: &mut W,
+    ) -> Result<(), AsyncWriteError> {
+        if let Some(jid) = self.from()? {
+            xml::attribute_async(output, "from", jid.as_str()).await?;
+        }
+        if let Some(jid) = self.to()? {
+            xml::attribute_async(output, "to", jid.as_str()).await?;
+        }
+        if let Some(id) = self.id()? {
+            xml::attribute_async(output, "id", id).await?;
+        }
+        if let Some(stanza_type) = self.serialized_type()? {
+            xml::attribute_async(output, "type", stanza_type).await?;
+        }
+        if let Some(lang) = self.lang()? {
+            xml::attribute_async(output, "xml:lang", lang).await?;
+        }
         Ok(())
     }
 }

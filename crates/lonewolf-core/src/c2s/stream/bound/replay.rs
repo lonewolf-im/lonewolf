@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use lonewolf_extension::message::{Backlog, MessageHandler};
 use lonewolf_storage::account::AccountKey;
-use lonewolf_storage::offline::OfflineSequence;
+use lonewolf_storage::offline::{OfflinePage, OfflineSequence};
 use lonewolf_storage::{RedbStorage, Storage};
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::{Jid, JidRef};
@@ -31,26 +31,13 @@ pub(super) struct ReplayCounts {
 }
 
 impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> Outbox<'_, A, W> {
-    #[expect(clippy::cognitive_complexity)]
     pub(super) async fn write_offline(
         &mut self,
         backlog: Backlog,
         handler: Arc<dyn MessageHandler<A, RedbStorage>>,
         policy: Option<ReplayPolicy<A>>,
     ) -> Result<ReplayCounts, CloseOutcome> {
-        // Bound the pending selective acknowledgement to one replay page.
-        if self
-            .releases
-            .iter()
-            .any(|(_, release)| matches!(release, Release::BacklogMessages { .. }))
-        {
-            self.writer.flush(self.written).await?;
-            self.release_through(self.written);
-        }
-        if let Some(task) = self.selective_acknowledgement.as_mut() {
-            task.await.map_err(|_| CloseOutcome::InternalError)?;
-            self.selective_acknowledgement = None;
-        }
+        self.settle_selective_acknowledgement().await?;
         let recipient = policy
             .as_ref()
             .map(|policy| {
@@ -147,43 +134,84 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> Outbox<'_, A, W> {
                 }
                 break;
             }
-            self.writer.flush(self.written).await?;
-            self.release_through(self.written);
-            // Commit this page before a later transport failure can retire the session.
-            if deferred {
-                self.acknowledge_replay_sequences(&*handler, mem::take(&mut acknowledged))
-                    .await?;
+            let selective = if deferred {
+                Some(mem::take(&mut acknowledged))
             } else {
-                acknowledge_backlog(
-                    &self.storage,
-                    &self.account,
-                    &self.liveness,
-                    &*handler,
-                    &Cell::new(last),
-                )
-                .await
-                .map_err(|error| {
-                    report_handler_failure(&error, &self.account);
-                    CloseOutcome::InternalError
-                })?;
-            }
-            let transaction = self.storage.begin_read().await.map_err(|error| {
-                close_storage_failure(error, "offline_replay_begin_read", &self.account)
-            })?;
-            if !self.liveness.is_alive() {
+                None
+            };
+            let Some(next) = self
+                .next_offline_page(&*handler, last, through, selective, page)
+                .await?
+            else {
                 break;
-            }
-            page = handler
-                .backlog_page(&self.account, &transaction, last, through, page)
-                .await
-                .map_err(|error| {
-                    report_handler_failure(&error, &self.account);
-                    CloseOutcome::InternalError
-                })?;
-            drop(transaction);
-            self.metrics.replay_page_read(kind, page.byte_len());
+            };
+            page = next;
         }
         Ok(counts)
+    }
+
+    async fn settle_selective_acknowledgement(&mut self) -> Result<(), CloseOutcome> {
+        // Bound the pending selective acknowledgement to one replay page.
+        if self
+            .releases
+            .iter()
+            .any(|(_, release)| matches!(release, Release::BacklogMessages { .. }))
+        {
+            self.writer.flush(self.written).await?;
+            self.release_through(self.written);
+        }
+        if let Some(task) = self.selective_acknowledgement.as_mut() {
+            task.await.map_err(|_| CloseOutcome::InternalError)?;
+            self.selective_acknowledgement = None;
+        }
+        Ok(())
+    }
+
+    async fn next_offline_page(
+        &mut self,
+        handler: &dyn MessageHandler<A, RedbStorage>,
+        last: OfflineSequence,
+        through: OfflineSequence,
+        selective: Option<Vec<OfflineSequence>>,
+        page: OfflinePage,
+    ) -> Result<Option<OfflinePage>, CloseOutcome> {
+        self.writer.flush(self.written).await?;
+        self.release_through(self.written);
+        // Commit this page before a later transport failure can retire the session.
+        if let Some(sequences) = selective {
+            self.acknowledge_replay_sequences(handler, sequences)
+                .await?;
+        } else {
+            acknowledge_backlog(
+                &self.storage,
+                &self.account,
+                &self.liveness,
+                handler,
+                &Cell::new(last),
+            )
+            .await
+            .map_err(|error| {
+                report_handler_failure(&error, &self.account);
+                CloseOutcome::InternalError
+            })?;
+        }
+        let transaction = self.storage.begin_read().await.map_err(|error| {
+            close_storage_failure(error, "offline_replay_begin_read", &self.account)
+        })?;
+        if !self.liveness.is_alive() {
+            return Ok(None);
+        }
+        let page = handler
+            .backlog_page(&self.account, &transaction, last, through, page)
+            .await
+            .map_err(|error| {
+                report_handler_failure(&error, &self.account);
+                CloseOutcome::InternalError
+            })?;
+        drop(transaction);
+        self.metrics
+            .replay_page_read(ReplayKind::OfflineMessage, page.byte_len());
+        Ok(Some(page))
     }
 
     pub(super) fn release_replay_sequences(

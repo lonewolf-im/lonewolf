@@ -1679,7 +1679,6 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> Outbox<'_, A, W> {
         flushed
     }
 
-    #[expect(clippy::cognitive_complexity)]
     async fn write_queue(&mut self) -> Result<(), CloseOutcome> {
         if self.queue.is_empty() {
             return Ok(());
@@ -1718,69 +1717,14 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> Outbox<'_, A, W> {
                     self.writer.write(Outgoing::Owned { stanza, arena }).await?;
                 }
                 Output::Requests {
-                    mut page,
+                    page,
                     resource,
                     handler,
                     router,
                 } => {
-                    let kind = ReplayKind::SubscriptionRequest;
-                    'pages: loop {
-                        for (sender, bytes) in page.iter() {
-                            if !self.liveness.is_alive() {
-                                break 'pages;
-                            }
-                            let stanza = self
-                                .parse_stored(bytes, StoredKind::Subscription(sender))
-                                .await?;
-                            self.written = self.written.next();
-                            self.writer.write(Outgoing::Routed(stanza)).await?;
-                            pending_count += 1;
-                            self.metrics
-                                .replay_records(kind, ReplayOutcome::Delivered, 1);
-                        }
-                        if page.is_complete() {
-                            break;
-                        }
-                        let Some(after) = page.resume_after().cloned() else {
-                            break;
-                        };
-                        let transaction = self.storage.begin_read().await.map_err(|error| {
-                            close_storage_failure(error, "pending_replay_begin_read", &self.account)
-                        })?;
-                        if !self.liveness.is_alive() {
-                            tracing::debug!(
-                                operation = "replay",
-                                outcome = "stale_session",
-                                owner_jid = ?self.account.as_str(),
-                                "pending replay stopped"
-                            );
-                            break;
-                        }
-                        page = handler
-                            .pending_page(&self.account, &after, &transaction, page)
-                            .await
-                            .map_err(|error| {
-                                report_handler_failure(&error, &self.account);
-                                CloseOutcome::InternalError
-                            })?;
-                        self.metrics.replay_page_read(kind, page.byte_len());
-                        policy::filter_pending(
-                            &router,
-                            &transaction,
-                            &self.allocator,
-                            (&self.account, Some(&resource)),
-                            StanzaType::Presence(PresenceType::Available),
-                            &mut page,
-                        )
-                        .await
-                        .map_err(|_| CloseOutcome::InternalError)?;
-                        drop(transaction);
-                        self.metrics.replay_records(
-                            kind,
-                            ReplayOutcome::Blocked,
-                            page.read_len() - page.len(),
-                        );
-                    }
+                    pending_count += self
+                        .write_pending_requests(page, resource, handler, router)
+                        .await?;
                 }
                 Output::Offline {
                     backlog,
@@ -1816,6 +1760,72 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> Outbox<'_, A, W> {
         }
         self.release_through(self.written);
         Ok(())
+    }
+
+    async fn write_pending_requests(
+        &mut self,
+        mut page: PendingPage,
+        resource: Box<str>,
+        handler: Arc<dyn PresenceHandler<A, RedbStorage>>,
+        router: RouterHandle<A>,
+    ) -> Result<usize, CloseOutcome> {
+        let mut written = 0;
+        let kind = ReplayKind::SubscriptionRequest;
+        'pages: loop {
+            for (sender, bytes) in page.iter() {
+                if !self.liveness.is_alive() {
+                    break 'pages;
+                }
+                let stanza = self
+                    .parse_stored(bytes, StoredKind::Subscription(sender))
+                    .await?;
+                self.written = self.written.next();
+                self.writer.write(Outgoing::Routed(stanza)).await?;
+                written += 1;
+                self.metrics
+                    .replay_records(kind, ReplayOutcome::Delivered, 1);
+            }
+            if page.is_complete() {
+                break;
+            }
+            let Some(after) = page.resume_after().cloned() else {
+                break;
+            };
+            let transaction = self.storage.begin_read().await.map_err(|error| {
+                close_storage_failure(error, "pending_replay_begin_read", &self.account)
+            })?;
+            if !self.liveness.is_alive() {
+                tracing::debug!(
+                    operation = "replay",
+                    outcome = "stale_session",
+                    owner_jid = ?self.account.as_str(),
+                    "pending replay stopped"
+                );
+                break;
+            }
+            page = handler
+                .pending_page(&self.account, &after, &transaction, page)
+                .await
+                .map_err(|error| {
+                    report_handler_failure(&error, &self.account);
+                    CloseOutcome::InternalError
+                })?;
+            self.metrics.replay_page_read(kind, page.byte_len());
+            policy::filter_pending(
+                &router,
+                &transaction,
+                &self.allocator,
+                (&self.account, Some(&resource)),
+                StanzaType::Presence(PresenceType::Available),
+                &mut page,
+            )
+            .await
+            .map_err(|_| CloseOutcome::InternalError)?;
+            drop(transaction);
+            self.metrics
+                .replay_records(kind, ReplayOutcome::Blocked, page.read_len() - page.len());
+        }
+        Ok(written)
     }
 
     fn release_through(&mut self, flushed: OutputSequence) {

@@ -12,7 +12,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use compio::io::compat::AsyncReadStream;
 use compio::net::TcpStream;
-use futures_util::io::{AsyncWrite, AsyncWriteExt as _, BufWriter};
+use futures_util::io::AsyncWrite;
 use lonewolf_util::arena::{Arena, ArenaConfig, ArenaRead, ChunkAllocator, HandleError};
 use lonewolf_util::rate_limited_reader::{RateLimitState, RateLimitedReader};
 use lonewolf_xmpp::jid::Jid;
@@ -30,13 +30,13 @@ use crate::config::limits::{ByteRate, EventRate};
 use crate::xml_stream::limiter::StanzaLimiter;
 use crate::xml_stream::parse::{ParseFailure, classify_parse_error};
 use crate::xml_stream::reader::{ReadMode, ReadObserver, XmlReader};
-use crate::xml_stream::{
-    STREAM_FOOTER, escape_attribute, peer_stream_error, stream_error_xml, version_components,
-};
+use crate::xml_stream::writer::StreamWriter;
+use crate::xml_stream::{escape_attribute, peer_stream_error, version_components};
 
 pub(crate) mod limits;
 pub(crate) mod traffic;
 
+const IO_BUFFER_BYTES: usize = 4_096;
 const TLS_NAMESPACE: &str = "urn:ietf:params:xml:ns:xmpp-tls";
 const SASL_NAMESPACE: &str = "urn:ietf:params:xml:ns:xmpp-sasl";
 const HEADER_PREFIX: &str = "<?xml version='1.0'?><stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:server' from='";
@@ -487,14 +487,23 @@ impl<A: ChunkAllocator + Clone, R: AsyncBufRead + Unpin + 'static> S2sReader<A, 
 }
 
 pub(crate) struct S2sWriter<W> {
-    output: BufWriter<W>,
+    stream: StreamWriter<W>,
     peer_limits: limits::StreamLimits,
 }
 
 impl<W: AsyncWrite + Unpin> S2sWriter<W> {
     pub(crate) fn new(output: W) -> Self {
+        Self::from_stream(StreamWriter::new(output, IO_BUFFER_BYTES))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn opened(output: W) -> Self {
+        Self::from_stream(StreamWriter::opened(output, IO_BUFFER_BYTES))
+    }
+
+    fn from_stream(stream: StreamWriter<W>) -> Self {
         Self {
-            output: BufWriter::with_capacity(4_096, output),
+            stream,
             peer_limits: limits::StreamLimits::default(),
         }
     }
@@ -509,6 +518,14 @@ impl<W: AsyncWrite + Unpin> S2sWriter<W> {
         }
     }
 
+    pub(crate) fn needs_header(&self) -> bool {
+        self.stream.needs_header()
+    }
+
+    pub(crate) fn restart(&mut self) {
+        self.stream.restart();
+    }
+
     pub(crate) async fn send(&mut self, xml: &str) -> Result<(), S2sError> {
         if self
             .peer_limits
@@ -517,20 +534,19 @@ impl<W: AsyncWrite + Unpin> S2sWriter<W> {
         {
             return Err(S2sError::Stream(StreamErrorCondition::PolicyViolation));
         }
-        self.send_header(xml).await
+        Ok(self.stream.send(xml).await?)
     }
 
     pub(crate) async fn send_header(&mut self, xml: &str) -> Result<(), S2sError> {
-        self.output.write_all(xml.as_bytes()).await?;
-        self.flush().await
+        Ok(self.stream.send_header(xml).await?)
     }
 
     pub(crate) async fn write_stanza<R: ArenaRead>(
         &mut self,
         stanza: &StanzaRef<'_, R>,
     ) -> Result<(), S2sError> {
-        stanza
-            .write_xml_async_as(StanzaNamespace::Server, &mut self.output)
+        self.stream
+            .write_stanza(stanza, StanzaNamespace::Server)
             .await
             .map_err(|error| match error {
                 AsyncWriteError::Access(_) => S2sError::Internal,
@@ -539,21 +555,20 @@ impl<W: AsyncWrite + Unpin> S2sWriter<W> {
     }
 
     pub(crate) async fn flush(&mut self) -> Result<(), S2sError> {
-        self.output.flush().await.map_err(Into::into)
+        Ok(self.stream.flush().await?)
     }
 
     pub(crate) async fn shutdown(&mut self) -> Result<(), S2sError> {
-        self.output.close().await.map_err(Into::into)
+        Ok(self.stream.shutdown().await?)
     }
 
+    /// The stream error or footer bypasses peer limits.
     pub(crate) async fn close(
         &mut self,
         condition: Option<StreamErrorCondition>,
     ) -> Result<(), S2sError> {
-        match condition {
-            Some(condition) => self.send_header(&stream_error_xml(condition)).await,
-            None => self.send_header(STREAM_FOOTER).await,
-        }
+        self.stream.close(condition).await?;
+        Ok(())
     }
 }
 

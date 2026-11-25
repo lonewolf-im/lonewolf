@@ -161,9 +161,3 @@ pub(super) fn response_header_xml(
     xml.push('>');
     Ok(xml)
 }
-
-pub(super) fn stream_error_xml(outcome: CloseOutcome) -> Option<String> {
-    outcome
-        .stream_condition()
-        .map(crate::xml_stream::stream_error_xml)
-}

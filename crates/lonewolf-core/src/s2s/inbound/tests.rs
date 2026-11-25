@@ -219,7 +219,7 @@ fn authenticated_stream_is_listed_until_run_returns() -> TestResult {
         let mut reader = fixture
             .reader("<message from='a@peer.test' to='b@local.test'/></stream:stream>")
             .await?;
-        let mut writer = S2sWriter::new(Output::default());
+        let mut writer = S2sWriter::opened(Output::default());
         let registry = &fixture.settings.connections;
         let mut running = std::pin::pin!(run(
             &mut reader,
@@ -263,7 +263,7 @@ fn conflicting_stream_is_never_listed() -> TestResult {
         let mut first_reader = fixture
             .reader("<message from='a@peer.test' to='b@local.test'/></stream:stream>")
             .await?;
-        let mut first_writer = S2sWriter::new(Output::default());
+        let mut first_writer = S2sWriter::opened(Output::default());
         let mut running = std::pin::pin!(run(
             &mut first_reader,
             &mut first_writer,
@@ -286,7 +286,7 @@ fn conflicting_stream_is_never_listed() -> TestResult {
             Ok(Some(StreamEvent::StreamStart { .. }))
         ));
         let output = Output::default();
-        let mut second_writer = S2sWriter::new(output.clone());
+        let mut second_writer = S2sWriter::opened(output.clone());
         let rejected = run(
             &mut second_reader,
             &mut second_writer,
@@ -321,7 +321,7 @@ fn dispatch_is_sequential_and_rescoped_before_the_second_stanza_is_read() -> Tes
         let (_stop, shutdown) = signal();
         let mut reader = fixture.reader("<message from='a@peer.test' to='b@local.test' id='one'/><message from='a@peer.test' to='b@local.test' id='two'/></stream:stream>").await?;
         let output = Output::default();
-        let mut writer = S2sWriter::new(output);
+        let mut writer = S2sWriter::opened(output);
         let (release, held) = std::sync::mpsc::sync_channel(0);
         let (started, entered) = std::sync::mpsc::sync_channel(0);
         let mut held = Some((started, held));
@@ -378,7 +378,7 @@ fn shutdown_closes_wire_then_drains_admitted_children_with_permit_and_gauges_hel
             .reader("<message from='a@peer.test' to='b@local.test'/></stream:stream>")
             .await?;
         let output = Output::default();
-        let mut writer = S2sWriter::new(output.clone());
+        let mut writer = S2sWriter::opened(output.clone());
         let (release, completion) = oneshot::channel::<()>();
         let mut completion = Some(completion);
         let (done, finished) = oneshot::channel();
@@ -460,7 +460,7 @@ fn expiry_interrupts_dispatch_and_idle_waits_for_its_completion() -> TestResult 
                 .reader("<message from='a@peer.test' to='b@local.test'/></stream:stream>")
                 .await?;
             let output = Output::default();
-            let mut writer = S2sWriter::new(output.clone());
+            let mut writer = S2sWriter::opened(output.clone());
             let (release, held) = oneshot::channel::<()>();
             let mut held = Some(held);
             let validity = LinkValidity::fixed(
@@ -526,7 +526,7 @@ fn hard_listener_deadline_aborts_socket_before_adapters_and_keeps_child_guard_al
             .reader("<message from='a@peer.test' to='b@local.test'/></stream:stream>")
             .await?;
         let output = Output::default();
-        let mut writer = S2sWriter::new(output);
+        let mut writer = S2sWriter::opened(output);
         let (release, completion) = oneshot::channel::<()>();
         let mut completion = Some(completion);
         let (done, mut finished) = oneshot::channel::<()>();
@@ -619,7 +619,7 @@ fn ingress_failure_closes_with_one_internal_error_outcome() -> TestResult {
             .reader("<message from='a@peer.test' to='b@local.test'/></stream:stream>")
             .await?;
         let output = Output::default();
-        let mut writer = S2sWriter::new(output.clone());
+        let mut writer = S2sWriter::opened(output.clone());
         let validity = LinkValidity::fixed(SystemTime::now() + Duration::from_secs(60));
         let outcome = run(
             &mut reader,
@@ -726,7 +726,7 @@ fn shutdown_shortens_pending_close_without_restarting_output_or_releasing_buffer
             ));
             let output = Output::default();
             let closes = Rc::new(std::cell::Cell::new(0));
-            let mut writer = S2sWriter::new(PendingFlush {
+            let mut writer = S2sWriter::opened(PendingFlush {
                 output: output.clone(),
                 pending: pending_flush,
                 closes: Rc::clone(&closes),
@@ -833,7 +833,7 @@ fn monitored_revocation_resets_the_stream_and_records_the_close() -> TestResult 
             .reader("<message from='a@peer.test' to='b@local.test'/></stream:stream>")
             .await?;
         let output = Output::default();
-        let mut writer = S2sWriter::new(output.clone());
+        let mut writer = S2sWriter::opened(output.clone());
         let initial = RevocationVerdict {
             source: RevocationSource::Fetched,
             status: RevocationStatus::Good,
@@ -909,7 +909,7 @@ fn monitored_file_deadline_resets_the_stream_and_records_staleness() -> TestResu
             .reader("<message from='a@peer.test' to='b@local.test'/></stream:stream>")
             .await?;
         let output = Output::default();
-        let mut writer = S2sWriter::new(output.clone());
+        let mut writer = S2sWriter::opened(output.clone());
         let now = SystemTime::now();
         let verdict = RevocationVerdict {
             source: RevocationSource::File,
@@ -1116,7 +1116,7 @@ fn buffered_stanza_and_close_flush_before_queue_handoff_and_peer_footer() -> Tes
         let mut queue = Some(registration.assigned().await.ok_or("missing assignment")?);
         let (input, mut reader) = close_reader(&fixture).await?;
         let output = CloseWriter::default();
-        let mut writer = S2sWriter::new(output.clone());
+        let mut writer = S2sWriter::opened(output.clone());
         let validity = LinkValidity::fixed(SystemTime::now() + Duration::from_secs(3600));
         let mut group = WorkGroup::new();
         let context = IngressContext { router: router.clone(), storage: fixture.settings.services.storage.clone(), allocator: GlobalChunkAllocator, work: group.handle() };
@@ -1184,7 +1184,7 @@ fn failed_cancelled_and_aborted_close_abort_before_releasing_once() -> TestResul
             let output = CloseWriter::default();
             output.0.borrow_mut().paused = case == 1 || case == 2;
             output.0.borrow_mut().failed = case == 0;
-            let mut writer = S2sWriter::new(output.clone());
+            let mut writer = S2sWriter::opened(output.clone());
             let (validity, monitor) = close_validity();
             let (stop, shutdown) = signal();
             let events = RefCell::new(Vec::new());
@@ -1248,7 +1248,7 @@ fn selected_reset_flushes_before_release_despite_existing_invalidation() -> Test
         let (input, mut reader) = close_reader(&fixture).await?;
         let output = CloseWriter::default();
         output.0.borrow_mut().paused = true;
-        let mut writer = S2sWriter::new(output.clone());
+        let mut writer = S2sWriter::opened(output.clone());
         let (validity, monitor) = close_validity();
         validity.record_invalidation(StreamClose::CertificateRevoked);
         drop(monitor);

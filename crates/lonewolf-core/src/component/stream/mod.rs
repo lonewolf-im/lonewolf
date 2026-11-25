@@ -7,7 +7,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use futures_util::io::{AsyncWrite, AsyncWriteExt as _, BufWriter};
+use futures_util::io::AsyncWrite;
 use lonewolf_util::arena::{ArenaConfig, ArenaRead, ChunkAllocator, HandleError};
 use lonewolf_util::rate_limited_reader::RateLimitedReader;
 use lonewolf_xmpp::parser::{ParseError, ParserConfig, StreamEvent, XmppParser};
@@ -20,7 +20,10 @@ use crate::config::limits::ComponentLimits;
 use crate::xml_stream::limiter::StanzaLimiter;
 use crate::xml_stream::parse::{ParseFailure, classify_parse_error};
 use crate::xml_stream::reader::{ReadMode, ReadObserver, XmlReader};
-use crate::xml_stream::{STREAM_FOOTER, escape_attribute, peer_stream_error, stream_error_xml};
+use crate::xml_stream::writer::StreamWriter;
+use crate::xml_stream::{escape_attribute, peer_stream_error};
+
+const IO_BUFFER_BYTES: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ComponentError {
@@ -131,59 +134,79 @@ impl WriteProgress {
     }
 }
 
+#[cfg(not(feature = "test-support"))]
+type Output<W> = W;
+#[cfg(feature = "test-support")]
+type Output<W> = crate::test_support::component_write::ComponentOutput<W>;
+
 pub(crate) struct ComponentWriter<W> {
-    #[cfg(not(feature = "test-support"))]
-    output: BufWriter<W>,
-    #[cfg(feature = "test-support")]
-    output: BufWriter<crate::test_support::component_write::ComponentOutput<W>>,
+    stream: StreamWriter<Output<W>>,
     progress: WriteProgress,
 }
 impl<W: AsyncWrite + Unpin> ComponentWriter<W> {
     pub(crate) fn new(output: W, progress: WriteProgress) -> Self {
-        #[cfg(feature = "test-support")]
-        let output = crate::test_support::component_write::ComponentOutput::new(output);
         Self {
-            output: BufWriter::with_capacity(4_096, output),
+            stream: StreamWriter::new(Self::output(output), IO_BUFFER_BYTES),
             progress,
         }
     }
+    #[cfg(test)]
+    pub(crate) fn opened(output: W, progress: WriteProgress) -> Self {
+        Self {
+            stream: StreamWriter::opened(Self::output(output), IO_BUFFER_BYTES),
+            progress,
+        }
+    }
+    #[cfg(not(feature = "test-support"))]
+    fn output(output: W) -> Output<W> {
+        output
+    }
+    #[cfg(feature = "test-support")]
+    fn output(output: W) -> Output<W> {
+        crate::test_support::component_write::ComponentOutput::new(output)
+    }
     #[cfg(feature = "test-support")]
     pub(crate) fn bind_write_probe(&mut self, peer: std::net::SocketAddr) {
-        self.output.get_mut().bind(peer);
+        if let Some(output) = self.stream.get_mut() {
+            output.bind(peer);
+        }
     }
     pub(crate) fn progress(&self) -> WriteProgress {
         self.progress.clone()
+    }
+    pub(crate) fn needs_header(&self) -> bool {
+        self.stream.needs_header()
     }
     pub(crate) async fn write_stanza<R: ArenaRead>(
         &mut self,
         stanza: &StanzaRef<'_, R>,
     ) -> Result<(), ComponentError> {
-        stanza
-            .write_xml_async_as(StanzaNamespace::ComponentAccept, &mut self.output)
+        self.stream
+            .write_stanza(stanza, StanzaNamespace::ComponentAccept)
             .await
             .map_err(|error| match error {
                 AsyncWriteError::Access(_) => ComponentError::Internal,
                 AsyncWriteError::Output(error) => error.into(),
             })
     }
+    pub(crate) async fn send_header(&mut self, xml: &str) -> Result<(), ComponentError> {
+        Ok(self.stream.send_header(xml).await?)
+    }
     pub(crate) async fn send(&mut self, xml: &str) -> Result<(), ComponentError> {
-        self.output.write_all(xml.as_bytes()).await?;
-        self.flush().await
+        Ok(self.stream.send(xml).await?)
     }
     pub(crate) async fn flush(&mut self) -> Result<(), ComponentError> {
-        self.output.flush().await.map_err(Into::into)
+        Ok(self.stream.flush().await?)
     }
     pub(crate) async fn close(
         &mut self,
         condition: Option<StreamErrorCondition>,
     ) -> Result<(), ComponentError> {
-        match condition {
-            Some(condition) => self.send(&stream_error_xml(condition)).await,
-            None => self.send(STREAM_FOOTER).await,
-        }
+        self.stream.close(condition).await?;
+        Ok(())
     }
     pub(crate) async fn shutdown(&mut self) -> Result<(), ComponentError> {
-        self.output.close().await.map_err(Into::into)
+        Ok(self.stream.shutdown().await?)
     }
 }
 

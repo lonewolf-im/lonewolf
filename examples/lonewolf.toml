@@ -474,7 +474,7 @@
 
 # [admin]
 
-# Enable the local HTTP API used to manage accounts.
+# Enable the local HTTP API used to manage accounts and list federation connections.
 # Access is controlled only by the Unix socket permissions.
 # enabled = true
 

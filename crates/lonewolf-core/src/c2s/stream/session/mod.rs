@@ -8,13 +8,14 @@ use std::task::{Context, Poll};
 
 use compio::io::compat::AsyncStream;
 use compio::net::TcpStream;
-use futures_util::io::{AsyncWrite, AsyncWriteExt as _, BufWriter, ReadHalf, WriteHalf};
+use futures_util::io::{AsyncWrite, ReadHalf, WriteHalf};
 use lonewolf_util::arena::{ArenaRead, ChunkAllocator};
 use lonewolf_util::rate_limited_reader::RateLimitedReader;
 use lonewolf_xmpp::parser::{ParseError, StreamEvent, XmppParser};
 use lonewolf_xmpp::stanza::{
     AsyncWriteError, CLIENT_NAMESPACE, SERVER_NAMESPACE, StanzaKind, StanzaNamespace, StanzaRef,
 };
+use lonewolf_xmpp::stream::StreamErrorCondition;
 use tokio::io::{AsyncBufRead, AsyncRead, BufReader, ReadBuf};
 
 use super::close::CloseContext;
@@ -32,6 +33,7 @@ use crate::xml_stream::peer_stream_error;
 pub(super) use crate::xml_stream::reader::ReadMode;
 use crate::xml_stream::reader::{ReadObserver, XmlReader};
 use crate::xml_stream::traffic::ObservedIo;
+use crate::xml_stream::writer::StreamWriter;
 
 pub(super) const IO_BUFFER_BYTES: usize = 4_096;
 
@@ -65,11 +67,9 @@ impl ReadObserver for C2sWorkerMetrics {
 }
 
 pub(super) struct Writer<W = TlsWriter> {
-    output: Option<BufWriter<W>>,
+    stream: StreamWriter<W>,
     host: String,
     metrics: C2sWorkerMetrics,
-    intact: bool,
-    open: bool,
 }
 
 pub(super) struct ClosingInput<R> {
@@ -163,7 +163,7 @@ impl<A: ChunkAllocator + Clone> Session<A> {
     }
 
     pub(super) fn restart(&mut self) -> Result<(), ParseError> {
-        self.writer.open = false;
+        self.writer.restart();
         self.reader.restart()
     }
 
@@ -307,46 +307,44 @@ impl<A: ChunkAllocator + Clone, R: AsyncBufRead + Unpin + 'static> Reader<A, R> 
 impl<W: AsyncWrite + Unpin> Writer<W> {
     pub(super) fn new(output: W, host: String, metrics: C2sWorkerMetrics) -> Self {
         Self {
-            output: Some(BufWriter::with_capacity(IO_BUFFER_BYTES, output)),
+            stream: StreamWriter::new(output, IO_BUFFER_BYTES),
             host,
             metrics,
-            intact: true,
-            open: false,
         }
     }
 
     pub(super) fn is_open(&self) -> bool {
-        self.open
+        self.stream.is_open()
     }
 
     pub(super) fn set_host(&mut self, host: String) {
         self.host = host;
     }
 
+    #[cfg(test)]
     pub(super) fn is_intact(&self) -> bool {
-        self.intact
+        self.stream.is_intact()
+    }
+
+    pub(super) fn restart(&mut self) {
+        self.stream.restart();
     }
 
     pub(super) fn take_output(&mut self) -> Result<W, CloseOutcome> {
-        self.output
-            .take()
-            .map(BufWriter::into_inner)
-            .ok_or(CloseOutcome::InternalError)
+        self.stream.take_output().ok_or(CloseOutcome::InternalError)
     }
 
     /// `xml` must not switch protocols, so a stream error may follow it after a cancelled flush.
     pub(super) async fn send(&mut self, xml: &str) -> Result<(), CloseOutcome> {
-        self.queue_complete(xml).await?;
-        self.flush().await
+        self.stream.send(xml).await.map_err(io_outcome)
     }
 
     /// Use for elements after which the peer leaves the current XML stream.
     pub(super) async fn send_protocol_switch(&mut self, xml: &str) -> Result<(), CloseOutcome> {
-        self.intact = false;
-        self.queue(xml).await?;
-        self.flush().await?;
-        self.intact = true;
-        Ok(())
+        self.stream
+            .send_protocol_switch(xml)
+            .await
+            .map_err(io_outcome)
     }
 
     /// `xml` must contain one complete stanza of `kind`.
@@ -360,36 +358,18 @@ impl<W: AsyncWrite + Unpin> Writer<W> {
         Ok(())
     }
 
-    async fn queue_complete(&mut self, xml: &str) -> Result<(), CloseOutcome> {
-        self.intact = false;
-        self.queue(xml).await?;
-        self.intact = true;
-        Ok(())
-    }
-
-    async fn queue(&mut self, xml: &str) -> Result<(), CloseOutcome> {
-        self.output
-            .as_mut()
-            .ok_or(CloseOutcome::TransportError)?
-            .write_all(xml.as_bytes())
-            .await
-            .map_err(|error| CloseOutcome::from_io_error(&error))
-    }
-
     /// The caller must flush buffered output.
     pub(super) async fn write_stanza<R: ArenaRead>(
         &mut self,
         stanza: &StanzaRef<'_, R>,
     ) -> Result<(), CloseOutcome> {
-        self.intact = false;
-        stanza
-            .write_xml_async(self.output.as_mut().ok_or(CloseOutcome::TransportError)?)
+        self.stream
+            .write_stanza(stanza, stanza.namespace())
             .await
             .map_err(|error| match error {
                 AsyncWriteError::Access(_) => CloseOutcome::InternalError,
                 AsyncWriteError::Output(error) => CloseOutcome::from_io_error(&error),
             })?;
-        self.intact = true;
         self.metrics.stanza_sent(stanza.kind());
         Ok(())
     }
@@ -409,8 +389,7 @@ impl<W: AsyncWrite + Unpin> Writer<W> {
             header.client_content_namespace,
             ResponseVersion::Current,
         )?;
-        self.queue_complete(&xml).await?;
-        self.flush_header().await
+        self.stream.send_header(&xml).await.map_err(io_outcome)
     }
 
     pub(super) async fn reject_header(
@@ -424,33 +403,28 @@ impl<W: AsyncWrite + Unpin> Writer<W> {
             Ok(header) => header,
             Err(outcome) => return outcome,
         };
-        if let Err(outcome) = self.queue_complete(&header).await {
-            return outcome;
-        }
-        self.flush_header().await.err().unwrap_or(outcome)
+        self.stream
+            .send_header(&header)
+            .await
+            .map_err(io_outcome)
+            .err()
+            .unwrap_or(outcome)
     }
 
-    /// A queued header opens the stream even if its flush is cancelled.
-    async fn flush_header(&mut self) -> Result<(), CloseOutcome> {
-        self.open = true;
-        let flushed = self.flush().await;
-        self.open = flushed.is_ok();
-        flushed
+    pub(super) async fn close(
+        &mut self,
+        condition: Option<StreamErrorCondition>,
+    ) -> Result<bool, CloseOutcome> {
+        self.stream.close(condition).await.map_err(io_outcome)
     }
 
     pub(super) async fn flush(&mut self) -> Result<(), CloseOutcome> {
-        if let Err(error) = self
-            .output
-            .as_mut()
-            .ok_or(CloseOutcome::TransportError)?
-            .flush()
-            .await
-        {
-            self.intact = false;
-            return Err(CloseOutcome::from_io_error(&error));
-        }
-        Ok(())
+        self.stream.flush().await.map_err(io_outcome)
     }
+}
+
+fn io_outcome(error: io::Error) -> CloseOutcome {
+    CloseOutcome::from_io_error(&error)
 }
 
 pub(super) fn namespace_error<A: ChunkAllocator>(event: &StreamEvent<A>) -> Option<CloseOutcome> {

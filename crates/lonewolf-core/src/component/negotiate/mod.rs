@@ -92,7 +92,6 @@ impl Drop for Accounting {
 
 struct Progress {
     domain: Option<Arc<str>>,
-    header_sent: bool,
     peer_footer: bool,
 }
 
@@ -145,7 +144,6 @@ pub(super) async fn negotiate<A: ChunkAllocator + Clone>(
         },
         progress: Progress {
             domain: None,
-            header_sent: false,
             peer_footer: false,
         },
         shutdown_deadline: None,
@@ -323,9 +321,9 @@ async fn finish<A: ChunkAllocator + Clone>(
                         d.min(started_closing + Duration::from_secs(6))
                     });
                 let _ = compio::time::timeout_at(deadline, async {
-                    if !progress.header_sent {
+                    if writer.needs_header() {
                         let (header, _) = stream::response_header_xml(progress.domain.as_deref())?;
-                        writer.send(&header).await?;
+                        writer.send_header(&header).await?;
                     }
                     let condition = match failure.error {
                         ComponentError::Stream(c) => Some(c),
@@ -413,9 +411,7 @@ async fn run<A: ChunkAllocator + Clone>(
         }
     }
     let (response, id) = stream::response_header_xml(progress.domain.as_deref())?;
-    // A buffered header still reaches the peer after a cancelled send, so never write a second one.
-    progress.header_sent = true;
-    writer.send(&response).await?;
+    writer.send_header(&response).await?;
     if content_namespace != NAMESPACE {
         return Err(reject(
             StreamErrorCondition::InvalidNamespace,

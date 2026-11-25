@@ -702,10 +702,11 @@ async fn negotiate<A: ChunkAllocator + Clone>(
         flow.send(EMPTY_RESPONSE).await?;
         sasl_reply(flow.expected().await?, true)?;
     }
-    let Some(Connection::Tls(reader, _)) = &mut flow.connection else {
+    let Some(Connection::Tls(reader, writer)) = &mut flow.connection else {
         return Err(protocol());
     };
     reader.restart()?;
+    writer.restart();
     flow.send_header(&header).await?;
     flow.header(remote).await?;
     let offered = features(flow.expected().await?)?;

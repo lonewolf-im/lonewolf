@@ -603,7 +603,7 @@ fn handoff_rechecks_an_unwritten_head_against_only_the_destination_writer() -> T
             let mut queue = first.assigned().await.ok_or("assigned queue")?;
             queue.current = Some(queue.receiver.recv().await?);
             let counters = Arc::clone(&queue.counters);
-            let mut old_writer = S2sWriter::new(Vec::new());
+            let mut old_writer = S2sWriter::opened(Vec::new());
             old_writer.update_peer_limits(Some(StreamLimits {
                 max_bytes: Some(old_maximum),
                 idle_seconds: Some(1),
@@ -628,7 +628,7 @@ fn handoff_rechecks_an_unwritten_head_against_only_the_destination_writer() -> T
             let mut queue = next.assigned().await.ok_or("handoff queue")?;
             assert!(Arc::ptr_eq(&queue.counters, &counters));
             assert_eq!(queue.counters.count.load(Ordering::Relaxed), 1);
-            let mut writer = S2sWriter::new(Vec::new());
+            let mut writer = S2sWriter::opened(Vec::new());
             assert_eq!(writer.peer_limits(), StreamLimits::default());
             if let Some(max_bytes) = next_maximum {
                 writer.update_peer_limits(Some(StreamLimits {

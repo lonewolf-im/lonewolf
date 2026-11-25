@@ -98,6 +98,13 @@ impl<A: ChunkAllocator + Clone> Connection<A> {
         }
     }
 
+    fn needs_header(&self) -> bool {
+        match self {
+            Self::Plain(_, writer) => writer.needs_header(),
+            Self::Tls(_, writer) => writer.needs_header(),
+        }
+    }
+
     fn update_peer_limits(&mut self, update: Option<stream::limits::StreamLimits>) {
         match self {
             Self::Plain(_, writer) => writer.update_peer_limits(update),
@@ -196,10 +203,7 @@ pub(super) async fn negotiate<A: ChunkAllocator + Clone>(
         crate::config::TlsMode::Direct => Box::default(),
         crate::config::TlsMode::StartTls => settings.hosts.default_host_name().into(),
     };
-    // A cancelled write can still send the buffered header or footer.
-    let mut header_sent = false;
     let mut peer_footer = false;
-    let mut footer_sent = false;
     let deadline = accounting.started + settings.timeout;
     let mut close_deadline = None;
     let mut cancelled = false;
@@ -208,9 +212,7 @@ pub(super) async fn negotiate<A: ChunkAllocator + Clone>(
             tcp,
             settings,
             &mut connection,
-            &mut header_sent,
             &mut peer_footer,
-            &mut footer_sent,
             &mut response_from,
             traffic,
         ));
@@ -287,18 +289,16 @@ pub(super) async fn negotiate<A: ChunkAllocator + Clone>(
                 let deadline = close_deadline
                     .unwrap_or_else(|| crate::clock::now() + CLOSE_GRACE + Duration::from_secs(1));
                 let _ = crate::clock::timeout_at(deadline, async {
-                    if !header_sent {
+                    if connection.needs_header() {
                         connection
                             .send_header(&stream::response_header_xml(&response_from, None)?)
                             .await?;
                     }
-                    if !footer_sent {
-                        let condition = match failure.error {
-                            S2sError::Stream(condition) => Some(condition),
-                            _ => None,
-                        };
-                        connection.close(condition).await?;
-                    }
+                    let condition = match failure.error {
+                        S2sError::Stream(condition) => Some(condition),
+                        _ => None,
+                    };
+                    connection.close(condition).await?;
                     if !peer_footer {
                         let _ = crate::clock::timeout_at(
                             deadline.min(crate::clock::now() + CLOSE_GRACE),
@@ -361,14 +361,11 @@ fn header<A: ChunkAllocator>(event: StreamEvent<A>) -> Result<stream::InitialHea
     })
 }
 
-#[expect(clippy::too_many_arguments)]
 async fn run<A: ChunkAllocator + Clone>(
     tcp: &TcpStream,
     settings: &Settings<A>,
     connection: &mut Option<Connection<A>>,
-    header_sent: &mut bool,
     peer_footer: &mut bool,
-    footer_sent: &mut bool,
     response_from: &mut Box<str>,
     traffic: &Arc<ConnectionTraffic>,
 ) -> Result<VerifiedPeer, Failure> {
@@ -419,7 +416,6 @@ async fn run<A: ChunkAllocator + Clone>(
                 settings.hosts.default_host_name(),
                 initial.from.as_deref(),
             )?;
-            *header_sent = true;
             plain.send_header(&response).await?;
             return Err(reject(
                 StreamErrorCondition::HostUnknown,
@@ -428,7 +424,6 @@ async fn run<A: ChunkAllocator + Clone>(
         }
         *response_from = initial.to.clone();
         let response = stream::response_header_xml(&initial.to, initial.from.as_deref())?;
-        *header_sent = true;
         plain.send_header(&response).await?;
         stream::limits::write_features_xml(
             &mut features_xml,
@@ -524,7 +519,6 @@ async fn run<A: ChunkAllocator + Clone>(
     #[cfg(feature = "test-support")]
     let reader = reader.with_transport_direction(Direction::Inbound);
     *connection = Some(Connection::Tls(reader, S2sWriter::new(output)));
-    *header_sent = false;
     let tls = connection.as_mut().ok_or(S2sError::Internal)?;
     #[cfg(feature = "test-support")]
     crate::test_support::ManualClock::record(
@@ -574,7 +568,6 @@ async fn run<A: ChunkAllocator + Clone>(
         }
     }
     let response = stream::response_header_xml(&local, Some(&remote))?;
-    *header_sent = true;
     tls.send_header(&response).await?;
     stream::limits::write_features_xml(
         &mut features_xml,
@@ -643,7 +636,6 @@ async fn run<A: ChunkAllocator + Clone>(
             Err(failure) => {
                 tls.send(&stream::sasl_failure_xml(failure)).await?;
                 if attempt == 1 {
-                    *footer_sent = true;
                     tls.close(None).await?;
                     return Err(Failure {
                         error: S2sError::Eof,
@@ -658,10 +650,10 @@ async fn run<A: ChunkAllocator + Clone>(
         }
     }
     tls.send(stream::SASL_SUCCESS).await?;
-    if let Connection::Tls(reader, _) = tls {
+    if let Connection::Tls(reader, writer) = tls {
         reader.restart()?;
+        writer.restart();
     }
-    *header_sent = false;
     let final_header = header(expected(tls, peer_footer).await?)?;
     if final_header.from.as_deref() != Some(&remote) {
         return Err(reject(
@@ -676,7 +668,6 @@ async fn run<A: ChunkAllocator + Clone>(
         ));
     }
     let response = stream::response_header_xml(&local, Some(&remote))?;
-    *header_sent = true;
     tls.send_header(&response).await?;
     stream::limits::write_features_xml(
         &mut features_xml,

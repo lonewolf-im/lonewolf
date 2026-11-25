@@ -15,6 +15,7 @@ use lonewolf_xmpp::stanza::BuildError;
 use tokio::io::{AsyncWriteExt as _, BufReader};
 
 use super::*;
+use crate::xml_stream::{STREAM_FOOTER, stream_error_xml};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 type TestReader = S2sReader<GlobalChunkAllocator, io::Cursor<Vec<u8>>>;
@@ -879,7 +880,7 @@ fn writer_buffers_stanzas_and_flushes_send_and_one_footer() -> TestResult {
         );
         for condition in [None, Some(StreamErrorCondition::HostUnknown)] {
             let output = Output::default();
-            let mut writer = S2sWriter::new(output.clone());
+            let mut writer = S2sWriter::opened(output.clone());
             success(writer.close(condition).await)?;
             let expected = condition
                 .map(stream_error_xml)

@@ -843,7 +843,7 @@ mod tests {
             let mut current = task.queue.receiver.recv().await?;
             assert_eq!(task.queue.counters.count.load(Ordering::Relaxed), 2);
             let calls = Arc::new(PlMutex::new(Calls::default()));
-            let mut writer = S2sWriter::new(ControlledWriter(Arc::clone(&calls)));
+            let mut writer = S2sWriter::opened(ControlledWriter(Arc::clone(&calls)));
             let expiry = rcgen::CertificateParams::default().not_after;
             let valid = LinkValidity::fixed(
                 SystemTime::UNIX_EPOCH + Duration::from_secs(expiry.unix_timestamp().try_into()?),
@@ -898,7 +898,7 @@ mod tests {
         run(async {
             let manager = manager(S2sLimits::default())?;
             let calls = Arc::new(PlMutex::new(Calls::default()));
-            let mut writer = S2sWriter::new(ControlledWriter(Arc::clone(&calls)));
+            let mut writer = S2sWriter::opened(ControlledWriter(Arc::clone(&calls)));
             let task = manager
                 .admit("localhost", "remote.test", message().await?)
                 .map_err(|error| format!("{error:?}"))?
@@ -957,7 +957,7 @@ mod tests {
                     .map_err(|error| format!("{error:?}"))?;
                 let mut current = Some(task.queue.receiver.recv().await?);
                 let calls = Arc::new(PlMutex::new(Calls::default()));
-                let mut writer = S2sWriter::new(ControlledWriter(Arc::clone(&calls)));
+                let mut writer = S2sWriter::opened(ControlledWriter(Arc::clone(&calls)));
                 if stopped {
                     manager.stop();
                 }
@@ -1095,7 +1095,7 @@ mod tests {
                 accepts: true,
                 ..Default::default()
             }));
-            let mut writer = S2sWriter::new(ControlledWriter(Arc::clone(&calls)));
+            let mut writer = S2sWriter::opened(ControlledWriter(Arc::clone(&calls)));
             writer.update_peer_limits(Some(crate::s2s::stream::limits::StreamLimits {
                 max_bytes: Some(expected.len().try_into()?),
                 idle_seconds: None,
@@ -1172,7 +1172,7 @@ mod tests {
                 accepts: true,
                 ..Default::default()
             }));
-            let mut writer = S2sWriter::new(ControlledWriter(Arc::clone(&calls)));
+            let mut writer = S2sWriter::opened(ControlledWriter(Arc::clone(&calls)));
             let mut buffered = false;
             let valid = LinkValidity::fixed(SystemTime::now() + Duration::from_secs(60));
             let mut head = task.queue.receiver.recv().await?;
@@ -1274,7 +1274,7 @@ mod tests {
                 accepts: true,
                 ..Default::default()
             }));
-            let mut writer = S2sWriter::new(ControlledWriter(Arc::clone(&calls)));
+            let mut writer = S2sWriter::opened(ControlledWriter(Arc::clone(&calls)));
             let mut buffered = false;
             let valid = LinkValidity::fixed(SystemTime::now() + Duration::from_secs(60));
             let mut first = task.queue.receiver.recv().await?;
@@ -1359,7 +1359,7 @@ mod tests {
                     .map_err(|error| format!("{error:?}"))?;
                 let mut current = Some(task.queue.receiver.recv().await?);
                 let calls = Arc::new(PlMutex::new(Calls::default()));
-                let mut writer = S2sWriter::new(ControlledWriter(Arc::clone(&calls)));
+                let mut writer = S2sWriter::opened(ControlledWriter(Arc::clone(&calls)));
                 let mut buffered = false;
                 allocator.exhausted.store(true, Ordering::Relaxed);
                 if stopped_first {
@@ -1474,7 +1474,7 @@ mod tests {
                         accepts: true,
                         ..Default::default()
                     }));
-                    let mut writer = S2sWriter::new(ControlledWriter(Arc::clone(&calls)));
+                    let mut writer = S2sWriter::opened(ControlledWriter(Arc::clone(&calls)));
                     let closed = serve(
                         &manager.inner,
                         &mut reader,
@@ -1573,7 +1573,7 @@ mod tests {
                     accepts,
                     ..Calls::default()
                 }));
-                let mut writer = S2sWriter::new(ControlledWriter(Arc::clone(&calls)));
+                let mut writer = S2sWriter::opened(ControlledWriter(Arc::clone(&calls)));
                 {
                     let validity = LinkValidity::fixed(
                         SystemTime::now() + Duration::from_secs(if expiry { 1 } else { 60 }),
@@ -1683,7 +1683,7 @@ mod tests {
                 accepts: true,
                 ..Default::default()
             }));
-            let mut writer = S2sWriter::new(ControlledWriter(Arc::clone(&calls)));
+            let mut writer = S2sWriter::opened(ControlledWriter(Arc::clone(&calls)));
             let initial = RevocationVerdict {
                 source: RevocationSource::Fetched,
                 status: RevocationStatus::Good,
@@ -1812,7 +1812,7 @@ mod tests {
                 );
                 let signal = validity.invalidated();
                 let calls = Arc::new(PlMutex::new(Calls::default()));
-                let mut writer = S2sWriter::new(ControlledWriter(Arc::clone(&calls)));
+                let mut writer = S2sWriter::opened(ControlledWriter(Arc::clone(&calls)));
                 let mut buffered = false;
                 allocator.exhausted.store(true, Ordering::Relaxed);
                 let work = async {
@@ -1927,7 +1927,7 @@ mod tests {
             let validity = LinkValidity::fixed(SystemTime::now() + Duration::from_secs(60));
             let clock = Clock::new();
             let mut current = None;
-            let mut writer = S2sWriter::new(Vec::new());
+            let mut writer = S2sWriter::opened(Vec::new());
             let end = {
                 let mut running = pin!(serve_with_clock(
                     &manager.inner,
@@ -1994,7 +1994,7 @@ mod tests {
                     accepts: true,
                     ..Default::default()
                 }));
-                let mut writer = S2sWriter::new(ControlledWriter(Arc::clone(&calls)));
+                let mut writer = S2sWriter::opened(ControlledWriter(Arc::clone(&calls)));
                 writer.update_peer_limits(Some(StreamLimits {
                     max_bytes: Some(maximum),
                     idle_seconds: None,

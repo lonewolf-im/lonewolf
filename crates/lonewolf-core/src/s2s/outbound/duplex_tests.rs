@@ -405,7 +405,7 @@ fn writes_continue_while_a_dispatch_is_pending() -> TestResult {
         let (input, mut reader) = f.reader().await?;
         input.unbounded_send(INPUT.as_bytes().to_vec())?;
         let output = Output::default();
-        let mut writer = S2sWriter::new(output.clone());
+        let mut writer = S2sWriter::opened(output.clone());
         let (release, wait) = oneshot::channel();
         let mut wait = Some(wait);
         let entered = Cell::new(false);
@@ -448,7 +448,7 @@ fn reads_continue_while_a_write_is_blocked() -> TestResult {
         let (input, mut reader) = f.reader().await?;
         let output = Output::default();
         output.pause_write();
-        let mut writer = S2sWriter::new(output.clone());
+        let mut writer = S2sWriter::opened(output.clone());
         let entered = Cell::new(false);
         let p = peer();
         let v = valid();
@@ -487,7 +487,7 @@ fn peer_closing_tag_lets_the_current_write_finish_and_keeps_the_rest_queued() ->
         let (input, mut reader) = f.reader().await?;
         let output = Output::default();
         output.pause_write();
-        let mut writer = S2sWriter::new(output.clone());
+        let mut writer = S2sWriter::opened(output.clone());
         let p = peer();
         let v = valid();
         let end = {
@@ -527,7 +527,7 @@ fn address_violation_stops_sending_at_a_boundary() -> TestResult {
         let (input, mut reader) = f.reader().await?;
         let output = Output::default();
         output.pause_write();
-        let mut writer = S2sWriter::new(output.clone());
+        let mut writer = S2sWriter::opened(output.clone());
         let p = peer();
         let v = valid();
         let end = {
@@ -569,7 +569,7 @@ fn transport_failure_during_a_write_aborts_and_counts_the_lost_stanza() -> TestR
             } else {
                 output.pause_write();
             }
-            let mut writer = S2sWriter::new(output.clone());
+            let mut writer = S2sWriter::opened(output.clone());
             let p = peer();
             let v = valid();
             let end = {
@@ -619,7 +619,7 @@ fn shutdown_ends_the_session() -> TestResult {
         let f = Fixture::new(GlobalChunkAllocator)?;
         let mut queue = f.queue(0).await?;
         let (_input, mut reader) = f.reader().await?;
-        let mut writer = S2sWriter::new(Output::default());
+        let mut writer = S2sWriter::opened(Output::default());
         let p = peer();
         let v = valid();
         let end = {
@@ -651,7 +651,7 @@ fn validity_expiry_waits_for_the_current_write() -> TestResult {
             let (_input, mut reader) = f.reader().await?;
             let output = Output::default();
             output.pause_write();
-            let mut writer = S2sWriter::new(output.clone());
+            let mut writer = S2sWriter::opened(output.clone());
             let p = peer();
             let (v, monitor) = expire_later();
             let end = {
@@ -686,7 +686,7 @@ fn idle_requires_silence_in_both_directions() -> TestResult {
             let mut queue = f.queue(0).await?;
             let (input, mut reader) = f.reader().await?;
             let output = Output::default();
-            let mut writer = S2sWriter::new(output.clone());
+            let mut writer = S2sWriter::opened(output.clone());
             let p = peer();
             let v = valid();
             let clock = Clock::new();
@@ -750,7 +750,7 @@ fn idle_requires_silence_in_both_directions() -> TestResult {
             }
             let output = Output::default();
             output.pause_write();
-            let mut writer = S2sWriter::new(output.clone());
+            let mut writer = S2sWriter::opened(output.clone());
             let p = peer();
             let v = valid();
             let clock = Clock::new();
@@ -827,7 +827,7 @@ fn assigned_queue_starts_sending_and_marks_the_link_ready() -> TestResult {
         let (input, mut reader) = f.reader().await?;
         input.unbounded_send(INPUT.as_bytes().to_vec())?;
         let output = Output::default();
-        let mut writer = S2sWriter::new(output.clone());
+        let mut writer = S2sWriter::opened(output.clone());
         let (flushed, flushing) = oneshot::channel();
         output.0.borrow_mut().flushed = Some(flushed);
         let (stop, stopped) = oneshot::channel();
@@ -888,7 +888,7 @@ fn bidirectional_stanza_counters_follow_the_direction() -> TestResult {
             let f = Fixture::new(GlobalChunkAllocator)?;
             let (input, mut reader) = f.reader().await?;
             input.unbounded_send(INPUT.as_bytes().to_vec())?;
-            let mut writer = S2sWriter::new(Output::default());
+            let mut writer = S2sWriter::opened(Output::default());
             let p = peer();
             let v = valid();
             if inbound {
@@ -998,7 +998,7 @@ fn transport_failure_during_discard_flush_preserves_terminal_accounting() -> Tes
         let output = Output::default();
         output.pause_write();
         output.0.borrow_mut().paused_flush = true;
-        let mut writer = S2sWriter::new(output.clone());
+        let mut writer = S2sWriter::opened(output.clone());
         let p = peer();
         let v = valid();
         let end = {
@@ -1050,7 +1050,7 @@ fn expired_validity_prevents_ready_traffic() -> TestResult {
         let (input, mut reader) = f.reader().await?;
         input.unbounded_send(INPUT.as_bytes().to_vec())?;
         let output = Output::default();
-        let mut writer = S2sWriter::new(output.clone());
+        let mut writer = S2sWriter::opened(output.clone());
         let p = peer();
         let v = LinkValidity::fixed(SystemTime::now() - Duration::from_secs(1));
         let received = Cell::new(0);
@@ -1088,7 +1088,7 @@ fn ready_shutdown_precedes_expiry_and_ready_traffic() -> TestResult {
         let (input, mut reader) = f.reader().await?;
         input.unbounded_send(INPUT.as_bytes().to_vec())?;
         let output = Output::default();
-        let mut writer = S2sWriter::new(output.clone());
+        let mut writer = S2sWriter::opened(output.clone());
         let p = peer();
         let v = LinkValidity::fixed(SystemTime::now() - Duration::from_secs(1));
         let received = Cell::new(0);
@@ -1129,7 +1129,7 @@ fn ready_batches_cooperate_with_shutdown_and_invalidation() -> TestResult {
             let (input, mut reader) = f.reader().await?;
             input.unbounded_send(INPUT.repeat(3).into_bytes())?;
             let output = Output::default();
-            let mut writer = S2sWriter::new(output.clone());
+            let mut writer = S2sWriter::opened(output.clone());
             let p = peer();
             let (v, monitor) = expire_later();
             let received = Cell::new(0);
@@ -1223,7 +1223,7 @@ fn physical_whitespace_and_partial_xml_extend_duplex_idle_until_silence() -> Tes
             let clock = Clock::new();
             let p = peer();
             let v = valid();
-            let mut writer = S2sWriter::new(Output::default());
+            let mut writer = S2sWriter::opened(Output::default());
             let received = Cell::new(0);
             let end = {
                 let mut parameters = parameters(&p, &f.context, &v);
@@ -1307,7 +1307,7 @@ fn incomplete_ready_reads_cooperate_before_shutdown_or_invalidation() -> TestRes
             let p = peer();
             let (v, monitor) = expire_later();
             let mut monitor = Some(monitor);
-            let mut writer = S2sWriter::new(Output::default());
+            let mut writer = S2sWriter::opened(Output::default());
             let received = Cell::new(0);
             let (stop, stopped) = oneshot::channel();
             let end = {
@@ -1379,7 +1379,7 @@ fn peer_size_rejection_transfers_ownership_before_prior_flush_can_be_aborted() -
             let (input, mut reader) = f.reader().await?;
             let output = Output::default();
             output.0.borrow_mut().paused_flush = true;
-            let mut writer = S2sWriter::new(output.clone());
+            let mut writer = S2sWriter::opened(output.clone());
             writer.update_peer_limits(Some(StreamLimits {
                 max_bytes: Some(300),
                 idle_seconds: None,

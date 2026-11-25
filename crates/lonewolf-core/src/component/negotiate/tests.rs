@@ -108,7 +108,6 @@ fn established_tls_without_application_bytes(shutdown: bool, cancel_close: bool)
                 connection: Some(connection),
                 progress: Progress {
                     domain: None,
-                    header_sent: false,
                     peer_footer: false,
                 },
                 shutdown_deadline: None,
@@ -283,7 +282,6 @@ fn shutdown_during_a_held_header_write_finishes_that_header_without_opening_anot
                 connection: Some(connection),
                 progress: Progress {
                     domain: None,
-                    header_sent: false,
                     peer_footer: false,
                 },
                 shutdown_deadline: None,

@@ -9,6 +9,7 @@ pub(crate) mod limiter;
 pub(crate) mod parse;
 pub(crate) mod reader;
 pub(crate) mod traffic;
+pub(crate) mod writer;
 
 pub(crate) const STREAM_FOOTER: &str = "</stream:stream>";
 

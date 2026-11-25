@@ -124,7 +124,7 @@ fn writer(clock: &TestClock) -> (ComponentWriter<Writer>, Output, WriteProgress)
     let output = Output::new();
     let progress = WriteProgress::new(clock.now());
     (
-        ComponentWriter::new(
+        ComponentWriter::opened(
             Writer {
                 output: output.clone(),
                 progress: progress.clone(),

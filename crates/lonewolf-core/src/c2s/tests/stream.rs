@@ -915,7 +915,10 @@ fn unpolled_admission_records_a_cancelled_close() -> Result<(), Box<dyn Error>> 
 #[test]
 fn internal_failure_sends_a_stream_error_before_closing() -> Result<(), Box<dyn Error>> {
     Runtime::new()?.block_on(async {
-        let output = super::header::stream_error_xml(CloseOutcome::InternalError).ok_or("missing error")?;
+        let output = CloseOutcome::InternalError
+            .stream_condition()
+            .map(crate::xml_stream::stream_error_xml)
+            .ok_or("missing error")?;
         assert_eq!(output, "<stream:error><internal-server-error xmlns='urn:ietf:params:xml:ns:xmpp-streams'/></stream:error></stream:stream>");
         Ok(())
     })

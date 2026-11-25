@@ -18,10 +18,8 @@ use lonewolf_xmpp::parser::StreamEvent;
 use socket2::SockRef;
 use tokio::io::AsyncBufRead;
 
-use super::header::stream_error_xml;
 use super::outcome::CloseOutcome;
 use super::session::{Reader, TlsTransport, Writer};
-use crate::xml_stream::STREAM_FOOTER;
 
 pub(super) const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 pub(super) type ShutdownSignal = Shared<LocalBoxFuture<'static, Instant>>;
@@ -220,7 +218,7 @@ where
 {
     let outcome = reason.outcome();
     let deadline = context.deadline_for(outcome);
-    let can_drain = writer.is_open() && writer.is_intact();
+    let can_drain = writer.is_open();
     let stage = Cell::new("xml");
     let result = context
         .until(
@@ -328,15 +326,12 @@ where
         return Ok(false);
     }
     reader.closing();
-    if !writer.is_open() || !writer.is_intact() {
+    let condition = match reason {
+        CloseReason::Local(outcome) => outcome.stream_condition(),
+        CloseReason::PeerFooter | CloseReason::PeerError(_) => None,
+    };
+    if !writer.close(condition).await? {
         return Ok(true);
-    }
-    if let CloseReason::Local(outcome) = reason
-        && let Some(error) = stream_error_xml(outcome)
-    {
-        writer.send(&error).await?;
-    } else {
-        writer.send(STREAM_FOOTER).await?;
     }
     #[cfg(feature = "test-support")]
     crate::test_support::ManualClock::record(crate::test_support::ClockEvent::FlushedCloseFooter);

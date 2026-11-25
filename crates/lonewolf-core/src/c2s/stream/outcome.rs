@@ -367,7 +367,10 @@ mod tests {
             assert!(!outcome.is_phase_timeout());
         }
         assert_eq!(
-            super::super::header::stream_error_xml(CloseOutcome::MailboxOverflow).as_deref(),
+            CloseOutcome::MailboxOverflow
+                .stream_condition()
+                .map(crate::xml_stream::stream_error_xml)
+                .as_deref(),
             Some(
                 "<stream:error><resource-constraint xmlns='urn:ietf:params:xml:ns:xmpp-streams'/></stream:error></stream:stream>"
             )

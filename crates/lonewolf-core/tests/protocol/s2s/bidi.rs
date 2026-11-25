@@ -260,7 +260,7 @@ fn shutdown_closes_a_bidi_stream_with_system_shutdown() -> TestResult {
     fixture.dns.stop()
 }
 
-fn outbound_listener(
+pub(super) fn outbound_listener(
     fixture: &SingleServer,
 ) -> TestResult<(RawS2sListener, std::sync::Arc<rustls::ServerConfig>)> {
     let listener = RawS2sListener::bind()?;

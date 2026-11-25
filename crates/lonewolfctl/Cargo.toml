@@ -1,6 +1,6 @@
 [package]
 name = "lonewolfctl"
-description = "Local account administration for the Lonewolf XMPP server"
+description = "Local administration for the Lonewolf XMPP server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

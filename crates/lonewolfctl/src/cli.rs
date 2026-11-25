@@ -31,6 +31,11 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: AccountCommand,
     },
+    #[command(about = "Inspect server-to-server connections")]
+    S2s {
+        #[command(subcommand)]
+        command: S2sCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -59,5 +64,20 @@ pub(crate) enum AccountCommand {
         jid: String,
         #[arg(long, help = "Read one password line from standard input")]
         password_stdin: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum S2sCommand {
+    #[command(about = "List live server-to-server connections")]
+    List {
+        #[arg(
+            long,
+            value_name = "DOMAIN",
+            help = "Show only connections to this remote domain"
+        )]
+        domain: Option<String>,
+        #[arg(long, value_name = "COUNT", help = "Maximum connections to print")]
+        limit: Option<NonZeroUsize>,
     },
 }

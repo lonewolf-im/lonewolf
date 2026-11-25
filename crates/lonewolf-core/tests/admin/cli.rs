@@ -2,23 +2,33 @@
 
 use std::error::Error;
 use std::io::{self, Read, Write};
+use std::num::NonZeroUsize;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
 use compio::runtime::Runtime;
 use futures_channel::oneshot;
-use lonewolf_admin::{RecordDeleter, Server};
+use lonewolf_admin::{
+    RecordDeleter, S2sConnection, S2sConnections, S2sDirection, S2sTlsMode, Server,
+};
 use lonewolf_storage::RedbStorage;
 use serde_json::{Value, json};
 
 type TestResult = Result<(), Box<dyn Error>>;
 
 fn with_admin_server(test: impl FnOnce(&Path) -> TestResult) -> TestResult {
+    with_admin_server_and_s2s(None, test)
+}
+
+fn with_admin_server_and_s2s(
+    source: Option<Arc<dyn S2sConnections>>,
+    test: impl FnOnce(&Path) -> TestResult,
+) -> TestResult {
     let directory = tempfile::tempdir()?;
     let socket = directory.path().join("run/lonewolf/admin.sock");
     let storage = RedbStorage::open(directory.path().join("accounts.redb"))?;
@@ -30,7 +40,7 @@ fn with_admin_server(test: impl FnOnce(&Path) -> TestResult) -> TestResult {
                 &socket,
                 storage.clone(),
                 Arc::new(RecordDeleter::new(storage)),
-                None,
+                source,
             )?;
             ready.send(()).map_err(io::Error::other)?;
             server
@@ -399,6 +409,299 @@ fn listing_follows_pages_and_honors_total_limit() -> TestResult {
     assert_eq!(
         serde_json::from_slice::<Value>(&output.stdout)?,
         json!({"accounts":[{"jid":"user000@example.org"}]})
+    );
+    Ok(())
+}
+
+struct ListedConnections(Vec<S2sConnection>);
+
+impl S2sConnections for ListedConnections {
+    fn connections(
+        &self,
+        after: Option<u64>,
+        remote_domain: Option<&str>,
+        limit: NonZeroUsize,
+    ) -> Vec<S2sConnection> {
+        self.0
+            .iter()
+            .filter(|c| after.is_none_or(|id| c.connection_id > id))
+            .filter(|c| remote_domain.is_none_or(|domain| c.remote_domain.as_ref() == domain))
+            .take(limit.get())
+            .cloned()
+            .collect()
+    }
+}
+
+#[test]
+fn s2s_list_prints_an_aligned_table_and_json() -> TestResult {
+    let inbound = S2sConnection {
+        connection_id: 1,
+        direction: S2sDirection::Inbound,
+        bidirectional: false,
+        local_domain: "a.test".into(),
+        remote_domain: "b.test".into(),
+        remote_address: Some("192.0.2.1:5269".parse()?),
+        tls_mode: S2sTlsMode::StartTls,
+        tls_version: "TLSv1.3",
+        cipher_suite: "TLS13_AES_256_GCM_SHA384",
+        established_at: UNIX_EPOCH,
+        uptime: Duration::from_secs(59),
+        certificate_expires_at: UNIX_EPOCH + Duration::from_secs(86400),
+        bytes_received: 1536,
+        bytes_sent: 1,
+    };
+    let outbound = S2sConnection {
+        connection_id: 23,
+        direction: S2sDirection::Outbound,
+        bidirectional: true,
+        remote_domain: "long.example".into(),
+        remote_address: Some("[2001:db8::1]:5269".parse()?),
+        tls_mode: S2sTlsMode::Direct,
+        tls_version: "TLSv1.2",
+        cipher_suite: "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+        uptime: Duration::from_secs(3720),
+        bytes_received: 1048576,
+        bytes_sent: 2048,
+        ..inbound.clone()
+    };
+    let no_address = S2sConnection {
+        connection_id: 300,
+        remote_domain: "c.test".into(),
+        remote_address: None,
+        tls_mode: S2sTlsMode::Direct,
+        uptime: Duration::from_secs(86400),
+        bytes_received: 0,
+        bytes_sent: 0,
+        ..inbound.clone()
+    };
+    let source = ListedConnections(vec![inbound, outbound, no_address]);
+    with_admin_server_and_s2s(Some(Arc::new(source)), |directory| {
+        let plain = ctl(directory, &["s2s", "list"], None)?;
+        assert!(
+            plain.status.success(),
+            "{}",
+            String::from_utf8_lossy(&plain.stderr)
+        );
+        assert!(plain.stderr.is_empty());
+        assert_eq!(
+            std::str::from_utf8(&plain.stdout)?,
+            concat!(
+                "ID   DIRECTION  BIDI  LOCAL   REMOTE        ADDRESS             TLS               UPTIME  RECEIVED  SENT\n",
+                "1    inbound    no    a.test  b.test        192.0.2.1:5269      starttls TLSv1.3  59s     1.5KiB    1B\n",
+                "23   outbound   yes   a.test  long.example  [2001:db8::1]:5269  direct TLSv1.2    1h02m   1.0MiB    2.0KiB\n",
+                "300  inbound    no    a.test  c.test        -                   direct TLSv1.3    1d00h   0B        0B\n",
+            )
+        );
+        let output = ctl(directory, &["--json", "s2s", "list"], None)?;
+        assert!(output.status.success());
+        assert!(output.stderr.is_empty());
+        assert_eq!(
+            std::str::from_utf8(&output.stdout)?,
+            concat!(
+                r#"{"connections":["#,
+                r#"{"connection_id":1,"direction":"inbound","bidirectional":false,"local_domain":"a.test","remote_domain":"b.test","remote_address":"192.0.2.1:5269","tls_mode":"starttls","tls_version":"TLSv1.3","cipher_suite":"TLS13_AES_256_GCM_SHA384","established_at":"1970-01-01T00:00:00Z","uptime_secs":59,"certificate_expires_at":"1970-01-02T00:00:00Z","bytes_received":1536,"bytes_sent":1},"#,
+                r#"{"connection_id":23,"direction":"outbound","bidirectional":true,"local_domain":"a.test","remote_domain":"long.example","remote_address":"[2001:db8::1]:5269","tls_mode":"direct","tls_version":"TLSv1.2","cipher_suite":"TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256","established_at":"1970-01-01T00:00:00Z","uptime_secs":3720,"certificate_expires_at":"1970-01-02T00:00:00Z","bytes_received":1048576,"bytes_sent":2048},"#,
+                r#"{"connection_id":300,"direction":"inbound","bidirectional":false,"local_domain":"a.test","remote_domain":"c.test","remote_address":null,"tls_mode":"direct","tls_version":"TLSv1.3","cipher_suite":"TLS13_AES_256_GCM_SHA384","established_at":"1970-01-01T00:00:00Z","uptime_secs":86400,"certificate_expires_at":"1970-01-02T00:00:00Z","bytes_received":0,"bytes_sent":0}"#,
+                "]}\n"
+            )
+        );
+        let empty = ctl(directory, &["s2s", "list", "--domain", "absent.test"], None)?;
+        assert!(empty.status.success());
+        assert!(empty.stderr.is_empty());
+        assert_eq!(
+            empty.stdout,
+            b"ID  DIRECTION  BIDI  LOCAL  REMOTE  ADDRESS  TLS  UPTIME  RECEIVED  SENT\n"
+        );
+        Ok(())
+    })
+}
+
+fn s2s_connection(id: u64) -> Value {
+    json!({
+        "connection_id":id, "direction":"inbound", "bidirectional":false,
+        "local_domain":"a.test", "remote_domain":"b.test", "remote_address":null,
+        "tls_mode":"direct", "tls_version":"TLSv1.3", "cipher_suite":"TLS13_AES_128_GCM_SHA256",
+        "established_at":null, "uptime_secs":42, "certificate_expires_at":null,
+        "bytes_received":12, "bytes_sent":34
+    })
+}
+
+fn scripted_listing(
+    args: &[&str],
+    script: &[(&str, u16, Value)],
+) -> Result<Output, Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let exchanges = script
+        .iter()
+        .map(|(target, status, body)| {
+            Ok(((*target).to_owned(), *status, serde_json::to_vec(body)?))
+        })
+        .collect::<serde_json::Result<_>>()?;
+    let worker = scripted_server(directory.path().join("s2s.sock"), exchanges)?;
+    let mut arguments = vec!["--socket", "s2s.sock", "s2s", "list"];
+    arguments.extend_from_slice(args);
+    let output = ctl(directory.path(), &arguments, None)?;
+    assert_ne!(
+        output.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    worker.join().map_err(|_| "fake server panicked")??;
+    Ok(output)
+}
+
+#[test]
+fn s2s_list_follows_pages_and_honors_total_limit() -> TestResult {
+    let rows = [s2s_connection(8), s2s_connection(11), s2s_connection(19)];
+    let mut first = rows[0].clone();
+    first["future_field"] = json!("ignored");
+    let output = scripted_listing(
+        &["--domain", "b.test", "--limit", "3", "--json"],
+        &[
+            (
+                "/v1/s2s/connections?limit=3&remote_domain=b%2Etest",
+                200,
+                json!({"connections":[first,rows[1]],"next_cursor":11}),
+            ),
+            (
+                "/v1/s2s/connections?limit=1&after=11&remote_domain=b%2Etest",
+                200,
+                json!({"connections":[rows[2]],"next_cursor":19}),
+            ),
+        ],
+    )?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout)?,
+        json!({"connections":rows})
+    );
+    Ok(())
+}
+
+#[test]
+fn s2s_list_reports_inactive_federation_and_invalid_domains() -> TestResult {
+    with_admin_server(|directory| {
+        for (args, code, message) in [
+            (
+                vec!["s2s", "list"],
+                "s2s_inactive",
+                "federation is not active on this server\n",
+            ),
+            (
+                vec!["s2s", "list", "--domain", "me@b.test"],
+                "invalid_domain",
+                "invalid domain name\n",
+            ),
+        ] {
+            let plain = ctl(directory, &args, None)?;
+            assert_eq!(
+                plain.status.code(),
+                Some(1),
+                "{}",
+                String::from_utf8_lossy(&plain.stderr)
+            );
+            assert!(plain.stdout.is_empty());
+            assert_eq!(plain.stderr, message.as_bytes());
+            let mut args = args;
+            args.push("--json");
+            let output = ctl(directory, &args, None)?;
+            assert_eq!(output.status.code(), Some(1));
+            assert!(output.stdout.is_empty());
+            assert_eq!(
+                serde_json::from_slice::<Value>(&output.stderr)?,
+                json!({"error":{"code":code}})
+            );
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn s2s_list_rejects_malformed_pages_without_printing_rows() -> TestResult {
+    let first = "/v1/s2s/connections?limit=2";
+    let next = "/v1/s2s/connections?limit=1&after=8";
+    let row = s2s_connection(8);
+    let valid = json!({"connections":[row],"next_cursor":8});
+    for (script, code) in [
+        (
+            vec![(
+                first,
+                200,
+                json!({"connections":[row,row,row],"next_cursor":null}),
+            )],
+            "invalid_response",
+        ),
+        (
+            vec![(first, 200, json!({"connections":[],"next_cursor":8}))],
+            "invalid_response",
+        ),
+        (
+            vec![
+                (first, 200, valid.clone()),
+                (
+                    next,
+                    200,
+                    json!({"connections":[s2s_connection(9)],"next_cursor":8}),
+                ),
+            ],
+            "invalid_response",
+        ),
+        (
+            vec![
+                (first, 200, valid),
+                (next, 500, json!({"error":{"code":"internal_error"}})),
+            ],
+            "internal_error",
+        ),
+    ] {
+        for json_mode in [false, true] {
+            let mut args = vec!["--limit", "2"];
+            if json_mode {
+                args.push("--json");
+            }
+            let output = scripted_listing(&args, &script)?;
+            assert_eq!(output.status.code(), Some(1), "{code}");
+            assert!(output.stdout.is_empty(), "{code}");
+            if json_mode {
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&output.stderr)?,
+                    json!({"error":{"code":code}})
+                );
+            } else {
+                assert!(!output.stderr.is_empty());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn s2s_list_replaces_control_characters() -> TestResult {
+    let mut row = s2s_connection(8);
+    row["remote_domain"] = json!("b\u{1b}[31m.test");
+    let output = scripted_listing(
+        &[],
+        &[(
+            "/v1/s2s/connections?limit=100",
+            200,
+            json!({"connections":[row],"next_cursor":null}),
+        )],
+    )?;
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let table = std::str::from_utf8(&output.stdout)?;
+    assert_eq!(
+        table
+            .lines()
+            .nth(1)
+            .and_then(|line| line.split_whitespace().nth(4)),
+        Some("b?[31m.test")
     );
     Ok(())
 }

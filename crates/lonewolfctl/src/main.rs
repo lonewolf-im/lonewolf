@@ -3,6 +3,7 @@
 #[cfg(not(unix))]
 compile_error!("Lonewolf supports Unix targets only.");
 
+use std::borrow::Cow;
 use std::fmt;
 use std::io::{self, BufRead, IsTerminal, Read, Write};
 use std::num::NonZeroUsize;
@@ -15,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use tokio::runtime::Builder;
 use zeroize::Zeroizing;
 
-use crate::cli::{AccountCommand, Cli, Command};
+use crate::cli::{AccountCommand, Cli, Command, S2sCommand};
 use crate::client::Client;
 
 mod cli;
@@ -108,6 +109,9 @@ async fn execute(cli: Cli) -> Result<(), CtlError> {
                 print_mutation(cli.json)
             }
         },
+        Command::S2s {
+            command: S2sCommand::List { domain, limit },
+        } => list_s2s(&client, cli.json, domain.as_deref(), limit).await,
     }
 }
 
@@ -231,6 +235,176 @@ fn print_mutation(json: bool) -> Result<(), CtlError> {
     Ok(())
 }
 
+#[derive(Deserialize, Serialize)]
+struct S2sConnection {
+    connection_id: u64,
+    direction: String,
+    bidirectional: bool,
+    local_domain: String,
+    remote_domain: String,
+    remote_address: Option<String>,
+    tls_mode: String,
+    tls_version: String,
+    cipher_suite: String,
+    established_at: Option<String>,
+    uptime_secs: u64,
+    certificate_expires_at: Option<String>,
+    bytes_received: u64,
+    bytes_sent: u64,
+}
+
+#[derive(Deserialize)]
+struct S2sConnectionPage {
+    connections: Vec<S2sConnection>,
+    next_cursor: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct S2sListing<'a> {
+    connections: &'a [S2sConnection],
+}
+
+async fn list_s2s(
+    client: &Client,
+    json: bool,
+    domain: Option<&str>,
+    limit: Option<NonZeroUsize>,
+) -> Result<(), CtlError> {
+    const CONNECTIONS_PATH: &str = "/v1/s2s/connections";
+    let limit = limit.map_or(usize::MAX, NonZeroUsize::get);
+    let mut connections = Vec::new();
+    let mut cursor = None;
+    while connections.len() < limit {
+        let page_size = (limit - connections.len()).min(PAGE_SIZE);
+        let mut uri = match cursor {
+            Some(after) => format!("{CONNECTIONS_PATH}?limit={page_size}&after={after}"),
+            None => format!("{CONNECTIONS_PATH}?limit={page_size}"),
+        };
+        if let Some(domain) = domain {
+            uri.push_str("&remote_domain=");
+            uri.extend(utf8_percent_encode(domain, NON_ALPHANUMERIC));
+        }
+        let body = client
+            .request(Method::GET, &uri, Vec::new())
+            .await?
+            .expect_status(StatusCode::OK)?;
+        let page: S2sConnectionPage =
+            serde_json::from_slice(&body).map_err(|_| CtlError::invalid_response())?;
+        if page.connections.len() > page_size
+            || (page.connections.is_empty() && page.next_cursor.is_some())
+            || cursor
+                .zip(page.next_cursor)
+                .is_some_and(|(after, next)| next <= after)
+        {
+            return Err(CtlError::invalid_response());
+        }
+
+        connections.extend(page.connections);
+        let Some(next) = page.next_cursor else { break };
+        cursor = Some(next);
+    }
+
+    let mut output = io::BufWriter::new(io::stdout().lock());
+    if json {
+        serde_json::to_writer(
+            &mut output,
+            &S2sListing {
+                connections: &connections,
+            },
+        )
+        .map_err(|_| CtlError::output(io::Error::other("cannot write JSON")))?;
+        output.write_all(b"\n").map_err(CtlError::output)?;
+    } else {
+        write_s2s_table(&mut output, &connections).map_err(CtlError::output)?;
+    }
+    output.flush().map_err(CtlError::output)
+}
+
+fn write_s2s_table(output: &mut impl Write, connections: &[S2sConnection]) -> io::Result<()> {
+    let headers = [
+        "ID",
+        "DIRECTION",
+        "BIDI",
+        "LOCAL",
+        "REMOTE",
+        "ADDRESS",
+        "TLS",
+        "UPTIME",
+        "RECEIVED",
+        "SENT",
+    ];
+    let mut widths = headers.map(str::len);
+    let mut rows = Vec::with_capacity(connections.len());
+    for connection in connections {
+        let tls_mode = table_value(&connection.tls_mode);
+        let tls_version = table_value(&connection.tls_version);
+        let row = [
+            Cow::Owned(connection.connection_id.to_string()),
+            table_value(&connection.direction),
+            Cow::Borrowed(if connection.bidirectional {
+                "yes"
+            } else {
+                "no"
+            }),
+            table_value(&connection.local_domain),
+            table_value(&connection.remote_domain),
+            table_value(connection.remote_address.as_deref().unwrap_or("-")),
+            Cow::Owned(format!("{tls_mode} {tls_version}")),
+            Cow::Owned(format_uptime(connection.uptime_secs)),
+            Cow::Owned(format_bytes(connection.bytes_received)),
+            Cow::Owned(format_bytes(connection.bytes_sent)),
+        ];
+        for (width, value) in widths.iter_mut().zip(&row) {
+            *width = (*width).max(value.chars().count());
+        }
+        rows.push(row);
+    }
+    for row in std::iter::once(headers.map(Cow::Borrowed)).chain(rows) {
+        let [columns @ .., last] = row;
+        for (value, width) in columns.into_iter().zip(widths) {
+            write!(output, "{value:<width$}  ")?;
+        }
+        writeln!(output, "{last}")?;
+    }
+    Ok(())
+}
+
+fn table_value(value: &str) -> Cow<'_, str> {
+    if value.chars().any(char::is_control) {
+        Cow::Owned(
+            value
+                .chars()
+                .map(|c| if c.is_control() { '?' } else { c })
+                .collect(),
+        )
+    } else {
+        Cow::Borrowed(value)
+    }
+}
+
+fn format_uptime(seconds: u64) -> String {
+    match seconds {
+        0..=59 => format!("{seconds}s"),
+        60..=3_599 => format!("{}m{:02}s", seconds / 60, seconds % 60),
+        3_600..=86_399 => format!("{}h{:02}m", seconds / 3_600, seconds / 60 % 60),
+        _ => format!("{}d{:02}h", seconds / 86_400, seconds / 3_600 % 24),
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        return format!("{bytes}B");
+    }
+    let mut amount = bytes as f64;
+    for unit in ["KiB", "MiB", "GiB"] {
+        amount /= 1024.0;
+        if amount < 1024.0 {
+            return format!("{amount:.1}{unit}");
+        }
+    }
+    format!("{:.1}TiB", amount / 1024.0)
+}
+
 fn serialize(value: &impl Serialize) -> Result<Vec<u8>, CtlError> {
     serde_json::to_vec(value).map_err(|_| CtlError::new("invalid_request", "cannot encode request"))
 }
@@ -340,6 +514,8 @@ impl CtlError {
             "invalid_request" => "admin service rejected the request",
             "body_too_large" => "password is too long for the admin service",
             "internal_error" => "admin service failed",
+            "s2s_inactive" => "federation is not active on this server",
+            "invalid_domain" => "invalid domain name",
             _ => "admin service returned an error",
         };
         Self::new(code, message)
@@ -370,6 +546,48 @@ impl fmt::Display for CtlError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uptime_format_boundaries() {
+        for (seconds, expected) in [
+            (0, "0s"),
+            (59, "59s"),
+            (60, "1m00s"),
+            (3_599, "59m59s"),
+            (3_600, "1h00m"),
+            (86_399, "23h59m"),
+            (86_400, "1d00h"),
+            (34_570_800, "400d03h"),
+        ] {
+            assert_eq!(format_uptime(seconds), expected, "{seconds}");
+        }
+    }
+
+    #[test]
+    fn byte_format_boundaries() {
+        for (bytes, expected) in [
+            (0, "0B"),
+            (1_023, "1023B"),
+            (1_024, "1.0KiB"),
+            (1_536, "1.5KiB"),
+            (1_048_576, "1.0MiB"),
+            (u64::MAX, "16777216.0TiB"),
+        ] {
+            assert_eq!(format_bytes(bytes), expected, "{bytes}");
+        }
+    }
+
+    #[test]
+    fn s2s_error_codes_have_public_messages() {
+        for (code, message) in [
+            ("s2s_inactive", "federation is not active on this server"),
+            ("invalid_domain", "invalid domain name"),
+        ] {
+            let error = CtlError::api(Some(code));
+            assert_eq!(error.code, code);
+            assert_eq!(error.message, message);
+        }
+    }
 
     #[test]
     fn weak_password_api_code_has_a_stable_public_message() {

@@ -396,6 +396,44 @@ fn rejects_invalid_routes_keys_queries_and_json() -> TestResult {
 }
 
 #[test]
+fn s2s_listing_validates_parameters_before_reporting_inactive_federation() -> TestResult {
+    with_server(|path, _| async move {
+        for (query, status, code) in [
+            ("", 404, "s2s_inactive"),
+            (
+                "?after=18446744073709551615&limit=100&remote_domain=EXAMPLE.org",
+                404,
+                "s2s_inactive",
+            ),
+            ("?limit=1&limit=2", 400, "invalid_request"),
+            ("?after=18446744073709551616", 400, "invalid_request"),
+            ("?remote_domain=%zz", 400, "invalid_request"),
+            ("?remote_domain=user%40example.org", 400, "invalid_domain"),
+        ] {
+            let target = format!("/v1/s2s/connections{query}");
+            let reply = request(&path, "GET", &target, None).await?;
+            assert_eq!(reply.status, status, "{target}");
+            assert_eq!(reply.body, json!({"error":{"code":code}}), "{target}");
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn s2s_listing_rejects_non_get_methods_even_when_federation_is_inactive() -> TestResult {
+    with_server(|path, _| async move {
+        let target = "/v1/s2s/connections";
+        let post = request(&path, "POST", target, None).await?;
+        assert_eq!(post.status, 405);
+        assert_eq!(post.body, json!({"error":{"code":"method_not_allowed"}}));
+        let head = request(&path, "HEAD", target, None).await?;
+        assert_eq!(head.status, 405);
+        assert_eq!(head.body, Value::Null);
+        Ok(())
+    })
+}
+
+#[test]
 fn route_fallbacks_return_json_and_advertise_allowed_methods() -> TestResult {
     with_server(|path, _| async move {
         for target in [

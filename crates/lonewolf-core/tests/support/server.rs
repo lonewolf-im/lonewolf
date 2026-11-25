@@ -782,6 +782,27 @@ timeout_secs = 1
         Client::connect(self, username, password, resource)
     }
 
+    pub fn admin_get(&self, target: &str) -> TestResult<(u16, serde_json::Value)> {
+        let mut stream = UnixStream::connect(self.fixture_path().join("run/lonewolf/admin.sock"))?;
+        stream.set_read_timeout(Some(TIMEOUT))?;
+        stream.set_write_timeout(Some(TIMEOUT))?;
+        write!(
+            stream,
+            "GET {target} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+        )?;
+        let mut response = String::new();
+        stream.read_to_string(&mut response)?;
+        let (headers, body) = response
+            .split_once("\r\n\r\n")
+            .ok_or("missing HTTP headers")?;
+        let status = headers
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .ok_or("missing HTTP status")?;
+        Ok((status.parse()?, serde_json::from_str(body)?))
+    }
+
     pub fn create_account(&self, username: &str, password: &str) -> TestResult {
         self.create_account_jid(&format!("{username}@{}", self.domain), password)
     }

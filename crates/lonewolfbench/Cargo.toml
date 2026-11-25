@@ -64,3 +64,6 @@ path = "../lonewolf-core/tests/benchmark/accounts.rs"
 [[test]]
 name = "benchmark_remote"
 path = "../lonewolf-core/tests/benchmark/remote.rs"
+
+[lints]
+workspace = true

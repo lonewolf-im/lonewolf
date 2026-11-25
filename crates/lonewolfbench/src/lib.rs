@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+#![cfg_attr(test, allow(clippy::cognitive_complexity))]
+
 pub mod accounts;
 pub mod cli;
 pub mod client;

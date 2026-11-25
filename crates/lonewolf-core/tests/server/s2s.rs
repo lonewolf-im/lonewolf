@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::cognitive_complexity)]
+
 #[path = "support/c2s_outbound.rs"]
 mod c2s_outbound;
 #[path = "support/s2s_outbound.rs"]

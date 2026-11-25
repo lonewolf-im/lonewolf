@@ -358,6 +358,7 @@ fn within_dispatch_bounds(
     at >= slot.scheduled_at && at < tail_end && at.duration_since(slot.scheduled_at) <= lag
 }
 
+#[expect(clippy::cognitive_complexity)]
 async fn run_phase(
     context: &mut RunContext,
     settings: PhaseSettings,

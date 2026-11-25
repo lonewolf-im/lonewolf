@@ -874,6 +874,7 @@ impl<'a, R: ArenaRead> StanzaRef<'a, R> {
     /// # Errors
     ///
     /// Access or I/O errors can leave partial XML; this method does not validate.
+    #[expect(clippy::cognitive_complexity)]
     pub async fn write_xml_async_as<W: AsyncWrite + Unpin>(
         &self,
         namespace: StanzaNamespace,

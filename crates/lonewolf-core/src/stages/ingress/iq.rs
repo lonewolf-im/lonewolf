@@ -205,6 +205,7 @@ pub(crate) enum UnavailableKind {
     Remote,
 }
 
+#[expect(clippy::cognitive_complexity)]
 pub(crate) async fn handle<A: ChunkAllocator + Clone + 'static>(
     stage: &Stage<'_, A>,
     origin: &Origin<'_, A>,

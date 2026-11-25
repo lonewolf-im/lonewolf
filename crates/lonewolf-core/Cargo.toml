@@ -70,3 +70,6 @@ path = "tests/admin/mod.rs"
 [[test]]
 name = "protocol"
 path = "tests/protocol/mod.rs"
+
+[lints]
+workspace = true

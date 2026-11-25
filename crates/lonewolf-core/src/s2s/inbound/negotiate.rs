@@ -361,6 +361,7 @@ fn header<A: ChunkAllocator>(event: StreamEvent<A>) -> Result<stream::InitialHea
     })
 }
 
+#[expect(clippy::cognitive_complexity)]
 async fn run<A: ChunkAllocator + Clone>(
     tcp: &TcpStream,
     settings: &Settings<A>,

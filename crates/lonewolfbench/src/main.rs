@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+#![cfg_attr(test, allow(clippy::cognitive_complexity))]
+
 use clap::Parser;
 use lonewolfbench::{
     cli::Cli,

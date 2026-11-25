@@ -329,6 +329,7 @@ struct Resources {
     previous_steal: Option<(f64, u64)>,
 }
 impl Resources {
+    #[expect(clippy::cognitive_complexity)]
     fn observe(
         &mut self,
         snapshot: MetricSnapshot,
@@ -503,6 +504,7 @@ impl ReadyBoundary {
     }
 }
 
+#[expect(clippy::cognitive_complexity)]
 async fn sample_loop(
     config: SamplerConfig,
     epoch: Instant,

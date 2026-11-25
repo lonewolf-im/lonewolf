@@ -21,3 +21,6 @@ futures-executor.workspace = true
 lonewolf-auth.workspace = true
 parking_lot.workspace = true
 tempfile.workspace = true
+
+[lints]
+workspace = true

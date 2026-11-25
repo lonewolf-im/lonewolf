@@ -3,6 +3,8 @@
 //! Serves the administration API for accounts and federation connections over a private Unix socket.
 //! Access relies on socket permissions.
 
+#![cfg_attr(test, allow(clippy::cognitive_complexity))]
+
 #[cfg(not(unix))]
 compile_error!("Lonewolf supports Unix targets only.");
 

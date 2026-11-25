@@ -32,3 +32,6 @@ nix = { workspace = true, features = ["feature"] }
 [[test]]
 name = "http"
 path = "../lonewolf-core/tests/metrics/http.rs"
+
+[lints]
+workspace = true

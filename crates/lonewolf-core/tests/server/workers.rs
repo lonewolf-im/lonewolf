@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::cognitive_complexity)]
+
 use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::ffi::OsStrExt;

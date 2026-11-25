@@ -16,3 +16,6 @@ sha2.workspace = true
 stringprep.workspace = true
 subtle = { version = "2.6.1", default-features = false }
 zeroize.workspace = true
+
+[lints]
+workspace = true

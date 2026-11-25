@@ -90,6 +90,7 @@ pub(crate) fn has_eof(body: &str) -> bool {
     body.trim_end().lines().last() == Some("# EOF")
 }
 
+#[expect(clippy::cognitive_complexity)]
 pub fn parse_snapshot(body: &str) -> BenchResult<MetricSnapshot> {
     if body.len() > 1_048_576 || !has_eof(body) {
         return Err(invalid());

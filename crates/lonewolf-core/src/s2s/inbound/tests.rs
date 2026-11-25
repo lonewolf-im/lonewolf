@@ -65,6 +65,7 @@ impl Fixture {
                 &config.limits.s2s,
                 GlobalChunkAllocator,
                 Arc::clone(&metrics),
+                Arc::default(),
                 Some(BidiIngress {
                     storage: storage.clone(),
                 }),

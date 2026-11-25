@@ -16,6 +16,7 @@ use tokio::io::AsyncBufRead;
 
 use super::duplex::{self, DuplexParameters};
 use super::*;
+use crate::s2s::connections::ConnectionFacts;
 use crate::s2s::ingress::{self, InboundPeer, IngressContext};
 use crate::s2s::metrics::{Direction, StreamClose};
 use crate::s2s::revocation::CheckPhase;
@@ -690,6 +691,20 @@ async fn run<A: ChunkAllocator + Clone + 'static>(
         };
         ready(&queue.counters, &mut failures);
         let gauge = inner.metrics.stream_opened(Direction::Outbound);
+        let listed = inner.connections.register(
+            ConnectionFacts {
+                connection_id: stream.connection_id,
+                direction: Direction::Outbound,
+                local: Arc::from(&*queue.pair.0),
+                remote: Arc::from(&*queue.pair.1),
+                remote_address: Some(stream.remote_address),
+                tls_mode: stream.tls_mode,
+                tls: stream.tls,
+                certificate_expires_at: stream.valid_until,
+                traffic: Arc::clone(&stream.traffic),
+            },
+            stream.bidi,
+        );
         connected(
             &inner,
             &router,
@@ -705,6 +720,7 @@ async fn run<A: ChunkAllocator + Clone + 'static>(
         )
         .await;
         drop(stream);
+        drop(listed);
         drop(gauge);
         queue.counters.ready.store(false, Ordering::Relaxed);
         let mut state = inner.state.lock();

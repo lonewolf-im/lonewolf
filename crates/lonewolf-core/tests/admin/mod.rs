@@ -3,16 +3,19 @@
 use std::error::Error;
 use std::future::Future;
 use std::io;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
 use compio::io::{AsyncReadExt, AsyncWriteExt};
 use compio::net::UnixStream;
 use compio::runtime::Runtime;
 use futures_channel::oneshot;
 use futures_util::future::join;
-use lonewolf_admin::{RecordDeleter, Server};
+use lonewolf_admin::{
+    RecordDeleter, S2sConnection, S2sConnections, S2sDirection, S2sTlsMode, Server,
+};
 use lonewolf_auth::scram::{
     SCRAM_POLICY_ITERATIONS, ScramCredentials, ScramHash, ScramIterations, ScramVerifier,
 };
@@ -29,6 +32,14 @@ where
     F: FnOnce(PathBuf, RedbStorage) -> Fut,
     Fut: Future<Output = TestResult>,
 {
+    with_s2s_server(None, test)
+}
+
+fn with_s2s_server<F, Fut>(source: Option<Arc<dyn S2sConnections>>, test: F) -> TestResult
+where
+    F: FnOnce(PathBuf, RedbStorage) -> Fut,
+    Fut: Future<Output = TestResult>,
+{
     let directory = tempfile::tempdir()?;
     let path = directory.path().join("private/admin.sock");
     let storage = RedbStorage::open(directory.path().join("accounts.redb"))?;
@@ -37,6 +48,7 @@ where
             &path,
             storage.clone(),
             Arc::new(RecordDeleter::new(storage.clone())),
+            source,
         )?;
         let (stop, stopped) = oneshot::channel();
         let client = async {
@@ -396,6 +408,117 @@ fn rejects_invalid_routes_keys_queries_and_json() -> TestResult {
 }
 
 #[test]
+fn s2s_listing_over_the_socket_answers_json_and_rejects_other_methods() -> TestResult {
+    struct Source(S2sConnection);
+
+    impl S2sConnections for Source {
+        fn connections(
+            &self,
+            after: Option<u64>,
+            remote_domain: Option<&str>,
+            _: NonZeroUsize,
+        ) -> Vec<S2sConnection> {
+            if after.is_none_or(|after| self.0.connection_id > after)
+                && remote_domain.is_none_or(|domain| domain == &*self.0.remote_domain)
+            {
+                vec![self.0.clone()]
+            } else {
+                Vec::new()
+            }
+        }
+    }
+
+    let source = Arc::new(Source(S2sConnection {
+        connection_id: 17,
+        direction: S2sDirection::Outbound,
+        bidirectional: true,
+        local_domain: Arc::from("example.com"),
+        remote_domain: Arc::from("example.org"),
+        remote_address: Some("203.0.113.7:5269".parse()?),
+        tls_mode: S2sTlsMode::StartTls,
+        tls_version: "TLSv1.3",
+        cipher_suite: "TLS13_AES_256_GCM_SHA384",
+        established_at: UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+        uptime: Duration::from_secs(12),
+        certificate_expires_at: UNIX_EPOCH + Duration::from_secs(1_800_000_000),
+        bytes_received: 1234,
+        bytes_sent: 4321,
+    }));
+    let target = "/v1/s2s/connections";
+    with_s2s_server(Some(source), |path, _| async move {
+        let reply = request(&path, "GET", target, None).await?;
+        assert_eq!(reply.status, 200);
+        assert!(reply.headers.contains("content-type: application/json"));
+        assert!(reply.headers.contains("cache-control: no-store"));
+        assert_eq!(
+            reply.body,
+            json!({
+                "connections": [{
+                    "connection_id": 17, "direction": "outbound", "bidirectional": true,
+                    "local_domain": "example.com", "remote_domain": "example.org",
+                    "remote_address": "203.0.113.7:5269", "tls_mode": "starttls",
+                    "tls_version": "TLSv1.3", "cipher_suite": "TLS13_AES_256_GCM_SHA384",
+                    "established_at": "2023-11-14T22:13:20Z", "uptime_secs": 12,
+                    "certificate_expires_at": "2027-01-15T08:00:00Z",
+                    "bytes_received": 1234, "bytes_sent": 4321
+                }],
+                "next_cursor": null
+            })
+        );
+
+        let reply = request(&path, "POST", target, None).await?;
+        assert_eq!(reply.status, 405);
+        assert_eq!(reply.body, json!({"error":{"code":"method_not_allowed"}}));
+        assert!(reply.headers.lines().any(|line| line == "allow: GET"));
+        Ok(())
+    })?;
+    with_server(|path, _| async move {
+        let reply = request(&path, "GET", target, None).await?;
+        assert_eq!(reply.status, 404);
+        assert_eq!(reply.body, json!({"error":{"code":"s2s_inactive"}}));
+        Ok(())
+    })
+}
+
+#[test]
+fn s2s_listing_validates_parameters_before_reporting_inactive_federation() -> TestResult {
+    with_server(|path, _| async move {
+        for (query, status, code) in [
+            ("", 404, "s2s_inactive"),
+            (
+                "?after=18446744073709551615&limit=100&remote_domain=EXAMPLE.org",
+                404,
+                "s2s_inactive",
+            ),
+            ("?limit=1&limit=2", 400, "invalid_request"),
+            ("?after=18446744073709551616", 400, "invalid_request"),
+            ("?remote_domain=%zz", 400, "invalid_request"),
+            ("?remote_domain=user%40example.org", 400, "invalid_domain"),
+        ] {
+            let target = format!("/v1/s2s/connections{query}");
+            let reply = request(&path, "GET", &target, None).await?;
+            assert_eq!(reply.status, status, "{target}");
+            assert_eq!(reply.body, json!({"error":{"code":code}}), "{target}");
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn s2s_listing_rejects_non_get_methods_even_when_federation_is_inactive() -> TestResult {
+    with_server(|path, _| async move {
+        let target = "/v1/s2s/connections";
+        let post = request(&path, "POST", target, None).await?;
+        assert_eq!(post.status, 405);
+        assert_eq!(post.body, json!({"error":{"code":"method_not_allowed"}}));
+        let head = request(&path, "HEAD", target, None).await?;
+        assert_eq!(head.status, 405);
+        assert_eq!(head.body, Value::Null);
+        Ok(())
+    })
+}
+
+#[test]
 fn route_fallbacks_return_json_and_advertise_allowed_methods() -> TestResult {
     with_server(|path, _| async move {
         for target in [
@@ -576,6 +699,7 @@ fn shutdown_drains_an_accepted_request_and_removes_the_socket() -> TestResult {
             &path,
             storage.clone(),
             Arc::new(RecordDeleter::new(storage.clone())),
+            None,
         )?;
         let (stop, stopped) = oneshot::channel();
         let client = async {

@@ -335,6 +335,7 @@ fn run_internal(
                             &config.admin.socket_path,
                             storage.clone(),
                             deleter,
+                            None,
                         )
                         .map_err(RunError::Admin)?,
                     )

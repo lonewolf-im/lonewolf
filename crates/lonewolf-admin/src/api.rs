@@ -11,7 +11,7 @@ use async_lock::Mutex;
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::{FromRequest, FromRequestParts, MatchedPath, Path, Request, State};
-use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
+use axum::http::header::{ALLOW, CACHE_CONTROL, CONTENT_TYPE};
 use axum::http::{HeaderValue, Method, StatusCode, Uri, request::Parts};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -27,6 +27,7 @@ use lonewolf_storage::account::{
 use lonewolf_storage::{Storage, StorageError, StorageErrorKind, WriteTransaction};
 
 use crate::deleter::{AccountDeleter, DeleterError};
+use crate::s2s::{self, S2sConnections};
 use lonewolf_util::arena::{Arena, ArenaConfig};
 use lonewolf_util::blocking::BlockingExecutor;
 use lonewolf_xmpp::jid::{Jid, JidError, MAX_PART_LEN};
@@ -36,10 +37,15 @@ use zeroize::{Zeroize, Zeroizing};
 
 const MAX_BODY: usize = 16 * 1024;
 const LIFECYCLE_SHARDS: usize = 64;
-const MAX_PAGE: usize = 100;
-const DEFAULT_PAGE: usize = 50;
+const S2S_CONNECTIONS_PATH: &str = "/v1/s2s/connections";
+pub(crate) const MAX_PAGE: usize = 100;
+pub(crate) const DEFAULT_PAGE: usize = 50;
 
-pub(crate) fn router<S: Storage>(storage: S, deleter: Arc<dyn AccountDeleter>) -> Router {
+pub(crate) fn router<S: Storage>(
+    storage: S,
+    deleter: Arc<dyn AccountDeleter>,
+    s2s: Option<Arc<dyn S2sConnections>>,
+) -> Router {
     Router::new()
         .route(
             "/v1/accounts",
@@ -50,16 +56,30 @@ pub(crate) fn router<S: Storage>(storage: S, deleter: Arc<dyn AccountDeleter>) -
             get(get_account::<S>).delete(delete_account::<S>),
         )
         .route("/v1/accounts/{jid}/password", put(change_password::<S>))
+        .route(
+            S2S_CONNECTIONS_PATH,
+            get(list_s2s_connections::<S>).head(method_not_allowed),
+        )
         .fallback(|| async { ApiError::not_found() })
-        .method_not_allowed_fallback(|| async {
-            ApiError::new(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed")
-        })
+        .method_not_allowed_fallback(method_not_allowed)
         .layer(middleware::from_fn(log_request))
-        .with_state(Arc::new(Api::new(storage, deleter)))
+        .with_state(Arc::new(Api::new(storage, deleter, s2s)))
+}
+
+async fn method_not_allowed(route: Option<MatchedPath>) -> Response {
+    let mut response =
+        ApiError::new(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed").into_response();
+    if route.as_ref().map(MatchedPath::as_str) == Some(S2S_CONNECTIONS_PATH) {
+        response
+            .headers_mut()
+            .insert(ALLOW, HeaderValue::from_static("GET"));
+    }
+    response
 }
 
 async fn log_request(route: Option<MatchedPath>, request: Request, next: Next) -> Response {
-    let command = admin_command(request.method(), route.as_ref());
+    let route = route.as_ref().map(MatchedPath::as_str);
+    let command = admin_command(request.method(), route);
     let started = Instant::now();
     let response = next.run(request).await;
     if let Some(command) = command {
@@ -72,7 +92,7 @@ async fn log_request(route: Option<MatchedPath>, request: Request, next: Next) -
     } else {
         // Concrete paths and queries can contain account identities or secrets.
         tracing::debug!(
-            route = route.as_ref().map_or("unmatched", MatchedPath::as_str),
+            route = route.unwrap_or("unmatched"),
             status = response.status().as_u16(),
             latency_ms = started.elapsed().as_millis(),
             "admin request completed"
@@ -81,13 +101,14 @@ async fn log_request(route: Option<MatchedPath>, request: Request, next: Next) -
     response
 }
 
-fn admin_command(method: &Method, route: Option<&MatchedPath>) -> Option<&'static str> {
-    match (method.as_str(), route.map(MatchedPath::as_str)) {
+fn admin_command(method: &Method, route: Option<&str>) -> Option<&'static str> {
+    match (method.as_str(), route) {
         ("GET", Some("/v1/accounts")) => Some("account_list"),
         ("POST", Some("/v1/accounts")) => Some("account_create"),
         ("GET", Some("/v1/accounts/{jid}")) => Some("account_get"),
         ("DELETE", Some("/v1/accounts/{jid}")) => Some("account_delete"),
         ("PUT", Some("/v1/accounts/{jid}/password")) => Some("account_password"),
+        ("GET", Some(S2S_CONNECTIONS_PATH)) => Some("s2s_connection_list"),
         _ => None,
     }
 }
@@ -97,6 +118,13 @@ async fn list_accounts<S: Storage>(
     uri: Uri,
 ) -> Result<Response, ApiError> {
     api.list(uri.query()).await
+}
+
+async fn list_s2s_connections<S: Storage>(
+    State(api): State<Arc<Api<S>>>,
+    uri: Uri,
+) -> Result<Response, ApiError> {
+    s2s::list(api.s2s.as_deref(), uri.query())
 }
 
 async fn create_account<S: Storage>(
@@ -182,6 +210,7 @@ where
 struct Api<S> {
     storage: S,
     deleter: Arc<dyn AccountDeleter>,
+    s2s: Option<Arc<dyn S2sConnections>>,
     passwords: BlockingExecutor,
     /// New sessions must wait until account deletion retires the old sessions.
     lifecycle: [Mutex<()>; LIFECYCLE_SHARDS],
@@ -189,10 +218,15 @@ struct Api<S> {
 }
 
 impl<S: Storage> Api<S> {
-    fn new(storage: S, deleter: Arc<dyn AccountDeleter>) -> Self {
+    fn new(
+        storage: S,
+        deleter: Arc<dyn AccountDeleter>,
+        s2s: Option<Arc<dyn S2sConnections>>,
+    ) -> Self {
         Self {
             storage,
             deleter,
+            s2s,
             passwords: BlockingExecutor::new(const { NonZeroUsize::new(2).unwrap() }),
             lifecycle: [const { Mutex::new(()) }; LIFECYCLE_SHARDS],
             hash_state: RandomState::new(),
@@ -400,7 +434,7 @@ fn validate_percent_encoding(value: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn decode(value: &str) -> Result<Cow<'_, str>, ApiError> {
+pub(crate) fn decode(value: &str) -> Result<Cow<'_, str>, ApiError> {
     validate_percent_encoding(value)?;
     percent_decode_str(value)
         .decode_utf8()
@@ -439,7 +473,7 @@ fn json(status: StatusCode, value: &impl Serialize) -> Result<Response, ApiError
         .map_err(|_| ApiError::internal())
 }
 
-fn response(status: StatusCode, body: Bytes) -> Response {
+pub(crate) fn response(status: StatusCode, body: Bytes) -> Response {
     let mut response = Response::new(Body::from(body));
     *response.status_mut() = status;
     response
@@ -455,22 +489,22 @@ fn empty() -> Response {
     response(StatusCode::NO_CONTENT, Bytes::new())
 }
 
-struct ApiError {
+pub(crate) struct ApiError {
     status: StatusCode,
     code: &'static str,
 }
 
 impl ApiError {
-    fn new(status: StatusCode, code: &'static str) -> Self {
+    pub(crate) fn new(status: StatusCode, code: &'static str) -> Self {
         Self { status, code }
     }
-    fn bad_request() -> Self {
+    pub(crate) fn bad_request() -> Self {
         Self::new(StatusCode::BAD_REQUEST, "invalid_request")
     }
     fn not_found() -> Self {
         Self::new(StatusCode::NOT_FOUND, "not_found")
     }
-    fn internal() -> Self {
+    pub(crate) fn internal() -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
     }
 }
@@ -563,6 +597,14 @@ mod tests {
 
     type TestError = Box<dyn std::error::Error + Send + Sync>;
     type TestResult = Result<(), TestError>;
+
+    #[test]
+    fn s2s_listing_has_a_stable_admin_command_name() {
+        assert_eq!(
+            admin_command(&Method::GET, Some("/v1/s2s/connections")),
+            Some("s2s_connection_list")
+        );
+    }
 
     /// Read snapshots exclude staged writes until the single writer commits.
     #[derive(Clone)]
@@ -1169,7 +1211,7 @@ mod tests {
             let key = account_key("alice@example.org").map_err(|error| error.code)?;
             let storage = MemoryStorage::new([key.clone()]);
             let deleter = GatedDeleter::counting(storage.clone());
-            let api = Arc::new(Api::new(storage.clone(), deleter.clone()));
+            let api = Arc::new(Api::new(storage.clone(), deleter.clone(), None));
 
             let response = api.delete(key.clone()).await.map_err(|error| error.code)?;
             assert_eq!(response.status(), StatusCode::NO_CONTENT);
@@ -1185,7 +1227,7 @@ mod tests {
             let key = account_key("alice@example.org").map_err(|error| error.code)?;
             let storage = MemoryStorage::new([]);
             let deleter = GatedDeleter::counting(storage.clone());
-            let api = Arc::new(Api::new(storage.clone(), deleter.clone()));
+            let api = Arc::new(Api::new(storage.clone(), deleter.clone(), None));
 
             let result = api.delete(key.clone()).await;
             expect_error(result, StatusCode::NOT_FOUND, "not_found").await?;
@@ -1200,7 +1242,7 @@ mod tests {
             let key = account_key("alice@example.org").map_err(|error| error.code)?;
             let storage = MemoryStorage::new([key.clone()]);
             let deleter = GatedDeleter::failing_once(storage.clone());
-            let api = Arc::new(Api::new(storage.clone(), deleter.clone()));
+            let api = Arc::new(Api::new(storage.clone(), deleter.clone(), None));
 
             let failed = api.delete(key.clone()).await;
             expect_error(failed, StatusCode::INTERNAL_SERVER_ERROR, "internal_error").await?;
@@ -1221,7 +1263,7 @@ mod tests {
             let key = account_key("alice@example.org").map_err(|error| error.code)?;
             let storage = MemoryStorage::new([key.clone()]);
             let (deleter, deletion_started, release) = GatedDeleter::gated(storage.clone());
-            let api = Arc::new(Api::new(storage.clone(), deleter.clone()));
+            let api = Arc::new(Api::new(storage.clone(), deleter.clone(), None));
             {
                 let mut delete = pin!(api.delete(key.clone()));
                 assert!(poll_once(delete.as_mut()).is_pending());
@@ -1263,7 +1305,7 @@ mod tests {
                 let key = account_key("alice@example.org").map_err(|error| error.code)?;
                 let storage = MemoryStorage::new([key.clone()]);
                 let deleter = GatedDeleter::failing_once_with(storage.clone(), kind);
-                let api = Arc::new(Api::new(storage.clone(), deleter.clone()));
+                let api = Arc::new(Api::new(storage.clone(), deleter.clone(), None));
                 let failed = api.delete(key.clone()).await;
                 expect_error(failed, status, code).await?;
                 assert!(stored(&storage, &key).await?);
@@ -1278,7 +1320,7 @@ mod tests {
             let key = account_key("alice@example.org").map_err(|error| error.code)?;
             let storage = MemoryStorage::new([key.clone()]);
             let deleter = GatedDeleter::counting(storage.clone());
-            let api = Arc::new(Api::new(storage.clone(), deleter.clone()));
+            let api = Arc::new(Api::new(storage.clone(), deleter.clone(), None));
 
             let response = api.delete(key.clone()).await.map_err(|error| error.code)?;
             assert_eq!(response.status(), StatusCode::NO_CONTENT);
@@ -1324,6 +1366,7 @@ mod tests {
                 let api = Api::new(
                     storage.clone(),
                     Arc::new(RecordDeleter::new(storage.clone())),
+                    None,
                 );
                 let body = list_body(&api, "limit=2").await?;
                 assert_eq!(
@@ -1343,6 +1386,7 @@ mod tests {
             let api = Api::new(
                 storage.clone(),
                 Arc::new(RecordDeleter::new(storage.clone())),
+                None,
             );
             let body = list_body(&api, "after=user00000%40example.org&limit=2").await?;
             assert_eq!(
@@ -1379,6 +1423,7 @@ mod tests {
                 let api = Api::new(
                     storage.clone(),
                     Arc::new(RecordDeleter::new(storage.clone())),
+                    None,
                 );
                 let error = match api.list(Some("limit=2")).await {
                     Err(error) => error,
@@ -1415,6 +1460,7 @@ mod tests {
             let api = Api::new(
                 storage.clone(),
                 Arc::new(RecordDeleter::new(storage.clone())),
+                None,
             );
             let key = account_key("alice@example.org").map_err(|error| error.code)?;
             let Err(error) = api.create(key.clone(), Password("a".into())).await else {

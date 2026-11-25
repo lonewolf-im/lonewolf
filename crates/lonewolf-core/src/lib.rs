@@ -276,6 +276,9 @@ fn run_internal(
                     );
                     None
                 };
+                let s2s_connections = s2s_metrics
+                    .as_ref()
+                    .map(|_| Arc::new(s2s::connections::ConnectionRegistry::default()));
                 let component_metrics = if !config.components.domains.is_empty() {
                     let metrics = component::metrics::ComponentMetrics::new(
                         config.components.listeners.len(),
@@ -335,7 +338,9 @@ fn run_internal(
                             &config.admin.socket_path,
                             storage.clone(),
                             deleter,
-                            None,
+                            s2s_connections.clone().map(|registry| {
+                                registry as Arc<dyn lonewolf_admin::S2sConnections>
+                            }),
                         )
                         .map_err(RunError::Admin)?,
                     )
@@ -416,7 +421,9 @@ fn run_internal(
                         RunError::C2s(failure.error)
                     })?.into_inner(),
                 );
-                if let (Some(metrics), Some(peers)) = (s2s_metrics, s2s_peers) {
+                if let (Some(metrics), Some(peers), Some(connections)) =
+                    (s2s_metrics, s2s_peers, s2s_connections)
+                {
                     serving.s2s = Some(
                         s2s::inbound::S2sListeners::start(
                             &config.s2s,
@@ -430,6 +437,7 @@ fn run_internal(
                                 allocator: Arc::clone(&stanza_pool),
                             },
                             metrics,
+                            connections,
                         )
                         .await
                         .map_err(|failure| {

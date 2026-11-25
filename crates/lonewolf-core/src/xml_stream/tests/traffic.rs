@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::future::Future;
+use std::sync::Arc;
 use std::task::Waker;
 use std::time::Instant;
 
@@ -74,7 +75,11 @@ fn check(observer: impl TrafficObserver + Unpin) {
 
 #[test]
 fn observed_io_does_not_allocate_after_observer_construction() {
-    check(S2sByteObserver::new(S2sMetrics::new(1), Direction::Inbound));
+    check(S2sByteObserver::new(
+        S2sMetrics::new(1),
+        Direction::Inbound,
+        Arc::default(),
+    ));
     check(ConnectionActivity::new(Instant::now()));
 }
 
@@ -350,7 +355,7 @@ fn owned_buffer_observation_does_not_allocate_per_operation() {
     use compio::io::{AsyncRead as _, AsyncWrite as _};
     let mut stream = ObservedIo::new(
         OwnedIo::new(),
-        S2sByteObserver::new(S2sMetrics::new(1), Direction::Inbound),
+        S2sByteObserver::new(S2sMetrics::new(1), Direction::Inbound, Arc::default()),
     );
     let mut cx = Context::from_waker(Waker::noop());
     let allocations = allocations_during(|| {

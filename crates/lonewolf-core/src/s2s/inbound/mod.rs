@@ -11,6 +11,7 @@ use lonewolf_util::arena::ChunkAllocator;
 use lonewolf_util::core_dispatcher::DispatchHandle;
 
 use super::NEXT_S2S_CONNECTION_ID;
+use super::connections::{ConnectionRegistry, ConnectionTraffic};
 use super::ingress::IngressServices;
 use super::metrics::{ConnectionRejection, Direction, S2sMetrics};
 use super::revocation::{PeerRevocation, PeerVerification};
@@ -45,6 +46,7 @@ struct Settings<A: ChunkAllocator> {
     max_streams: usize,
     idle_timeout: Duration,
     metrics: Arc<S2sMetrics>,
+    connections: Arc<ConnectionRegistry>,
 }
 
 struct AdmissionLimits {
@@ -98,6 +100,7 @@ impl AdmissionLimits {
 
 pub(crate) struct S2sListeners(ListenerSet);
 impl S2sListeners {
+    #[expect(clippy::too_many_arguments)]
     pub(crate) async fn start<A: ChunkAllocator + Clone>(
         config: &S2sConfig,
         limits: &S2sLimits,
@@ -106,6 +109,7 @@ impl S2sListeners {
         dispatcher: &DispatchHandle,
         services: IngressServices<A>,
         metrics: Arc<S2sMetrics>,
+        connections: Arc<ConnectionRegistry>,
     ) -> Result<Self, StartError> {
         let admission = Arc::new(AdmissionLimits {
             attempts: AttemptLimiter::new(&limits.connection_attempts_per_ip),
@@ -128,6 +132,7 @@ impl S2sListeners {
             max_streams: limits.max_inbound_streams_per_domain.get(),
             idle_timeout: Duration::from_secs(limits.idle_timeout_secs.get()),
             metrics,
+            connections,
         };
         let specs = config
             .listeners
@@ -212,12 +217,14 @@ impl<A: ChunkAllocator + Clone> AcceptHandler for S2sAcceptor<A> {
             let _permits = permits;
             let _gauge = gauge;
             let connection_id = NEXT_S2S_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
+            let traffic = Arc::new(ConnectionTraffic::default());
             let started = Instant::now();
             let outcome = match negotiate::negotiate(
                 &tcp,
                 &settings,
                 shutdown.clone(),
                 connection_id,
+                &traffic,
                 attempt,
             )
             .await

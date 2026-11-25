@@ -2,6 +2,7 @@
 
 use std::future::Future;
 use std::pin::pin;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use compio::net::TcpStream;
@@ -19,6 +20,7 @@ use super::negotiate::Authenticated;
 use super::{Settings, ShutdownSignal};
 use crate::delivery::WorkGroup;
 use crate::router::RoutedStanza;
+use crate::s2s::connections::ConnectionFacts;
 use crate::s2s::ingress::{self, InboundPeer, IngressContext, IngressFailure};
 use crate::s2s::log_domain;
 use crate::s2s::metrics::{Direction, S2sMetrics, StreamClose};
@@ -151,6 +153,17 @@ pub(super) async fn serve<A: ChunkAllocator + Clone + 'static>(
     settings: &Settings<A>,
     shutdown: ShutdownSignal,
 ) -> StreamClose {
+    let connection = ConnectionFacts {
+        connection_id: authenticated.connection_id,
+        direction: Direction::Inbound,
+        local: Arc::from(&*authenticated.local),
+        remote: Arc::from(&*authenticated.remote),
+        remote_address: tcp.peer_addr().ok(),
+        tls_mode: settings.tls_mode,
+        tls: authenticated.tls,
+        certificate_expires_at: authenticated.valid_until,
+        traffic: authenticated.traffic,
+    };
     let peer = InboundPeer {
         local: authenticated.local,
         remote: authenticated.remote,
@@ -159,11 +172,11 @@ pub(super) async fn serve<A: ChunkAllocator + Clone + 'static>(
     tracing::info!(connection_id = peer.connection_id, local_domain = %log_domain(&peer.local), remote_domain = %log_domain(&peer.remote), direction = "inbound", tls_mode = settings.tls_mode.as_str(), bidi = authenticated.bidi, "s2s connection authenticated");
     let (validity, monitor) = match authenticated.revocation {
         Some(verdict) if verdict.needs_rechecks() => {
-            let revocation = std::sync::Arc::clone(&settings.revocation);
+            let revocation = Arc::clone(&settings.revocation);
             let chain = authenticated.chain;
             let revalidate = Box::new(move || {
-                let revocation = std::sync::Arc::clone(&revocation);
-                let chain = std::sync::Arc::clone(&chain);
+                let revocation = Arc::clone(&revocation);
+                let chain = Arc::clone(&chain);
                 async move {
                     revocation
                         .check(chain, Direction::Inbound, CheckPhase::Recheck)
@@ -190,6 +203,7 @@ pub(super) async fn serve<A: ChunkAllocator + Clone + 'static>(
             settings,
             shutdown,
             bidi: authenticated.bidi,
+            connection,
         },
         || {
             let _ = socket2::SockRef::from(tcp).shutdown(std::net::Shutdown::Both);
@@ -216,6 +230,7 @@ struct Parameters<'a, A: ChunkAllocator> {
     settings: &'a Settings<A>,
     shutdown: ShutdownSignal,
     bidi: bool,
+    connection: ConnectionFacts,
 }
 
 async fn run<A, R, W, D>(
@@ -241,6 +256,7 @@ where
         settings,
         shutdown,
         bidi,
+        connection,
     } = parameters;
     let mut terminal = Terminal {
         metrics: &settings.metrics,
@@ -266,6 +282,11 @@ where
     } else {
         None
     };
+    let listed = permit.as_ref().map(|_| {
+        settings
+            .connections
+            .register(connection, registration.is_some())
+    });
     let bidi_gauge = registration
         .as_ref()
         .map(|_| settings.metrics.bidi_stream_opened(Direction::Inbound));
@@ -323,7 +344,7 @@ where
     .await;
     drop(context);
     group.drain().await;
-    drop((permit, gauge, bidi_gauge));
+    drop((listed, permit, gauge, bidi_gauge));
     closed.outcome
 }
 

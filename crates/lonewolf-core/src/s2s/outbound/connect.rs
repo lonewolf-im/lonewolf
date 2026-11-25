@@ -641,7 +641,11 @@ async fn negotiate<A: ChunkAllocator + Clone>(
             setup.identity.clone(),
             Box::pin(AsyncStream::new(ObservedIo::new(
                 socket.0.clone(),
-                S2sByteObserver::new(Arc::clone(&context.metrics), Direction::Outbound),
+                S2sByteObserver::new(
+                    Arc::clone(&context.metrics),
+                    Direction::Outbound,
+                    Arc::default(),
+                ),
             ))),
         )
         .await

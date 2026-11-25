@@ -5,6 +5,7 @@ use std::sync::atomic::AtomicU64;
 
 use crate::connection::socket::ConnectionSocket;
 
+pub(crate) mod connections;
 pub(crate) mod dns;
 mod expiry;
 pub(crate) mod inbound;

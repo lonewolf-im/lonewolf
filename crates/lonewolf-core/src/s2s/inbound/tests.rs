@@ -3,15 +3,17 @@
 use std::cell::{Cell, RefCell};
 use std::error::Error;
 use std::io;
+use std::num::NonZeroUsize;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use compio::runtime::Runtime;
 use futures_channel::oneshot;
 use futures_util::io::AsyncWrite;
 use futures_util::{FutureExt, poll};
+use lonewolf_admin::S2sConnections;
 use lonewolf_storage::RedbStorage;
 use lonewolf_util::arena::GlobalChunkAllocator;
 use prometheus_client::registry::Registry;
@@ -20,6 +22,7 @@ use super::*;
 use crate::config::Config;
 use crate::hosts::{Hosts, peer_identity::PeerTrust};
 use crate::router::{Router, local::LocalRouter};
+use crate::s2s::connections::TlsSummary;
 use crate::s2s::ingress::IngressServices;
 use crate::s2s::revocation::PeerRevocation;
 use crate::s2s::stream::S2sReaderLimits;
@@ -88,6 +91,7 @@ impl Fixture {
                 max_streams: 1,
                 idle_timeout: Duration::from_secs(30),
                 metrics,
+                connections: Arc::default(),
             },
             _directory: directory,
         })
@@ -125,6 +129,20 @@ impl Fixture {
             settings: &self.settings,
             shutdown,
             bidi: false,
+            connection: ConnectionFacts {
+                connection_id: peer.connection_id,
+                direction: Direction::Inbound,
+                local: Arc::from(&*peer.local),
+                remote: Arc::from(&*peer.remote),
+                remote_address: None,
+                tls_mode: self.settings.tls_mode,
+                tls: TlsSummary {
+                    version: "TLSv1.3",
+                    cipher_suite: "TLS13_AES_256_GCM_SHA384",
+                },
+                certificate_expires_at: UNIX_EPOCH + Duration::from_secs(2_000_000_000),
+                traffic: Arc::default(),
+            },
         }
     }
 }
@@ -180,6 +198,116 @@ fn sample(metrics: &Arc<S2sMetrics>, key: &str, value: usize) -> TestResult {
         render(metrics)?
     );
     Ok(())
+}
+
+async fn hold_dispatch(
+    _: &IngressContext<GlobalChunkAllocator>,
+    _: &InboundPeer,
+    _: RoutedStanza<GlobalChunkAllocator>,
+) -> Result<(), IngressFailure> {
+    std::future::pending().await
+}
+
+#[test]
+fn authenticated_stream_is_listed_until_run_returns() -> TestResult {
+    Runtime::new()?.block_on(async {
+        let fixture = Fixture::new()?;
+        let peer = peer();
+        let validity = LinkValidity::fixed(SystemTime::now() + Duration::from_secs(60));
+        let (stop, shutdown) = signal();
+        let mut reader = fixture
+            .reader("<message from='a@peer.test' to='b@local.test'/></stream:stream>")
+            .await?;
+        let mut writer = S2sWriter::new(Output::default());
+        let registry = &fixture.settings.connections;
+        let mut running = std::pin::pin!(run(
+            &mut reader,
+            &mut writer,
+            fixture.parameters(&peer, shutdown, &validity),
+            || {},
+            hold_dispatch,
+        ));
+
+        assert!(poll!(running.as_mut()).is_pending());
+        let entries = registry.connections(None, None, NonZeroUsize::MIN);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].connection_id, peer.connection_id);
+
+        stop.send(Instant::now() + Duration::from_secs(1))
+            .map_err(|_| "stop dropped")?;
+        assert!(matches!(running.await, StreamClose::Shutdown));
+        assert!(
+            registry
+                .connections(None, None, NonZeroUsize::MIN)
+                .is_empty()
+        );
+        Ok(())
+    })
+}
+
+#[test]
+fn conflicting_stream_is_never_listed() -> TestResult {
+    use crate::s2s::stream::traffic::test_support::Fragments;
+    use tokio_util::compat::FuturesAsyncReadCompatExt;
+
+    Runtime::new()?.block_on(async {
+        let fixture = Fixture::new()?;
+        let first = peer();
+        let second = InboundPeer {
+            connection_id: 2,
+            ..peer()
+        };
+        let validity = LinkValidity::fixed(SystemTime::now() + Duration::from_secs(60));
+        let (stop, shutdown) = signal();
+        let mut first_reader = fixture
+            .reader("<message from='a@peer.test' to='b@local.test'/></stream:stream>")
+            .await?;
+        let mut first_writer = S2sWriter::new(Output::default());
+        let mut running = std::pin::pin!(run(
+            &mut first_reader,
+            &mut first_writer,
+            fixture.parameters(&first, shutdown.clone(), &validity),
+            || {},
+            hold_dispatch,
+        ));
+        assert!(poll!(running.as_mut()).is_pending());
+
+        let input = Fragments::default();
+        input.push(HEADER.as_bytes());
+        let mut second_reader = S2sReader::new(
+            tokio::io::BufReader::new(input.compat()),
+            &fixture.settings.reader_limits,
+            GlobalChunkAllocator,
+            None,
+        );
+        assert!(matches!(
+            second_reader.next_event().await,
+            Ok(Some(StreamEvent::StreamStart { .. }))
+        ));
+        let output = Output::default();
+        let mut second_writer = S2sWriter::new(output.clone());
+        let rejected = run(
+            &mut second_reader,
+            &mut second_writer,
+            fixture.parameters(&second, shutdown, &validity),
+            || {},
+            hold_dispatch,
+        );
+        let mut rejected = Box::pin(rejected);
+        assert!(poll!(rejected.as_mut()).is_pending());
+        assert!(std::str::from_utf8(&output.0.borrow())?.contains("<conflict"));
+
+        let registry = &fixture.settings.connections;
+        let entries = registry.connections(None, None, NonZeroUsize::MIN.saturating_add(1));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].connection_id, first.connection_id);
+
+        drop(rejected);
+        stop.send(Instant::now() + Duration::from_secs(1))
+            .map_err(|_| "stop dropped")?;
+        assert!(matches!(running.await, StreamClose::Shutdown));
+        Ok(())
+    })
 }
 
 #[test]

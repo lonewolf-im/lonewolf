@@ -25,24 +25,25 @@ fn render(metrics: &Arc<S2sMetrics>) -> Result<String, Box<dyn std::error::Error
 fn reads_and_writes_are_counted() -> Result<(), Box<dyn std::error::Error>> {
     compio::runtime::Runtime::new()?.block_on(async {
         let metrics = metrics();
-        let mut input = ObservedIo::new(
-            Cursor::new(b"hello"),
-            S2sByteObserver::new(Arc::clone(&metrics), Direction::Inbound),
+        let traffic = Arc::new(ConnectionTraffic::default());
+        let observer = S2sByteObserver::new(
+            Arc::clone(&metrics),
+            Direction::Inbound,
+            Arc::clone(&traffic),
         );
+        let mut input = ObservedIo::new(Cursor::new(b"hello"), observer.clone());
         let mut buffer = [0; 3];
         assert_eq!(input.read(&mut buffer).await?, 3);
         assert_eq!(input.read(&mut buffer).await?, 2);
         assert_eq!(input.read(&mut buffer).await?, 0);
         assert_eq!(input.read(&mut []).await?, 0);
-        let mut output = ObservedIo::new(
-            Vec::new(),
-            S2sByteObserver::new(Arc::clone(&metrics), Direction::Inbound),
-        );
+        let mut output = ObservedIo::new(Vec::new(), observer);
         output.write_all(b"goodbye").await?;
         assert_eq!(output.write(&[]).await?, 0);
         output.flush().await?;
         output.close().await?;
         assert_eq!(*output.inner_mut(), b"goodbye");
+        assert_eq!(traffic.totals(), (5, 7));
         let body = render(&metrics)?;
         assert!(
             body.contains("lonewolf_s2s_received_bytes_total{direction=\"inbound\"} 5\n"),
@@ -99,13 +100,18 @@ impl AsyncWrite for ControlledIo {
 fn pending_errors_and_partial_operations_preserve_actual_byte_counts()
 -> Result<(), Box<dyn std::error::Error>> {
     let metrics = metrics();
+    let traffic = Arc::new(ConnectionTraffic::default());
     let mut io = ObservedIo::new(
         ControlledIo {
             result: Poll::Pending,
             flushes: 0,
             closes: 0,
         },
-        S2sByteObserver::new(Arc::clone(&metrics), Direction::Inbound),
+        S2sByteObserver::new(
+            Arc::clone(&metrics),
+            Direction::Inbound,
+            Arc::clone(&traffic),
+        ),
     );
     let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
     let mut buffer = [0; 8];
@@ -145,6 +151,7 @@ fn pending_errors_and_partial_operations_preserve_actual_byte_counts()
     ));
     assert_eq!(io.inner_mut().flushes, 1);
     assert_eq!(io.inner_mut().closes, 1);
+    assert_eq!(traffic.totals(), (2, 3));
     let body = render(&metrics)?;
     assert!(
         body.contains("lonewolf_s2s_received_bytes_total{direction=\"inbound\"} 2\n"),

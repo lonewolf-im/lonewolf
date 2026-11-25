@@ -21,6 +21,7 @@ use tokio::io::BufReader;
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt as _};
 
 use super::{Settings, ShutdownSignal};
+use crate::s2s::connections::{ConnectionTraffic, TlsSummary};
 use crate::s2s::log_domain;
 use crate::s2s::metrics::{AuthOutcome, BidiOutcome, Direction, S2sMetrics, TransportAttempt};
 use crate::s2s::outbound::RemoteRouter;
@@ -54,6 +55,8 @@ pub(crate) struct Authenticated<A: ChunkAllocator> {
     pub(crate) writer: S2sWriter<TlsOutput>,
     pub(crate) connection_id: u64,
     pub(crate) bidi: bool,
+    pub(crate) tls: TlsSummary,
+    pub(crate) traffic: Arc<ConnectionTraffic>,
 }
 
 struct VerifiedPeer {
@@ -64,6 +67,8 @@ struct VerifiedPeer {
     valid_until: SystemTime,
     chain: Arc<[CertificateDer<'static>]>,
     revocation: Option<RevocationVerdict>,
+    tls: TlsSummary,
+    traffic: Arc<ConnectionTraffic>,
 }
 
 enum Connection<A: ChunkAllocator> {
@@ -166,6 +171,7 @@ pub(super) async fn negotiate<A: ChunkAllocator + Clone>(
     settings: &Settings<A>,
     shutdown: ShutdownSignal,
     connection_id: u64,
+    traffic: &Arc<ConnectionTraffic>,
     mut attempt: TransportAttempt,
 ) -> Result<Authenticated<A>, S2sError> {
     let mut accounting = Accounting {
@@ -190,7 +196,7 @@ pub(super) async fn negotiate<A: ChunkAllocator + Clone>(
         crate::config::TlsMode::Direct => Box::default(),
         crate::config::TlsMode::StartTls => settings.hosts.default_host_name().into(),
     };
-    // Mark the header and footer sent before writing them, because a cancelled write still delivers its buffered bytes.
+    // A cancelled write can still send the buffered header or footer.
     let mut header_sent = false;
     let mut peer_footer = false;
     let mut footer_sent = false;
@@ -206,6 +212,7 @@ pub(super) async fn negotiate<A: ChunkAllocator + Clone>(
             &mut peer_footer,
             &mut footer_sent,
             &mut response_from,
+            traffic,
         ));
         match select(
             pin!(shutdown),
@@ -243,6 +250,8 @@ pub(super) async fn negotiate<A: ChunkAllocator + Clone>(
             valid_until,
             chain,
             revocation,
+            tls,
+            traffic,
         }) => {
             accounting.outcome = AuthOutcome::Success;
             if bidi_offered {
@@ -268,6 +277,8 @@ pub(super) async fn negotiate<A: ChunkAllocator + Clone>(
                 reader,
                 writer,
                 connection_id,
+                tls,
+                traffic,
             })
         }
         Err(failure) => {
@@ -350,6 +361,7 @@ fn header<A: ChunkAllocator>(event: StreamEvent<A>) -> Result<stream::InitialHea
     })
 }
 
+#[expect(clippy::too_many_arguments)]
 async fn run<A: ChunkAllocator + Clone>(
     tcp: &TcpStream,
     settings: &Settings<A>,
@@ -358,6 +370,7 @@ async fn run<A: ChunkAllocator + Clone>(
     peer_footer: &mut bool,
     footer_sent: &mut bool,
     response_from: &mut Box<str>,
+    traffic: &Arc<ConnectionTraffic>,
 ) -> Result<VerifiedPeer, Failure> {
     let local_limits = stream::limits::local_limits(
         settings.reader_limits.max_stanza_bytes.get(),
@@ -374,7 +387,11 @@ async fn run<A: ChunkAllocator + Clone>(
             rustls::server::Acceptor::default(),
             Box::pin(AsyncStream::new(ObservedIo::new(
                 tcp.clone(),
-                S2sByteObserver::new(Arc::clone(&settings.metrics), Direction::Inbound),
+                S2sByteObserver::new(
+                    Arc::clone(&settings.metrics),
+                    Direction::Inbound,
+                    Arc::clone(traffic),
+                ),
             ))),
         )
         .await
@@ -458,7 +475,11 @@ async fn run<A: ChunkAllocator + Clone>(
         let tls = TlsAcceptor::from(config)
             .accept(Box::pin(AsyncStream::new(ObservedIo::new(
                 tcp.clone(),
-                S2sByteObserver::new(Arc::clone(&settings.metrics), Direction::Inbound),
+                S2sByteObserver::new(
+                    Arc::clone(&settings.metrics),
+                    Direction::Inbound,
+                    Arc::clone(traffic),
+                ),
             ))))
             .await
             .map_err(|_| Failure {
@@ -467,7 +488,9 @@ async fn run<A: ChunkAllocator + Clone>(
             })?;
         (initial.to, tls, Some(state))
     };
-    let certificate = tls.get_ref().1.peer_certificates().and_then(|chain| {
+    let tls_state = tls.get_ref().1;
+    let tls_summary = TlsSummary::of(tls_state);
+    let certificate = tls_state.peer_certificates().and_then(|chain| {
         chain.first().map(|_| {
             (
                 chain
@@ -669,6 +692,8 @@ async fn run<A: ChunkAllocator + Clone>(
         valid_until,
         chain,
         revocation,
+        tls: tls_summary,
+        traffic: Arc::clone(traffic),
     })
 }
 

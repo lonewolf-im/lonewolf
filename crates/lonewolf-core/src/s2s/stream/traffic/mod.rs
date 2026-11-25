@@ -6,6 +6,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::s2s::connections::ConnectionTraffic;
 use crate::s2s::metrics::{Direction, S2sMetrics};
 use crate::xml_stream::traffic::TrafficObserver;
 
@@ -42,20 +43,31 @@ impl ConnectionActivity {
 pub(crate) struct S2sByteObserver {
     metrics: Arc<S2sMetrics>,
     direction: Direction,
+    traffic: Arc<ConnectionTraffic>,
 }
 
 impl S2sByteObserver {
-    pub(crate) fn new(metrics: Arc<S2sMetrics>, direction: Direction) -> Self {
-        Self { metrics, direction }
+    pub(crate) fn new(
+        metrics: Arc<S2sMetrics>,
+        direction: Direction,
+        traffic: Arc<ConnectionTraffic>,
+    ) -> Self {
+        Self {
+            metrics,
+            direction,
+            traffic,
+        }
     }
 }
 
 impl TrafficObserver for S2sByteObserver {
     fn received(&self, bytes: usize) {
         self.metrics.bytes(self.direction, bytes as u64, 0);
+        self.traffic.received(bytes as u64);
     }
     fn sent(&self, bytes: usize) {
         self.metrics.bytes(self.direction, 0, bytes as u64);
+        self.traffic.sent(bytes as u64);
     }
 }
 

@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -24,6 +25,7 @@ use tokio::io::BufReader;
 use tokio_util::compat::Compat;
 
 use super::ConnectionSocket;
+use super::connections::{ConnectionRegistry, ConnectionTraffic, TlsSummary};
 use super::dns::Resolver;
 use super::metrics::{
     AdmissionReason, ConnectionGauge, DropReason, LinkSnapshot, LinkStats, S2sMetrics,
@@ -31,7 +33,7 @@ use super::metrics::{
 use super::revocation::{PeerRevocation, PeerVerification, RevocationVerdict};
 use super::stream::traffic::{ConnectionActivity, S2sByteObserver};
 use super::stream::{S2sReader, S2sWriter};
-use crate::config::limits::S2sLimits;
+use crate::config::{TlsMode, limits::S2sLimits};
 use crate::delivery::{WorkGroup, WorkGuard, WorkHandle};
 use crate::hosts::{Hosts, peer_identity::PeerTrust};
 use crate::router::RouterHandle;
@@ -61,6 +63,10 @@ pub(crate) struct OutboundStream<A: ChunkAllocator> {
     pub(crate) chain: Arc<[CertificateDer<'static>]>,
     pub(crate) revocation: Option<RevocationVerdict>,
     pub(crate) connection_id: u64,
+    tls_mode: TlsMode,
+    remote_address: SocketAddr,
+    tls: TlsSummary,
+    traffic: Arc<ConnectionTraffic>,
     _connection_gauge: ConnectionGauge,
 }
 
@@ -115,6 +121,7 @@ struct Inner<A: ChunkAllocator> {
     limits: S2sLimits,
     allocator: A,
     metrics: Arc<S2sMetrics>,
+    connections: Arc<ConnectionRegistry>,
     bidi: Option<BidiIngress>,
     next_standby: AtomicU64,
     state: PlMutex<State<A>>,
@@ -329,6 +336,7 @@ impl<A: ChunkAllocator> State<A> {
 }
 
 impl<A: ChunkAllocator + Clone> RemoteRouter<A> {
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
         hosts: Hosts,
         peers: PeerVerification,
@@ -336,6 +344,7 @@ impl<A: ChunkAllocator + Clone> RemoteRouter<A> {
         limits: &S2sLimits,
         allocator: A,
         metrics: Arc<S2sMetrics>,
+        connections: Arc<ConnectionRegistry>,
         bidi: Option<BidiIngress>,
     ) -> Self {
         let group = WorkGroup::new();
@@ -349,6 +358,7 @@ impl<A: ChunkAllocator + Clone> RemoteRouter<A> {
             limits: limits.clone(),
             allocator,
             metrics,
+            connections,
             bidi,
             next_standby: AtomicU64::new(0),
             state: PlMutex::new(State {

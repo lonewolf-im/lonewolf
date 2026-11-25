@@ -2,9 +2,11 @@
 
 use crate::s2s::test_endpoint::RefusedEndpoint;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::num::NonZeroUsize;
 use std::pin::pin;
 
 use futures_util::poll;
+use lonewolf_admin::{S2sConnections, S2sDirection};
 use lonewolf_storage::Storage;
 use lonewolf_util::arena::GlobalChunkAllocator;
 use prometheus_client::registry::Registry;
@@ -13,7 +15,8 @@ use super::manager_tests::{manager, message, run, stanza};
 use super::*;
 use crate::config::Config;
 use crate::router::{Router, local::LocalRouter};
-use crate::s2s::metrics::StreamClose;
+use crate::s2s::connections::ConnectionFacts;
+use crate::s2s::metrics::{Direction, StreamClose};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 type Registration = BidiRegistration<GlobalChunkAllocator>;
@@ -55,6 +58,7 @@ impl Fixture {
             &config.limits.s2s,
             GlobalChunkAllocator,
             S2sMetrics::new(0),
+            Arc::default(),
             Some(BidiIngress { storage }),
         );
         let router =
@@ -302,6 +306,50 @@ fn dial_failure_hands_the_queue_to_a_standby_registered_meanwhile() -> TestResul
         assert!(!fixture.render()?.contains("lonewolf_s2s_bounces_total"));
         fixture.remote.stop();
         registration.release(Some(queue));
+        fixture.finish().await
+    })
+}
+
+#[test]
+fn bidi_handoff_is_not_listed_twice() -> TestResult {
+    run(async {
+        let fixture = Fixture::new()?;
+        let standby = fixture.register()?;
+        let connections = &fixture.remote.inner.connections;
+        let listed = connections.register(
+            ConnectionFacts {
+                connection_id: 1,
+                direction: Direction::Inbound,
+                local: Arc::from("localhost"),
+                remote: Arc::from("remote.test"),
+                remote_address: None,
+                tls_mode: TlsMode::StartTls,
+                tls: TlsSummary {
+                    version: "TLSv1.3",
+                    cipher_suite: "TLS13_AES_256_GCM_SHA384",
+                },
+                certificate_expires_at: SystemTime::UNIX_EPOCH,
+                traffic: Arc::default(),
+            },
+            true,
+        );
+        fixture.route().await?;
+        let queue = standby.assigned().await.ok_or("missing assigned queue")?;
+        assert_eq!(queue.receiver.len(), 1);
+
+        let page = connections.connections(
+            None,
+            Some("remote.test"),
+            NonZeroUsize::MIN.saturating_add(1),
+        );
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].connection_id, 1);
+        assert_eq!(page[0].direction, S2sDirection::Inbound);
+        assert!(page[0].bidirectional);
+
+        fixture.remote.stop();
+        standby.release(Some(queue));
+        drop(listed);
         fixture.finish().await
     })
 }

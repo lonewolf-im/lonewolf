@@ -2,18 +2,26 @@
 
 use std::error::Error;
 use std::future::{Future, pending};
+use std::net::Ipv4Addr;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::pin::pin;
 
+use base64::Engine as _;
+use compio::net::TcpListener;
 use compio::runtime::Runtime;
+use futures_rustls::TlsAcceptor;
+use futures_util::io::{AsyncReadExt, AsyncWriteExt};
 use futures_util::poll;
+use lonewolf_admin::{S2sConnections, S2sDirection, S2sTlsMode};
 use lonewolf_util::arena::{ArenaConfig, GlobalChunkAllocator};
 use lonewolf_xmpp::parser::{ParserConfig, StreamEvent, XmppParser};
 use prometheus_client::registry::Registry;
+use tokio_util::compat::FuturesAsyncReadCompatExt;
 
 use super::*;
-use crate::config::Config;
+use crate::config::{Config, S2sRouteEndpoint};
 use crate::router::{Router, RouterError, local::LocalRouter};
+use crate::s2s::stream::response_header_xml;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 type Manager = RemoteRouter<GlobalChunkAllocator>;
@@ -44,6 +52,7 @@ pub(super) fn manager_with_allocator<A: ChunkAllocator + Clone>(
         &limits,
         allocator,
         S2sMetrics::new(0),
+        Arc::default(),
         None,
     ))
 }
@@ -677,6 +686,152 @@ fn spawned_link_tasks_keep_link_state_off_the_stack() -> TestResult {
         let size = std::mem::size_of_val(&task);
         assert!(size <= 256, "spawned link task is {size} bytes");
         drop(task);
+        remote.join(Instant::now() + TIMEOUT).await?;
+        router.shutdown().await?;
+        Ok(())
+    })
+}
+
+async fn receive_on_outbound_peer(
+    listener: &TcpListener,
+    tls: &TlsAcceptor,
+    connections: &ConnectionRegistry,
+    stanza_id: &str,
+) -> TestResult<u64> {
+    let (tcp, _) = listener.accept().await?;
+    let (reader, mut writer) = tls.accept(Box::pin(AsyncStream::new(tcp))).await?.split();
+    let mut parser = XmppParser::new(
+        BufReader::new(reader.compat()),
+        ParserConfig {
+            max_stanza_bytes: NonZeroUsize::new(65_536).ok_or("invalid stanza size")?,
+            arena: ArenaConfig::default(),
+        },
+        GlobalChunkAllocator,
+    );
+    let header = response_header_xml("remote.test", Some("localhost"))
+        .map_err(|error| format!("{error:?}"))?;
+    assert!(matches!(
+        parser.next_event().await?,
+        Some(StreamEvent::StreamStart { .. })
+    ));
+    writer.write_all(header.as_bytes()).await?;
+    writer
+        .write_all(b"<stream:features><mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><mechanism>EXTERNAL</mechanism></mechanisms></stream:features>")
+        .await?;
+    writer.flush().await?;
+    let Some(StreamEvent::Element(auth)) = parser.next_event().await? else {
+        return Err("missing SASL negotiation".into());
+    };
+    let auth = auth.value().resolve(auth.arena())?;
+    assert_eq!(auth.name(), "auth");
+    assert_eq!(auth.namespace(), "urn:ietf:params:xml:ns:xmpp-sasl");
+    writer
+        .write_all(b"<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>")
+        .await?;
+    writer.flush().await?;
+    let mut parser = parser.restart()?;
+    assert!(matches!(
+        parser.next_event().await?,
+        Some(StreamEvent::StreamStart { .. })
+    ));
+    writer.write_all(header.as_bytes()).await?;
+    writer.write_all(b"<stream:features/>").await?;
+    writer.flush().await?;
+    let Some(StreamEvent::Stanza(parsed)) = parser.next_event().await? else {
+        return Err("missing routed stanza".into());
+    };
+    assert_eq!(
+        RoutedStanza::from_parsed(parsed).resolve()?.id()?,
+        Some(stanza_id)
+    );
+
+    let entries = connections.connections(None, None, NonZeroUsize::MIN.saturating_add(1));
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].direction, S2sDirection::Outbound);
+    assert_eq!(entries[0].tls_mode, S2sTlsMode::Direct);
+    assert_eq!(entries[0].remote_address, Some(listener.local_addr()?));
+    assert!(entries[0].bytes_received > 0 && entries[0].bytes_sent > 0);
+    let connection_id = entries[0].connection_id;
+
+    writer.write_all(b"</stream:stream>").await?;
+    writer.flush().await?;
+    assert!(matches!(
+        parser.next_event().await?,
+        Some(StreamEvent::StreamEnd)
+    ));
+    writer.close().await?;
+    Ok(connection_id)
+}
+
+#[test]
+fn connected_link_is_listed_until_the_stream_closes() -> TestResult {
+    run(async {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let directory = tempfile::tempdir()?;
+        let mut config = Config::default();
+        config.s2s.routes.insert(
+            "remote.test".into(),
+            vec![S2sRouteEndpoint {
+                address: listener.local_addr()?,
+                tls_mode: TlsMode::Direct,
+            }],
+        );
+        let hosts = Hosts::new(&config.hosts, config.xmpp.default_host.as_deref())?;
+        let mut parameters = rcgen::CertificateParams::new(vec!["remote.test".into()])?;
+        parameters.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+        parameters.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        let (cert, key) = crate::hosts::test_support::material(parameters)?;
+        let anchors = directory.path().join("anchors.pem");
+        let encoded = base64::engine::general_purpose::STANDARD.encode(cert.as_ref());
+        std::fs::write(
+            &anchors,
+            format!("-----BEGIN CERTIFICATE-----\n{encoded}\n-----END CERTIFICATE-----\n"),
+        )?;
+        config.s2s.tls.trust_anchors_path = Some(anchors);
+        let trust = PeerTrust::load(&config.s2s.tls, hosts.crypto_provider())?;
+        let tls = TlsAcceptor::from(Arc::new(
+            rustls::ServerConfig::builder_with_provider(hosts.crypto_provider())
+                .with_safe_default_protocol_versions()?
+                .with_no_client_auth()
+                .with_single_cert(vec![cert], key)?,
+        ));
+        let connections = Arc::new(ConnectionRegistry::default());
+        let remote = RemoteRouter::new(
+            hosts.clone(),
+            PeerVerification {
+                trust,
+                revocation: PeerRevocation::disabled(),
+            },
+            Arc::new(Resolver::new(&config.s2s)?),
+            &config.limits.s2s,
+            GlobalChunkAllocator,
+            S2sMetrics::new(0),
+            Arc::clone(&connections),
+            None,
+        );
+        let router =
+            Router::new(hosts, LocalRouter::new(GlobalChunkAllocator)).with_remote(remote.clone());
+        let mut previous_id = None;
+        for stanza_id in ["first", "second"] {
+            let outbound = stanza(&format!(
+                "<message from='alice@localhost/desk' to='bob@remote.test/phone' id='{stanza_id}'/>"
+            ))
+            .await?;
+            remote
+                .route(&router.handle(), "localhost", "remote.test", outbound)
+                .map_err(|error| format!("{error:?}"))?;
+            let id = receive_on_outbound_peer(&listener, &tls, &connections, stanza_id).await?;
+            if let Some(previous) = previous_id {
+                assert!(id > previous);
+            }
+            previous_id = Some(id);
+            remote.inner.group.lock().await.drain().await;
+            assert!(
+                connections
+                    .connections(None, None, NonZeroUsize::MIN)
+                    .is_empty()
+            );
+        }
         remote.join(Instant::now() + TIMEOUT).await?;
         router.shutdown().await?;
         Ok(())

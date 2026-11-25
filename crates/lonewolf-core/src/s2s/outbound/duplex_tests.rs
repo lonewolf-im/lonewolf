@@ -212,6 +212,7 @@ impl<A: ChunkAllocator + Clone + 'static> Fixture<A> {
             &config.limits.s2s,
             allocator.clone(),
             S2sMetrics::new(0),
+            Arc::default(),
             Some(BidiIngress {
                 storage: storage.clone(),
             }),

@@ -347,7 +347,9 @@ fn run_internal(
                 } else {
                     None
                 };
-                let s2s_peers = if let Some(metrics) = &s2s_metrics {
+                let s2s_peers = if let (Some(metrics), Some(connections)) =
+                    (&s2s_metrics, &s2s_connections)
+                {
                     let trust = hosts::peer_identity::PeerTrust::load(
                         &config.s2s.tls,
                         hosts.crypto_provider(),
@@ -368,6 +370,7 @@ fn run_internal(
                         &config.limits.s2s,
                         Arc::clone(&stanza_pool),
                         Arc::clone(metrics),
+                        Arc::clone(connections),
                         config.s2s.bidirectional.then(|| s2s::outbound::BidiIngress {
                             storage: storage.clone(),
                         }),

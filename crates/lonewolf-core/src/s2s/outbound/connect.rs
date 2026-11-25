@@ -23,6 +23,7 @@ use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt as _};
 use super::{ClientTlsInput, ClientTlsOutput, OutboundStream};
 use crate::config::{TlsMode, limits::S2sLimits};
 use crate::hosts::{Hosts, peer_identity::PeerTrust, tls_identity};
+use crate::s2s::connections::{ConnectionTraffic, TlsSummary};
 use crate::s2s::dns::{ResolveError, Resolved, ResolvedVia, Resolver};
 use crate::s2s::log_domain;
 use crate::s2s::metrics::{AuthOutcome, BidiOutcome, Direction, DnsOutcome, S2sMetrics};
@@ -591,8 +592,10 @@ struct VerifiedPeer {
     valid_until: SystemTime,
     chain: Arc<[CertificateDer<'static>]>,
     revocation: Option<RevocationVerdict>,
+    tls: TlsSummary,
 }
 
+#[expect(clippy::too_many_arguments)]
 async fn negotiate<A: ChunkAllocator + Clone>(
     flow: &mut Negotiation<A>,
     socket: &ConnectionSocket,
@@ -600,6 +603,7 @@ async fn negotiate<A: ChunkAllocator + Clone>(
     remote: &str,
     context: &ConnectContext<'_>,
     setup: &TlsSetup,
+    traffic: &Arc<ConnectionTraffic>,
     allocator: A,
 ) -> Result<VerifiedPeer, Failure> {
     let header = stream::initial_header_xml(local, remote);
@@ -644,7 +648,7 @@ async fn negotiate<A: ChunkAllocator + Clone>(
                 S2sByteObserver::new(
                     Arc::clone(&context.metrics),
                     Direction::Outbound,
-                    Arc::default(),
+                    Arc::clone(traffic),
                 ),
             ))),
         )
@@ -659,7 +663,9 @@ async fn negotiate<A: ChunkAllocator + Clone>(
     {
         return Err(EstablishError::Tls("alpn").into());
     }
-    let certificates = tls.get_ref().1.peer_certificates().map(<[_]>::to_vec);
+    let tls_state = tls.get_ref().1;
+    let certificates = tls_state.peer_certificates().map(<[_]>::to_vec);
+    let tls_summary = TlsSummary::of(tls_state);
     let counted = ObservedIo::new(tls, ConnectionActivity::new(crate::clock::now()));
     let activity = counted.observer().clone();
     let (input, output) = counted.split();
@@ -735,6 +741,7 @@ async fn negotiate<A: ChunkAllocator + Clone>(
         valid_until,
         chain,
         revocation,
+        tls: tls_summary,
     })
 }
 
@@ -825,6 +832,7 @@ where
             .metrics
             .connection_opened(Direction::Outbound, endpoint.tls_mode);
         let connection_id = NEXT_S2S_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
+        let traffic = Arc::new(ConnectionTraffic::default());
         let mut flow = Negotiation {
             connection: None,
             peer_footer: false,
@@ -847,6 +855,7 @@ where
                     remote,
                     context,
                     setup,
+                    &traffic,
                     allocator.clone(),
                 ),
             )
@@ -869,6 +878,7 @@ where
                 valid_until,
                 chain,
                 revocation,
+                tls,
             }) => {
                 let Some(Connection::Tls(reader, writer)) = flow.connection.take() else {
                     attempt.complete(AuthOutcome::Protocol);
@@ -896,6 +906,10 @@ where
                     chain,
                     revocation,
                     connection_id,
+                    tls_mode: endpoint.tls_mode,
+                    remote_address: endpoint.address,
+                    tls,
+                    traffic,
                     _connection_gauge: gauge,
                 });
             }

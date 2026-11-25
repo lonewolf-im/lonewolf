@@ -595,7 +595,7 @@ struct VerifiedPeer {
     tls: TlsSummary,
 }
 
-#[expect(clippy::too_many_arguments)]
+#[expect(clippy::cognitive_complexity, clippy::too_many_arguments)]
 async fn negotiate<A: ChunkAllocator + Clone>(
     flow: &mut Negotiation<A>,
     socket: &ConnectionSocket,

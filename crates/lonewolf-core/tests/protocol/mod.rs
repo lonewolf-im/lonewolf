@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::cognitive_complexity)]
+
 #[path = "../support/mod.rs"]
 mod support;
 

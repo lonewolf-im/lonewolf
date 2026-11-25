@@ -1679,6 +1679,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> Outbox<'_, A, W> {
         flushed
     }
 
+    #[expect(clippy::cognitive_complexity)]
     async fn write_queue(&mut self) -> Result<(), CloseOutcome> {
         if self.queue.is_empty() {
             return Ok(());

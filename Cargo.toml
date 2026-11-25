@@ -100,3 +100,6 @@ ureq = { version = "=3.5.2", default-features = false, features = ["rustls-no-pr
 webpki-roots = { version = "1.0.10", default-features = false }
 zeroize = { version = "1.9.0", default-features = false, features = ["alloc"] }
 x509-cert = { version = "0.3.0", default-features = false }
+
+[workspace.lints.clippy]
+cognitive_complexity = "warn"

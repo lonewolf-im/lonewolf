@@ -518,6 +518,7 @@ struct Actor {
 }
 
 impl Actor {
+    #[expect(clippy::cognitive_complexity)]
     async fn run(self) -> ShutdownSummary {
         let Self {
             index,

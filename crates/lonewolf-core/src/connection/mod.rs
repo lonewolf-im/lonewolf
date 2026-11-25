@@ -437,6 +437,7 @@ pub(crate) async fn run_listener<H: AcceptHandler>(
     }
 }
 
+#[expect(clippy::cognitive_complexity)]
 async fn run_listener_with_accept<H, F>(
     listener: &TcpListener,
     context: WorkerContext,

@@ -50,3 +50,6 @@ blocking.workspace = true
 futures-executor.workspace = true
 p256 = { version = "0.14.0", default-features = false, features = ["alloc", "ecdsa", "pkcs8"] }
 tempfile.workspace = true
+
+[lints]
+workspace = true

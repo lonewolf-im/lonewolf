@@ -333,6 +333,7 @@ pub(crate) async fn prime(context: &mut RunContext) -> BenchResult<()> {
     result
 }
 
+#[expect(clippy::cognitive_complexity)]
 async fn prime_with(
     context: &mut RunContext,
     pool: &mut AccountPool,
@@ -657,6 +658,7 @@ struct PhaseSettings {
     duration: Duration,
 }
 
+#[expect(clippy::cognitive_complexity)]
 async fn run_phase(
     context: &mut RunContext,
     pool: &mut AccountPool,

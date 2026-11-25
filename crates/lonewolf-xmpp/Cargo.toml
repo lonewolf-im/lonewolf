@@ -21,3 +21,6 @@ tokio-util.workspace = true
 [dev-dependencies]
 futures-executor.workspace = true
 parking_lot.workspace = true
+
+[lints]
+workspace = true

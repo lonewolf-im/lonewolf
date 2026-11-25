@@ -29,3 +29,6 @@ parking_lot.workspace = true
 [[bench]]
 name = "pool"
 harness = false
+
+[lints]
+workspace = true

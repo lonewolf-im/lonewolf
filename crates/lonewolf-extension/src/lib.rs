@@ -2,6 +2,8 @@
 
 //! These interfaces are not stable for independent crates.
 
+#![cfg_attr(test, allow(clippy::cognitive_complexity))]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;

@@ -571,6 +571,7 @@ impl<S: Storage, C: Clock, E: Engine> Driver<'_, S, C, E> {
         Ok(())
     }
 
+    #[expect(clippy::cognitive_complexity)]
     async fn run<I: Installer>(
         &mut self,
         installer: &I,

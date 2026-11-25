@@ -67,3 +67,6 @@ path = "../lonewolf-core/tests/benchmark/local.rs"
 [[test]]
 name = "s2s"
 path = "../lonewolf-core/tests/server/s2s.rs"
+
+[lints]
+workspace = true

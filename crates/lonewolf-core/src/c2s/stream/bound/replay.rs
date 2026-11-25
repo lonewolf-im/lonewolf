@@ -31,6 +31,7 @@ pub(super) struct ReplayCounts {
 }
 
 impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> Outbox<'_, A, W> {
+    #[expect(clippy::cognitive_complexity)]
     pub(super) async fn write_offline(
         &mut self,
         backlog: Backlog,

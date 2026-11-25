@@ -36,12 +36,10 @@ const CLOSE_GRACE: Duration = Duration::from_secs(5);
 
 type PlainInput = Compat<Pin<Box<AsyncReadStream<TcpStream>>>>;
 type PlainOutput = Pin<Box<AsyncStream<TcpStream>>>;
-type TlsTransport = ObservedIo<
-    futures_rustls::server::TlsStream<
-        Pin<Box<AsyncStream<ObservedIo<TcpStream, S2sByteObserver>>>>,
-    >,
-    ConnectionActivity,
+type ServerTls = futures_rustls::server::TlsStream<
+    Pin<Box<AsyncStream<ObservedIo<TcpStream, S2sByteObserver>>>>,
 >;
+type TlsTransport = ObservedIo<ServerTls, ConnectionActivity>;
 type TlsInput = BufReader<Compat<ReadHalf<TlsTransport>>>;
 type TlsOutput = WriteHalf<TlsTransport>;
 
@@ -69,6 +67,12 @@ struct VerifiedPeer {
     revocation: Option<RevocationVerdict>,
     tls: TlsSummary,
     traffic: Arc<ConnectionTraffic>,
+}
+
+struct Negotiation<A: ChunkAllocator> {
+    connection: Option<Connection<A>>,
+    peer_footer: bool,
+    response_from: Box<str>,
 }
 
 enum Connection<A: ChunkAllocator> {
@@ -187,7 +191,7 @@ pub(super) async fn negotiate<A: ChunkAllocator + Clone>(
         outcome: AuthOutcome::Protocol,
         elapsed: None,
     };
-    let mut connection = match settings.tls_mode {
+    let connection = match settings.tls_mode {
         crate::config::TlsMode::Direct => None,
         crate::config::TlsMode::StartTls => Some(Connection::Plain(
             S2sReader::plain(
@@ -199,26 +203,23 @@ pub(super) async fn negotiate<A: ChunkAllocator + Clone>(
             S2sWriter::new(Box::pin(AsyncStream::new(tcp.clone()))),
         )),
     };
-    let mut response_from: Box<str> = match settings.tls_mode {
+    let response_from = match settings.tls_mode {
         crate::config::TlsMode::Direct => Box::default(),
         crate::config::TlsMode::StartTls => settings.hosts.default_host_name().into(),
     };
-    let mut peer_footer = false;
+    let mut flow = Negotiation {
+        connection,
+        peer_footer: false,
+        response_from,
+    };
     let deadline = accounting.started + settings.timeout;
     let mut close_deadline = None;
     let mut cancelled = false;
     let result = {
-        let flow = pin!(run(
-            tcp,
-            settings,
-            &mut connection,
-            &mut peer_footer,
-            &mut response_from,
-            traffic,
-        ));
+        let run = pin!(run(tcp, settings, &mut flow, traffic));
         match select(
             pin!(shutdown),
-            pin!(crate::clock::timeout_at(deadline, flow)),
+            pin!(crate::clock::timeout_at(deadline, run)),
         )
         .await
         {
@@ -266,7 +267,7 @@ pub(super) async fn negotiate<A: ChunkAllocator + Clone>(
                     },
                 );
             }
-            let Some(Connection::Tls(reader, writer)) = connection.take() else {
+            let Some(Connection::Tls(reader, writer)) = flow.connection.take() else {
                 return Err(S2sError::Internal);
             };
             Ok(Authenticated {
@@ -285,6 +286,11 @@ pub(super) async fn negotiate<A: ChunkAllocator + Clone>(
         }
         Err(failure) => {
             accounting.outcome = failure.outcome;
+            let Negotiation {
+                mut connection,
+                mut peer_footer,
+                response_from,
+            } = flow;
             if let Some(connection) = &mut connection {
                 let deadline = close_deadline
                     .unwrap_or_else(|| crate::clock::now() + CLOSE_GRACE + Duration::from_secs(1));
@@ -361,13 +367,10 @@ fn header<A: ChunkAllocator>(event: StreamEvent<A>) -> Result<stream::InitialHea
     })
 }
 
-#[expect(clippy::cognitive_complexity)]
 async fn run<A: ChunkAllocator + Clone>(
     tcp: &TcpStream,
     settings: &Settings<A>,
-    connection: &mut Option<Connection<A>>,
-    peer_footer: &mut bool,
-    response_from: &mut Box<str>,
+    flow: &mut Negotiation<A>,
     traffic: &Arc<ConnectionTraffic>,
 ) -> Result<VerifiedPeer, Failure> {
     let local_limits = stream::limits::local_limits(
@@ -381,108 +384,20 @@ async fn run<A: ChunkAllocator + Clone>(
         .remote_router()
         .is_some_and(RemoteRouter::bidirectional);
     let (local, tls, state) = if settings.tls_mode == crate::config::TlsMode::Direct {
-        let accepted = LazyConfigAcceptor::new(
-            rustls::server::Acceptor::default(),
-            Box::pin(AsyncStream::new(ObservedIo::new(
-                tcp.clone(),
-                S2sByteObserver::new(
-                    Arc::clone(&settings.metrics),
-                    Direction::Inbound,
-                    Arc::clone(traffic),
-                ),
-            ))),
-        )
-        .await
-        .map_err(|_| Failure {
-            error: S2sError::Io,
-            outcome: AuthOutcome::TlsFailure,
-        })?;
-        let local = select_sni(accepted.client_hello().server_name(), settings)
-            .ok_or_else(|| reject(StreamErrorCondition::HostUnknown, AuthOutcome::HostUnknown))?;
-        let config = settings
-            .hosts
-            .s2s_direct_server_config(&local, &settings.trust)
-            .ok_or_else(|| reject(StreamErrorCondition::HostUnknown, AuthOutcome::HostUnknown))?;
-        let tls = accepted.into_stream(config).await.map_err(|_| Failure {
-            error: S2sError::Io,
-            outcome: AuthOutcome::TlsFailure,
-        })?;
-        *response_from = local.clone();
+        let (local, tls) = accept_direct(tcp, settings, traffic).await?;
+        flow.response_from = local.clone();
         (local, tls, None)
     } else {
-        let plain = connection.as_mut().ok_or(S2sError::Internal)?;
-        let initial = header(expected(plain, peer_footer).await?)?;
-        if !settings.services.router.federates_domain(&initial.to) {
-            let response = stream::response_header_xml(
-                settings.hosts.default_host_name(),
-                initial.from.as_deref(),
-            )?;
-            plain.send_header(&response).await?;
-            return Err(reject(
-                StreamErrorCondition::HostUnknown,
-                AuthOutcome::HostUnknown,
-            ));
-        }
-        *response_from = initial.to.clone();
-        let response = stream::response_header_xml(&initial.to, initial.from.as_deref())?;
-        plain.send_header(&response).await?;
-        stream::limits::write_features_xml(
+        let (local, tls, state) = accept_starttls(
+            tcp,
+            settings,
+            flow,
             &mut features_xml,
-            stream::limits::FeaturePhase::StartTls,
             local_limits,
-        )?;
-        plain.send(&features_xml).await?;
-        match expected(plain, peer_footer).await? {
-            StreamEvent::Element(element)
-                if is_empty_element(&element, "starttls", TLS_NAMESPACE)? => {}
-            StreamEvent::Element(element)
-                if element
-                    .value()
-                    .resolve(element.arena())
-                    .map_err(S2sError::from)?
-                    .namespace()
-                    == TLS_NAMESPACE =>
-            {
-                plain.send(stream::TLS_FAILURE).await?;
-                return Err(S2sError::Eof.into());
-            }
-            _ => {
-                return Err(reject(
-                    StreamErrorCondition::NotAuthorized,
-                    AuthOutcome::Protocol,
-                ));
-            }
-        }
-        let Some(config) = settings
-            .hosts
-            .s2s_server_config(&initial.to, &settings.trust)
-        else {
-            plain.send(stream::TLS_FAILURE).await?;
-            return Err(S2sError::Eof.into());
-        };
-        let Some(Connection::Plain(mut reader, mut writer)) = connection.take() else {
-            return Err(S2sError::Internal.into());
-        };
-        writer.send(stream::PROCEED).await?;
-        let (input, state) = reader.take_input().await?;
-        drop(input);
-        drop(reader);
-        drop(writer);
-        let tls = TlsAcceptor::from(config)
-            .accept(Box::pin(AsyncStream::new(ObservedIo::new(
-                tcp.clone(),
-                S2sByteObserver::new(
-                    Arc::clone(&settings.metrics),
-                    Direction::Inbound,
-                    Arc::clone(traffic),
-                ),
-            ))))
-            .await
-            .map_err(|_| Failure {
-                error: S2sError::Io,
-                outcome: AuthOutcome::TlsFailure,
-            })?;
-        (initial.to, tls, Some(state))
+            traffic,
+        )
+        .await?;
+        (local, tls, Some(state))
     };
     let tls_state = tls.get_ref().1;
     let tls_summary = TlsSummary::of(tls_state);
@@ -519,6 +434,11 @@ async fn run<A: ChunkAllocator + Clone>(
     .with_activity(activity);
     #[cfg(feature = "test-support")]
     let reader = reader.with_transport_direction(Direction::Inbound);
+    let Negotiation {
+        connection,
+        peer_footer,
+        ..
+    } = flow;
     *connection = Some(Connection::Tls(reader, S2sWriter::new(output)));
     let tls = connection.as_mut().ok_or(S2sError::Internal)?;
     #[cfg(feature = "test-support")]
@@ -559,15 +479,7 @@ async fn run<A: ChunkAllocator + Clone>(
             CheckPhase::Handshake,
         )
         .await;
-    if let Some(verdict) = &revocation {
-        if let Some(outcome) = verdict.auth_outcome() {
-            tracing::warn!(outcome = outcome.as_str(), direction = "inbound", tls_mode = settings.tls_mode.as_str(), local_domain = %log_domain(&local), remote_domain = %log_domain(&remote), "s2s certificate rejected");
-            return Err(reject(StreamErrorCondition::NotAuthorized, outcome));
-        }
-        if let RevocationStatus::Unknown(reason) = verdict.status {
-            tracing::debug!(reason = reason.as_str(), direction = "inbound", tls_mode = settings.tls_mode.as_str(), local_domain = %log_domain(&local), remote_domain = %log_domain(&remote), "s2s revocation status unknown");
-        }
-    }
+    screen_revocation(settings, revocation.as_ref(), &local, &remote)?;
     let response = stream::response_header_xml(&local, Some(&remote))?;
     tls.send_header(&response).await?;
     stream::limits::write_features_xml(
@@ -576,6 +488,174 @@ async fn run<A: ChunkAllocator + Clone>(
         local_limits,
     )?;
     tls.send(&features_xml).await?;
+    let requested = authenticate_sasl(tls, peer_footer, &remote, offer_bidi).await?;
+    tls.send(stream::SASL_SUCCESS).await?;
+    if let Connection::Tls(reader, writer) = tls {
+        reader.restart()?;
+        writer.restart();
+    }
+    let final_header = header(expected(tls, peer_footer).await?)?;
+    if final_header.from.as_deref() != Some(&remote) {
+        return Err(reject(
+            StreamErrorCondition::InvalidFrom,
+            AuthOutcome::InvalidFrom,
+        ));
+    }
+    if final_header.to != local {
+        return Err(reject(
+            StreamErrorCondition::HostUnknown,
+            AuthOutcome::InvalidFrom,
+        ));
+    }
+    let response = stream::response_header_xml(&local, Some(&remote))?;
+    tls.send_header(&response).await?;
+    stream::limits::write_features_xml(
+        &mut features_xml,
+        stream::limits::FeaturePhase::Authenticated,
+        local_limits,
+    )?;
+    tls.send(&features_xml).await?;
+    Ok(VerifiedPeer {
+        bidi_offered: offer_bidi,
+        bidi: requested,
+        local,
+        remote,
+        valid_until,
+        chain,
+        revocation,
+        tls: tls_summary,
+        traffic: Arc::clone(traffic),
+    })
+}
+
+async fn accept_direct<A: ChunkAllocator + Clone>(
+    tcp: &TcpStream,
+    settings: &Settings<A>,
+    traffic: &Arc<ConnectionTraffic>,
+) -> Result<(Box<str>, ServerTls), Failure> {
+    let accepted = LazyConfigAcceptor::new(
+        rustls::server::Acceptor::default(),
+        Box::pin(AsyncStream::new(ObservedIo::new(
+            tcp.clone(),
+            S2sByteObserver::new(
+                Arc::clone(&settings.metrics),
+                Direction::Inbound,
+                Arc::clone(traffic),
+            ),
+        ))),
+    )
+    .await
+    .map_err(|_| Failure {
+        error: S2sError::Io,
+        outcome: AuthOutcome::TlsFailure,
+    })?;
+    let local = select_sni(accepted.client_hello().server_name(), settings)
+        .ok_or_else(|| reject(StreamErrorCondition::HostUnknown, AuthOutcome::HostUnknown))?;
+    let config = settings
+        .hosts
+        .s2s_direct_server_config(&local, &settings.trust)
+        .ok_or_else(|| reject(StreamErrorCondition::HostUnknown, AuthOutcome::HostUnknown))?;
+    let tls = accepted.into_stream(config).await.map_err(|_| Failure {
+        error: S2sError::Io,
+        outcome: AuthOutcome::TlsFailure,
+    })?;
+    Ok((local, tls))
+}
+
+async fn accept_starttls<A: ChunkAllocator + Clone>(
+    tcp: &TcpStream,
+    settings: &Settings<A>,
+    flow: &mut Negotiation<A>,
+    features_xml: &mut String,
+    local_limits: stream::limits::StreamLimits,
+    traffic: &Arc<ConnectionTraffic>,
+) -> Result<(Box<str>, ServerTls, stream::S2sReaderState), Failure> {
+    let Negotiation {
+        connection,
+        peer_footer,
+        response_from,
+    } = flow;
+    let plain = connection.as_mut().ok_or(S2sError::Internal)?;
+    let initial = header(expected(plain, peer_footer).await?)?;
+    if !settings.services.router.federates_domain(&initial.to) {
+        let response = stream::response_header_xml(
+            settings.hosts.default_host_name(),
+            initial.from.as_deref(),
+        )?;
+        plain.send_header(&response).await?;
+        return Err(reject(
+            StreamErrorCondition::HostUnknown,
+            AuthOutcome::HostUnknown,
+        ));
+    }
+    *response_from = initial.to.clone();
+    let response = stream::response_header_xml(&initial.to, initial.from.as_deref())?;
+    plain.send_header(&response).await?;
+    stream::limits::write_features_xml(
+        features_xml,
+        stream::limits::FeaturePhase::StartTls,
+        local_limits,
+    )?;
+    plain.send(features_xml).await?;
+    match expected(plain, peer_footer).await? {
+        StreamEvent::Element(element) if is_empty_element(&element, "starttls", TLS_NAMESPACE)? => {
+        }
+        StreamEvent::Element(element)
+            if element
+                .value()
+                .resolve(element.arena())
+                .map_err(S2sError::from)?
+                .namespace()
+                == TLS_NAMESPACE =>
+        {
+            plain.send(stream::TLS_FAILURE).await?;
+            return Err(S2sError::Eof.into());
+        }
+        _ => {
+            return Err(reject(
+                StreamErrorCondition::NotAuthorized,
+                AuthOutcome::Protocol,
+            ));
+        }
+    }
+    let Some(config) = settings
+        .hosts
+        .s2s_server_config(&initial.to, &settings.trust)
+    else {
+        plain.send(stream::TLS_FAILURE).await?;
+        return Err(S2sError::Eof.into());
+    };
+    let Some(Connection::Plain(mut reader, mut writer)) = connection.take() else {
+        return Err(S2sError::Internal.into());
+    };
+    writer.send(stream::PROCEED).await?;
+    let (input, state) = reader.take_input().await?;
+    drop(input);
+    drop(reader);
+    drop(writer);
+    let tls = TlsAcceptor::from(config)
+        .accept(Box::pin(AsyncStream::new(ObservedIo::new(
+            tcp.clone(),
+            S2sByteObserver::new(
+                Arc::clone(&settings.metrics),
+                Direction::Inbound,
+                Arc::clone(traffic),
+            ),
+        ))))
+        .await
+        .map_err(|_| Failure {
+            error: S2sError::Io,
+            outcome: AuthOutcome::TlsFailure,
+        })?;
+    Ok((initial.to, tls, state))
+}
+
+async fn authenticate_sasl<A: ChunkAllocator + Clone>(
+    tls: &mut Connection<A>,
+    peer_footer: &mut bool,
+    remote: &str,
+    offer_bidi: bool,
+) -> Result<bool, Failure> {
     let mut requested = false;
     for attempt in 0..2 {
         let mut auth = expected(tls, peer_footer).await?;
@@ -628,7 +708,7 @@ async fn run<A: ChunkAllocator + Clone>(
             };
         }
         let authorized = match response {
-            Ok(Auth::Response(bytes)) => authorize(&bytes, &remote),
+            Ok(Auth::Response(bytes)) => authorize(&bytes, remote),
             Ok(Auth::NoInitialResponse) => Err(SaslFailure::MalformedRequest),
             Err(failure) => Err(failure),
         };
@@ -650,43 +730,25 @@ async fn run<A: ChunkAllocator + Clone>(
             }
         }
     }
-    tls.send(stream::SASL_SUCCESS).await?;
-    if let Connection::Tls(reader, writer) = tls {
-        reader.restart()?;
-        writer.restart();
+    Ok(requested)
+}
+
+fn screen_revocation<A: ChunkAllocator>(
+    settings: &Settings<A>,
+    revocation: Option<&RevocationVerdict>,
+    local: &str,
+    remote: &str,
+) -> Result<(), Failure> {
+    if let Some(verdict) = revocation {
+        if let Some(outcome) = verdict.auth_outcome() {
+            tracing::warn!(outcome = outcome.as_str(), direction = "inbound", tls_mode = settings.tls_mode.as_str(), local_domain = %log_domain(local), remote_domain = %log_domain(remote), "s2s certificate rejected");
+            return Err(reject(StreamErrorCondition::NotAuthorized, outcome));
+        }
+        if let RevocationStatus::Unknown(reason) = verdict.status {
+            tracing::debug!(reason = reason.as_str(), direction = "inbound", tls_mode = settings.tls_mode.as_str(), local_domain = %log_domain(local), remote_domain = %log_domain(remote), "s2s revocation status unknown");
+        }
     }
-    let final_header = header(expected(tls, peer_footer).await?)?;
-    if final_header.from.as_deref() != Some(&remote) {
-        return Err(reject(
-            StreamErrorCondition::InvalidFrom,
-            AuthOutcome::InvalidFrom,
-        ));
-    }
-    if final_header.to != local {
-        return Err(reject(
-            StreamErrorCondition::HostUnknown,
-            AuthOutcome::InvalidFrom,
-        ));
-    }
-    let response = stream::response_header_xml(&local, Some(&remote))?;
-    tls.send_header(&response).await?;
-    stream::limits::write_features_xml(
-        &mut features_xml,
-        stream::limits::FeaturePhase::Authenticated,
-        local_limits,
-    )?;
-    tls.send(&features_xml).await?;
-    Ok(VerifiedPeer {
-        bidi_offered: offer_bidi,
-        bidi: requested,
-        local,
-        remote,
-        valid_until,
-        chain,
-        revocation,
-        tls: tls_summary,
-        traffic: Arc::clone(traffic),
-    })
+    Ok(())
 }
 
 pub(super) fn select_sni<A: ChunkAllocator + Clone>(

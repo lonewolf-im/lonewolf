@@ -571,12 +571,65 @@ impl<S: Storage, C: Clock, E: Engine> Driver<'_, S, C, E> {
         Ok(())
     }
 
-    #[expect(clippy::cognitive_complexity)]
     async fn run<I: Installer>(
         &mut self,
         installer: &I,
         supplied: Option<CertificateIdentifier<'static>>,
     ) -> Result<AttemptSuccess, AttemptFailure> {
+        let (mut snapshot, replacement) = self.open_order(supplied.as_ref()).await?;
+        let mut lease: Option<ChallengeLease> = None;
+        let mut acknowledged = false;
+        let mut finalized = false;
+        let mut interval = Duration::from_secs(2);
+        loop {
+            let now = unix(self.clock.now())?;
+            if self
+                .host
+                .order
+                .as_ref()
+                .and_then(|order| order.expires_unix)
+                .is_some_and(|expiry| expiry <= now)
+            {
+                return Err(AttemptFailure {
+                    terminal_order: true,
+                    ..failure(FailureKind::Protocol)
+                });
+            }
+            match snapshot.status {
+                OrderStatus::Invalid => {
+                    return Err(AttemptFailure {
+                        terminal_order: true,
+                        ..failure(FailureKind::Protocol)
+                    });
+                }
+                OrderStatus::Pending => {
+                    self.authorize(&mut lease, &mut acknowledged).await?;
+                }
+                OrderStatus::Ready if !finalized => {
+                    self.before().await?;
+                    let pending = self.host.order.as_ref().ok_or(StateError::CorruptData)?;
+                    snapshot = self.engine.finalize(&pending.csr_der).await?;
+                    self.observe(&snapshot, replacement.as_ref()).await?;
+                    finalized = true;
+                    continue;
+                }
+                OrderStatus::Valid => {
+                    return self.install(installer).await;
+                }
+                _ => {}
+            }
+            self.wait(interval).await?;
+            interval = (interval * 2).min(Duration::from_secs(30));
+            self.before().await?;
+            snapshot = self.engine.refresh().await?;
+            self.observe(&snapshot, replacement.as_ref()).await?;
+        }
+    }
+
+    async fn open_order(
+        &mut self,
+        supplied: Option<&CertificateIdentifier<'static>>,
+    ) -> Result<(Snapshot, Option<CertificateIdentifier<'static>>), AttemptFailure> {
         let account = self
             .store
             .account()
@@ -589,7 +642,7 @@ impl<S: Storage, C: Clock, E: Engine> Driver<'_, S, C, E> {
                 ..failure(FailureKind::Account)
             });
         }
-        if let Some(supplied) = &supplied {
+        if let Some(supplied) = supplied {
             let current = self
                 .host
                 .certificate
@@ -677,7 +730,7 @@ impl<S: Storage, C: Clock, E: Engine> Driver<'_, S, C, E> {
             return Err(failure(FailureKind::Protocol));
         }
         self.before().await?;
-        let mut snapshot = if let Some(url) = url {
+        let snapshot = if let Some(url) = url {
             self.engine.resume(&url).await?
         } else {
             self.engine
@@ -685,135 +738,104 @@ impl<S: Storage, C: Clock, E: Engine> Driver<'_, S, C, E> {
                 .await?
         };
         self.observe(&snapshot, replacement.as_ref()).await?;
-        let mut lease: Option<ChallengeLease> = None;
-        let mut acknowledged = false;
-        let mut finalized = false;
-        let mut interval = Duration::from_secs(2);
-        loop {
-            let now = unix(self.clock.now())?;
-            if self
-                .host
-                .order
-                .as_ref()
-                .and_then(|order| order.expires_unix)
-                .is_some_and(|expiry| expiry <= now)
-            {
-                return Err(AttemptFailure {
+        Ok((snapshot, replacement))
+    }
+
+    async fn authorize(
+        &mut self,
+        lease: &mut Option<ChallengeLease>,
+        acknowledged: &mut bool,
+    ) -> Result<(), AttemptFailure> {
+        self.before().await?;
+        let authorization = self.engine.authorization(*acknowledged).await?;
+        if authorization.wildcard || authorization.dns_name != self.host.host.dns_name {
+            return Err(AttemptFailure {
+                terminal_order: true,
+                ..failure(FailureKind::Authorization)
+            });
+        }
+        match authorization.status {
+            AuthorizationStatus::Valid => {}
+            AuthorizationStatus::Pending => {
+                let challenge = authorization.challenge.ok_or_else(|| AttemptFailure {
                     terminal_order: true,
-                    ..failure(FailureKind::Protocol)
-                });
-            }
-            match snapshot.status {
-                OrderStatus::Invalid => {
+                    ..failure(FailureKind::Authorization)
+                })?;
+                if challenge.status == ChallengeStatus::Invalid {
                     return Err(AttemptFailure {
                         terminal_order: true,
-                        ..failure(FailureKind::Protocol)
+                        ..failure(FailureKind::Authorization)
                     });
                 }
-                OrderStatus::Pending => {
-                    self.before().await?;
-                    let authorization = self.engine.authorization(acknowledged).await?;
-                    if authorization.wildcard || authorization.dns_name != self.host.host.dns_name {
-                        return Err(AttemptFailure {
-                            terminal_order: true,
-                            ..failure(FailureKind::Authorization)
-                        });
-                    }
-                    match authorization.status {
-                        AuthorizationStatus::Valid => {}
-                        AuthorizationStatus::Pending => {
-                            let challenge =
-                                authorization.challenge.ok_or_else(|| AttemptFailure {
-                                    terminal_order: true,
-                                    ..failure(FailureKind::Authorization)
-                                })?;
-                            if challenge.status == ChallengeStatus::Invalid {
-                                return Err(AttemptFailure {
-                                    terminal_order: true,
-                                    ..failure(FailureKind::Authorization)
-                                });
-                            }
-                            if lease.is_none() {
-                                lease = Some(
-                                    self.challenges
-                                        .publish(
-                                            &self.host.host.dns_name,
-                                            &challenge.token,
-                                            &challenge.authorization,
-                                        )
-                                        .map_err(|_| failure(FailureKind::Authorization))?,
-                                );
-                            }
-                            if !acknowledged && challenge.status == ChallengeStatus::Pending {
-                                self.before().await?;
-                                self.engine.ready().await?;
-                            }
-                            acknowledged = true;
-                        }
-                        _ => {
-                            return Err(AttemptFailure {
-                                terminal_order: true,
-                                ..failure(FailureKind::Authorization)
-                            });
-                        }
-                    }
+                if lease.is_none() {
+                    *lease = Some(
+                        self.challenges
+                            .publish(
+                                &self.host.host.dns_name,
+                                &challenge.token,
+                                &challenge.authorization,
+                            )
+                            .map_err(|_| failure(FailureKind::Authorization))?,
+                    );
                 }
-                OrderStatus::Ready if !finalized => {
+                if !*acknowledged && challenge.status == ChallengeStatus::Pending {
                     self.before().await?;
-                    let pending = self.host.order.as_ref().ok_or(StateError::CorruptData)?;
-                    snapshot = self.engine.finalize(&pending.csr_der).await?;
-                    self.observe(&snapshot, replacement.as_ref()).await?;
-                    finalized = true;
-                    continue;
+                    self.engine.ready().await?;
                 }
-                OrderStatus::Valid => {
-                    self.before().await?;
-                    let pem = self.engine.certificate().await?;
-                    let chain = parse_chain(&pem)?;
-                    let pending = self.host.order.as_mut().ok_or(StateError::CorruptData)?;
-                    let replaces = pending.replaces.clone();
-                    let material = CertificateMaterial {
-                        chain,
-                        private_key_pkcs8: pending.key_pkcs8.clone(),
-                    };
-                    let prepared = installer
-                        .prepare(&self.host.host, &material)
-                        .map_err(|_| failure(FailureKind::Material))?;
-                    let validity = prepared.validity;
-                    let now = unix(self.clock.now())?;
-                    if validity.not_before_unix > now || now >= validity.not_after_unix {
-                        return Err(failure(FailureKind::Material));
-                    }
-                    let renew_at_unix = fallback(validity, self.clock)?;
-                    self.host.certificate = Some(StoredCertificate {
-                        replaces,
-                        material,
-                        not_before_unix: validity.not_before_unix,
-                        not_after_unix: validity.not_after_unix,
-                        renew_at_unix,
-                        ari_check_at_unix: now,
-                        fallback_at_unix: renew_at_unix,
-                        ari_window: None,
-                        ari_failures: 0,
-                        profile: pending.profile.take(),
-                    });
-                    self.host.order = None;
-                    self.host.retry = RetryState {
-                        failures: 0,
-                        not_before_unix: 0,
-                    };
-                    self.store.save_host(&self.host).await?;
-                    installer.activate(prepared.candidate);
-                    return Ok(AttemptSuccess { validity });
-                }
-                _ => {}
+                *acknowledged = true;
             }
-            self.wait(interval).await?;
-            interval = (interval * 2).min(Duration::from_secs(30));
-            self.before().await?;
-            snapshot = self.engine.refresh().await?;
-            self.observe(&snapshot, replacement.as_ref()).await?;
+            _ => {
+                return Err(AttemptFailure {
+                    terminal_order: true,
+                    ..failure(FailureKind::Authorization)
+                });
+            }
         }
+        Ok(())
+    }
+
+    async fn install<I: Installer>(
+        &mut self,
+        installer: &I,
+    ) -> Result<AttemptSuccess, AttemptFailure> {
+        self.before().await?;
+        let pem = self.engine.certificate().await?;
+        let chain = parse_chain(&pem)?;
+        let pending = self.host.order.as_mut().ok_or(StateError::CorruptData)?;
+        let replaces = pending.replaces.clone();
+        let material = CertificateMaterial {
+            chain,
+            private_key_pkcs8: pending.key_pkcs8.clone(),
+        };
+        let prepared = installer
+            .prepare(&self.host.host, &material)
+            .map_err(|_| failure(FailureKind::Material))?;
+        let validity = prepared.validity;
+        let now = unix(self.clock.now())?;
+        if validity.not_before_unix > now || now >= validity.not_after_unix {
+            return Err(failure(FailureKind::Material));
+        }
+        let renew_at_unix = fallback(validity, self.clock)?;
+        self.host.certificate = Some(StoredCertificate {
+            replaces,
+            material,
+            not_before_unix: validity.not_before_unix,
+            not_after_unix: validity.not_after_unix,
+            renew_at_unix,
+            ari_check_at_unix: now,
+            fallback_at_unix: renew_at_unix,
+            ari_window: None,
+            ari_failures: 0,
+            profile: pending.profile.take(),
+        });
+        self.host.order = None;
+        self.host.retry = RetryState {
+            failures: 0,
+            not_before_unix: 0,
+        };
+        self.store.save_host(&self.host).await?;
+        installer.activate(prepared.candidate);
+        Ok(AttemptSuccess { validity })
     }
 
     async fn observe(

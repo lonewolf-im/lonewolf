@@ -560,6 +560,80 @@ impl<A: ChunkAllocator + Clone> Negotiation<A> {
             }
         })
     }
+    async fn starttls(
+        &mut self,
+        socket: &ConnectionSocket,
+        header: &str,
+        remote: &str,
+        limits: &S2sReaderLimits,
+        context: &ConnectContext<'_>,
+        allocator: A,
+    ) -> Result<stream::S2sReaderState, Failure> {
+        self.connection = Some(Connection::Plain(
+            S2sReader::plain(
+                socket.0.clone(),
+                limits,
+                allocator,
+                Some(Arc::clone(&context.metrics)),
+            ),
+            S2sWriter::new(Box::pin(AsyncStream::new(socket.0.clone()))),
+        ));
+        self.send_header(header).await?;
+        self.header(remote).await?;
+        let offered = features(self.expected().await?)?;
+        require_starttls(&offered)?;
+        self.update_peer_limits(offered.limits)?;
+        self.send(stream::STARTTLS).await?;
+        proceed(self.expected().await?)?;
+        let Some(Connection::Plain(mut reader, writer)) = self.connection.take() else {
+            return Err(protocol());
+        };
+        let (input, state) = reader.take_input().await?;
+        drop(input);
+        drop(reader);
+        drop(writer);
+        Ok(state)
+    }
+
+    async fn authenticate(
+        &mut self,
+        header: &str,
+        local: &str,
+        remote: &str,
+        context: &ConnectContext<'_>,
+    ) -> Result<bool, Failure> {
+        self.send_header(header).await?;
+        self.header(remote).await?;
+        let offered = features(self.expected().await?)?;
+        require_external(&offered)?;
+        self.update_peer_limits(offered.limits)?;
+        let bidi = context.bidirectional && offered.bidi;
+        if bidi {
+            let mut xml = String::new();
+            let limits = stream::limits::local_limits(
+                context.limits.max_stanza_bytes.get(),
+                context.limits.idle_timeout_secs.get(),
+            )?;
+            stream::limits::write_bidi_xml(&mut xml, limits)?;
+            self.send(&xml).await?;
+        }
+        self.send(&stream::auth_external_xml(local)).await?;
+        if sasl_reply(self.expected().await?, false)? == SaslReply::Challenge {
+            self.send(EMPTY_RESPONSE).await?;
+            sasl_reply(self.expected().await?, true)?;
+        }
+        let Some(Connection::Tls(reader, writer)) = &mut self.connection else {
+            return Err(protocol());
+        };
+        reader.restart()?;
+        writer.restart();
+        self.send_header(header).await?;
+        self.header(remote).await?;
+        let offered = features(self.expected().await?)?;
+        self.update_peer_limits(offered.limits)?;
+        Ok(bidi)
+    }
+
     async fn cleanup(&mut self, failure: Failure, selected_at: Instant) {
         let Some(connection) = &mut self.connection else {
             return;
@@ -595,7 +669,7 @@ struct VerifiedPeer {
     tls: TlsSummary,
 }
 
-#[expect(clippy::cognitive_complexity, clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 async fn negotiate<A: ChunkAllocator + Clone>(
     flow: &mut Negotiation<A>,
     socket: &ConnectionSocket,
@@ -613,30 +687,10 @@ async fn negotiate<A: ChunkAllocator + Clone>(
         xml: context.limits.incoming_xml_per_connection.clone(),
     };
     let state = if setup.tls_mode == TlsMode::StartTls {
-        flow.connection = Some(Connection::Plain(
-            S2sReader::plain(
-                socket.0.clone(),
-                &limits,
-                allocator.clone(),
-                Some(Arc::clone(&context.metrics)),
-            ),
-            S2sWriter::new(Box::pin(AsyncStream::new(socket.0.clone()))),
-        ));
-        flow.send_header(&header).await?;
-        flow.header(remote).await?;
-        let offered = features(flow.expected().await?)?;
-        require_starttls(&offered)?;
-        flow.update_peer_limits(offered.limits)?;
-        flow.send(stream::STARTTLS).await?;
-        proceed(flow.expected().await?)?;
-        let Some(Connection::Plain(mut reader, writer)) = flow.connection.take() else {
-            return Err(protocol());
-        };
-        let (input, state) = reader.take_input().await?;
-        drop(input);
-        drop(reader);
-        drop(writer);
-        Some(state)
+        Some(
+            flow.starttls(socket, &header, remote, &limits, context, allocator.clone())
+                .await?,
+        )
     } else {
         None
     };
@@ -682,35 +736,7 @@ async fn negotiate<A: ChunkAllocator + Clone>(
     #[cfg(feature = "test-support")]
     let reader = reader.with_transport_direction(Direction::Outbound);
     flow.connection = Some(Connection::Tls(reader, S2sWriter::new(output)));
-    flow.send_header(&header).await?;
-    flow.header(remote).await?;
-    let offered = features(flow.expected().await?)?;
-    require_external(&offered)?;
-    flow.update_peer_limits(offered.limits)?;
-    let bidi = context.bidirectional && offered.bidi;
-    if bidi {
-        let mut xml = String::new();
-        let limits = stream::limits::local_limits(
-            context.limits.max_stanza_bytes.get(),
-            context.limits.idle_timeout_secs.get(),
-        )?;
-        stream::limits::write_bidi_xml(&mut xml, limits)?;
-        flow.send(&xml).await?;
-    }
-    flow.send(&stream::auth_external_xml(local)).await?;
-    if sasl_reply(flow.expected().await?, false)? == SaslReply::Challenge {
-        flow.send(EMPTY_RESPONSE).await?;
-        sasl_reply(flow.expected().await?, true)?;
-    }
-    let Some(Connection::Tls(reader, writer)) = &mut flow.connection else {
-        return Err(protocol());
-    };
-    reader.restart()?;
-    writer.restart();
-    flow.send_header(&header).await?;
-    flow.header(remote).await?;
-    let offered = features(flow.expected().await?)?;
-    flow.update_peer_limits(offered.limits)?;
+    let bidi = flow.authenticate(&header, local, remote, context).await?;
     let validity = context
         .trust
         .verify_chain(
@@ -728,15 +754,7 @@ async fn negotiate<A: ChunkAllocator + Clone>(
             CheckPhase::Handshake,
         )
         .await;
-    if let Some(verdict) = &revocation {
-        if let Some(outcome) = verdict.auth_outcome() {
-            tracing::warn!(outcome = outcome.as_str(), direction = "outbound", tls_mode = setup.tls_mode.as_str(), local_domain = %log_domain(local), remote_domain = %log_domain(remote), "s2s certificate rejected");
-            return Err(EstablishError::Tls(outcome.as_str()).into());
-        }
-        if let RevocationStatus::Unknown(reason) = verdict.status {
-            tracing::debug!(reason = reason.as_str(), direction = "outbound", tls_mode = setup.tls_mode.as_str(), local_domain = %log_domain(local), remote_domain = %log_domain(remote), "s2s revocation status unknown");
-        }
-    }
+    screen_revocation(revocation.as_ref(), setup.tls_mode, local, remote)?;
     Ok(VerifiedPeer {
         bidi,
         valid_until,
@@ -744,6 +762,24 @@ async fn negotiate<A: ChunkAllocator + Clone>(
         revocation,
         tls: tls_summary,
     })
+}
+
+fn screen_revocation(
+    revocation: Option<&RevocationVerdict>,
+    tls_mode: TlsMode,
+    local: &str,
+    remote: &str,
+) -> Result<(), Failure> {
+    if let Some(verdict) = revocation {
+        if let Some(outcome) = verdict.auth_outcome() {
+            tracing::warn!(outcome = outcome.as_str(), direction = "outbound", tls_mode = tls_mode.as_str(), local_domain = %log_domain(local), remote_domain = %log_domain(remote), "s2s certificate rejected");
+            return Err(EstablishError::Tls(outcome.as_str()).into());
+        }
+        if let RevocationStatus::Unknown(reason) = verdict.status {
+            tracing::debug!(reason = reason.as_str(), direction = "outbound", tls_mode = tls_mode.as_str(), local_domain = %log_domain(local), remote_domain = %log_domain(remote), "s2s revocation status unknown");
+        }
+    }
+    Ok(())
 }
 
 pub(crate) async fn establish<A: ChunkAllocator + Clone>(

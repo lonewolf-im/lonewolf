@@ -44,7 +44,12 @@ impl SocketFixture {
     }
 
     fn bind(&self) -> io::Result<Server> {
-        Server::bind(&self.path, self.storage.clone(), Arc::clone(&self.deleter))
+        Server::bind(
+            &self.path,
+            self.storage.clone(),
+            Arc::clone(&self.deleter),
+            None,
+        )
     }
 
     fn bind_error(&self) -> TestResult<io::ErrorKind> {

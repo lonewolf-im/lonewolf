@@ -30,6 +30,7 @@ fn with_admin_server(test: impl FnOnce(&Path) -> TestResult) -> TestResult {
                 &socket,
                 storage.clone(),
                 Arc::new(RecordDeleter::new(storage)),
+                None,
             )?;
             ready.send(()).map_err(io::Error::other)?;
             server

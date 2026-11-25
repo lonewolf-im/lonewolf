@@ -23,6 +23,7 @@ use tokio_util::compat::FuturesAsyncReadCompatExt;
 
 use crate::api;
 use crate::deleter::AccountDeleter;
+use crate::s2s::S2sConnections;
 
 const MAX_CONNECTIONS: usize = 32;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -39,6 +40,7 @@ impl Server {
     ///
     /// Creates missing directories with mode 0700 and the socket with mode 0600.
     /// Refuses existing paths, including stale sockets.
+    /// The S2S listing answers `s2s_inactive` without a source.
     ///
     /// # Errors
     ///
@@ -54,6 +56,7 @@ impl Server {
         path: &Path,
         storage: impl Storage,
         deleter: Arc<dyn AccountDeleter>,
+        s2s: Option<Arc<dyn S2sConnections>>,
     ) -> io::Result<Self> {
         let parent = path
             .parent()
@@ -93,7 +96,7 @@ impl Server {
         Ok(Self {
             listener: UnixListener::from_std(listener)?,
             socket,
-            router: api::router(storage, deleter),
+            router: api::router(storage, deleter, s2s),
         })
     }
 

@@ -4,7 +4,7 @@ use crate::roster::RosterQuota;
 
 use std::error::Error;
 
-use ::redb::ReadableDatabase;
+use ::redb::{ReadableDatabase, ReadableTable};
 use futures_executor::block_on;
 use lonewolf_util::arena::{Arena, ArenaConfig};
 use lonewolf_xmpp::jid::Jid;

@@ -185,24 +185,22 @@ struct UncertainCommitBackend {
 }
 
 impl redb::StorageBackend for UncertainCommitBackend {
-    fn len(&self) -> std::io::Result<u64> {
+    fn len(&self) -> Result<u64, redb::BackendError> {
         self.inner.len()
     }
-    fn read(&self, offset: u64, output: &mut [u8]) -> std::io::Result<()> {
+    fn read(&self, offset: u64, output: &mut [u8]) -> Result<(), redb::BackendError> {
         self.inner.read(offset, output)
     }
-    fn set_len(&self, length: u64) -> std::io::Result<()> {
+    fn set_len(&self, length: u64) -> Result<(), redb::BackendError> {
         self.inner.set_len(length)
     }
-    fn write(&self, offset: u64, input: &[u8]) -> std::io::Result<()> {
+    fn write(&self, offset: u64, input: &[u8]) -> Result<(), redb::BackendError> {
         self.inner.write(offset, input)
     }
-    fn sync_data(&self) -> std::io::Result<()> {
+    fn sync_data(&self) -> Result<(), redb::BackendError> {
         self.inner.sync_data()?;
         if self.fail_next_sync.swap(false, Ordering::SeqCst) {
-            Err(std::io::Error::other(
-                crate::delivery::failure_tests::SENSITIVE_SOURCE,
-            ))
+            Err(std::io::Error::other(crate::delivery::failure_tests::SENSITIVE_SOURCE).into())
         } else {
             Ok(())
         }

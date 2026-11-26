@@ -3,7 +3,7 @@
 use std::error::Error;
 use std::num::NonZeroUsize;
 
-use ::redb::ReadableDatabase;
+use ::redb::{ReadableDatabase, ReadableTable};
 use futures_executor::block_on;
 use lonewolf_auth::scram::{ScramCredentials, ScramHash, ScramVerifier};
 

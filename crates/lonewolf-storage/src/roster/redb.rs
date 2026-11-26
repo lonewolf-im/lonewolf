@@ -84,7 +84,7 @@ macro_rules! roster_reads {
                     let table = transaction.open_table(ITEMS).map_err(storage_error)?;
                     let (start,end)=owner_range(&owner);
                     let lower=after.as_deref().map_or(std::ops::Bound::Included(start.as_ref()),std::ops::Bound::Excluded);
-                    table.range::<&str>((lower,std::ops::Bound::Excluded(end.as_ref()))).map_err(storage_error)?.next().map(|entry| {
+                    table.range((lower,std::ops::Bound::Excluded(end.as_ref()))).map_err(storage_error)?.next().map(|entry| {
                         let (key,value)=entry.map_err(storage_error)?;
                         Ok((decode_key(&owner,key.value())?,decode_subscription(value.value())?))
                     }).transpose()
@@ -98,7 +98,7 @@ macro_rules! roster_reads {
                     let table = transaction.open_table(PENDING).map_err(storage_error)?;
                     let (start,end)=owner_range(&owner);
                     let lower=after.as_deref().map_or(std::ops::Bound::Included(start.as_ref()),std::ops::Bound::Excluded);
-                    table.range::<&str>((lower,std::ops::Bound::Excluded(end.as_ref()))).map_err(storage_error)?.next().map(|entry| {
+                    table.range((lower,std::ops::Bound::Excluded(end.as_ref()))).map_err(storage_error)?.next().map(|entry| {
                         let (key,_)=entry.map_err(storage_error)?;
                         decode_key(&owner,key.value()).map_err(Into::into)
                     }).transpose()
@@ -393,7 +393,7 @@ fn read_pending_page<T: ReadableTable<&'static str, &'static [u8]>>(
     let (start, end) = owner_range(owner);
     let lower = after.map_or(Bound::Included(start.as_ref()), Bound::Excluded);
     for entry in table
-        .range::<&str>((lower, Bound::Excluded(end.as_ref())))
+        .range((lower, Bound::Excluded(end.as_ref())))
         .map_err(storage_error)?
     {
         let (key, stanza) = entry.map_err(storage_error)?;

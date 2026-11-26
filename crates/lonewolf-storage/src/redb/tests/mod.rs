@@ -14,7 +14,8 @@ use std::thread;
 
 use ::redb::backends::InMemoryBackend;
 use ::redb::{
-    Database, ReadableDatabase, ReadableTableMetadata, StorageBackend, TableDefinition, TableHandle,
+    Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, StorageBackend,
+    TableDefinition, TableHandle,
 };
 use futures_executor::block_on;
 use lonewolf_auth::scram::{ScramCredentials, ScramHash, ScramVerifier};
@@ -965,8 +966,6 @@ fn reopened_pending_queue_preserves_rows_above_a_lower_limit() -> TestResult {
 
 #[test]
 fn existing_database_gains_only_an_empty_vcard_table_without_rewriting_other_rows() -> TestResult {
-    use ::redb::ReadableTable;
-
     let storage = storage()?;
     let alice = key("alice@example.com")?;
     block_on(async {

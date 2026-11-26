@@ -74,7 +74,7 @@ pub fn assert_absent(directory: &Path, jid: &str) -> TestResult {
 }
 
 pub fn assert_raw(directory: &Path, jid: &str, expected: &[u8]) -> TestResult {
-    use redb::ReadableDatabase;
+    use redb::{ReadableDatabase, ReadableTable};
     let database = redb::Database::open(directory.join("data/lonewolf.dat"))?;
     let transaction = database.begin_read()?;
     let table =

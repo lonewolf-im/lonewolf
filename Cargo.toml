@@ -76,7 +76,7 @@ pin-project-lite = "0.2.17"
 precis-profiles = { version = "0.2.0", default-features = false }
 prometheus-client = { version = "0.26.0", default-features = false }
 quick-xml = { version = "0.42.0", default-features = false, features = ["async-tokio"] }
-redb = { version = "4.3.0", default-features = false, features = ["std"] }
+redb = { version = "5.0.0", default-features = false, features = ["std"] }
 rpassword = "7.5.4"
 rcgen = { version = "0.14.10", default-features = false }
 rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "prefer-post-quantum", "std", "tls12"] }

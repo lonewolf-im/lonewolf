@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread::{self, ThreadId};
 
-use ::redb::StorageBackend;
 use ::redb::backends::InMemoryBackend;
+use ::redb::{BackendError, StorageBackend};
 use parking_lot::Mutex as PlMutex;
 
 use crate::tests::TIMEOUT;
@@ -26,28 +26,28 @@ impl FailingSyncBackend {
 }
 
 impl StorageBackend for FailingSyncBackend {
-    fn len(&self) -> io::Result<u64> {
+    fn len(&self) -> Result<u64, BackendError> {
         self.inner.len()
     }
 
-    fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
+    fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), BackendError> {
         self.inner.read(offset, out)
     }
 
-    fn set_len(&self, len: u64) -> io::Result<()> {
+    fn set_len(&self, len: u64) -> Result<(), BackendError> {
         self.inner.set_len(len)
     }
 
-    fn sync_data(&self) -> io::Result<()> {
+    fn sync_data(&self) -> Result<(), BackendError> {
         self.inner.sync_data()?;
         if self.fail_next_sync.swap(false, Ordering::SeqCst) {
-            Err(io::Error::other("injected sync failure"))
+            Err(io::Error::other("injected sync failure").into())
         } else {
             Ok(())
         }
     }
 
-    fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+    fn write(&self, offset: u64, data: &[u8]) -> Result<(), BackendError> {
         self.inner.write(offset, data)
     }
 }
@@ -84,30 +84,29 @@ impl ObservedBackend {
         Ok((started, release))
     }
 
-    fn record_thread(&self) -> io::Result<()> {
+    fn record_thread(&self) {
         self.threads.lock().push(thread::current().id());
-        Ok(())
     }
 }
 
 impl StorageBackend for ObservedBackend {
-    fn len(&self) -> io::Result<u64> {
-        self.record_thread()?;
+    fn len(&self) -> Result<u64, BackendError> {
+        self.record_thread();
         self.inner.len()
     }
 
-    fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
-        self.record_thread()?;
+    fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), BackendError> {
+        self.record_thread();
         self.inner.read(offset, out)
     }
 
-    fn set_len(&self, len: u64) -> io::Result<()> {
-        self.record_thread()?;
+    fn set_len(&self, len: u64) -> Result<(), BackendError> {
+        self.record_thread();
         self.inner.set_len(len)
     }
 
-    fn sync_data(&self) -> io::Result<()> {
-        self.record_thread()?;
+    fn sync_data(&self) -> Result<(), BackendError> {
+        self.record_thread();
         let gate = self.sync_gate.lock().take();
         if let Some(gate) = gate {
             gate.entered.send(()).map_err(io::Error::other)?;
@@ -118,8 +117,8 @@ impl StorageBackend for ObservedBackend {
         self.inner.sync_data()
     }
 
-    fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
-        self.record_thread()?;
+    fn write(&self, offset: u64, data: &[u8]) -> Result<(), BackendError> {
+        self.record_thread();
         self.inner.write(offset, data)
     }
 }

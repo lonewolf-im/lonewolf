@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use ::redb::ReadableDatabase;
+use ::redb::{ReadableDatabase, ReadableTable};
 use futures_executor::block_on;
 
 use super::redb::{MESSAGES, SEQUENCES};

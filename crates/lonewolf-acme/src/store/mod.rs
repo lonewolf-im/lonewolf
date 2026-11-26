@@ -133,9 +133,8 @@ impl StateStore {
                 if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 {
                     return Err(StateError::UnsafePath);
                 }
-                let backend = FileBackend::new(file).map_err(backend_error)?;
                 let database = Database::builder()
-                    .create_with_backend(backend)
+                    .create_with_backend(FileBackend::new(file))
                     .map_err(backend_error)?;
                 let mut namespace = [0; 32];
                 namespace.copy_from_slice(digest(&SHA256, directory_url.as_bytes()).as_ref());

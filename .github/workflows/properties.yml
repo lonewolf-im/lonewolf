@@ -1,0 +1,48 @@
+name: XMPP property tests
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  properties:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PROPTEST_CASES: "10000"
+      PROPTEST_RNG_SEED: ${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c
+        with:
+          tool: nextest@0.9.149
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Check XML chunking and JID round trips
+        shell: bash
+        run: |
+          mkdir -p target/properties
+          {
+            printf 'commit=%s\nseed=%s\ncases=%s\n' "$GITHUB_SHA" "$PROPTEST_RNG_SEED" "$PROPTEST_CASES"
+            cargo nextest run --locked -p lonewolf-xmpp --lib --run-ignored only \
+              -E 'test(/::property_/)' --no-fail-fast
+          } 2>&1 | tee target/properties/run.log
+      - name: Upload failing cases
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: xmpp-properties-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            target/properties/run.log
+            crates/lonewolf-xmpp/proptest-regressions/
+          retention-days: 14

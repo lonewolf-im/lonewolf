@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::pin::pin;
 use std::sync::Arc;
 
 use lonewolf_extension::Effects;
@@ -154,7 +155,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             }
             Preparation::Commit(mut committed) => {
                 self.outbox
-                    .drain_until(&self.registration, committed.turned())
+                    .drain_until(&self.registration, pin!(committed.turned()))
                     .await?;
                 let queued = committed
                     .finished()
@@ -205,13 +206,13 @@ impl<A: ChunkAllocator + Clone> Subscription<'_, A> {
         let Some(handler) = sender else {
             drop(snapshot);
             return outbox
-                .drain_until(self.registration, self.without_handler())
+                .drain_until(self.registration, pin!(self.without_handler()))
                 .await?;
         };
         if let Err(error) = outbox
             .drain_until(
                 self.registration,
-                self.authorize(handler, request(self.source, self.kind)?),
+                pin!(self.authorize(handler, request(self.source, self.kind)?)),
             )
             .await?
         {
@@ -221,7 +222,7 @@ impl<A: ChunkAllocator + Clone> Subscription<'_, A> {
         outbox
             .drain_until(
                 self.registration,
-                self.prepare(handler, snapshot, delivery, outbox.work),
+                pin!(self.prepare(handler, snapshot, delivery, outbox.work)),
             )
             .await?
     }
@@ -235,7 +236,7 @@ impl<A: ChunkAllocator + Clone> Subscription<'_, A> {
                 outbox
                     .drain_until(
                         self.registration,
-                        self.read_policy("presence_subscription_begin_read"),
+                        pin!(self.read_policy("presence_subscription_begin_read")),
                     )
                     .await??,
             ));
@@ -267,13 +268,13 @@ impl<A: ChunkAllocator + Clone> Subscription<'_, A> {
         let verdict = outbox
             .drain_until(
                 self.registration,
-                policy::evaluate_selected_in(
+                pin!(policy::evaluate_selected_in(
                     self.router,
                     snapshot,
                     self.routed.resolve()?.stanza_type(),
                     &checks,
                     policy::Selection::Standard,
-                ),
+                )),
             )
             .await??;
         Ok(Preparation::denied(verdict))

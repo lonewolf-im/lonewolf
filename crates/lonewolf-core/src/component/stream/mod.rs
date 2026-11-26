@@ -3,6 +3,7 @@
 use std::cell::Cell;
 use std::fmt::Write as _;
 use std::io;
+use std::pin::pin;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -210,23 +211,26 @@ pub(super) async fn close<
 ) {
     let deadline = Instant::now() + Duration::from_secs(6);
     let deadline = shutdown_deadline.map_or(deadline, |shutdown| deadline.min(shutdown));
-    let _ = compio::time::timeout_at(deadline, async {
-        writer.close(condition).await?;
-        if !peer_footer {
-            let _ = compio::time::timeout_at(
-                deadline.min(Instant::now() + Duration::from_secs(5)),
-                async {
-                    while let Ok(Some(event)) = reader.next_event().await {
-                        if matches!(event, StreamEvent::StreamEnd) {
-                            break;
+    let _ = compio::time::timeout_at(
+        deadline,
+        pin!(async {
+            writer.close(condition).await?;
+            if !peer_footer {
+                let _ = compio::time::timeout_at(
+                    deadline.min(Instant::now() + Duration::from_secs(5)),
+                    pin!(async {
+                        while let Ok(Some(event)) = reader.next_event().await {
+                            if matches!(event, StreamEvent::StreamEnd) {
+                                break;
+                            }
                         }
-                    }
-                },
-            )
-            .await;
-        }
-        writer.shutdown().await
-    })
+                    }),
+                )
+                .await;
+            }
+            writer.shutdown().await
+        }),
+    )
     .await;
 }
 

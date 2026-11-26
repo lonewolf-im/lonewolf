@@ -320,26 +320,32 @@ async fn finish<A: ChunkAllocator + Clone>(
                     .map_or(started_closing + Duration::from_secs(6), |d| {
                         d.min(started_closing + Duration::from_secs(6))
                     });
-                let _ = compio::time::timeout_at(deadline, async {
-                    if writer.needs_header() {
-                        let (header, _) = stream::response_header_xml(progress.domain.as_deref())?;
-                        writer.send_header(&header).await?;
-                    }
-                    let condition = match failure.error {
-                        ComponentError::Stream(c) => Some(c),
-                        ComponentError::Internal => Some(StreamErrorCondition::InternalServerError),
-                        _ => None,
-                    };
-                    stream::close(
-                        reader,
-                        writer,
-                        condition,
-                        progress.peer_footer,
-                        Some(deadline),
-                    )
-                    .await;
-                    Ok::<(), ComponentError>(())
-                })
+                let _ = compio::time::timeout_at(
+                    deadline,
+                    pin!(async {
+                        if writer.needs_header() {
+                            let (header, _) =
+                                stream::response_header_xml(progress.domain.as_deref())?;
+                            writer.send_header(&header).await?;
+                        }
+                        let condition = match failure.error {
+                            ComponentError::Stream(c) => Some(c),
+                            ComponentError::Internal => {
+                                Some(StreamErrorCondition::InternalServerError)
+                            }
+                            _ => None,
+                        };
+                        stream::close(
+                            reader,
+                            writer,
+                            condition,
+                            progress.peer_footer,
+                            Some(deadline),
+                        )
+                        .await;
+                        Ok::<(), ComponentError>(())
+                    }),
+                )
                 .await;
             }
             let _ = socket2::SockRef::from(tcp).shutdown(std::net::Shutdown::Both);

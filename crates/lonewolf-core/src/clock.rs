@@ -55,28 +55,32 @@ pub(crate) async fn sleep_until(deadline: Instant) {
     compio::time::sleep_until(deadline).await;
 }
 
+/// Races `future` against `deadline` while storing `future` once.
 pub(crate) fn timeout_at<F: std::future::Future>(
     deadline: Instant,
     future: F,
 ) -> impl std::future::Future<Output = Result<F::Output, ()>> {
-    use futures_util::TryFutureExt as _;
+    use futures_util::FutureExt as _;
+    use futures_util::future::Either;
     #[cfg(any(test, feature = "test-support"))]
-    {
-        use futures_util::{FutureExt as _, future::Either};
-        if is_controlled() {
-            return lonewolf_util::race::race(sleep_until(deadline), future)
-                .map(|result| match result {
-                    Either::Left(()) => Err(()),
-                    Either::Right(output) => Ok(output),
-                })
-                .left_future();
-        }
-        compio::time::timeout_at(deadline, future)
-            .map_err(|_| ())
-            .right_future()
+    if is_controlled() {
+        return lonewolf_util::race::race(sleep_until(deadline), future)
+            .map(|result| match result {
+                Either::Left(()) => Err(()),
+                Either::Right(output) => Ok(output),
+            })
+            .left_future();
     }
-    #[cfg(not(any(test, feature = "test-support")))]
-    compio::time::timeout_at(deadline, future).map_err(|_| ())
+    let raced =
+        lonewolf_util::race::race(future, compio::time::sleep_until(deadline)).map(|result| {
+            match result {
+                Either::Left(output) => Ok(output),
+                Either::Right(()) => Err(()),
+            }
+        });
+    #[cfg(any(test, feature = "test-support"))]
+    let raced = raced.right_future();
+    raced
 }
 
 #[cfg(any(test, feature = "test-support"))]

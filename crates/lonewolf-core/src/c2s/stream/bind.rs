@@ -112,7 +112,7 @@ pub(super) async fn bind_resource<A: ChunkAllocator + Clone>(
                     )
                     .await);
             }
-            let operation = bind_session(
+            let operation = pin!(bind_session(
                 &mut session,
                 hosts,
                 account,
@@ -122,7 +122,7 @@ pub(super) async fn bind_resource<A: ChunkAllocator + Clone>(
                 &storage,
                 monitor.as_ref(),
                 &settings.metrics,
-            );
+            ));
             match &monitor {
                 Some(monitor) => monitor.interrupt(operation).await,
                 None => operation.await,

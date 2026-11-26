@@ -2,6 +2,7 @@
 
 use std::borrow::Cow;
 use std::fmt::Write as _;
+use std::pin::pin;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -382,9 +383,11 @@ impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
         }
         super::certificate::before_expiry(
             validity.valid_until,
-            self.session
-                .writer
-                .send_protocol_switch("<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>"),
+            pin!(
+                self.session
+                    .writer
+                    .send_protocol_switch("<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>")
+            ),
         )
         .await?;
         self.client_validity = Some(validity);

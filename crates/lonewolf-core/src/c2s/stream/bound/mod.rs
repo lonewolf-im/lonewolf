@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::mem;
 use std::num::NonZeroUsize;
-use std::pin::pin;
+use std::pin::{Pin, pin};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -439,14 +439,14 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         self.outbox
             .drain_until(
                 &self.registration,
-                observe::session(
+                pin!(observe::session(
                     &stage,
                     &delivery,
                     SessionChange {
                         session: session.resolve(&arena)?,
                         event: SessionEvent::Bound,
                     },
-                ),
+                )),
             )
             .await
     }
@@ -563,98 +563,112 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         let archive_needed = is_message && self.router.archive_handler(account.domain()).is_some();
         let prepared = self
             .outbox
-            .drain_until(&self.registration, async {
-                let stage = Stage {
-                    router: &self.router,
-                    storage: &self.storage,
-                    allocator: &self.allocator,
-                    work: &self.work,
-                };
-                let view = routed.resolve()?;
-                let peer = view.to()?.ok_or(CloseOutcome::InternalError)?;
-                let checks = [policy::Check {
-                    account,
-                    direction: Direction::Outbound,
-                    peer,
-                }];
-                let ordered = ingress::checks::fix_explicit_snapshot(
-                    stage.router,
-                    stage.storage,
-                    Some(account),
-                    None,
-                )
-                .await?;
-                let (verdict, mut admission) = if let Some((snapshot, ticket)) = ordered {
-                    (
-                        policy::evaluate_in(stage.router, &snapshot, view.stanza_type(), &checks)
-                            .await?,
-                        Some(ticket),
-                    )
-                } else {
-                    (
-                        policy::evaluate(&stage, view.stanza_type(), &checks).await?,
+            .drain_until(
+                &self.registration,
+                pin!(async {
+                    let stage = Stage {
+                        router: &self.router,
+                        storage: &self.storage,
+                        allocator: &self.allocator,
+                        work: &self.work,
+                    };
+                    let view = routed.resolve()?;
+                    let peer = view.to()?.ok_or(CloseOutcome::InternalError)?;
+                    let checks = [policy::Check {
+                        account,
+                        direction: Direction::Outbound,
+                        peer,
+                    }];
+                    let ordered = ingress::checks::fix_explicit_snapshot(
+                        stage.router,
+                        stage.storage,
+                        Some(account),
                         None,
                     )
-                };
-                if verdict != Verdict::Allow {
-                    return Ok(ServiceAdmission::Refused(verdict, routed));
-                }
-                if let Some(ticket) = &mut admission {
-                    ticket.turn().await;
-                }
-                if !liveness.is_alive() {
-                    return Ok(ServiceAdmission::Refused(Verdict::Drop, routed));
-                }
-                if directed {
-                    return Ok(ServiceAdmission::Directed(routed, route));
-                }
-                let archived = if archive_needed {
-                    archive::archive_addressed(&stage, routed, Some(account), None, Some(&liveness))
-                        .await?
-                } else {
-                    archive::ArchiveStep::Accepted(archive::Archived {
-                        stanza: routed,
-                        sent: None,
-                        received: None,
-                    })
-                };
-                let archive::Archived { stanza, sent, .. } = match archived {
-                    archive::ArchiveStep::Accepted(archived) => archived,
-                    archive::ArchiveStep::Rejected {
-                        stanza,
-                        condition,
-                        text,
-                    } => {
-                        return Ok(ServiceAdmission::Refused(
-                            Verdict::Reject {
-                                condition,
-                                application: None,
-                                text: Some(text),
-                            },
-                            stanza,
-                        ));
+                    .await?;
+                    let (verdict, mut admission) = if let Some((snapshot, ticket)) = ordered {
+                        (
+                            policy::evaluate_in(
+                                stage.router,
+                                &snapshot,
+                                view.stanza_type(),
+                                &checks,
+                            )
+                            .await?,
+                            Some(ticket),
+                        )
+                    } else {
+                        (
+                            policy::evaluate(&stage, view.stanza_type(), &checks).await?,
+                            None,
+                        )
+                    };
+                    if verdict != Verdict::Allow {
+                        return Ok(ServiceAdmission::Refused(verdict, routed));
                     }
-                };
-                if !liveness.is_alive() {
-                    return Ok(ServiceAdmission::Refused(Verdict::Drop, stanza));
-                }
-                let observer = (is_message
-                    && !self.router.message_observers(account.domain()).is_empty())
-                .then(|| self.registration.handle());
-                let work = ServiceWork {
-                    router: self.router.clone(),
-                    storage: self.storage.clone(),
-                    allocator: self.allocator.clone(),
-                    work: self.work.clone(),
-                    observer,
-                    archived: sent,
-                    stanza,
-                    route,
-                };
-                let pending = Pending::spawn(self.work.start(), work.run());
-                drop(admission);
-                Ok::<_, CloseOutcome>(ServiceAdmission::Dispatched(pending))
-            })
+                    if let Some(ticket) = &mut admission {
+                        ticket.turn().await;
+                    }
+                    if !liveness.is_alive() {
+                        return Ok(ServiceAdmission::Refused(Verdict::Drop, routed));
+                    }
+                    if directed {
+                        return Ok(ServiceAdmission::Directed(routed, route));
+                    }
+                    let archived = if archive_needed {
+                        archive::archive_addressed(
+                            &stage,
+                            routed,
+                            Some(account),
+                            None,
+                            Some(&liveness),
+                        )
+                        .await?
+                    } else {
+                        archive::ArchiveStep::Accepted(archive::Archived {
+                            stanza: routed,
+                            sent: None,
+                            received: None,
+                        })
+                    };
+                    let archive::Archived { stanza, sent, .. } = match archived {
+                        archive::ArchiveStep::Accepted(archived) => archived,
+                        archive::ArchiveStep::Rejected {
+                            stanza,
+                            condition,
+                            text,
+                        } => {
+                            return Ok(ServiceAdmission::Refused(
+                                Verdict::Reject {
+                                    condition,
+                                    application: None,
+                                    text: Some(text),
+                                },
+                                stanza,
+                            ));
+                        }
+                    };
+                    if !liveness.is_alive() {
+                        return Ok(ServiceAdmission::Refused(Verdict::Drop, stanza));
+                    }
+                    let observer = (is_message
+                        && !self.router.message_observers(account.domain()).is_empty())
+                    .then(|| self.registration.handle());
+                    let work = ServiceWork {
+                        router: self.router.clone(),
+                        storage: self.storage.clone(),
+                        allocator: self.allocator.clone(),
+                        work: self.work.clone(),
+                        observer,
+                        archived: sent,
+                        stanza,
+                        route,
+                    };
+                    let pending = Pending::spawn(self.work.start(), work.run());
+                    drop(admission);
+                    Ok::<_, CloseOutcome>(ServiceAdmission::Dispatched(pending))
+                }),
+            )
             .await??;
         match prepared {
             ServiceAdmission::Refused(Verdict::OutboundBlocked, stanza) => {
@@ -680,7 +694,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             ServiceAdmission::Dispatched(pending) => {
                 let reply = self
                     .outbox
-                    .drain_until(&self.registration, pending.finished())
+                    .drain_until(&self.registration, pin!(pending.finished()))
                     .await?
                     .ok_or(CloseOutcome::InternalError)??;
                 match reply {
@@ -731,7 +745,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         let pending = Pending::spawn(self.work.start(), work.run());
         let outcome = match self
             .outbox
-            .drain_until(&self.registration, pending.finished())
+            .drain_until(&self.registration, pin!(pending.finished()))
             .await?
             .ok_or(CloseOutcome::InternalError)?
         {
@@ -803,7 +817,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             .outbox
             .drain_until(
                 &self.registration,
-                ingress::iq::handle(
+                pin!(ingress::iq::handle(
                     &stage,
                     &origin,
                     IqInput::Owned {
@@ -813,7 +827,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                     },
                     route.destination,
                     route.kind,
-                ),
+                )),
             )
             .await??;
         if route.kind == IqType::Get && matches!(&disposition, IqDisposition::Ordered(_)) {
@@ -905,7 +919,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             IqDisposition::Answer(answer) => self.queue_iq_answer(answer),
             IqDisposition::Ordered(mut pending) => {
                 self.outbox
-                    .drain_until(&self.registration, pending.turned())
+                    .drain_until(&self.registration, pin!(pending.turned()))
                     .await?;
                 let completed = pending
                     .finished()
@@ -1031,7 +1045,13 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             .outbox
             .drain_until(
                 &self.registration,
-                ingress::iq::prepare_get(&stage, &origin, answer, handler, target_account),
+                pin!(ingress::iq::prepare_get(
+                    &stage,
+                    &origin,
+                    answer,
+                    handler,
+                    target_account
+                )),
             )
             .await??;
         #[cfg(feature = "test-support")]
@@ -1071,7 +1091,13 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             .outbox
             .drain_until(
                 &self.registration,
-                ingress::iq::prepare_set(&stage, &origin, answer, handler, target_account),
+                pin!(ingress::iq::prepare_set(
+                    &stage,
+                    &origin,
+                    answer,
+                    handler,
+                    target_account
+                )),
             )
             .await??;
         self.complete_iq(disposition).await
@@ -1149,45 +1175,51 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                 (None, PresenceType::Error) => {
                     let routed = self.stamp(parsed)?;
                     self.outbox
-                        .drain_until(&self.registration, async {
-                            let (verdict, admission) = explicit_presence_policy(
-                                &self.router,
-                                &self.storage,
-                                &self.registration,
-                                &routed,
-                            )
-                            .await?;
-                            let liveness = self.registration.liveness();
-                            if verdict != Verdict::Allow || !liveness.is_alive() {
-                                return Ok(());
-                            }
-                            if self.router.federation_enabled()
-                                && self.router.destination(
-                                    routed.resolve()?.to()?.ok_or(CloseOutcome::InternalError)?,
-                                ) == Destination::Remote
-                            {
-                                let _ = self.router.route_remote_or_bounce(routed);
-                                return Ok(());
-                            }
-                            match self
-                                .router
-                                .route_addressed_presence_error(
-                                    routed,
-                                    Some(liveness),
-                                    admission.as_ref().map(|(snapshot, _)| snapshot),
+                        .drain_until(
+                            &self.registration,
+                            pin!(async {
+                                let (verdict, admission) = explicit_presence_policy(
+                                    &self.router,
+                                    &self.storage,
+                                    &self.registration,
+                                    &routed,
                                 )
-                                .await
-                            {
-                                Ok(())
-                                | Err(
-                                    RouterError::NotFound
-                                    | RouterError::Busy
-                                    | RouterError::InvalidTarget
-                                    | RouterError::RemoteUnsupported,
-                                ) => Ok(()),
-                                Err(_) => Err(CloseOutcome::InternalError),
-                            }
-                        })
+                                .await?;
+                                let liveness = self.registration.liveness();
+                                if verdict != Verdict::Allow || !liveness.is_alive() {
+                                    return Ok(());
+                                }
+                                if self.router.federation_enabled()
+                                    && self.router.destination(
+                                        routed
+                                            .resolve()?
+                                            .to()?
+                                            .ok_or(CloseOutcome::InternalError)?,
+                                    ) == Destination::Remote
+                                {
+                                    let _ = self.router.route_remote_or_bounce(routed);
+                                    return Ok(());
+                                }
+                                match self
+                                    .router
+                                    .route_addressed_presence_error(
+                                        routed,
+                                        Some(liveness),
+                                        admission.as_ref().map(|(snapshot, _)| snapshot),
+                                    )
+                                    .await
+                                {
+                                    Ok(())
+                                    | Err(
+                                        RouterError::NotFound
+                                        | RouterError::Busy
+                                        | RouterError::InvalidTarget
+                                        | RouterError::RemoteUnsupported,
+                                    ) => Ok(()),
+                                    Err(_) => Err(CloseOutcome::InternalError),
+                                }
+                            }),
+                        )
                         .await?
                 }
                 (None, _) => Ok(()),
@@ -1209,11 +1241,19 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
     ) -> Result<(), CloseOutcome> {
         let verdict = self
             .outbox
-            .drain_until(&self.registration, async {
-                explicit_presence_policy(&self.router, &self.storage, &self.registration, routed)
+            .drain_until(
+                &self.registration,
+                pin!(async {
+                    explicit_presence_policy(
+                        &self.router,
+                        &self.storage,
+                        &self.registration,
+                        routed,
+                    )
                     .await
                     .map(|(verdict, _admission)| verdict)
-            })
+                }),
+            )
             .await??;
         match verdict {
             Verdict::Allow if destination == Destination::Remote => {
@@ -1281,7 +1321,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         });
         let blocked = self
             .outbox
-            .drain_until(&self.registration, pending.finished())
+            .drain_until(&self.registration, pin!(pending.finished()))
             .await?
             .ok_or(CloseOutcome::InternalError)?
             .map_err(|_| CloseOutcome::InternalError)?;
@@ -1396,7 +1436,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         });
         let result = self
             .outbox
-            .drain_until(&self.registration, pending.finished())
+            .drain_until(&self.registration, pin!(pending.finished()))
             .await?
             .ok_or(CloseOutcome::InternalError)?;
         match result {
@@ -1447,7 +1487,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         });
         let disposition = self
             .outbox
-            .drain_until(&self.registration, pending.finished())
+            .drain_until(&self.registration, pin!(pending.finished()))
             .await?
             .ok_or(CloseOutcome::InternalError)??;
         match disposition {
@@ -1641,12 +1681,12 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> Outbox<'_, A, W> {
     /// Drain while work is pending to avoid evicting a client that keeps reading.
     /// Poll `until` first to leave deliveries after its cut in the mailbox.
     /// Local work must transfer or drop shared guards before it returns.
+    /// Takes `until` pinned so its future is not stored twice.
     async fn drain_until<F: Future>(
         &mut self,
         registration: &Registration<A>,
-        until: F,
+        mut until: Pin<&mut F>,
     ) -> Result<F::Output, CloseOutcome> {
-        let mut until = pin!(until);
         loop {
             let event = {
                 let receive = pin!(registration.recv());

@@ -370,9 +370,11 @@ fn cancelling_local_writer_admission_does_not_authorize_a_later_commit() -> Test
             Ok::<_, Box<dyn Error>>(())
         };
         let mut outbox = fixture.outbox(GlobalChunkAllocator, ControlledWriter::default());
-        let mut pending = Box::pin(outbox.drain_until(&fixture.registration, operation));
+        let mut operation = Box::pin(operation);
+        let mut pending = Box::pin(outbox.drain_until(&fixture.registration, operation.as_mut()));
         assert!(poll!(pending.as_mut()).is_pending());
         drop(pending);
+        drop(operation);
         drop(held);
         drop(fixture.storage.begin_write().await?);
         assert!(!authorized.load(Ordering::Acquire));
@@ -398,7 +400,7 @@ fn ready_local_preparation_leaves_deliveries_after_its_cut_in_the_mailbox() -> T
             .await?;
         let mut outbox = fixture.outbox(GlobalChunkAllocator, ControlledWriter::default());
         let prepared = outbox
-            .drain_until(&fixture.registration, std::future::ready(17))
+            .drain_until(&fixture.registration, pin!(std::future::ready(17)))
             .await
             .map_err(|error| format!("{error:?}"))?;
         assert_eq!(prepared, 17);
@@ -1226,7 +1228,7 @@ fn certificate_revalidation_keeps_the_outbox_draining() -> TestResult {
         let revalidating = Cell::new(false);
         let flushed = monitor
             .interrupt(
-                async {
+                pin!(async {
                     outbox.push(Output::Offline {
                         backlog: fixture
                             .backlog()
@@ -1236,7 +1238,7 @@ fn certificate_revalidation_keeps_the_outbox_draining() -> TestResult {
                         policy: None,
                     });
                     outbox.flush().await
-                },
+                }),
                 |_| {
                     revalidating.set(true);
                     std::future::pending()
@@ -1274,13 +1276,15 @@ fn certificate_expiry_interrupts_a_blocked_outbox_write() -> TestResult {
         let mut validity = monitor.validity.get();
         validity.valid_until = monitor.clock.now() + Duration::from_millis(30);
         monitor.validity.set(validity);
-        let mut operation = Box::pin(monitor.interrupt(outbox.flush(), |_| std::future::pending()));
+        let mut flush = Box::pin(outbox.flush());
+        let mut operation = Box::pin(monitor.interrupt(flush.as_mut(), |_| std::future::pending()));
         match select(writing, operation.as_mut()).await {
             Either::Left((entered, _)) => entered?,
             Either::Right(_) => return Err("outbox write completed before expiry".into()),
         }
         monitor.clock.advance(Duration::from_millis(30));
         assert_eq!(operation.await, Err(CloseOutcome::CertificateInvalid));
+        drop(flush);
         assert_eq!(fixture.count().await?, 1);
         drop(outbox);
         fixture.finish().await
@@ -1293,7 +1297,8 @@ fn account_retirement_wins_while_certificate_revalidation_is_pending() -> TestRe
         let fixture = Fixture::new(&[MESSAGE]).await?;
         let monitor = certificate_monitor();
         let revalidating = Cell::new(false);
-        let session = monitor.interrupt(std::future::pending::<Result<(), CloseOutcome>>(), |_| {
+        let work = pin!(std::future::pending::<Result<(), CloseOutcome>>());
+        let session = monitor.interrupt(work, |_| {
             revalidating.set(true);
             std::future::pending()
         });
@@ -1321,7 +1326,8 @@ fn late_certificate_revalidation_cannot_retire_a_replacement_resource() -> TestR
         let blocked = PlMutex::new(Some(blocked));
         let entered = PlMutex::new(Some(entered));
         let done = PlMutex::new(Some(done));
-        let session = monitor.interrupt(std::future::pending::<Result<(), CloseOutcome>>(), |_| {
+        let work = pin!(std::future::pending::<Result<(), CloseOutcome>>());
+        let session = monitor.interrupt(work, |_| {
             let blocked = blocked.lock().take();
             let entered = entered.lock().take();
             let done = done.lock().take();
@@ -1400,13 +1406,11 @@ fn shutdown_interrupts_pending_certificate_revalidation() -> TestResult {
         };
         let monitor = certificate_monitor();
         let revalidating = Cell::new(false);
-        let session = context.interrupt(monitor.interrupt(
-            std::future::pending::<Result<(), CloseOutcome>>(),
-            |_| {
-                revalidating.set(true);
-                std::future::pending()
-            },
-        ));
+        let work = pin!(std::future::pending::<Result<(), CloseOutcome>>());
+        let session = context.interrupt(monitor.interrupt(work, |_| {
+            revalidating.set(true);
+            std::future::pending()
+        }));
         let mut session = Box::pin(session);
         assert!(futures_util::poll!(session.as_mut()).is_pending());
         assert!(revalidating.get());

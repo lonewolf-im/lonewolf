@@ -644,3 +644,20 @@ fn remote_delivery_requires_federation_and_default_delivery_refuses_it() -> Test
         Ok(())
     })
 }
+
+#[test]
+fn guarded_work_stores_the_work_future_once() {
+    let work = async {
+        let buffer = [0_u8; 4096];
+        std::future::pending::<()>().await;
+        buffer.len()
+    };
+    let work_size = std::mem::size_of_val(&work);
+    let group = WorkGroup::new();
+    let guarded = group.start().run(work);
+    let overhead = std::mem::size_of_val(&guarded) - work_size;
+    assert!(
+        overhead < 64,
+        "guarded work adds {overhead} bytes to a {work_size}-byte future"
+    );
+}

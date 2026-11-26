@@ -27,9 +27,8 @@ fn released_pending_writes_complete_without_cancellation() -> TestResult {
         let probe = install_stream_probe(target)?;
         probe.hold_next_pending_write()?;
         let (release, blocked) = oneshot::channel();
-        let mut write = pin!(observe_write(Some(target), async {
-            blocked.await.map(|()| 42)
-        }));
+        let blocked = pin!(async { blocked.await.map(|()| 42) });
+        let mut write = pin!(observe_write(Some(target), blocked));
         assert!(write.as_mut().now_or_never().is_none());
         assert_eq!(probe.next_event().await?, StreamProbeEvent::WriteHeld);
         release.send(()).map_err(|_| "write receiver dropped")?;
@@ -48,7 +47,8 @@ fn dropping_a_held_write_reports_cancellation() -> TestResult {
         let probe = install_stream_probe(target)?;
         probe.hold_next_pending_write()?;
         {
-            let mut write = pin!(observe_write(Some(target), pending::<()>()));
+            let idle = pin!(pending::<()>());
+            let mut write = pin!(observe_write(Some(target), idle));
             assert!(write.as_mut().now_or_never().is_none());
             assert_eq!(probe.next_event().await?, StreamProbeEvent::WriteHeld);
         }
@@ -73,6 +73,7 @@ fn dropping_the_owner_wakes_and_releases_its_held_write() -> TestResult {
         let probe = install_stream_probe(target)?;
         probe.hold_next_pending_write()?;
         let (release, blocked) = oneshot::channel();
+        let blocked = pin!(blocked);
         let mut write = pin!(observe_write(Some(target), blocked));
         let wakes = Arc::new(WakeCount(AtomicUsize::new(0)));
         let waker = waker(wakes.clone());
@@ -133,9 +134,10 @@ fn ready_writes_leave_the_arm_for_the_next_pending_write() -> TestResult {
         let target = "ready@localhost/desk";
         let probe = install_stream_probe(target)?;
         probe.hold_next_pending_write()?;
-        assert_eq!(observe_write(Some(target), ready(42)).await, 42);
+        assert_eq!(observe_write(Some(target), pin!(ready(42))).await, 42);
         assert!(probe.next_event().now_or_never().is_none());
-        let mut write = pin!(observe_write(Some(target), pending::<()>()));
+        let idle = pin!(pending::<()>());
+        let mut write = pin!(observe_write(Some(target), idle));
         assert!(write.as_mut().now_or_never().is_none());
         assert_eq!(probe.next_event().await?, StreamProbeEvent::WriteHeld);
         Ok(())

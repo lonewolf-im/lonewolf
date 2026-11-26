@@ -2,7 +2,7 @@
 
 use std::cell::Cell;
 use std::future::{Future, poll_fn};
-use std::pin::pin;
+use std::pin::{Pin, pin};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
@@ -54,8 +54,9 @@ async fn cooperate() {
     .await;
 }
 
+/// Takes the operation pinned so its future is not stored twice.
 async fn watch<T>(
-    operation: impl Future<Output = Result<T, ComponentError>>,
+    mut operation: Pin<&mut impl Future<Output = Result<T, ComponentError>>>,
     progress: &WriteProgress,
     timeout: Duration,
     clock: &impl Clock,
@@ -63,7 +64,6 @@ async fn watch<T>(
 ) -> Result<T, StreamClose> {
     let started = clock.now();
     let mut deadline = started + timeout;
-    let mut operation = pin!(operation);
     loop {
         if clock.now() >= deadline {
             deadline = started.max(progress.last()) + timeout;
@@ -109,7 +109,7 @@ async fn sending<A: ChunkAllocator + Clone + 'static, W: AsyncWrite + Unpin>(
             Some(stanza) => stanza,
             None => {
                 if buffered {
-                    watch(writer.flush(), &progress, timeout, clock, abort).await?;
+                    watch(pin!(writer.flush()), &progress, timeout, clock, abort).await?;
                     buffered = false;
                 }
                 match select(pin!(stop.wait()), pin!(link.next())).await {
@@ -124,7 +124,14 @@ async fn sending<A: ChunkAllocator + Clone + 'static, W: AsyncWrite + Unpin>(
                 .is_ok()
         });
         if let Some(view) = view {
-            watch(writer.write_stanza(&view), &progress, timeout, clock, abort).await?;
+            watch(
+                pin!(writer.write_stanza(&view)),
+                &progress,
+                timeout,
+                clock,
+                abort,
+            )
+            .await?;
             buffered = true;
             metrics.stanza_sent(view.kind());
         } else {
@@ -335,7 +342,7 @@ where
     if !end.abort {
         let closing = async {
             watch(
-                authenticated.writer.flush(),
+                pin!(authenticated.writer.flush()),
                 &progress,
                 timeout,
                 clock,
@@ -343,7 +350,7 @@ where
             )
             .await?;
             watch(
-                authenticated.writer.close(end.condition),
+                pin!(authenticated.writer.close(end.condition)),
                 &progress,
                 timeout,
                 clock,
@@ -368,7 +375,7 @@ where
                 let _ = select(pin!(wait), pin!(clock.sleep_until(peer_until))).await;
             }
             watch(
-                authenticated.writer.shutdown(),
+                pin!(authenticated.writer.shutdown()),
                 &progress,
                 timeout,
                 clock,

@@ -4,6 +4,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::pin::pin;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -349,7 +350,8 @@ impl Resolver {
         let wire = Rc::new(message.to_vec().map_err(|_| QueryError::Unavailable)?);
         for &nameserver in &self.nameservers {
             if let Ok(Ok(response)) =
-                compio::time::timeout(self.timeout, exchange(nameserver, &message, &wire)).await
+                compio::time::timeout(self.timeout, pin!(exchange(nameserver, &message, &wire)))
+                    .await
             {
                 match response.metadata.response_code {
                     ResponseCode::NXDomain => {

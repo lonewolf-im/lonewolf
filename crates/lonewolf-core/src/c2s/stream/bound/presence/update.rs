@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::pin::pin;
 use std::{mem, sync::Arc};
 
 use futures_channel::oneshot;
@@ -102,7 +103,11 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
         let metrics = self.outbox.metrics.clone();
         let registration = &self.registration;
         let prepare = request.prepare(&stage, registration, &handlers, &metrics, service);
-        let mut pending = match self.outbox.drain_until(registration, prepare).await?? {
+        let preparation = self
+            .outbox
+            .drain_until(registration, pin!(prepare))
+            .await??;
+        let mut pending = match preparation {
             Preparation::Admitted(pending) => pending,
             Preparation::Rejected(routed, error) => {
                 return self.reply_rejection_with_text(
@@ -121,7 +126,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             );
         }
         self.outbox
-            .drain_until(&self.registration, pending.turned())
+            .drain_until(&self.registration, pin!(pending.turned()))
             .await?;
         let outcome = pending
             .finished()
@@ -153,7 +158,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
             self.outbox
                 .drain_until(
                     &self.registration,
-                    observe::session(
+                    pin!(observe::session(
                         &stage,
                         &delivery,
                         SessionChange {
@@ -163,7 +168,7 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                                 stanza: &echo,
                             },
                         },
-                    ),
+                    )),
                 )
                 .await?;
         }

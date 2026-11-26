@@ -2,7 +2,7 @@
 
 use std::cell::Cell;
 use std::future::Future;
-use std::pin::pin;
+use std::pin::{Pin, pin};
 use std::task::Poll;
 use std::time::{Duration, SystemTime};
 
@@ -33,7 +33,7 @@ impl CertificateMonitor {
 
     pub(super) async fn interrupt<T>(
         &self,
-        operation: impl Future<Output = Result<T, CloseOutcome>>,
+        operation: Pin<&mut impl Future<Output = Result<T, CloseOutcome>>>,
     ) -> Result<T, CloseOutcome> {
         self.state
             .interrupt(operation, |validity| revalidate(&self.client, validity))
@@ -55,15 +55,15 @@ impl ValidityMonitor {
         }
     }
 
+    /// Takes the operation pinned so its future is not stored twice.
     pub(super) async fn interrupt<T, F>(
         &self,
-        operation: impl Future<Output = Result<T, CloseOutcome>>,
+        mut operation: Pin<&mut impl Future<Output = Result<T, CloseOutcome>>>,
         revalidate: impl Fn(ClientValidity) -> F,
     ) -> Result<T, CloseOutcome>
     where
         F: Future<Output = Result<ClientValidity, CloseOutcome>>,
     {
-        let mut operation = pin!(operation);
         let guarded = poll_fn(|context| match self.check() {
             Err(outcome) => Poll::Ready(Err(outcome)),
             Ok(()) => operation.as_mut().poll(context),
@@ -85,7 +85,7 @@ impl ValidityMonitor {
                 .await;
             match self
                 .clock
-                .before_expiry(validity.valid_until, revalidate(validity))
+                .before_expiry(validity.valid_until, pin!(revalidate(validity)))
                 .await
             {
                 Ok(validity) => self.validity.set(validity),
@@ -99,19 +99,22 @@ pub(super) async fn revalidate(
     client: &VerifiedClient,
     validity: ClientValidity,
 ) -> Result<ClientValidity, CloseOutcome> {
-    before_expiry(validity.valid_until, async {
-        client
-            .policy()
-            .revalidate_client(client)
-            .await
-            .map_err(|_| CloseOutcome::CertificateInvalid)
-    })
+    before_expiry(
+        validity.valid_until,
+        pin!(async {
+            client
+                .policy()
+                .revalidate_client(client)
+                .await
+                .map_err(|_| CloseOutcome::CertificateInvalid)
+        }),
+    )
     .await
 }
 
 pub(super) async fn before_expiry<T>(
     deadline: SystemTime,
-    operation: impl Future<Output = Result<T, CloseOutcome>>,
+    operation: Pin<&mut impl Future<Output = Result<T, CloseOutcome>>>,
 ) -> Result<T, CloseOutcome> {
     Clock::default().before_expiry(deadline, operation).await
 }
@@ -146,12 +149,12 @@ impl Clock {
             .advance(elapsed);
     }
 
+    /// Takes the operation pinned so its future is not stored twice.
     async fn before_expiry<T>(
         &self,
         deadline: SystemTime,
-        operation: impl Future<Output = Result<T, CloseOutcome>>,
+        mut operation: Pin<&mut impl Future<Output = Result<T, CloseOutcome>>>,
     ) -> Result<T, CloseOutcome> {
-        let mut operation = pin!(operation);
         let guarded = poll_fn(|context| {
             if self.now() >= deadline {
                 Poll::Ready(Err(CloseOutcome::CertificateInvalid))

@@ -150,13 +150,14 @@ fn no_progress_watchdog_rearms_without_restarting_the_output_future() -> TestRes
         };
         let aborted = Cell::new(false);
         let abort = || aborted.set(true);
+        let work = pin!(async {
+            writer
+                .write_all(b"abcde")
+                .await
+                .map_err(ComponentError::from)
+        });
         let mut writing = Box::pin(watch(
-            async {
-                writer
-                    .write_all(b"abcde")
-                    .await
-                    .map_err(ComponentError::from)
-            },
+            work,
             &progress,
             Duration::from_millis(10),
             &clock,
@@ -184,8 +185,9 @@ fn incoming_reads_and_zero_byte_writes_do_not_postpone_a_stalled_write() -> Test
         let observer = ComponentByteObserver::new(metrics, progress.clone());
         let aborted = Cell::new(false);
         let abort = || aborted.set(true);
+        let work = pin!(std::future::pending::<Result<(), ComponentError>>());
         let mut operation = Box::pin(watch(
-            std::future::pending::<Result<(), ComponentError>>(),
+            work,
             &progress,
             Duration::from_secs(1),
             &clock,
@@ -819,8 +821,9 @@ fn write_readiness_after_the_progress_deadline_does_not_revive_the_operation() -
         };
         let aborted = Cell::new(false);
         let abort = || aborted.set(true);
+        let work = pin!(async { writer.write_all(b"ab").await.map_err(ComponentError::from) });
         let mut operation = Box::pin(watch(
-            async { writer.write_all(b"ab").await.map_err(ComponentError::from) },
+            work,
             &progress,
             Duration::from_secs(1),
             &clock,

@@ -205,6 +205,10 @@
 # Limit the time from authentication success through resource binding.
 # resource_binding_timeout_secs = 5
 
+# Close a bound client connection when pending output makes no progress for this many seconds.
+# Raise this value for clients on slow or intermittent networks.
+# stalled_write_timeout_secs = 60
+
 # Allow users more retries when they enter passwords by hand.
 # Choose between 2 and 5 retries after the first failed authentication attempt.
 # authentication_retries = 2

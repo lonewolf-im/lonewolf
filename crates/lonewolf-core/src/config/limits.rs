@@ -451,6 +451,10 @@ impl C2sLimits {
                     "resource_binding_timeout_secs",
                     profile.resource_binding_timeout_secs,
                 ),
+                (
+                    "stalled_write_timeout_secs",
+                    profile.stalled_write_timeout_secs,
+                ),
             ] {
                 if Instant::now()
                     .checked_add(Duration::from_secs(value.get()))
@@ -493,6 +497,8 @@ pub struct C2sLimitProfile {
     pub connection_establishment_timeout_secs: NonZeroU64,
     pub authentication_timeout_secs: NonZeroU64,
     pub resource_binding_timeout_secs: NonZeroU64,
+    /// Measures time without outgoing TCP progress while a bound stream has output pending.
+    pub stalled_write_timeout_secs: NonZeroU64,
     pub authentication_retries: NonZeroUsize,
     pub resource_binding_retries: NonZeroUsize,
     /// Shares one bucket per IP across all workers of one listener.
@@ -511,6 +517,7 @@ impl Default for C2sLimitProfile {
             connection_establishment_timeout_secs: nonzero_secs(10),
             authentication_timeout_secs: nonzero_secs(15),
             resource_binding_timeout_secs: nonzero_secs(5),
+            stalled_write_timeout_secs: nonzero_secs(60),
             authentication_retries: nonzero(2),
             resource_binding_retries: nonzero(5),
             connection_attempts_per_ip: EventRate {
@@ -538,6 +545,7 @@ struct C2sLimitProfileInput {
     connection_establishment_timeout_secs: Option<NonZeroU64>,
     authentication_timeout_secs: Option<NonZeroU64>,
     resource_binding_timeout_secs: Option<NonZeroU64>,
+    stalled_write_timeout_secs: Option<NonZeroU64>,
     authentication_retries: Option<NonZeroUsize>,
     resource_binding_retries: Option<NonZeroUsize>,
     connection_attempts_per_ip: EventRateInput,
@@ -563,6 +571,9 @@ impl From<C2sLimitProfileInput> for C2sLimitProfile {
             resource_binding_timeout_secs: input
                 .resource_binding_timeout_secs
                 .unwrap_or(defaults.resource_binding_timeout_secs),
+            stalled_write_timeout_secs: input
+                .stalled_write_timeout_secs
+                .unwrap_or(defaults.stalled_write_timeout_secs),
             authentication_retries: input
                 .authentication_retries
                 .unwrap_or(defaults.authentication_retries),

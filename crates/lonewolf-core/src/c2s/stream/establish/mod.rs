@@ -30,10 +30,11 @@ use super::renegotiation::RecordGuard;
 use super::session::{
     ClosingInput, IO_BUFFER_BYTES, ReadMode, Reader, Session, TlsTransport, Writer, namespace_error,
 };
+use super::traffic::C2sTraffic;
 use crate::hosts::Hosts;
 use crate::hosts::client_identity::VerifiedClient;
 use crate::xml_stream::limiter::StanzaLimiter;
-use crate::xml_stream::traffic::ObservedIo;
+use crate::xml_stream::traffic::{ObservedIo, WriteProgress};
 
 pub(super) const STARTTLS_NAMESPACE: &str = "urn:ietf:params:xml:ns:xmpp-tls";
 pub(super) const STARTTLS_FEATURES: &str = "<stream:features><starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'><required/></starttls></stream:features>";
@@ -192,6 +193,10 @@ pub(super) async fn establish<A: ChunkAllocator + Clone>(
         }
     };
     drop(writer);
+    let traffic = C2sTraffic::new(
+        settings.metrics.clone(),
+        WriteProgress::new(crate::clock::now()),
+    );
     let transport = super::run_phase(
         context.phase_deadline,
         CloseOutcome::EstablishmentTimeout,
@@ -201,7 +206,7 @@ pub(super) async fn establish<A: ChunkAllocator + Clone>(
                 .accept(RecordGuard::new(
                     Box::pin(AsyncStream::new(ObservedIo::new(
                         transport.clone(),
-                        settings.metrics.clone(),
+                        traffic.clone(),
                     ))),
                     transport,
                 ))
@@ -223,6 +228,7 @@ pub(super) async fn establish<A: ChunkAllocator + Clone>(
             selected_host,
             server_end_point: handshake.server_end_point,
             rate_state: Some(rate_state),
+            traffic,
         },
         hosts,
         settings,
@@ -236,6 +242,7 @@ struct AcceptedTls {
     selected_host: String,
     server_end_point: Arc<[u8]>,
     rate_state: Option<RateLimitState>,
+    traffic: C2sTraffic,
 }
 
 async fn accept_direct<A: ChunkAllocator>(
@@ -243,10 +250,14 @@ async fn accept_direct<A: ChunkAllocator>(
     hosts: &Hosts,
     settings: &StreamSettings<A>,
 ) -> Result<AcceptedTls, CloseOutcome> {
+    let traffic = C2sTraffic::new(
+        settings.metrics.clone(),
+        WriteProgress::new(crate::clock::now()),
+    );
     let io = RecordGuard::new(
         Box::pin(AsyncStream::new(ObservedIo::new(
             transport.clone(),
-            settings.metrics.clone(),
+            traffic.clone(),
         ))),
         transport,
     );
@@ -270,6 +281,7 @@ async fn accept_direct<A: ChunkAllocator>(
         selected_host: host,
         server_end_point: handshake.server_end_point,
         rate_state: None,
+        traffic,
     })
 }
 
@@ -284,6 +296,7 @@ async fn complete_tls<A: ChunkAllocator + Clone>(
         selected_host,
         server_end_point,
         rate_state,
+        traffic,
     } = accepted;
     let version = transport.get_ref().1.protocol_version();
     transport.get_mut().0.handshake_complete(version);
@@ -337,7 +350,7 @@ async fn complete_tls<A: ChunkAllocator + Clone>(
         StanzaLimiter::new(settings.stanzas_per_second, settings.stanza_burst),
         closing,
         context.clone(),
-        settings.metrics.clone(),
+        traffic,
     );
     if settings.tls_mode == crate::config::TlsMode::Direct {
         session.use_selected_host_as_default();

@@ -50,11 +50,12 @@ pub(crate) enum CloseOutcome {
     MailboxOverflow,
     InternalError,
     TransportError,
+    StalledWrite,
 }
 
 impl CloseOutcome {
     /// Declaration order; `PeerError` stands for every peer condition.
-    pub(crate) const ALL: [Self; 35] = [
+    pub(crate) const ALL: [Self; 36] = [
         Self::StreamEnd,
         Self::PeerError(StreamErrorCondition::UndefinedCondition),
         Self::ClosingTimeout,
@@ -90,6 +91,7 @@ impl CloseOutcome {
         Self::MailboxOverflow,
         Self::InternalError,
         Self::TransportError,
+        Self::StalledWrite,
     ];
 
     pub(crate) const COUNT: usize = Self::ALL.len();
@@ -131,6 +133,7 @@ impl CloseOutcome {
             Self::MailboxOverflow => 32,
             Self::InternalError => 33,
             Self::TransportError => 34,
+            Self::StalledWrite => 35,
         }
     }
 
@@ -238,6 +241,7 @@ impl CloseOutcome {
             Self::MailboxOverflow => "mailbox_overflow",
             Self::InternalError => "internal_error",
             Self::TransportError => "transport_error",
+            Self::StalledWrite => "stalled_write",
         }
     }
 }

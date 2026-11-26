@@ -469,7 +469,7 @@ fn blocked_certificate_preparation_cancels_without_losing_completed_tls()
             Box::pin(AsyncStream::new(
                 crate::xml_stream::traffic::ObservedIo::new(
                     socket.clone(),
-                    crate::c2s::metrics::C2sWorkerMetrics::detached(),
+                    crate::c2s::stream::traffic::C2sTraffic::detached(),
                 ),
             )),
             socket.clone(),

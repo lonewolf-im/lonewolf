@@ -6,20 +6,65 @@ use std::task::{Context, Poll};
 
 use futures_util::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, Cursor};
 
+use super::C2sTraffic;
 use crate::c2s::metrics::C2sMetrics;
-use crate::xml_stream::traffic::ObservedIo;
+use crate::clock::FrozenClock;
+use crate::xml_stream::traffic::{ObservedIo, WriteProgress};
+
+fn traffic(metrics: &C2sMetrics) -> C2sTraffic {
+    C2sTraffic::new(
+        metrics.worker(0, 0),
+        WriteProgress::new(crate::clock::now()),
+    )
+}
+
+#[test]
+fn only_accepted_outgoing_bytes_record_write_progress() {
+    let clock = FrozenClock::start();
+    let started = clock.now();
+    let progress = WriteProgress::new(started);
+    let mut io = ObservedIo::new(
+        ControlledIo {
+            result: Poll::Pending,
+            flushes: 0,
+            closes: 0,
+        },
+        C2sTraffic::new(C2sMetrics::detached().worker(0, 0), progress.clone()),
+    );
+    let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
+    let mut buffer = [0; 8];
+    clock.advance(std::time::Duration::from_secs(1));
+    assert!(Pin::new(&mut io).poll_write(&mut cx, &buffer).is_pending());
+    io.inner_mut().result = Poll::Ready(Ok(0));
+    assert!(matches!(
+        Pin::new(&mut io).poll_write(&mut cx, &buffer),
+        Poll::Ready(Ok(0))
+    ));
+    io.inner_mut().result = Poll::Ready(Ok(4));
+    assert!(matches!(
+        Pin::new(&mut io).poll_read(&mut cx, &mut buffer),
+        Poll::Ready(Ok(4))
+    ));
+    assert_eq!(progress.last(), started);
+    io.inner_mut().result = Poll::Ready(Ok(3));
+    assert!(matches!(
+        Pin::new(&mut io).poll_write(&mut cx, &buffer),
+        Poll::Ready(Ok(3))
+    ));
+    assert_eq!(progress.last(), clock.now());
+}
 
 #[test]
 fn reads_and_writes_are_counted() -> Result<(), Box<dyn std::error::Error>> {
     compio::runtime::Runtime::new()?.block_on(async {
         let metrics = C2sMetrics::detached();
-        let mut input = ObservedIo::new(Cursor::new(b"hello"), metrics.worker(0, 0));
+        let mut input = ObservedIo::new(Cursor::new(b"hello"), traffic(&metrics));
         let mut buffer = [0; 3];
         assert_eq!(input.read(&mut buffer).await?, 3);
         assert_eq!(input.read(&mut buffer).await?, 2);
         assert_eq!(input.read(&mut buffer).await?, 0);
         assert_eq!(input.read(&mut []).await?, 0);
-        let mut output = ObservedIo::new(Vec::new(), metrics.worker(0, 0));
+        let mut output = ObservedIo::new(Vec::new(), traffic(&metrics));
         output.write_all(b"goodbye").await?;
         assert_eq!(output.write(&[]).await?, 0);
         output.flush().await?;
@@ -87,7 +132,7 @@ fn pending_errors_and_partial_operations_preserve_actual_byte_counts()
             flushes: 0,
             closes: 0,
         },
-        metrics.worker(0, 0),
+        traffic(&metrics),
     );
     let mut cx = Context::from_waker(futures_util::task::noop_waker_ref());
     let mut buffer = [0; 8];
@@ -155,7 +200,7 @@ fn socket_observation_excludes_discarded_buffers_and_counts_returned_writes()
             let metrics = C2sMetrics::detached();
             let mut adapter = Box::pin(compio::io::compat::AsyncStream::new(ObservedIo::new(
                 server,
-                metrics.worker(0, 0),
+                traffic(&metrics),
             )));
             adapter.write_all(b"discard").await?;
             let before = metrics.render()?;

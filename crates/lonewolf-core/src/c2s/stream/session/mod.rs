@@ -25,6 +25,7 @@ use super::header::{
 };
 use super::outcome::CloseOutcome;
 use super::renegotiation::RecordGuard;
+use super::traffic::C2sTraffic;
 use crate::c2s::metrics::{C2sWorkerMetrics, RateLimit};
 use crate::hosts::Hosts;
 use crate::router::RoutedStanza;
@@ -32,13 +33,13 @@ use crate::xml_stream::limiter::StanzaLimiter;
 use crate::xml_stream::peer_stream_error;
 pub(super) use crate::xml_stream::reader::ReadMode;
 use crate::xml_stream::reader::{ReadObserver, XmlReader};
-use crate::xml_stream::traffic::ObservedIo;
+use crate::xml_stream::traffic::{ObservedIo, WriteProgress};
 use crate::xml_stream::writer::StreamWriter;
 
 pub(super) const IO_BUFFER_BYTES: usize = 4_096;
 
 pub(super) type TlsTransport = futures_rustls::server::TlsStream<
-    RecordGuard<Pin<Box<AsyncStream<ObservedIo<TcpStream, C2sWorkerMetrics>>>>>,
+    RecordGuard<Pin<Box<AsyncStream<ObservedIo<TcpStream, C2sTraffic>>>>>,
 >;
 pub(super) type TlsReader = ReadHalf<TlsTransport>;
 pub(super) type TlsWriter = WriteHalf<TlsTransport>;
@@ -49,6 +50,7 @@ pub(super) struct Session<A: ChunkAllocator> {
     pub(super) reader: Reader<A>,
     pub(super) writer: Writer,
     pub(super) close: CloseContext,
+    pub(super) write_progress: WriteProgress,
     selected_host_default: bool,
 }
 
@@ -133,12 +135,14 @@ impl<A: ChunkAllocator + Clone> Session<A> {
         stanzas: StanzaLimiter,
         closing: Rc<Cell<ReadMode>>,
         close: CloseContext,
-        metrics: C2sWorkerMetrics,
+        traffic: C2sTraffic,
     ) -> Self {
+        let (metrics, write_progress) = traffic.into_parts();
         Self {
             reader: Reader::with_mode(parser, stanzas, closing, metrics.clone()),
             writer: Writer::new(writer, host, metrics),
             close,
+            write_progress,
             selected_host_default: false,
         }
     }

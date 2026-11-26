@@ -17,7 +17,7 @@ use super::{
     account_exists, push_change, push_removal, push_roster, require_account, roster_error, xml,
 };
 use crate::Effects;
-use crate::delivery::{Delivery, DeliveryError, HandlerError, HostLookup, SessionTag};
+use crate::delivery::{DeliveryError, DeliveryHandle, HandlerError, HostLookup, SessionTag};
 use crate::presence::{PresenceRequest, PresenceRequestType, PresenceSend};
 
 #[derive(Default)]
@@ -41,7 +41,7 @@ impl Retirements {
     async fn finish<A: ChunkAllocator>(
         self,
         result: Result<(), DeliveryError>,
-        delivery: &dyn Delivery<A>,
+        delivery: &dyn DeliveryHandle<A>,
     ) -> Result<(), DeliveryError> {
         let mut failure = result.err();
         for account in self.accounts {
@@ -1225,7 +1225,7 @@ async fn replay_cleanup_push<A: ChunkAllocator>(
     contact: &AccountKey,
     owner: &RosterJid,
     changed: Option<RosterSubscription>,
-    delivery: &dyn Delivery<A>,
+    delivery: &dyn DeliveryHandle<A>,
 ) -> Result<(), DeliveryError> {
     let Some(subscription) = changed else {
         return Ok(());
@@ -1278,7 +1278,7 @@ async fn notify_cancelled_requester<A: ChunkAllocator>(
     owner: &AccountKey,
     sender: &AccountKey,
     cancellation: Cancellation,
-    delivery: &dyn Delivery<A>,
+    delivery: &dyn DeliveryHandle<A>,
 ) -> Result<(), DeliveryError> {
     if cancellation.route {
         let (_, cancelled) =
@@ -1299,7 +1299,7 @@ async fn notify_removed_contact<A: ChunkAllocator>(
     owner: &AccountKey,
     contact: &AccountKey,
     removal: Removal,
-    delivery: &dyn Delivery<A>,
+    delivery: &dyn DeliveryHandle<A>,
 ) -> Result<bool, DeliveryError> {
     let owner_granted = grants(removal.subscription.state);
     let contact_granted = grants(removal.contact_before.unwrap_or_default().state);
@@ -1351,7 +1351,7 @@ async fn notify_removed_remote_contact<A: ChunkAllocator>(
     contact: &str,
     subscription: RosterSubscription,
     pending: bool,
-    delivery: &dyn Delivery<A>,
+    delivery: &dyn DeliveryHandle<A>,
 ) -> Result<(), DeliveryError> {
     let withdraw = matches!(
         subscription.state,

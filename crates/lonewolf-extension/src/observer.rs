@@ -7,7 +7,7 @@ use lonewolf_xmpp::jid::JidRef;
 use lonewolf_xmpp::stanza::RoutedStanza;
 
 use crate::archive::ArchiveId;
-use crate::delivery::{Delivery, DeliveryFuture, SessionId};
+use crate::delivery::{DeliveryFuture, DeliveryHandle, SessionId};
 use crate::presence::PresenceTransition;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -59,7 +59,7 @@ pub trait MessageObserver<A: ChunkAllocator, S: Storage>: Send + Sync {
         &'a self,
         event: MessageEvent<'a, A>,
         storage: &'a S,
-        delivery: &'a dyn Delivery<A>,
+        delivery: &'a dyn DeliveryHandle<A>,
     ) -> DeliveryFuture<'a>;
 }
 
@@ -101,6 +101,6 @@ pub trait SessionObserver<A: ChunkAllocator, S: Storage>: Send + Sync {
         &'a self,
         change: SessionChange<'a, A>,
         storage: &'a S,
-        delivery: &'a dyn Delivery<A>,
+        delivery: &'a dyn DeliveryHandle<A>,
     ) -> DeliveryFuture<'a>;
 }

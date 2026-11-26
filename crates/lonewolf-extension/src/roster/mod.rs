@@ -22,7 +22,7 @@ use serde::Deserialize;
 
 use crate::account::AccountHandler;
 use crate::delivery::{
-    Delivery, DeliveryError, Failure, FailureKind, HandlerError, HostLookup, SessionTag,
+    DeliveryError, DeliveryHandle, Failure, FailureKind, HandlerError, HostLookup, SessionTag,
 };
 use crate::discovery::DiscoScope;
 use crate::iq::{IqFuture, IqHandler, IqReply, IqRequest, IqRequestType, IqRoute, IqScope};
@@ -541,7 +541,7 @@ where
 async fn push_change<A: ChunkAllocator>(
     owner: &AccountKey,
     change: state::ItemChange,
-    delivery: &dyn Delivery<A>,
+    delivery: &dyn DeliveryHandle<A>,
 ) -> Result<(), DeliveryError> {
     match change {
         state::ItemChange::Push(mutation) => push_roster(owner, mutation, delivery).await,
@@ -555,7 +555,7 @@ async fn push_change<A: ChunkAllocator>(
 async fn push_roster<A: ChunkAllocator>(
     owner: &AccountKey,
     mutation: RosterMutation<RosterItem>,
-    delivery: &dyn Delivery<A>,
+    delivery: &dyn DeliveryHandle<A>,
 ) -> Result<(), DeliveryError> {
     delivery
         .push_to_tagged(
@@ -573,7 +573,7 @@ async fn push_removal<A: ChunkAllocator>(
     owner: &AccountKey,
     contact: RosterJid,
     version: RosterVersion,
-    delivery: &dyn Delivery<A>,
+    delivery: &dyn DeliveryHandle<A>,
 ) -> Result<(), DeliveryError> {
     delivery
         .push_to_tagged(

@@ -15,7 +15,7 @@ use lonewolf_auth::scram::{
 };
 use lonewolf_extension::blocking::Blocking;
 use lonewolf_extension::delivery::{
-    Delivery, DeliveryError, DeliveryFuture, HostLookup, SessionTag, StanzaFactory,
+    DeliveryError, DeliveryFuture, DeliveryHandle, HostLookup, SessionTag, StanzaFactory,
 };
 use lonewolf_extension::offline::Offline;
 use lonewolf_extension::{Effects, Extensions};
@@ -481,7 +481,7 @@ impl HostLookup for NoDelivery {
     }
 }
 
-impl Delivery<GlobalChunkAllocator> for NoDelivery {
+impl DeliveryHandle<GlobalChunkAllocator> for NoDelivery {
     fn arena(&self) -> Result<Arena<GlobalChunkAllocator>, DeliveryError> {
         Arena::try_new(ArenaConfig::default()).map_err(|_| DeliveryError)
     }

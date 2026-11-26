@@ -6,7 +6,7 @@ use lonewolf_storage::Storage;
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::stanza::{StanzaErrorCondition, StanzaErrorText, StanzaNamespace};
 
-use crate::delivery::{Delivery, DeliveryFuture, HandlerError, SessionTag, TagChange};
+use crate::delivery::{DeliveryFuture, DeliveryHandle, HandlerError, SessionTag, TagChange};
 use crate::discovery::DiscoScope;
 use crate::iq::{IqError, IqRequest, SessionIqHandler, SessionIqReply};
 use crate::observer::{MessageEvent, MessageObserver, MessageOutcome, MessageRole};
@@ -78,7 +78,7 @@ impl<A: ChunkAllocator, S: Storage> MessageObserver<A, S> for Carbons {
         &'a self,
         event: MessageEvent<'a, A>,
         _storage: &'a S,
-        delivery: &'a dyn Delivery<A>,
+        delivery: &'a dyn DeliveryHandle<A>,
     ) -> DeliveryFuture<'a> {
         Box::pin(async move {
             let view = event.stanza.resolve()?;

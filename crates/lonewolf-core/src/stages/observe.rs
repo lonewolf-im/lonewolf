@@ -80,7 +80,9 @@ mod tests {
 
     use compio::runtime::Runtime;
     use lonewolf_extension::archive::ArchiveId;
-    use lonewolf_extension::delivery::{Delivery, DeliveryError, DeliveryFuture, FailureKind};
+    use lonewolf_extension::delivery::{
+        DeliveryError, DeliveryFuture, DeliveryHandle, FailureKind,
+    };
     use lonewolf_extension::observer::{
         MessageObserver, MessageRole, SessionEvent, SessionObserver,
     };
@@ -135,7 +137,7 @@ mod tests {
             &'a self,
             event: MessageEvent<'a, GlobalChunkAllocator>,
             _: &'a RedbStorage,
-            _: &'a dyn Delivery<GlobalChunkAllocator>,
+            _: &'a dyn DeliveryHandle<GlobalChunkAllocator>,
         ) -> DeliveryFuture<'a> {
             Box::pin(async move {
                 self.calls.lock().push((
@@ -290,7 +292,7 @@ mod tests {
             &'a self,
             change: SessionChange<'a, GlobalChunkAllocator>,
             _: &'a RedbStorage,
-            _: &'a dyn Delivery<GlobalChunkAllocator>,
+            _: &'a dyn DeliveryHandle<GlobalChunkAllocator>,
         ) -> DeliveryFuture<'a> {
             Box::pin(async move {
                 self.calls

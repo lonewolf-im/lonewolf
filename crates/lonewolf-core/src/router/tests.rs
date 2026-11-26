@@ -23,7 +23,7 @@ use crate::router::{
 use compio::runtime::Runtime;
 use compio::time::timeout;
 use lonewolf_extension::ExtensionFuture;
-use lonewolf_extension::delivery::{BoundResource, Delivery, HandlerError, HostLookup};
+use lonewolf_extension::delivery::{BoundResource, DeliveryHandle, HandlerError, HostLookup};
 use lonewolf_extension::delivery::{DeliveryError, SessionTag};
 use lonewolf_extension::offline::Offline;
 use lonewolf_extension::service::{ServiceContext, ServiceHandler};

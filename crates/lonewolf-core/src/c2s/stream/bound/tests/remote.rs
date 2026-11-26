@@ -550,7 +550,7 @@ impl lonewolf_extension::observer::MessageObserver<GlobalChunkAllocator, RedbSto
         &'a self,
         event: MessageEvent<'a, GlobalChunkAllocator>,
         _: &'a RedbStorage,
-        _: &'a dyn lonewolf_extension::delivery::Delivery<GlobalChunkAllocator>,
+        _: &'a dyn lonewolf_extension::delivery::DeliveryHandle<GlobalChunkAllocator>,
     ) -> lonewolf_extension::delivery::DeliveryFuture<'a> {
         assert_eq!(event.account.as_str(), "alice@example.com");
         self.steps.lock().push(MessageStep::Observe(

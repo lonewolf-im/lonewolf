@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use lonewolf_extension::delivery::{Delivery, DeliveryError, DeliveryFuture, SessionId};
+use lonewolf_extension::delivery::{DeliveryError, DeliveryFuture, DeliveryHandle, SessionId};
 use lonewolf_extension::observer::MessageObserver;
 use lonewolf_extension::service::{ServiceContext, ServiceHandler};
 use lonewolf_extension::{Extension, ExtensionFuture, Extensions, RegistrationError, Slots};
@@ -42,7 +42,7 @@ impl MessageObserver<GlobalChunkAllocator, RedbStorage> for Recorder {
         &'a self,
         event: MessageEvent<'a, GlobalChunkAllocator>,
         _: &'a RedbStorage,
-        _: &'a dyn Delivery<GlobalChunkAllocator>,
+        _: &'a dyn DeliveryHandle<GlobalChunkAllocator>,
     ) -> DeliveryFuture<'a> {
         Box::pin(async move {
             let rejection = if let Some(reply) = event.rejection {

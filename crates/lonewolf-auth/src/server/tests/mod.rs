@@ -10,6 +10,7 @@ use hmac::{Hmac, KeyInit, Mac};
 use pbkdf2::pbkdf2_hmac;
 use sha2::{Digest, Sha256};
 
+mod properties;
 mod sha512;
 
 type TestResult = Result<(), Box<dyn Error>>;

@@ -25,6 +25,7 @@ nix = { workspace = true, features = ["sched"] }
 compio = { workspace = true, features = ["net"] }
 futures-executor.workspace = true
 parking_lot.workspace = true
+proptest.workspace = true
 
 [[bench]]
 name = "pool"

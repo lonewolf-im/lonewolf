@@ -1,6 +1,57 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use proptest::prelude::*;
+
+fn namespace_payload() -> impl Strategy<Value = String> {
+    let leaf = prop_oneof![
+        "[a-zé]{0,8}".prop_map(|v| format!("<body p:flag='{v}'>{v}</body>")),
+        "[a-z李]{0,8}".prop_map(|v| format!("<p:item p:code='{v}'/>")),
+    ];
+    leaf.prop_recursive(3, 16, 3, |child| {
+        (
+            prop::sample::select(&["", " xmlns='urn:extension'", " xmlns=''"]),
+            prop::sample::select(&["", " xmlns:p='urn:one'", " xmlns:p='urn:two'"]),
+            prop::collection::vec(child, 1..=3),
+        )
+            .prop_map(|(default, prefix, children)| {
+                format!("<x{default}{prefix}>{}</x>", children.concat())
+            })
+    })
+}
+
+fn stanza_namespace() -> impl Strategy<Value = StanzaNamespace> {
+    prop::sample::select(&[
+        StanzaNamespace::Client,
+        StanzaNamespace::Server,
+        StanzaNamespace::ComponentAccept,
+    ])
+}
+
+proptest! {
+    #[test]
+    #[ignore = "runs in the XMPP property workflow"]
+    fn property_namespace_conversion(
+        from in stanza_namespace(),
+        to in stanza_namespace(),
+        payload in namespace_payload(),
+    ) {
+        let xml = format!("<message from='a@example.org/r' to='b@example.net'>{payload}</message>");
+        let (stanza, source) = parse_stream_with_header(from, "xmlns:p='urn:root'", &xml)
+            .expect("generated stanza must parse");
+        let view = stanza.resolve(&source)?;
+        let expected = walk_as(&view, to)?;
+        let mut direct = String::new();
+        view.write_xml_as(to, &mut direct)?;
+
+        let mut arena = Arena::try_new(ArenaConfig::default())?;
+        let copied = view.rescope_in(to, &mut arena)?;
+        let copied_xml = stanza_xml(copied, &arena).expect("converted stanza must serialize");
+        prop_assert_eq!(&direct, &copied_xml);
+        let (parsed, arena) = parse_stream_stanza(to, &direct).expect("converted stanza must parse");
+        prop_assert_eq!(structural_walk(&parsed.resolve(&arena)?)?, expected);
+    }
+}
 
 fn parse_stream_stanza(
     namespace: StanzaNamespace,

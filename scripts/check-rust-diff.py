@@ -38,7 +38,7 @@ def changed_lines(base):
 
 
 def in_test(node, path):
-    if "tests" in path.parts or path.name == "tests.rs":
+    if path.parts[:1] == ("e2e",) or "tests" in path.parts or path.name == "tests.rs":
         return True
     while node:
         if node.type in {"mod_item", "function_item"}:

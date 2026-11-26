@@ -27,8 +27,8 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 
 [[test]]
-name = "cli"
-path = "../lonewolf-core/tests/admin/cli.rs"
+name = "e2e_cli"
+path = "../../e2e/admin/cli.rs"
 
 [lints]
 workspace = true

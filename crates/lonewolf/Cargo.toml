@@ -36,36 +36,36 @@ nix.workspace = true
 tempfile.workspace = true
 
 [[test]]
-name = "admin"
-path = "../lonewolf-core/tests/server/admin.rs"
+name = "e2e_admin"
+path = "../../e2e/server/admin.rs"
 
 [[test]]
-name = "c2s"
-path = "../lonewolf-core/tests/server/c2s.rs"
+name = "e2e_c2s"
+path = "../../e2e/server/c2s.rs"
 
 [[test]]
-name = "cli"
-path = "../lonewolf-core/tests/server/cli.rs"
+name = "e2e_cli"
+path = "../../e2e/server/cli.rs"
 
 [[test]]
-name = "workers"
-path = "../lonewolf-core/tests/server/workers.rs"
+name = "e2e_workers"
+path = "../../e2e/server/workers.rs"
 
 [[test]]
-name = "metrics"
-path = "../lonewolf-core/tests/server/metrics.rs"
+name = "e2e_metrics"
+path = "../../e2e/server/metrics.rs"
 
 [[test]]
-name = "acme"
-path = "../lonewolf-core/tests/server/acme.rs"
+name = "e2e_acme"
+path = "../../e2e/server/acme.rs"
 
 [[test]]
-name = "benchmark_local"
-path = "../lonewolf-core/tests/benchmark/local.rs"
+name = "e2e_benchmark_local"
+path = "../../e2e/benchmark/local.rs"
 
 [[test]]
-name = "s2s"
-path = "../lonewolf-core/tests/server/s2s.rs"
+name = "e2e_s2s"
+path = "../../e2e/server/s2s.rs"
 
 [lints]
 workspace = true

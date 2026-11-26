@@ -121,13 +121,13 @@ Do not add AI or tool attribution anywhere in commits or pull requests.
 
 ## 13. Test Organization Rule
 
-- Keep all integration test sources and fixtures under `crates/lonewolf-core/tests/`.
-- An integration test covers a complete client-server, client-component, or server-server workflow, including its failure and shutdown paths. Using a public Rust API or a real file does not by itself make a test an integration test.
+- Keep all end-to-end (e2e) test sources and fixtures under the root `e2e/` directory.
+- An e2e test covers a complete client-server, client-component, or server-server workflow, including its failure and shutdown paths. Using a public Rust API or a real file does not by itself make a test an e2e test.
 - Keep all other tests with the implementation they exercise, in a `#[cfg(test)]` module. Small suites may be inline; larger suites may use `src/<module>/tests.rs` and child modules.
-- Keep implementation test fixtures under `src/`. Do not include test cases from the integration directory into implementation modules.
-- Write named integration scenarios with visible setup, actions, and expected replies. Share transport and setup helpers without hiding the interaction being tested.
-- When a workflow tests an executable, declare its Cargo test target in the executable's package with a `path` under `crates/lonewolf-core/tests/`, so Cargo supplies the executable path.
-- Run `cargo test --workspace` to cover the central integration suite and each crate's implementation tests.
+- Keep implementation test fixtures under `src/`. Do not include test cases from the e2e directory into implementation modules.
+- Write named e2e scenarios with visible setup, actions, and expected replies. Share transport and setup helpers without hiding the interaction being tested.
+- When a workflow tests an executable, declare its Cargo test target in the executable's package with a `path` under the root `e2e/` directory, so Cargo supplies the executable path.
+- Run `cargo test --workspace` to cover the e2e suite and each crate's implementation tests.
 - Do not assert on or synchronize tests through emitted logs or tracing events. Do not capture, parse, match, count, or wait for them.
 - Use protocol replies, typed results, observable state, metrics, or explicit completion signals to verify behavior.
 

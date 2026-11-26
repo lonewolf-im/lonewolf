@@ -321,7 +321,10 @@ where
 {
     if matches!(
         reason.outcome(),
-        CloseOutcome::Eof | CloseOutcome::TransportError | CloseOutcome::TlsFailure
+        CloseOutcome::Eof
+            | CloseOutcome::TransportError
+            | CloseOutcome::TlsFailure
+            | CloseOutcome::StalledWrite
     ) {
         return Ok(false);
     }

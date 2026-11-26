@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::cell::Cell;
 use std::io;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::task::{Context, Poll};
+use std::time::Instant;
 
 use futures_util::io::{AsyncRead, AsyncWrite};
 
@@ -11,6 +14,24 @@ pub(crate) trait TrafficObserver {
     const COOPERATIVE_READS: bool = false;
     fn received(&self, bytes: usize);
     fn sent(&self, bytes: usize);
+}
+
+/// Shares the latest instant at which the transport accepted outgoing bytes.
+#[derive(Clone)]
+pub(crate) struct WriteProgress(Rc<Cell<Instant>>);
+
+impl WriteProgress {
+    pub(crate) fn new(at: Instant) -> Self {
+        Self(Rc::new(Cell::new(at)))
+    }
+
+    pub(crate) fn record(&self, at: Instant) {
+        self.0.set(self.0.get().max(at));
+    }
+
+    pub(crate) fn last(&self) -> Instant {
+        self.0.get()
+    }
 }
 
 pub(crate) struct ObservedIo<T, O: TrafficObserver> {

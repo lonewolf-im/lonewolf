@@ -556,3 +556,48 @@ fn account_iq_dispatch_observes_completed_deletion_and_recreation() -> TestResul
     alice.expect_xml("<iq xmlns='jabber:client' type='result' id='calls' to='alice@localhost/desk'><calls xmlns='urn:lonewolf:test:iq' gets='2' sets='2'/></iq>")?;
     alice.close()
 }
+
+#[test]
+fn bound_client_that_stops_reading_closes_after_the_stalled_write_timeout() -> TestResult {
+    let suite = C2sSuite::with_limits(
+        "stalled_write_timeout_secs = 1\n\
+         incoming_stanzas_per_connection = { per_second = 2000, burst = 2000 }\n\
+         incoming_xml_per_connection = { bytes_per_second = 67108864, burst_bytes = 67108864 }",
+    )?;
+    suite.create_account("alice", PASSWORD)?;
+    suite.create_account("bob", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let mut bob = suite.connect("bob", PASSWORD, "phone")?;
+    let body = "x".repeat(200_000);
+    let mut rejected = None;
+    for n in 0..1_024 {
+        alice.send(&format!(
+            "<message type='chat' to='bob@localhost/phone' id='load{n}'><body>{body}</body></message>"
+        ))?;
+        alice.send("<iq type='get' id='admitted'><query xmlns='urn:test:barrier'/></iq>")?;
+        loop {
+            let reply = alice.receive()?;
+            if reply.name == "iq" {
+                assert_eq!(reply.attribute("id"), Some("admitted"));
+                break;
+            }
+            reply.assert_name("jabber:client", "message");
+            assert_eq!(reply.attribute("type"), Some("error"));
+            reply
+                .child("jabber:client", "error")?
+                .child("urn:ietf:params:xml:ns:xmpp-stanzas", "resource-constraint")?;
+            rejected = reply.attribute("id").map(str::to_owned);
+        }
+        if rejected.is_some() {
+            break;
+        }
+    }
+    assert!(
+        rejected.is_some(),
+        "the stalled recipient never refused a message"
+    );
+    suite.wait_for_metric("lonewolf_c2s_connections_closed_total{listener=\"0\",phase=\"bound\",outcome=\"stalled_write\"} 1")?;
+    bob.drain()?;
+    super::support::barrier(&mut alice)?;
+    alice.close()
+}

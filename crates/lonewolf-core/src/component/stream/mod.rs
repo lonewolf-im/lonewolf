@@ -20,6 +20,7 @@ use crate::config::limits::ComponentLimits;
 use crate::xml_stream::limiter::StanzaLimiter;
 use crate::xml_stream::parse::{ParseFailure, classify_parse_error};
 use crate::xml_stream::reader::{ReadMode, ReadObserver, XmlReader};
+pub(crate) use crate::xml_stream::traffic::WriteProgress;
 use crate::xml_stream::writer::StreamWriter;
 use crate::xml_stream::{escape_attribute, peer_stream_error};
 
@@ -117,20 +118,6 @@ impl<A: ChunkAllocator + Clone, R: AsyncBufRead + Unpin + 'static> ComponentRead
             return Err(ComponentError::PeerError(condition));
         }
         Ok(event)
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct WriteProgress(Rc<Cell<Instant>>);
-impl WriteProgress {
-    pub(crate) fn new(at: Instant) -> Self {
-        Self(Rc::new(Cell::new(at)))
-    }
-    pub(crate) fn record(&self, at: Instant) {
-        self.0.set(self.0.get().max(at));
-    }
-    pub(crate) fn last(&self) -> Instant {
-        self.0.get()
     }
 }
 

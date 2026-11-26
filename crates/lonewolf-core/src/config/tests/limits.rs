@@ -101,6 +101,7 @@ fn limits_defaults_match_the_policy() -> TestResult {
         ("connection_establishment_timeout_secs", 10),
         ("authentication_timeout_secs", 15),
         ("resource_binding_timeout_secs", 5),
+        ("stalled_write_timeout_secs", 60),
         ("authentication_retries", 2),
         ("resource_binding_retries", 5),
         ("connection_attempts_per_ip.per_second", 10),
@@ -614,6 +615,25 @@ fn component_timeouts_must_fit_the_platform_clock() -> TestResult {
         assert!(
             matches!(result, Err(ConfigError::Invalid { ref reason, .. })
                 if reason == &format!("limits.components.{field} exceeds the platform clock range")),
+            "{result:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn c2s_timeouts_must_fit_the_platform_clock() -> TestResult {
+    for field in [
+        "connection_establishment_timeout_secs",
+        "authentication_timeout_secs",
+        "resource_binding_timeout_secs",
+        "stalled_write_timeout_secs",
+    ] {
+        let path = format!("c2s.profiles.default.{field}");
+        let result = Config::load(Some(setting(&path, u64::MAX)?.path()));
+        assert!(
+            matches!(result, Err(ConfigError::Invalid { ref reason, .. })
+                if reason == &format!("limits.{path} exceeds the platform clock range")),
             "{result:?}"
         );
     }

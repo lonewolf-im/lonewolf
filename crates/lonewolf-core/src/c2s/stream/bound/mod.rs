@@ -8,6 +8,7 @@ use std::num::NonZeroUsize;
 use std::pin::pin;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 #[cfg(test)]
 use std::time::Instant;
 
@@ -97,7 +98,7 @@ use presence::ResourcePresence;
 #[cfg(test)]
 use presence::{PresenceContext, PresenceWork};
 use replay::ReplayPolicy;
-use transport::Transport;
+use transport::{Transport, WriteStall};
 
 const STORED_STANZA_STREAM_HEADER: &[u8] =
     b"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client'>";
@@ -245,6 +246,7 @@ pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(
     bound: Bound<A>,
     work: &mut WorkGroup,
     recipients: RecipientLimiter,
+    stalled_write_timeout: Duration,
     metrics: C2sWorkerMetrics,
 ) -> CloseOutcome {
     let Bound {
@@ -253,6 +255,7 @@ pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(
                 reader,
                 writer,
                 close,
+                write_progress,
                 ..
             },
         monitor,
@@ -273,6 +276,7 @@ pub(super) async fn bound_stream<A: ChunkAllocator + Clone>(
         close,
         monitor,
         link: transport_link,
+        stall: WriteStall::new(write_progress, stalled_write_timeout),
     };
     {
         let serve = async {

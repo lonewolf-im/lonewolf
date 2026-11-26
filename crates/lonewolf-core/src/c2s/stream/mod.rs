@@ -115,6 +115,7 @@ pub(super) struct StreamSettings<A: ChunkAllocator> {
     establishment_timeout: Duration,
     authentication_timeout: Duration,
     binding_timeout: Duration,
+    stalled_write_timeout: Duration,
     authentication_retries: NonZeroUsize,
     resource_binding_retries: NonZeroUsize,
     max_resources_per_account: NonZeroUsize,
@@ -153,6 +154,7 @@ impl<A: ChunkAllocator> StreamSettings<A> {
             establishment_timeout: timeouts.establishment,
             authentication_timeout: timeouts.authentication,
             binding_timeout: timeouts.binding,
+            stalled_write_timeout: Duration::from_secs(profile.stalled_write_timeout_secs.get()),
             authentication_retries: profile.authentication_retries,
             resource_binding_retries: profile.resource_binding_retries,
             max_resources_per_account,
@@ -368,7 +370,14 @@ impl<A: ChunkAllocator + Clone> XmppStream<A> {
                 crate::clock::now(),
                 settings.metrics.clone(),
             );
-            Ok(bound_stream(bound, &mut work, recipients, settings.metrics.clone()).await)
+            Ok(bound_stream(
+                bound,
+                &mut work,
+                recipients,
+                settings.stalled_write_timeout,
+                settings.metrics.clone(),
+            )
+            .await)
         };
         let outcome = finish_phases(phases, &close_control, &settings.metrics).await;
         work.drain().await;

@@ -188,7 +188,7 @@ fn list_accounts<T: ReadableTable<&'static str, &'static [u8]>>(
     let start = after.map_or(Bound::Unbounded, |key| Bound::Excluded(key.as_str()));
     let mut accounts = Vec::new();
     for entry in table
-        .range::<&str>((start, Bound::Unbounded))
+        .range((start, Bound::Unbounded))
         .map_err(storage_error)?
         .take(limit.get())
     {

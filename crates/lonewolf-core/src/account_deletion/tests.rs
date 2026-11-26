@@ -29,7 +29,7 @@ use lonewolf_util::arena::{Arena, ArenaConfig, GlobalChunkAllocator};
 use lonewolf_xmpp::jid::Jid;
 use redb::backends::InMemoryBackend;
 use redb::{
-    Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, StorageBackend,
+    BackendError, Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, StorageBackend,
     TableDefinition,
 };
 
@@ -397,28 +397,28 @@ struct FailingSyncBackend {
 }
 
 impl StorageBackend for FailingSyncBackend {
-    fn len(&self) -> io::Result<u64> {
+    fn len(&self) -> Result<u64, BackendError> {
         self.inner.len()
     }
 
-    fn read(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
+    fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), BackendError> {
         self.inner.read(offset, out)
     }
 
-    fn set_len(&self, len: u64) -> io::Result<()> {
+    fn set_len(&self, len: u64) -> Result<(), BackendError> {
         self.inner.set_len(len)
     }
 
-    fn sync_data(&self) -> io::Result<()> {
+    fn sync_data(&self) -> Result<(), BackendError> {
         self.inner.sync_data()?;
         if self.fail_next_sync.swap(false, Ordering::SeqCst) {
-            Err(io::Error::other("injected sync failure"))
+            Err(io::Error::other("injected sync failure").into())
         } else {
             Ok(())
         }
     }
 
-    fn write(&self, offset: u64, data: &[u8]) -> io::Result<()> {
+    fn write(&self, offset: u64, data: &[u8]) -> Result<(), BackendError> {
         self.inner.write(offset, data)
     }
 }

@@ -2,7 +2,7 @@
 
 use std::error::Error;
 
-use ::redb::{ReadableDatabase, ReadableTableMetadata};
+use ::redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata};
 use futures_executor::block_on;
 
 use super::redb::VCARDS;

@@ -202,9 +202,8 @@ impl RedbBackend {
         options.read(true).write(true).create(true).truncate(false);
         options.mode(0o600);
         let file = options.open(path).map_err(storage_error)?;
-        let backend = FileBackend::new(file).map_err(storage_error)?;
         let database = Database::builder()
-            .create_with_backend(backend)
+            .create_with_backend(FileBackend::new(file))
             .map_err(storage_error)?;
         Self::new(database)
     }

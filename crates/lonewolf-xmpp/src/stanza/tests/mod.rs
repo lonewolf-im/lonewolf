@@ -1130,19 +1130,20 @@ fn preserves_mixed_content_expanded_names_and_xml_whitespace() -> TestResult {
         .attribute("lang", XML_NAMESPACE, "en")?
         .attribute("key", "", "a\t\n\r\"<&>")?
         .attribute("key", "urn:other", "namespaced")?
-        .text("before\r")?
+        .text("\"quoted\"\t&\r")?
         .child(emphasis)?
         .text("after & ]]>\n")?
         .child(empty)?
         .build()?;
-    assert_eq!(
-        element_xml(element, &arena)?,
-        concat!(
-            "<p xmlns=\"urn:text\" xml:lang=\"en\" key=\"a&#x9;&#xA;&#xD;&quot;&lt;&amp;&gt;\" xmlns:ns2=\"urn:other\" ns2:key=\"namespaced\">",
-            "before&#xD;<em>bold</em>after &amp; ]]&gt;\n<empty xmlns=\"\"/></p>"
-        )
+    let expected = concat!(
+        "<p xmlns=\"urn:text\" xml:lang=\"en\" key=\"a&#x9;&#xA;&#xD;&quot;&lt;&amp;&gt;\" xmlns:ns2=\"urn:other\" ns2:key=\"namespaced\">",
+        "\"quoted\"\t&amp;&#xD;<em>bold</em>after &amp; ]]&gt;\n<empty xmlns=\"\"/></p>"
     );
+    assert_eq!(element_xml(element, &arena)?, expected);
     let view = element.resolve(&arena)?;
+    let mut writer = FragmentedWriter::default();
+    futures_executor::block_on(view.write_xml_async(&mut writer))?;
+    assert_eq!(writer.bytes, expected.as_bytes());
     assert_eq!(view.attribute("key", "")?, Some("a\t\n\r\"<&>"));
     assert_eq!(view.attribute("key", "urn:other")?, Some("namespaced"));
     assert_eq!(view.text()?, None);
@@ -1150,7 +1151,7 @@ fn preserves_mixed_content_expanded_names_and_xml_whitespace() -> TestResult {
     assert!(matches!(
         children.as_slice(),
         [
-            NodeRef::Text("before\r"),
+            NodeRef::Text("\"quoted\"\t&\r"),
             NodeRef::Element(_),
             NodeRef::Text("after & ]]>\n"),
             NodeRef::Element(_)

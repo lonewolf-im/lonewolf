@@ -190,9 +190,8 @@ async fn cycle(
     };
     let (login, close, failure, tls) = match result {
         Some(Ok((session, timings))) => {
-            let bound = match observation.bound_at {
-                Some(at) => at,
-                None => unreachable!("validated bind has a timestamp"),
+            let Some(bound) = observation.bound_at else {
+                unreachable!("validated bind has a timestamp")
             };
             let login = LoginOutcome::Succeeded { at: bound, timings };
             let tls = session.identity().tls.clone();

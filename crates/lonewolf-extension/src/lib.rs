@@ -2,7 +2,13 @@
 
 //! These interfaces are not stable for independent crates.
 
-#![cfg_attr(test, allow(clippy::cognitive_complexity))]
+#![cfg_attr(
+    test,
+    expect(
+        clippy::cognitive_complexity,
+        reason = "Keep each test scenario and its assertions together."
+    )
+)]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -241,27 +247,26 @@ impl fmt::Display for RegistrationError {
 
 impl Error for RegistrationError {}
 
+pub type RegisteredHandler<K, H> = (K, Arc<H>);
+pub type RegisteredDecoration<A, S> = (
+    &'static str,
+    &'static str,
+    &'static str,
+    Arc<dyn PresenceDecorator<A, S>>,
+);
+
 pub struct ExtensionRegistry<A: ChunkAllocator, S: Storage> {
     iq: IqRegistry<A, S>,
     presence: PresenceRegistry<A, S>,
     messages: Option<Arc<dyn MessageHandler<A, S>>>,
     archive: Option<Arc<dyn ArchiveHandler<A, S>>>,
-    services: Vec<(String, Arc<dyn ServiceHandler<A, S>>)>,
+    services: Vec<RegisteredHandler<String, dyn ServiceHandler<A, S>>>,
     discovery: Arc<Discovery>,
-    #[expect(clippy::type_complexity)]
-    accounts: Vec<(&'static str, Arc<dyn AccountHandler<A, S>>)>,
-    #[expect(clippy::type_complexity)]
-    message_observers: Vec<(&'static str, Arc<dyn MessageObserver<A, S>>)>,
-    #[expect(clippy::type_complexity)]
-    session_observers: Vec<(&'static str, Arc<dyn SessionObserver<A, S>>)>,
-    #[expect(clippy::type_complexity)]
-    presence_decorations: Vec<(
-        &'static str,
-        &'static str,
-        &'static str,
-        Arc<dyn PresenceDecorator<A, S>>,
-    )>,
-    policies: Vec<(&'static str, Arc<dyn PolicyHandler<S>>)>,
+    accounts: Vec<RegisteredHandler<&'static str, dyn AccountHandler<A, S>>>,
+    message_observers: Vec<RegisteredHandler<&'static str, dyn MessageObserver<A, S>>>,
+    session_observers: Vec<RegisteredHandler<&'static str, dyn SessionObserver<A, S>>>,
+    presence_decorations: Vec<RegisteredDecoration<A, S>>,
+    policies: Vec<RegisteredHandler<&'static str, dyn PolicyHandler<S>>>,
     stream_features: String,
     enabled: Vec<&'static str>,
 }
@@ -303,8 +308,7 @@ impl<A: ChunkAllocator, S: Storage> ExtensionRegistry<A, S> {
         self.messages.as_ref()
     }
 
-    #[expect(clippy::type_complexity)]
-    pub fn services(&self) -> &[(String, Arc<dyn ServiceHandler<A, S>>)] {
+    pub fn services(&self) -> &[RegisteredHandler<String, dyn ServiceHandler<A, S>>] {
         &self.services
     }
 
@@ -317,34 +321,27 @@ impl<A: ChunkAllocator, S: Storage> ExtensionRegistry<A, S> {
         Arc::make_mut(&mut self.discovery).add_service(domain);
     }
 
-    #[expect(clippy::type_complexity)]
-    pub fn account_handlers(&self) -> &[(&'static str, Arc<dyn AccountHandler<A, S>>)] {
+    pub fn account_handlers(&self) -> &[RegisteredHandler<&'static str, dyn AccountHandler<A, S>>] {
         &self.accounts
     }
 
-    #[expect(clippy::type_complexity)]
-    pub fn message_observers(&self) -> &[(&'static str, Arc<dyn MessageObserver<A, S>>)] {
+    pub fn message_observers(
+        &self,
+    ) -> &[RegisteredHandler<&'static str, dyn MessageObserver<A, S>>] {
         &self.message_observers
     }
 
-    #[expect(clippy::type_complexity)]
-    pub fn session_observers(&self) -> &[(&'static str, Arc<dyn SessionObserver<A, S>>)] {
+    pub fn session_observers(
+        &self,
+    ) -> &[RegisteredHandler<&'static str, dyn SessionObserver<A, S>>] {
         &self.session_observers
     }
 
-    #[expect(clippy::type_complexity)]
-    pub fn presence_decorations(
-        &self,
-    ) -> &[(
-        &'static str,
-        &'static str,
-        &'static str,
-        Arc<dyn PresenceDecorator<A, S>>,
-    )] {
+    pub fn presence_decorations(&self) -> &[RegisteredDecoration<A, S>] {
         &self.presence_decorations
     }
 
-    pub fn policies(&self) -> &[(&'static str, Arc<dyn PolicyHandler<S>>)] {
+    pub fn policies(&self) -> &[RegisteredHandler<&'static str, dyn PolicyHandler<S>>] {
         &self.policies
     }
 

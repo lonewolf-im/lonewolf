@@ -76,7 +76,7 @@ pub(crate) fn parse_crl(der: &[u8], now: SystemTime) -> Result<ParsedCrl, CrlLoa
     parse_crl_with_cost_limit(der, now, usize::MAX)?.ok_or(CrlLoadError::Invalid)
 }
 
-/// Returns None when the estimated retained CRL cost exceeds max_cost.
+/// Returns None when the estimated retained CRL cost exceeds `max_cost`.
 pub(crate) fn parse_crl_with_cost_limit(
     der: &[u8],
     now: SystemTime,

@@ -669,7 +669,10 @@ struct VerifiedPeer {
     tls: TlsSummary,
 }
 
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Negotiation borrows the connection and both peer identities across exchanges."
+)]
 async fn negotiate<A: ChunkAllocator + Clone>(
     flow: &mut Negotiation<A>,
     socket: &ConnectionSocket,

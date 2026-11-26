@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
-#![allow(clippy::cognitive_complexity)]
+#![expect(
+    unreachable_pub,
+    reason = "Test targets compile shared fixtures as private modules."
+)]
+#![expect(
+    clippy::cognitive_complexity,
+    reason = "Keep each test scenario and its assertions together."
+)]
 
 #[path = "support/c2s_outbound.rs"]
 mod c2s_outbound;

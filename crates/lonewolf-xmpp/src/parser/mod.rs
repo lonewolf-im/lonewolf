@@ -206,7 +206,7 @@ impl<R, A: ChunkAllocator> XmppParser<R, A> {
     }
 
     /// Returns the unchanged parser if its stream cannot restart.
-    #[allow(
+    #[expect(
         clippy::result_large_err,
         reason = "Failures retain the parser without allocating."
     )]

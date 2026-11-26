@@ -61,10 +61,10 @@ pub fn serve() -> io::Result<()> {
                 {
                     continue;
                 }
-                let millis = u64::from_be_bytes(command[1..9].try_into().unwrap());
-                let duration = Duration::from_millis(millis);
-                let count = u32::from_be_bytes(command[9..].try_into().unwrap());
-                let result = match command[0] {
+                let [opcode, millis @ .., c0, c1, c2, c3] = command;
+                let duration = Duration::from_millis(u64::from_be_bytes(millis));
+                let count = u32::from_be_bytes([c0, c1, c2, c3]);
+                let result = match opcode {
                     ADVANCE => {
                         clock.advance(duration);
                         Ok(())

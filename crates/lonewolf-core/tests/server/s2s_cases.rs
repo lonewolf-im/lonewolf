@@ -497,7 +497,7 @@ fn endpoint_attempts_are_ordered_and_only_the_final_establishment_records_authen
         let second = out::listener()?;
         let refused = out::refused()?;
         let first_address = if mode == "refused" {
-            out::address(&refused)?
+            refused.address()
         } else {
             first.local_addr()?
         };
@@ -553,11 +553,11 @@ fn all_refusals_and_mixed_connected_failures_preserve_terminal_error_precedence(
         let refused_last = out::refused()?;
         let first = out::listener()?;
         let last = out::listener()?;
-        let mut endpoints = vec![out::address(&refused_first)?];
+        let mut endpoints = vec![refused_first.address()];
         if connected {
             endpoints.extend([first.local_addr()?, last.local_addr()?]);
         }
-        endpoints.push(out::address(&refused_last)?);
+        endpoints.push(refused_last.address());
         let (mut server, mut initiator) = out::start(&fixture, &endpoints, "")?;
         out::trigger(&mut initiator, "failure")?;
         if connected {

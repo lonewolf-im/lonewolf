@@ -531,7 +531,7 @@ fn two_slots_serialize_each_host_and_allow_progress_while_another_is_pending() -
     Ok(())
 }
 
-fn assert_profile_due(recorded: Option<&str>, configured: Option<&str>, due: u64) -> TestResult {
+fn assert_profile_due(recorded: Option<&str>, configured: Option<&str>, due: u64) {
     let mut record = host("example.com");
     let mut certificate = cert(NOW - 100, NOW + 100_000);
     certificate.profile = recorded.map(str::to_owned);
@@ -564,32 +564,29 @@ fn assert_profile_due(recorded: Option<&str>, configured: Option<&str>, due: u64
     }
     assert_eq!(*script.calls.borrow(), [("example.com".into(), false, due)]);
     assert_eq!(status.snapshot()[0].1.state, HostState::Ready);
-    Ok(())
 }
 
 #[test]
-fn profile_change_makes_a_valid_certificate_due_at_its_retry_floor() -> TestResult {
+fn profile_change_makes_a_valid_certificate_due_at_its_retry_floor() {
     for due in [NOW, NOW + 600] {
-        assert_profile_due(None, Some("shortlived"), due)?;
+        assert_profile_due(None, Some("shortlived"), due);
     }
-    Ok(())
 }
 
 #[test]
-fn matching_profile_keeps_the_renewal_schedule() -> TestResult {
+fn matching_profile_keeps_the_renewal_schedule() {
     assert_profile_due(Some("shortlived"), Some("shortlived"), NOW + 50_000)
 }
 
 #[test]
-fn removing_the_profile_renews_early() -> TestResult {
+fn removing_the_profile_renews_early() {
     for due in [NOW, NOW + 600] {
-        assert_profile_due(Some("shortlived"), None, due)?;
+        assert_profile_due(Some("shortlived"), None, due);
     }
-    Ok(())
 }
 
 #[test]
-fn unrecorded_certificates_keep_the_baseline_schedule_when_unset() -> TestResult {
+fn unrecorded_certificates_keep_the_baseline_schedule_when_unset() {
     assert_profile_due(None, None, NOW + 50_000)
 }
 
@@ -996,7 +993,7 @@ fn ordinary_ari_failure_retains_schedule_and_malformed_window_restores_fallback(
 }
 
 #[test]
-fn durable_state_errors_are_fatal_during_normal_operation() -> TestResult {
+fn durable_state_errors_are_fatal_during_normal_operation() {
     for error in [
         StateError::CorruptData,
         StateError::StateUncertain,
@@ -1019,7 +1016,6 @@ fn durable_state_errors_are_fatal_during_normal_operation() -> TestResult {
             assert_eq!(script.active.get(), 0);
         }
     }
-    Ok(())
 }
 
 #[test]

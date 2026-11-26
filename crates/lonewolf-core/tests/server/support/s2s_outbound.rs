@@ -119,10 +119,6 @@ pub fn refused() -> Result<RefusedEndpoint> {
     Ok(RefusedEndpoint::reserve(Instant::now() + TIMEOUT)?)
 }
 
-pub fn address(endpoint: &RefusedEndpoint) -> Result<SocketAddr> {
-    Ok(endpoint.address())
-}
-
 pub fn start(fixture: &Fixture, endpoints: &[SocketAddr], extra: &str) -> Result<(Server, Peer)> {
     let route = endpoints
         .iter()

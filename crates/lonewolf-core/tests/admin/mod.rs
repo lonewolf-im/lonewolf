@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-#![allow(clippy::cognitive_complexity)]
-
 use std::error::Error;
 use std::future::Future;
 use std::io;

@@ -772,11 +772,14 @@ pub(super) fn transport_attempts(
             .iter()
             .all(|sample| body.lines().any(|line| line == sample))
     })?;
-    let actual: Vec<_> = body
-        .lines()
-        .filter(|line| line.starts_with(&prefix))
-        .collect();
-    assert_eq!(actual.len(), samples.len(), "{body}");
+
+    assert_eq!(
+        body.lines()
+            .filter(|line| line.starts_with(&prefix))
+            .count(),
+        samples.len(),
+        "{body}"
+    );
     Ok(())
 }
 

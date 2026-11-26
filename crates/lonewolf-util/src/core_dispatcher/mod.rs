@@ -140,7 +140,16 @@ impl CoreDispatcher {
     /// before reporting startup. Also returns CPU affinity, thread creation,
     /// or runtime initialization errors.
     pub fn new(workers: NonZeroUsize, queue_capacity: NonZeroUsize) -> io::Result<Self> {
-        Self::start(worker_assignment(workers)?, queue_capacity, create_runtime)
+        #[cfg(target_os = "linux")]
+        let assignments = worker_assignment(workers)?;
+        #[cfg(not(target_os = "linux"))]
+        let assignments = (0..workers.get())
+            .map(|index| WorkerInfo {
+                index,
+                cpu_id: None,
+            })
+            .collect();
+        Self::start(assignments, queue_capacity, create_runtime)
     }
 
     fn start(
@@ -437,16 +446,6 @@ fn worker_assignment(count: NonZeroUsize) -> io::Result<Vec<WorkerInfo>> {
         io::ErrorKind::InvalidInput,
         "worker count exceeds the allowed CPU set",
     ))
-}
-
-#[cfg(not(target_os = "linux"))]
-fn worker_assignment(count: NonZeroUsize) -> io::Result<Vec<WorkerInfo>> {
-    Ok((0..count.get())
-        .map(|index| WorkerInfo {
-            index,
-            cpu_id: None,
-        })
-        .collect())
 }
 
 fn create_runtime(worker: WorkerInfo) -> io::Result<Runtime> {

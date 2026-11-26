@@ -1,6 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
-#![allow(clippy::cognitive_complexity)]
+#![expect(
+    unreachable_pub,
+    reason = "Test targets compile shared fixtures as private modules."
+)]
+#![expect(
+    clippy::disallowed_macros,
+    reason = "Integration fixtures report diagnostics on the console."
+)]
+#![expect(
+    clippy::cognitive_complexity,
+    reason = "Keep each test scenario and its assertions together."
+)]
 
 #[path = "../support/ports.rs"]
 mod ports;
@@ -519,12 +530,7 @@ fn proxy_preserves_alabel_host_and_path_and_rejects_wrong_host_and_token() -> Te
         )?
         .starts_with("HTTP/1.1 404 ")
     );
-    assert!(
-        proxy
-            .requests
-            .lock()
-            .contains(&(callback.0.clone(), callback.1.clone()))
-    );
+    assert!(proxy.requests.lock().contains(&(callback.0, callback.1)));
     ca.release(AcmeStage::Challenge);
     wait_until(|| server.secure("bücher.example").is_ok(), "IDN issuance")?;
     server.account("bücher.example")?;
@@ -1305,6 +1311,10 @@ fn automatic_setup_never_restarts_a_child_after_readiness() -> TestResult {
 fn twenty_bootstraps_under_concurrent_tcp_activity_cover_proxy_ipv6_and_cached_restart()
 -> TestResult {
     let results = std::thread::scope(|scope| {
+        #[expect(
+            clippy::needless_collect,
+            reason = "Start all workers before joining any of them."
+        )]
         let workers: Vec<_> = (0..4)
             .map(|worker| {
                 scope.spawn(move || -> Result<(usize, usize), String> {

@@ -407,9 +407,8 @@ async fn preparation_stops_retain_resources_until_the_admitted_cpu_unit_finishes
         assert!(!probe.dropped.load(Ordering::Acquire));
         assert!(RedbStorage::open(directory.join("accounts.redb")).is_err());
         release.send(())?;
-        let error = match work.await {
-            Err(error) => error,
-            Ok(_) => return Err("stopped preparation succeeded".into()),
+        let Err(error) = work.await else {
+            return Err("stopped preparation succeeded".into());
         };
         assert_eq!(
             error.context(),
@@ -454,9 +453,8 @@ async fn standalone_expiry_and_queued_cancellation_do_not_run_unadmitted_cpu_wor
             tokio::time::advance(Duration::from_millis(2)).await;
             assert!(poll_once(work.as_mut()).await.is_pending());
             release.send(())?;
-            let error = match work.await {
-                Err(error) => error,
-                Ok(_) => return Err("expired preparation succeeded".into()),
+            let Err(error) = work.await else {
+                return Err("expired preparation succeeded".into());
             };
             assert_eq!(error.context(), "fixture_setup_deadline");
         } else {
@@ -539,9 +537,8 @@ async fn stopped_preparation_finishes_the_whole_transaction_without_starting_the
                 Ok(())
             })
             .map_err(|_| "release closed")?;
-        let error = match work.await {
-            Err(error) => error,
-            Ok(_) => return Err("stopped transaction succeeded".into()),
+        let Err(error) = work.await else {
+            return Err("stopped transaction succeeded".into());
         };
         assert_eq!(
             error.context(),

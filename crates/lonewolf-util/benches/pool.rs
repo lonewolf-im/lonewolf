@@ -1,5 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
+#![expect(
+    clippy::disallowed_macros,
+    reason = "The benchmark writes its measurements to standard output."
+)]
+#![expect(
+    clippy::expect_used,
+    reason = "A failed benchmark operation invalidates the measurement."
+)]
 use std::alloc::Layout;
 use std::hint::black_box;
 use std::num::NonZeroUsize;

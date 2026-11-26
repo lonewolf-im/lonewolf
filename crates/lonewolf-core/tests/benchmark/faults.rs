@@ -827,9 +827,8 @@ async fn actual_cli_ctrl_c_during_pending_setup_closes_http_before_returning() -
     http.request().await?;
     http.partial_body().await?;
     process.signal()?;
-    let result = tokio::task::spawn_blocking(move || process.wait().map_err(|e| e.to_string()))
-        .await?
-        .map_err(|e| e.to_string())?;
+    let result =
+        tokio::task::spawn_blocking(move || process.wait().map_err(|e| e.to_string())).await??;
     assert_eq!(result.status.code(), Some(130));
     artifacts::complete(&out, RunStatus::Interrupted)?;
     timeout(Duration::from_secs(2), async {

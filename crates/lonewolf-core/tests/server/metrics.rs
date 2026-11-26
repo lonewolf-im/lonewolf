@@ -1,13 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 
-#![allow(clippy::cognitive_complexity)]
+#![expect(
+    unreachable_pub,
+    reason = "Test targets compile shared fixtures as private modules."
+)]
 
+#[expect(dead_code, reason = "Only the S2S suite checks for missing readiness.")]
 #[path = "support/process.rs"]
 mod process;
 
 use process::{Server, TIMEOUT, field, request};
 
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "Each test target uses a different subset of this fixture."
+)]
 #[path = "../support/ports.rs"]
 mod ports;
 

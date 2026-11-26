@@ -102,4 +102,20 @@ zeroize = { version = "1.9.0", default-features = false, features = ["alloc"] }
 x509-cert = { version = "0.3.0", default-features = false }
 
 [workspace.lints.clippy]
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
 cognitive_complexity = "warn"
+disallowed_macros = "warn"
+doc_markdown = "warn"
+empty_docs = "warn"
+expect_used = "warn"
+implicit_clone = "warn"
+manual_let_else = "warn"
+needless_collect = "warn"
+redundant_clone = "warn"
+too_long_first_doc_paragraph = "warn"
+unnecessary_wraps = "warn"
+unwrap_used = "warn"
+
+[workspace.lints.rust]
+unreachable_pub = "warn"

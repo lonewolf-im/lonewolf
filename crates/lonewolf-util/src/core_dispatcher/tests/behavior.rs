@@ -147,12 +147,9 @@ fn listener_connection_and_local_state_share_a_worker() -> TestResult {
                 Ok::<_, io::Error>(())
             })
             .await?;
-        let address = match address.await {
-            Ok(address) => address,
-            Err(_) => {
-                server.await??;
-                return Err("listener stopped before binding".into());
-            }
+        let Ok(address) = address.await else {
+            server.await??;
+            return Err("listener stopped before binding".into());
         };
         ::blocking::unblock(move || -> io::Result<()> {
             let mut client = std::net::TcpStream::connect_timeout(&address, TIMEOUT)?;

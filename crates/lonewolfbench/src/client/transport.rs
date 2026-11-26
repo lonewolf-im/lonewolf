@@ -604,7 +604,7 @@ impl<W: AsyncWrite + Unpin> Writer<W> {
         Ok(())
     }
 
-    /// Cancellation or failure after WriteStarted prevents reuse of the connection.
+    /// Cancellation or failure after `WriteStarted` prevents reuse of the connection.
     pub async fn send(&mut self, command: &WriteCommand, events: &EventSink) -> BenchResult<()> {
         if self.closed || self.retirement.retired() {
             return Err(failure("connection_retired"));
@@ -724,7 +724,7 @@ impl<W> Drop for WriteGuard<'_, W> {
 }
 
 /// Joins the reader and passes queued events to the callback, including after a close deadline.
-/// After cancellation, retire the writer and await reader.retire_and_drain before dropping either owner.
+/// After cancellation, retire the writer and await `reader.retire_and_drain` before dropping either owner.
 pub async fn shutdown(
     reader: &mut SessionReader,
     writer: &mut SessionWriter,

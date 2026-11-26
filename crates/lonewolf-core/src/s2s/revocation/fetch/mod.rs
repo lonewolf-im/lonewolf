@@ -78,7 +78,7 @@ impl CrlUrl {
     pub(crate) fn host(&self) -> &str {
         &self.host
     }
-    #[cfg_attr(not(test), expect(dead_code))]
+    #[cfg(test)]
     pub(crate) fn port(&self) -> u16 {
         self.port
     }

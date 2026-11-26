@@ -166,7 +166,10 @@ fn unknown(reason: UnknownReason) -> RevocationStatus {
     RevocationStatus::Unknown(reason)
 }
 
-#[allow(deprecated)]
+#[expect(
+    deprecated,
+    reason = "Map legacy webpki error variants to their TLS errors."
+)]
 pub(super) fn signature_error(error: &webpki::Error) -> bool {
     matches!(
         error,

@@ -1,14 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 
-#![allow(clippy::cognitive_complexity)]
+#![expect(
+    unreachable_pub,
+    reason = "Test targets compile shared fixtures as private modules."
+)]
+#![expect(
+    clippy::cognitive_complexity,
+    reason = "Keep each test scenario and its assertions together."
+)]
 
-#[allow(dead_code)]
 #[path = "support/mod.rs"]
 mod bench_support;
 mod faults;
 #[path = "support/peer.rs"]
 mod peer;
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "Each test target uses a different subset of this fixture."
+)]
 #[path = "../support/mod.rs"]
 mod support;
 

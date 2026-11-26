@@ -8,7 +8,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use lonewolf_extension::ExtensionRegistry;
 use lonewolf_extension::account::AccountHandler;
 use lonewolf_extension::archive::ArchiveHandler;
 use lonewolf_extension::delivery::{BoundResource, CopyFactory, SessionId, SessionTag};
@@ -17,8 +16,9 @@ use lonewolf_extension::iq::IqRegistry;
 use lonewolf_extension::message::MessageHandler;
 use lonewolf_extension::observer::{MessageObserver, SessionObserver};
 use lonewolf_extension::policy::PolicyHandler;
-use lonewolf_extension::presence::{PresenceDecorator, PresenceRegistry};
+use lonewolf_extension::presence::PresenceRegistry;
 use lonewolf_extension::service::ServiceHandler;
+use lonewolf_extension::{ExtensionRegistry, RegisteredDecoration, RegisteredHandler};
 use lonewolf_storage::account::AccountKey;
 use lonewolf_storage::roster::RosterJid;
 use lonewolf_storage::{RedbRead, RedbStorage};
@@ -556,36 +556,28 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
             .and_then(ExtensionRegistry::archive)
     }
 
-    #[expect(clippy::type_complexity)]
     pub(crate) fn message_observers(
         &self,
         domain: &str,
-    ) -> &[(&'static str, Arc<dyn MessageObserver<A, RedbStorage>>)] {
+    ) -> &[RegisteredHandler<&'static str, dyn MessageObserver<A, RedbStorage>>] {
         self.extensions
             .get(domain)
             .map_or(&[], ExtensionRegistry::message_observers)
     }
 
-    #[expect(clippy::type_complexity)]
     pub(crate) fn session_observers(
         &self,
         domain: &str,
-    ) -> &[(&'static str, Arc<dyn SessionObserver<A, RedbStorage>>)] {
+    ) -> &[RegisteredHandler<&'static str, dyn SessionObserver<A, RedbStorage>>] {
         self.extensions
             .get(domain)
             .map_or(&[], ExtensionRegistry::session_observers)
     }
 
-    #[expect(clippy::type_complexity)]
     pub(crate) fn presence_decorations(
         &self,
         domain: &str,
-    ) -> &[(
-        &'static str,
-        &'static str,
-        &'static str,
-        Arc<dyn PresenceDecorator<A, RedbStorage>>,
-    )] {
+    ) -> &[RegisteredDecoration<A, RedbStorage>] {
         self.extensions
             .get(domain)
             .map_or(&[], ExtensionRegistry::presence_decorations)
@@ -594,7 +586,7 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
     pub(crate) fn policies(
         &self,
         domain: &str,
-    ) -> &[(&'static str, Arc<dyn PolicyHandler<RedbStorage>>)] {
+    ) -> &[RegisteredHandler<&'static str, dyn PolicyHandler<RedbStorage>>] {
         self.extensions
             .get(domain)
             .map_or(&[], ExtensionRegistry::policies)
@@ -632,11 +624,10 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         &self.order
     }
 
-    #[expect(clippy::type_complexity)]
     pub(crate) fn account_handlers(
         &self,
         domain: &str,
-    ) -> &[(&'static str, Arc<dyn AccountHandler<A, RedbStorage>>)] {
+    ) -> &[RegisteredHandler<&'static str, dyn AccountHandler<A, RedbStorage>>] {
         self.extensions
             .get(domain)
             .map_or(&[], ExtensionRegistry::account_handlers)

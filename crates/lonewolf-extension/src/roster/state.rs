@@ -233,7 +233,10 @@ pub(super) async fn resolve_pending<W: WriteTransaction>(
     update_subscription(roster, transaction, owner, sender, update).await
 }
 
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The transaction needs both account keys and both wire addresses."
+)]
 pub(super) async fn request_subscription<W: WriteTransaction>(
     roster: &super::Roster,
     transaction: &mut W,

@@ -164,8 +164,7 @@ fn pending_errors_and_partial_operations_preserve_actual_byte_counts()
     Ok(())
 }
 #[test]
-fn physical_activity_and_read_cooperation_follow_only_successful_positive_io()
--> Result<(), Box<dyn std::error::Error>> {
+fn physical_activity_and_read_cooperation_follow_only_successful_positive_io() {
     struct Wake(std::sync::atomic::AtomicUsize);
     impl futures_util::task::ArcWake for Wake {
         fn wake_by_ref(this: &Arc<Self>) {
@@ -251,5 +250,4 @@ fn physical_activity_and_read_cooperation_follow_only_successful_positive_io()
     assert_eq!(io.inner_mut().flushes, 1);
     assert_eq!(io.inner_mut().closes, 1);
     assert!(!io.yields_read());
-    Ok(())
 }

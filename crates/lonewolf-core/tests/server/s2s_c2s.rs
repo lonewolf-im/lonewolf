@@ -372,7 +372,7 @@ fn c2s_chat_iq_and_headline_establishment_failures_bounce_to_sending_resource() 
             let dns = UdpSocket::bind("127.0.0.1:0")?;
             dns.set_read_timeout(Some(TIMEOUT))?;
             let endpoint = match &refused {
-                Some(endpoint) => out::address(endpoint)?,
+                Some(endpoint) => endpoint.address(),
                 None => listener.local_addr()?,
             };
             let negotiation = if mode == "timeout" {

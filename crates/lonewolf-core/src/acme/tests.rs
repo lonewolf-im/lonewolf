@@ -320,7 +320,7 @@ fn responder_is_polled_before_manager_and_both_receive_the_same_deadline() -> Te
 }
 
 #[test]
-fn io_failures_never_retain_untrusted_details() -> TestResult {
+fn io_failures_never_retain_untrusted_details() {
     let error = io_failure(
         "HTTP",
         io::Error::other("TOKEN-KEY-PEM-JWS-PROBLEM-SENTINEL"),
@@ -333,7 +333,6 @@ fn io_failures_never_retain_untrusted_details() -> TestResult {
         source = cause.source();
     }
     assert!(!rendered.contains("SENTINEL"), "{rendered}");
-    Ok(())
 }
 
 #[test]

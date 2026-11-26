@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
-#![cfg_attr(test, allow(clippy::cognitive_complexity))]
+#![expect(
+    clippy::disallowed_macros,
+    reason = "The command reports results and errors on the console."
+)]
 
 use clap::Parser;
 use lonewolfbench::{

@@ -32,7 +32,7 @@ pub struct ResolvedTarget {
     pub address: SocketAddr,
     /// Controls stream addressing, SNI and certificate identity, including through a tunnel.
     pub xmpp_domain: String,
-    /// Use local_tls_config or remote_tls_config to select the permitted trust policy and provider.
+    /// Use `local_tls_config` or `remote_tls_config` to select the permitted trust policy and provider.
     pub tls: Arc<rustls::ClientConfig>,
 }
 

@@ -133,7 +133,10 @@ struct StreamServices<A: ChunkAllocator> {
 
 pub(crate) struct Listeners(ListenerSet);
 impl Listeners {
-    #[expect(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Pass each listener dependency with its required ownership."
+    )]
     pub(crate) async fn start<A: ChunkAllocator + Clone>(
         config: &C2sConfig,
         limits: &C2sLimits,

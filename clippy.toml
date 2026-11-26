@@ -1,1 +1,4 @@
 cognitive-complexity-threshold = 20
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+disallowed-macros = ["std::println", "std::eprintln", "std::dbg", "core::todo", "core::unimplemented"]

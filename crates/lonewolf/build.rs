@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
+#![expect(
+    clippy::disallowed_macros,
+    reason = "Cargo reads build directives from standard output."
+)]
 use std::path::Path;
 use std::process::Command;
 

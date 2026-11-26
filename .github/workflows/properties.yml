@@ -28,13 +28,14 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Check XML chunking and JID round trips
+      - name: Run nightly property tests
         shell: bash
         run: |
           mkdir -p target/properties
           {
             printf 'commit=%s\nseed=%s\ncases=%s\n' "$GITHUB_SHA" "$PROPTEST_RNG_SEED" "$PROPTEST_CASES"
-            cargo nextest run --locked -p lonewolf-xmpp --lib --run-ignored only \
+            cargo nextest run --locked --lib --run-ignored only \
+              -p lonewolf-xmpp -p lonewolf-util -p lonewolf-extension -p lonewolf-auth \
               -E 'test(/::property_/)' --no-fail-fast
           } 2>&1 | tee target/properties/run.log
       - name: Upload failing cases
@@ -44,5 +45,5 @@ jobs:
           name: xmpp-properties-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             target/properties/run.log
-            crates/lonewolf-xmpp/proptest-regressions/
+            crates/*/proptest-regressions/
           retention-days: 14

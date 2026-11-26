@@ -3,6 +3,7 @@
 use lonewolf_storage::roster::RosterQuota;
 
 mod options;
+mod properties;
 mod state;
 
 use std::cell::{Cell, RefCell};
@@ -2992,7 +2993,7 @@ fn federated_cleanup_keeps_its_existing_s2s_gate() -> Result<(), Box<dyn std::er
     Ok(())
 }
 
-fn remote_request(
+fn subscription_stanza(
     kind: PresenceRequestType,
     sender: &str,
     target: &str,
@@ -3176,7 +3177,7 @@ fn inbound_subscription_table(
             let contact = roster_jid(remote)?;
             create_account(&fixture, &owner);
             create_account(&fixture, &other);
-            let stanza = remote_request(kind, remote, owner.as_str())?;
+            let stanza = subscription_stanza(kind, remote, owner.as_str())?;
             block_on(async {
                 let mut tx = fixture.storage.begin_write().await?;
                 if state != N || pending_out {
@@ -3419,7 +3420,8 @@ fn inbound_preapproval_bypasses_full_pending_queue(
             component,
             ..Default::default()
         };
-        let stanza = remote_request(PresenceRequestType::Subscribe, remote, "alice@example.com")?;
+        let stanza =
+            subscription_stanza(PresenceRequestType::Subscribe, remote, "alice@example.com")?;
         let effects = block_on(receive_remote_request(
             &roster,
             &fixture,
@@ -3497,7 +3499,7 @@ fn inbound_pending_request_limit(
         component,
         ..Default::default()
     };
-    let stanza = remote_request(PresenceRequestType::Subscribe, remote, owner.as_str())?;
+    let stanza = subscription_stanza(PresenceRequestType::Subscribe, remote, owner.as_str())?;
     for index in 0..2 {
         let effects = block_on(receive_remote_request(
             &roster,
@@ -3526,7 +3528,7 @@ fn inbound_pending_request_limit(
         );
     }
     let before = pending(&fixture, &owner);
-    let excess = remote_request(
+    let excess = subscription_stanza(
         PresenceRequestType::Subscribe,
         excess_sender,
         owner.as_str(),
@@ -3608,7 +3610,7 @@ fn remote_inbound_missing_owner_and_domain_only_sender_have_no_effects()
                     federated: true,
                     ..Default::default()
                 };
-                let stanza = remote_request(kind, sender, owner.as_str())?;
+                let stanza = subscription_stanza(kind, sender, owner.as_str())?;
                 let effects = block_on(receive_remote_request(
                     &Roster::default(),
                     &fixture,
@@ -3672,7 +3674,7 @@ fn remote_inbound_subscriptions_require_federation_and_keep_other_receive_kinds(
             if federated {
                 continue;
             }
-            let stanza = remote_request(kind, "bob@remote.test", owner.as_str())?;
+            let stanza = subscription_stanza(kind, "bob@remote.test", owner.as_str())?;
             let error = block_on(receive_remote_request(
                 &Roster::default(),
                 &fixture,
@@ -3689,7 +3691,7 @@ fn remote_inbound_subscriptions_require_federation_and_keep_other_receive_kinds(
             PresenceRequestType::Unavailable,
             PresenceRequestType::Probe,
         ] {
-            let stanza = remote_request(
+            let stanza = subscription_stanza(
                 PresenceRequestType::Subscribe,
                 "remote.test",
                 owner.as_str(),

@@ -64,3 +64,4 @@ fn thread_local_identities_stay_unique_across_refills_and_thread_exit() {
 
 mod behavior;
 mod chunk_allocator;
+mod properties;

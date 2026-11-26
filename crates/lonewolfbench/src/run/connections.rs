@@ -517,83 +517,33 @@ struct Actor {
     observer: RunObserver,
 }
 
+struct Served {
+    deadline: Option<Instant>,
+    spontaneous: Option<Instant>,
+}
+
 impl Actor {
-    #[expect(clippy::cognitive_complexity)]
-    async fn run(self) -> ShutdownSummary {
+    async fn run(mut self) -> ShutdownSummary {
+        let (writes, mut written) = EventSink::bounded(
+            const { NonZeroUsize::new(2).unwrap() },
+            self.invalid.clone(),
+        );
+        let Served {
+            deadline,
+            spontaneous,
+        } = self.serve(&writes, &mut written).await;
         let Self {
             index,
             mut reader,
             mut writer,
-            mut commands,
-            mut control,
+            commands: _commands,
+            control: _control,
             state,
             events,
             invalid,
             active,
             observer,
         } = self;
-        let (writes, mut written) =
-            EventSink::bounded(const { NonZeroUsize::new(2).unwrap() }, invalid.clone());
-        let mut spontaneous = None;
-        let deadline = loop {
-            mirror_reader_invalid(&reader, index, &events, &invalid);
-            let current = *control.borrow_and_update();
-            match current {
-                Control::Shutdown(deadline) => break Some(deadline),
-                Control::Observe(epoch) => {
-                    if state.borrow().epoch != epoch {
-                        for _ in 0..256 {
-                            let queued = poll_fn(|cx| {
-                                let mut next = std::pin::pin!(reader.next());
-                                Poll::Ready(match next.as_mut().poll(cx) {
-                                    Poll::Ready(result) => Some(result),
-                                    Poll::Pending => None,
-                                })
-                            })
-                            .await;
-                            let Some(result) = queued else {
-                                break;
-                            };
-                            if let Some(at) = receive(index, result, &events) {
-                                spontaneous = Some(at);
-                                break;
-                            }
-                        }
-                        mirror_reader_invalid(&reader, index, &events, &invalid);
-                        state.send_modify(|state| state.epoch = epoch);
-                        if spontaneous.is_some() {
-                            break None;
-                        }
-                    }
-                }
-            }
-            if invalid.load(std::sync::atomic::Ordering::Acquire) {
-                break None;
-            }
-            tokio::select! {
-                biased;
-                changed = control.changed() => { if changed.is_err() { break None; } }
-                received = reader.next() => { if let Some(at) = receive(index, received, &events) { spontaneous = Some(at); break None; } }
-                command = commands.recv(), if !commands.is_closed() => {
-                    if let Some(command) = command {
-                        let result = send_until_shutdown(writer.send(&command, &writes), &mut control).await;
-                        while let Ok(event) = written.try_recv() {
-                            events.emit(match event {
-                                WriterEvent::WriteStarted { operation, at } => RunEvent::WriteStarted { index, operation, at },
-                                WriterEvent::WriteCompleted { operation, at, bytes } => RunEvent::WriteFinished { index, operation, at, succeeded: true, bytes },
-                                WriterEvent::WriteFailed { operation, at } => RunEvent::WriteFinished { index, operation, at, succeeded: false, bytes: 0 },
-                            });
-                        }
-                        if result.is_err() {
-                            let at = Instant::now();
-                            events.emit(RunEvent::ConnectionClosed { index, at });
-                            spontaneous = Some(at);
-                            break None;
-                        }
-                    }
-                }
-            }
-        };
         mirror_reader_invalid(&reader, index, &events, &invalid);
         if let Some(at) = spontaneous {
             state.send_modify(|state| state.closed_at = Some(at));
@@ -646,6 +596,125 @@ impl Actor {
                 clean: 0,
             }
         }
+    }
+
+    async fn serve(
+        &mut self,
+        writes: &EventSink,
+        written: &mut mpsc::Receiver<WriterEvent>,
+    ) -> Served {
+        let Self {
+            index,
+            reader,
+            writer,
+            commands,
+            control,
+            state,
+            events,
+            invalid,
+            ..
+        } = self;
+        let index = *index;
+        let mut spontaneous = None;
+        let deadline = loop {
+            mirror_reader_invalid(reader, index, events, invalid);
+            let current = *control.borrow_and_update();
+            match current {
+                Control::Shutdown(deadline) => break Some(deadline),
+                Control::Observe(epoch) => {
+                    if state.borrow().epoch != epoch {
+                        spontaneous = drain_queued(reader, index, events).await;
+                        mirror_reader_invalid(reader, index, events, invalid);
+                        state.send_modify(|state| state.epoch = epoch);
+                        if spontaneous.is_some() {
+                            break None;
+                        }
+                    }
+                }
+            }
+            if invalid.load(std::sync::atomic::Ordering::Acquire) {
+                break None;
+            }
+            tokio::select! {
+                biased;
+                changed = control.changed() => { if changed.is_err() { break None; } }
+                received = reader.next() => { if let Some(at) = receive(index, received, events) { spontaneous = Some(at); break None; } }
+                command = commands.recv(), if !commands.is_closed() => {
+                    if let Some(command) = command {
+                        let result = send_until_shutdown(writer.send(&command, writes), control).await;
+                        forward_writer_events(written, index, events);
+                        if result.is_err() {
+                            let at = Instant::now();
+                            events.emit(RunEvent::ConnectionClosed { index, at });
+                            spontaneous = Some(at);
+                            break None;
+                        }
+                    }
+                }
+            }
+        };
+        Served {
+            deadline,
+            spontaneous,
+        }
+    }
+}
+
+async fn drain_queued(
+    reader: &mut SessionReader,
+    index: u32,
+    events: &EventSender,
+) -> Option<Instant> {
+    for _ in 0..256 {
+        let queued = poll_fn(|cx| {
+            let mut next = std::pin::pin!(reader.next());
+            Poll::Ready(match next.as_mut().poll(cx) {
+                Poll::Ready(result) => Some(result),
+                Poll::Pending => None,
+            })
+        })
+        .await;
+        let Some(result) = queued else {
+            break;
+        };
+        if let Some(at) = receive(index, result, events) {
+            return Some(at);
+        }
+    }
+    None
+}
+
+fn forward_writer_events(
+    written: &mut mpsc::Receiver<WriterEvent>,
+    index: u32,
+    events: &EventSender,
+) {
+    while let Ok(event) = written.try_recv() {
+        events.emit(match event {
+            WriterEvent::WriteStarted { operation, at } => RunEvent::WriteStarted {
+                index,
+                operation,
+                at,
+            },
+            WriterEvent::WriteCompleted {
+                operation,
+                at,
+                bytes,
+            } => RunEvent::WriteFinished {
+                index,
+                operation,
+                at,
+                succeeded: true,
+                bytes,
+            },
+            WriterEvent::WriteFailed { operation, at } => RunEvent::WriteFinished {
+                index,
+                operation,
+                at,
+                succeeded: false,
+                bytes: 0,
+            },
+        });
     }
 }
 

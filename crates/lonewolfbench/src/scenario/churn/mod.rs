@@ -7,9 +7,9 @@ use crate::{
         TrafficPhase,
     },
     cpu::CpuPool,
-    error::BenchResult,
+    error::{BenchError, BenchResult},
     measurement::{
-        CloseOutcome, FinishReason, Ledger, LedgerContext, LedgerTopology, LoginOutcome,
+        CloseOutcome, DueSlots, FinishReason, Ledger, LedgerContext, LedgerTopology, LoginOutcome,
         MeasurementResult, OperationEvent, PhaseBarrier, RateSchedule, ReserveError, RouteIdentity,
         ScheduledSlot, SkipReason, Termination,
     },
@@ -333,7 +333,6 @@ pub(crate) async fn prime(context: &mut RunContext) -> BenchResult<()> {
     result
 }
 
-#[expect(clippy::cognitive_complexity)]
 async fn prime_with(
     context: &mut RunContext,
     pool: &mut AccountPool,
@@ -360,35 +359,37 @@ async fn prime_with(
     };
     let mut pending = Vec::with_capacity(count.min(context.config.measurement.connect_concurrency));
     let mut next = 0;
-    let mut error = None;
-    let mut iterations = None;
-    let mut mixed_iterations = false;
-    let mut tls = None;
-    let mut counters = CounterReport {
-        requested_connections: count as u64,
-        ..Default::default()
+    let mut tally = PrimeTally {
+        counters: CounterReport {
+            requested_connections: count as u64,
+            ..Default::default()
+        },
+        error: None,
+        iterations: None,
+        mixed_iterations: false,
+        tls: None,
     };
     let concurrency = context.config.measurement.connect_concurrency;
     while next < count || !pending.is_empty() {
         let now = Instant::now();
-        if error.is_none() {
+        if tally.error.is_none() {
             if *context.interruption.borrow() {
-                error = Some(failure("interrupted"));
+                tally.error = Some(failure("interrupted"));
             } else if now >= context.setup_deadline {
-                error = Some(failure("setup_deadline"));
+                tally.error = Some(failure("setup_deadline"));
             }
         }
-        if error.is_some() {
+        if tally.error.is_some() {
             stop.send_replace(true);
         }
         let slot = (next < count).then(|| schedule.slot(next as u64));
-        if error.is_none()
+        if tally.error.is_none()
             && let Some(slot) = slot
             && now >= slot.scheduled_at
             && pending.len() < concurrency
         {
             let Some(account) = pool.take(next) else {
-                error = Some(failure("churn_prime_account"));
+                tally.error = Some(failure("churn_prime_account"));
                 continue;
             };
             pending.push(launch(
@@ -402,14 +403,14 @@ async fn prime_with(
                 },
                 control.clone(),
             ));
-            counters.connection_attempts += 1;
+            tally.counters.connection_attempts += 1;
             next += 1;
             continue;
         }
-        if error.is_some() && pending.is_empty() {
+        if tally.error.is_some() && pending.is_empty() {
             break;
         }
-        let wake = if error.is_some() {
+        let wake = if tally.error.is_some() {
             context.setup_deadline
         } else {
             match slot {
@@ -421,44 +422,99 @@ async fn prime_with(
         tokio::select! {
             biased;
             completed = next_completed(&mut pending), if !pending.is_empty() => {
-                let succeeded = matches!(completed.outcome.login, LoginOutcome::Succeeded { .. });
-                let clean = matches!(completed.outcome.close, Some(CloseOutcome::Clean { .. }));
-                if succeeded { counters.login_succeeded += 1; } else { counters.login_failed += 1; }
-                if let LoginOutcome::Failed { category, .. } = completed.outcome.login { *counters.errors.entry(category).or_default() += 1; }
-                if let Some(failure) = &completed.outcome.failure && failure.kind == ConnectFailureKind::Deadline { *counters.errors.entry(ErrorCategory::Deadline).or_default() += 1; }
-                if let Some(CloseOutcome::Failed { category, .. }) = completed.outcome.close { *counters.errors.entry(category).or_default() += 1; }
-                if clean {
-                    counters.closed_cleanly += 1;
-                    let observed = completed.account.cached_scram_iterations();
-                    if counters.closed_cleanly == 1 { iterations = observed; tls = completed.tls.clone(); }
-                    else if iterations != observed { mixed_iterations = true; }
-                } else {
-                    counters.close_failed += u64::from(succeeded);
-                    if error.is_none() {
-                        error = Some(if *context.interruption.borrow() { failure("interrupted") }
-                            else { completed.outcome.failure.as_ref().map_or_else(|| failure("churn_prime_close_failed"), |failure| failure.error.clone()) });
-                    }
-                }
+                tally.record(&completed, &context.interruption);
                 pool.complete(completed);
             },
-            _ = context.interruption.changed(), if error.is_none() => {},
-            _ = sleep_until(wake), if error.is_none() => {},
+            _ = context.interruption.changed(), if tally.error.is_none() => {},
+            _ = sleep_until(wake), if tally.error.is_none() => {},
         }
     }
-    context.setup_attempts = counters.connection_attempts;
-    context.setup_failures = counters.login_failed;
-    counters.established_connections = counters.login_succeeded;
-    if let Some(phase) = context.report.phases.last_mut() {
-        phase.counters = counters;
-    }
-    if error.is_none() {
-        context.report.target.scram_iterations = if mixed_iterations { None } else { iterations };
-        if let Some(tls) = tls {
-            context.report.target.negotiated_tls = Some(format!("{:?}", tls.version));
-            context.report.target.cipher = Some(format!("{:?}", tls.cipher));
+    tally.finish(context)
+}
+
+struct PrimeTally {
+    counters: CounterReport,
+    error: Option<BenchError>,
+    iterations: Option<u32>,
+    mixed_iterations: bool,
+    tls: Option<NegotiatedTls>,
+}
+
+impl PrimeTally {
+    fn record(&mut self, completed: &CompletedCycle, interruption: &watch::Receiver<bool>) {
+        let Self {
+            counters,
+            error,
+            iterations,
+            mixed_iterations,
+            tls,
+        } = self;
+        let succeeded = matches!(completed.outcome.login, LoginOutcome::Succeeded { .. });
+        let clean = matches!(completed.outcome.close, Some(CloseOutcome::Clean { .. }));
+        if succeeded {
+            counters.login_succeeded += 1;
+        } else {
+            counters.login_failed += 1;
+        }
+        if let LoginOutcome::Failed { category, .. } = completed.outcome.login {
+            *counters.errors.entry(category).or_default() += 1;
+        }
+        if let Some(failure) = &completed.outcome.failure
+            && failure.kind == ConnectFailureKind::Deadline
+        {
+            *counters.errors.entry(ErrorCategory::Deadline).or_default() += 1;
+        }
+        if let Some(CloseOutcome::Failed { category, .. }) = completed.outcome.close {
+            *counters.errors.entry(category).or_default() += 1;
+        }
+        if clean {
+            counters.closed_cleanly += 1;
+            let observed = completed.account.cached_scram_iterations();
+            if counters.closed_cleanly == 1 {
+                *iterations = observed;
+                *tls = completed.tls.clone();
+            } else if *iterations != observed {
+                *mixed_iterations = true;
+            }
+        } else {
+            counters.close_failed += u64::from(succeeded);
+            if error.is_none() {
+                *error = Some(if *interruption.borrow() {
+                    failure("interrupted")
+                } else {
+                    completed.outcome.failure.as_ref().map_or_else(
+                        || failure("churn_prime_close_failed"),
+                        |failure| failure.error.clone(),
+                    )
+                });
+            }
         }
     }
-    error.map_or(Ok(()), Err)
+
+    fn finish(self, context: &mut RunContext) -> BenchResult<()> {
+        let Self {
+            mut counters,
+            error,
+            iterations,
+            mixed_iterations,
+            tls,
+        } = self;
+        context.setup_attempts = counters.connection_attempts;
+        context.setup_failures = counters.login_failed;
+        counters.established_connections = counters.login_succeeded;
+        if let Some(phase) = context.report.phases.last_mut() {
+            phase.counters = counters;
+        }
+        if error.is_none() {
+            context.report.target.scram_iterations =
+                if mixed_iterations { None } else { iterations };
+            if let Some(tls) = tls {
+                context.report.target.negotiated_tls = Some(format!("{:?}", tls.version));
+                context.report.target.cipher = Some(format!("{:?}", tls.cipher));
+            }
+        }
+        error.map_or(Ok(()), Err)
+    }
 }
 
 struct ChurnPhase {
@@ -658,7 +714,6 @@ struct PhaseSettings {
     duration: Duration,
 }
 
-#[expect(clippy::cognitive_complexity)]
 async fn run_phase(
     context: &mut RunContext,
     pool: &mut AccountPool,
@@ -669,7 +724,7 @@ async fn run_phase(
     let timeout = Duration::from_millis(context.config.measurement.operation_timeout_ms);
     let shutdown = Duration::from_millis(context.config.measurement.shutdown_timeout_ms);
     let dispatch = policy(&context.config);
-    let mut schedule = RateSchedule::new(
+    let schedule = RateSchedule::new(
         start,
         settings.duration,
         NonZeroU32::new(settings.rate).ok_or_else(|| failure("churn_rate"))?,
@@ -680,7 +735,7 @@ async fn run_phase(
         accounts: NonZeroU32::new(pool.accounts.len() as u32)
             .ok_or_else(|| failure("churn_accounts"))?,
     };
-    let mut phase = ChurnPhase {
+    let phase = ChurnPhase {
         ledger: Ledger::new(
             schedule.planned(),
             context
@@ -721,8 +776,7 @@ async fn run_phase(
     }
     let phase_index = context.start_phase_at(name, start, Some(end));
     let drain_deadline = end + timeout + shutdown;
-    let mut drain_index = None;
-    let mut pending = Vec::with_capacity(
+    let pending = Vec::with_capacity(
         pool.accounts
             .len()
             .min(context.config.measurement.connect_concurrency),
@@ -732,12 +786,114 @@ async fn run_phase(
         interruption: context.interruption.clone(),
         stop: stopped,
     };
-    let mut next_dispatch = Some(start);
-    let termination = loop {
+    let mut run = ChurnRun {
+        phase,
+        schedule,
+        pending,
+        next_dispatch: Some(start),
+        phase_index,
+        drain_index: None,
+        drain_name,
+        end,
+        drain_deadline,
+        timeout,
+        lag_allowance: dispatch.lag_allowance,
+        letter,
+        nonce,
+        control,
+        stop,
+        measuring,
+        duration: settings.duration,
+        rate: settings.rate,
+        topology,
+    };
+    let termination = run.drive(context, pool, launch).await;
+    Ok(run.conclude(context, pool, termination).await)
+}
+
+struct InvalidLedger;
+
+struct ChurnRun {
+    phase: ChurnPhase,
+    schedule: RateSchedule,
+    pending: Vec<CycleFuture>,
+    next_dispatch: Option<Instant>,
+    phase_index: usize,
+    drain_index: Option<usize>,
+    drain_name: PhaseName,
+    end: Instant,
+    drain_deadline: Instant,
+    timeout: Duration,
+    lag_allowance: Duration,
+    letter: char,
+    nonce: String,
+    control: CycleControl,
+    stop: watch::Sender<bool>,
+    measuring: bool,
+    duration: Duration,
+    rate: u32,
+    topology: LedgerTopology,
+}
+
+impl ChurnRun {
+    async fn drive(
+        &mut self,
+        context: &mut RunContext,
+        pool: &mut AccountPool,
+        launch: &mut Launcher<'_>,
+    ) -> Termination {
+        loop {
+            if self.observe_ready(pool).await {
+                break Termination::Failed;
+            }
+            let now = Instant::now();
+            if *context.interruption.borrow() {
+                break Termination::Cancelled;
+            }
+            if context.invalid.load(Ordering::Acquire) {
+                let _ = self.phase.ledger.observe(OperationEvent::EventOverflow);
+                break Termination::Failed;
+            }
+            if now >= self.end && self.drain_index.is_none() {
+                context.finish_phase(self.phase_index, PhaseStatus::Completed);
+                self.drain_index = Some(context.start_phase_at(
+                    self.drain_name,
+                    self.end,
+                    Some(self.drain_deadline),
+                ));
+            }
+            if self.next_dispatch.is_some_and(|at| now >= at) {
+                let due = self.schedule.poll_due(now);
+                if self.dispatch_due(due, pool, launch).is_err() {
+                    break Termination::Failed;
+                }
+            }
+            if now >= self.end && self.next_dispatch.is_none() && self.pending.is_empty() {
+                break Termination::Completed;
+            }
+            if now >= self.drain_deadline {
+                self.phase
+                    .reason(ReasonCode::AccountingError, "churn_drain_deadline");
+                break Termination::Failed;
+            }
+            let wake = self.wake(now);
+            tokio::select! {
+                biased;
+                completed = next_completed(&mut self.pending), if !self.pending.is_empty() => {
+                    let outcome = pool.complete(completed);
+                    if self.phase.observe(outcome).is_err() { break Termination::Failed; }
+                },
+                _ = context.interruption.changed() => {},
+                _ = sleep_until(wake) => {},
+            }
+        }
+    }
+
+    async fn observe_ready(&mut self, pool: &mut AccountPool) -> bool {
         let mut observation_error = false;
-        for _ in 0..pending.len() {
+        for _ in 0..self.pending.len() {
             let completed = poll_fn(|cx| {
-                Poll::Ready(match poll_completed(&mut pending, cx) {
+                Poll::Ready(match poll_completed(&mut self.pending, cx) {
                     Poll::Ready(value) => Some(value),
                     Poll::Pending => None,
                 })
@@ -746,192 +902,205 @@ async fn run_phase(
             let Some(completed) = completed else {
                 break;
             };
-            if phase.observe(pool.complete(completed)).is_err() {
+            if self.phase.observe(pool.complete(completed)).is_err() {
                 observation_error = true;
             }
         }
-        if observation_error {
-            break Termination::Failed;
+        observation_error
+    }
+
+    fn dispatch_due(
+        &mut self,
+        due: DueSlots,
+        pool: &mut AccountPool,
+        launch: &mut Launcher<'_>,
+    ) -> Result<(), InvalidLedger> {
+        let Self {
+            phase,
+            schedule,
+            pending,
+            next_dispatch,
+            timeout,
+            lag_allowance,
+            letter,
+            nonce,
+            control,
+            ..
+        } = self;
+        let (timeout, lag_allowance, letter) = (*timeout, *lag_allowance, *letter);
+        if phase
+            .ledger
+            .record_skipped(due.skipped, SkipReason::Scheduler)
+            .is_err()
+        {
+            return Err(InvalidLedger);
         }
-        let now = Instant::now();
-        if *context.interruption.borrow() {
-            break Termination::Cancelled;
+        let mut invalid = false;
+        for sequence in due.dispatch {
+            let slot = schedule.slot(sequence);
+            let index = (sequence % pool.accounts.len() as u64) as usize;
+            let at = Instant::now();
+            let skipped = if at >= schedule.tail_end()
+                || at.saturating_duration_since(slot.scheduled_at) > lag_allowance
+            {
+                Some(SkipReason::Scheduler)
+            } else if pool.states[index] == ChurnAccountState::Retired {
+                Some(SkipReason::Disconnected)
+            } else if pool.states[index] != ChurnAccountState::Idle {
+                Some(SkipReason::AccountBusy)
+            } else {
+                None
+            };
+            if let Some(reason) = skipped {
+                if pool.states[index] == ChurnAccountState::Retired {
+                    phase.reason(
+                        ReasonCode::OperationsFailed,
+                        "churn_retired_account_selected",
+                    );
+                }
+                if phase
+                    .ledger
+                    .record_skipped(sequence..sequence + 1, reason)
+                    .is_err()
+                {
+                    invalid = true;
+                    break;
+                }
+                continue;
+            }
+            let operation = match phase.ledger.reserve(
+                slot,
+                RouteIdentity::Churn {
+                    account_index: index as u32,
+                },
+            ) {
+                Ok(id) => id,
+                Err(ReserveError::Skipped(_)) => continue,
+                Err(ReserveError::Invalid(_)) => {
+                    invalid = true;
+                    break;
+                }
+            };
+            let admitted = Instant::now();
+            if admitted >= schedule.tail_end()
+                || admitted.saturating_duration_since(slot.scheduled_at) > lag_allowance
+            {
+                if phase
+                    .ledger
+                    .rollback_reservation(operation, SkipReason::Scheduler)
+                    .is_err()
+                {
+                    invalid = true;
+                    break;
+                }
+                continue;
+            }
+            let Some(account) = pool.take(index) else {
+                let _ = phase
+                    .ledger
+                    .rollback_reservation(operation, SkipReason::AccountBusy);
+                invalid = true;
+                break;
+            };
+            pending.push(launch(
+                account,
+                CycleRequest {
+                    slot,
+                    index: index as u32,
+                    resource: resource(nonce, letter, sequence),
+                    mode: KeyMode::Reuse,
+                    deadline: slot.scheduled_at + timeout,
+                },
+                control.clone(),
+            ));
+            if phase.ledger.commit_dispatch(operation, admitted).is_err() {
+                invalid = true;
+                break;
+            }
+        }
+        *next_dispatch = due.next_deadline;
+        if invalid { Err(InvalidLedger) } else { Ok(()) }
+    }
+
+    fn wake(&self, now: Instant) -> Instant {
+        self.next_dispatch
+            .unwrap_or(self.drain_deadline)
+            .min(if now < self.end {
+                self.end
+            } else {
+                self.drain_deadline
+            })
+    }
+
+    async fn conclude(
+        self,
+        context: &mut RunContext,
+        pool: &mut AccountPool,
+        termination: Termination,
+    ) -> MeasurementResult {
+        let Self {
+            mut phase,
+            mut pending,
+            phase_index,
+            mut drain_index,
+            drain_name,
+            drain_deadline,
+            control: _control,
+            stop,
+            measuring,
+            duration,
+            rate,
+            topology,
+            ..
+        } = self;
+        if drain_index.is_none() {
+            context.finish_phase(phase_index, PhaseStatus::Truncated);
+            drain_index = Some(context.start_phase(drain_name, Some(drain_deadline)));
+        }
+        let barrier = if pending.is_empty() && phase.ledger.is_settled() {
+            PhaseBarrier::Settled
+        } else {
+            PhaseBarrier::RetiredAndDrained
+        };
+        stop.send_replace(true);
+        while !pending.is_empty() {
+            let completed = next_completed(&mut pending).await;
+            let outcome = pool.complete(completed);
+            let _ = phase.observe(outcome);
         }
         if context.invalid.load(Ordering::Acquire) {
             let _ = phase.ledger.observe(OperationEvent::EventOverflow);
-            break Termination::Failed;
         }
-        if now >= end && drain_index.is_none() {
-            context.finish_phase(phase_index, PhaseStatus::Completed);
-            drain_index = Some(context.start_phase_at(drain_name, end, Some(drain_deadline)));
-        }
-        if next_dispatch.is_some_and(|at| now >= at) {
-            let due = schedule.poll_due(now);
-            if phase
-                .ledger
-                .record_skipped(due.skipped, SkipReason::Scheduler)
-                .is_err()
-            {
-                break Termination::Failed;
-            }
-            let mut invalid = false;
-            for sequence in due.dispatch {
-                let slot = schedule.slot(sequence);
-                let index = (sequence % pool.accounts.len() as u64) as usize;
-                let at = Instant::now();
-                let skipped = if at >= schedule.tail_end()
-                    || at.saturating_duration_since(slot.scheduled_at) > dispatch.lag_allowance
-                {
-                    Some(SkipReason::Scheduler)
-                } else if pool.states[index] == ChurnAccountState::Retired {
-                    Some(SkipReason::Disconnected)
-                } else if pool.states[index] != ChurnAccountState::Idle {
-                    Some(SkipReason::AccountBusy)
+        let result = phase.finish(termination, barrier);
+        if let Some(index) = drain_index {
+            context.finish_phase(
+                index,
+                if result.status().measured() {
+                    PhaseStatus::Completed
                 } else {
-                    None
-                };
-                if let Some(reason) = skipped {
-                    if pool.states[index] == ChurnAccountState::Retired {
-                        phase.reason(
-                            ReasonCode::OperationsFailed,
-                            "churn_retired_account_selected",
-                        );
-                    }
-                    if phase
-                        .ledger
-                        .record_skipped(sequence..sequence + 1, reason)
-                        .is_err()
-                    {
-                        invalid = true;
-                        break;
-                    }
-                    continue;
-                }
-                let operation = match phase.ledger.reserve(
-                    slot,
-                    RouteIdentity::Churn {
-                        account_index: index as u32,
-                    },
-                ) {
-                    Ok(id) => id,
-                    Err(ReserveError::Skipped(_)) => continue,
-                    Err(ReserveError::Invalid(_)) => {
-                        invalid = true;
-                        break;
-                    }
-                };
-                let admitted = Instant::now();
-                if admitted >= schedule.tail_end()
-                    || admitted.saturating_duration_since(slot.scheduled_at)
-                        > dispatch.lag_allowance
-                {
-                    if phase
-                        .ledger
-                        .rollback_reservation(operation, SkipReason::Scheduler)
-                        .is_err()
-                    {
-                        invalid = true;
-                        break;
-                    }
-                    continue;
-                }
-                let Some(account) = pool.take(index) else {
-                    let _ = phase
-                        .ledger
-                        .rollback_reservation(operation, SkipReason::AccountBusy);
-                    invalid = true;
-                    break;
-                };
-                pending.push(launch(
-                    account,
-                    CycleRequest {
-                        slot,
-                        index: index as u32,
-                        resource: resource(&nonce, letter, sequence),
-                        mode: KeyMode::Reuse,
-                        deadline: slot.scheduled_at + timeout,
-                    },
-                    control.clone(),
-                ));
-                if phase.ledger.commit_dispatch(operation, admitted).is_err() {
-                    invalid = true;
-                    break;
-                }
-            }
-            next_dispatch = due.next_deadline;
-            if invalid {
-                break Termination::Failed;
+                    PhaseStatus::Failed
+                },
+            );
+        }
+        context.report.phases[phase_index].counters = result.counters.clone();
+        let rates = result.rates(duration, rate, topology);
+        context.report.phases[phase_index].rates = rates.clone();
+        for reason in &result.reasons {
+            if (measuring || !reason.code.status().measured())
+                && !context.report.reasons.contains(reason)
+            {
+                context.report.reasons.push(reason.clone());
+                context.report.status = context.report.status.combine(reason.code.status());
             }
         }
-        if now >= end && next_dispatch.is_none() && pending.is_empty() {
-            break Termination::Completed;
+        if measuring {
+            context.report.counters = result.counters.clone();
+            context.report.counters.requested_connections = pool.accounts.len() as u64;
+            context.report.rates = rates;
+            context.report.latencies = result.latencies.clone();
         }
-        if now >= drain_deadline {
-            phase.reason(ReasonCode::AccountingError, "churn_drain_deadline");
-            break Termination::Failed;
-        }
-        let wake = next_dispatch.unwrap_or(drain_deadline).min(if now < end {
-            end
-        } else {
-            drain_deadline
-        });
-        tokio::select! {
-            biased;
-            completed = next_completed(&mut pending), if !pending.is_empty() => {
-                let outcome = pool.complete(completed);
-                if phase.observe(outcome).is_err() { break Termination::Failed; }
-            },
-            _ = context.interruption.changed() => {},
-            _ = sleep_until(wake) => {},
-        }
-    };
-    if drain_index.is_none() {
-        context.finish_phase(phase_index, PhaseStatus::Truncated);
-        drain_index = Some(context.start_phase(drain_name, Some(drain_deadline)));
+        result
     }
-    let barrier = if pending.is_empty() && phase.ledger.is_settled() {
-        PhaseBarrier::Settled
-    } else {
-        PhaseBarrier::RetiredAndDrained
-    };
-    stop.send_replace(true);
-    while !pending.is_empty() {
-        let completed = next_completed(&mut pending).await;
-        let outcome = pool.complete(completed);
-        let _ = phase.observe(outcome);
-    }
-    if context.invalid.load(Ordering::Acquire) {
-        let _ = phase.ledger.observe(OperationEvent::EventOverflow);
-    }
-    let result = phase.finish(termination, barrier);
-    if let Some(index) = drain_index {
-        context.finish_phase(
-            index,
-            if result.status().measured() {
-                PhaseStatus::Completed
-            } else {
-                PhaseStatus::Failed
-            },
-        );
-    }
-    context.report.phases[phase_index].counters = result.counters.clone();
-    let rates = result.rates(settings.duration, settings.rate, topology);
-    context.report.phases[phase_index].rates = rates.clone();
-    for reason in &result.reasons {
-        if (measuring || !reason.code.status().measured())
-            && !context.report.reasons.contains(reason)
-        {
-            context.report.reasons.push(reason.clone());
-            context.report.status = context.report.status.combine(reason.code.status());
-        }
-    }
-    if measuring {
-        context.report.counters = result.counters.clone();
-        context.report.counters.requested_connections = pool.accounts.len() as u64;
-        context.report.rates = rates;
-        context.report.latencies = result.latencies.clone();
-    }
-    Ok(result)
 }
 
 #[cfg(test)]

@@ -63,6 +63,24 @@ mod unit {
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("warning: review log field token", result.stdout)
 
+    def test_e2e_sources_reject_test_step_comments(self):
+        with tempfile.TemporaryDirectory() as work:
+            root = Path(work)
+            def git(*args):
+                subprocess.run(["git", *args], cwd=root, check=True, capture_output=True)
+
+            git("init", "-q")
+            git("-c", "user.name=Test", "-c", "user.email=test@example.org",
+                "commit", "--no-gpg-sign", "--signoff", "--allow-empty", "-qm", "baseline")
+            for name in ("e2e", "src"):
+                (root / name).mkdir()
+                (root / name / "flow.rs").write_text("fn flow() {\n    // Now connect\n}\n")
+            git("add", ".")
+            result = subprocess.run([sys.executable, SCRIPTS / "check-rust-diff.py", "HEAD"],
+                                    cwd=root, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertEqual(result.stdout.splitlines(), ["e2e/flow.rs:2: error: test step comment"])
+
 
 class NativeDependenciesTest(unittest.TestCase):
     def test_only_enabled_native_build_edges_and_links_fail(self):

@@ -54,12 +54,12 @@ x509-cert.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 
 [[test]]
-name = "benchmark_accounts"
-path = "../lonewolf-core/tests/benchmark/accounts.rs"
+name = "e2e_benchmark_accounts"
+path = "../../e2e/benchmark/accounts.rs"
 
 [[test]]
-name = "benchmark_remote"
-path = "../lonewolf-core/tests/benchmark/remote.rs"
+name = "e2e_benchmark_remote"
+path = "../../e2e/benchmark/remote.rs"
 
 [lints]
 workspace = true

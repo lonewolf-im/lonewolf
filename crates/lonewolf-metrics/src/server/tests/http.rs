@@ -1,17 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-#![expect(
-    unreachable_pub,
-    reason = "Test targets compile shared fixtures as private modules."
-)]
-
-#[expect(
-    dead_code,
-    reason = "Each test target uses a different subset of this fixture."
-)]
-#[path = "../support/ports.rs"]
-mod ports;
-
 use std::error::Error;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -22,11 +10,35 @@ use compio::runtime::Runtime;
 use compio::time::timeout;
 use futures_channel::oneshot;
 use futures_util::future::{Either, select};
-use lonewolf_metrics::MetricsServer;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::registry::Registry;
+use socket2::{Domain, Protocol, Socket, Type};
+
+use crate::MetricsServer;
 
 type TestResult = Result<(), Box<dyn Error>>;
+
+fn bind_released_listener(address: SocketAddr, deadline: Instant) -> io::Result<Socket> {
+    loop {
+        let result = Socket::new(
+            Domain::for_address(address),
+            Type::STREAM,
+            Some(Protocol::TCP),
+        )
+        .and_then(|socket| {
+            socket.set_reuse_address(true)?;
+            socket.bind(&address.into())?;
+            socket.listen(128)?;
+            Ok(socket)
+        });
+        match result {
+            Err(error) if error.kind() == io::ErrorKind::AddrInUse && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            result => return result,
+        }
+    }
+}
 
 async fn request(address: SocketAddr, request: &'static str) -> io::Result<String> {
     blocking::unblock(move || {
@@ -143,11 +155,10 @@ fn unknown_paths_and_methods_are_rejected() -> TestResult {
 #[test]
 fn shutdown_drains_connections_and_releases_the_port() -> TestResult {
     Runtime::new()?.block_on(async {
-        let (_reservation, address) = ports::reserve_listener_address()?;
-        let server = MetricsServer::bind(address).await?;
-        assert_eq!(server.local_addr(), address);
+        let server = MetricsServer::bind("127.0.0.1:0".parse()?).await?;
+        let address = server.local_addr();
         assert_eq!(
-            ports::bind_released_listener(address, Instant::now())
+            bind_released_listener(address, Instant::now())
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::AddrInUse
@@ -189,7 +200,7 @@ fn shutdown_drains_connections_and_releases_the_port() -> TestResult {
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(timeout(Duration::from_secs(5), task).await?.is_ok());
         let replacement = blocking::unblock(move || {
-            ports::bind_released_listener(address, Instant::now() + Duration::from_secs(2))
+            bind_released_listener(address, Instant::now() + Duration::from_secs(2))
         })
         .await?;
         assert_eq!(replacement.local_addr()?.as_socket(), Some(address));

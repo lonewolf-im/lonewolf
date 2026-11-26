@@ -9,7 +9,7 @@ filter = '''
 threads-required = "num-test-threads"
 
 [[profile.default.overrides]]
-filter = 'binary(protocol) | binary(benchmark_remote) | binary(benchmark_local)'
+filter = 'binary(e2e_protocol) | binary(e2e_benchmark_remote) | binary(e2e_benchmark_local)'
 test-group = 'protocol-servers'
 
 [profile.ci]

@@ -81,10 +81,10 @@ fn expired_validity_does_not_poll_session_work() -> TestResult {
         let polled = Cell::new(false);
         let result = monitor
             .interrupt(
-                async {
+                pin!(async {
                     polled.set(true);
                     Ok(())
-                },
+                }),
                 |_| ready(Err(CloseOutcome::CertificateInvalid)),
             )
             .await;
@@ -98,8 +98,8 @@ fn expired_validity_does_not_poll_session_work() -> TestResult {
 fn pending_revalidation_cannot_extend_expired_authority() -> TestResult {
     Runtime::new()?.block_on(async {
         let monitor = monitor(Duration::ZERO, Duration::from_millis(30));
-        let mut operation =
-            Box::pin(monitor.interrupt(pending::<Result<(), CloseOutcome>>(), |_| pending()));
+        let work = pin!(pending::<Result<(), CloseOutcome>>());
+        let mut operation = Box::pin(monitor.interrupt(work, |_| pending()));
         let wakes = std::sync::Arc::new(WakeCount::default());
         let waker = std::task::Waker::from(wakes.clone());
         let mut context = std::task::Context::from_waker(&waker);
@@ -121,20 +121,18 @@ fn slow_revalidation_keeps_session_work_polling() -> TestResult {
         let revalidating = Cell::new(false);
         let polled = Cell::new(false);
         let complete = Cell::new(false);
-        let mut operation = Box::pin(monitor.interrupt(
-            poll_fn(|_| {
-                polled.set(true);
-                if complete.get() {
-                    Poll::Ready(Ok(()))
-                } else {
-                    Poll::Pending
-                }
-            }),
-            |_| {
-                revalidating.set(true);
-                pending()
-            },
-        ));
+        let work = pin!(poll_fn(|_| {
+            polled.set(true);
+            if complete.get() {
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
+            }
+        }));
+        let mut operation = Box::pin(monitor.interrupt(work, |_| {
+            revalidating.set(true);
+            pending()
+        }));
         assert!(futures_util::poll!(operation.as_mut()).is_pending());
         assert!(revalidating.get());
         assert!(polled.get());
@@ -150,7 +148,7 @@ fn revoked_certificate_stops_a_pending_session() -> TestResult {
     Runtime::new()?.block_on(async {
         let monitor = monitor(Duration::ZERO, Duration::from_secs(1));
         let result = monitor
-            .interrupt(pending::<Result<(), CloseOutcome>>(), |_| {
+            .interrupt(pin!(pending::<Result<(), CloseOutcome>>()), |_| {
                 ready(Err(CloseOutcome::CertificateInvalid))
             })
             .await;
@@ -169,14 +167,14 @@ fn renewed_validity_survives_transition_between_operations() -> TestResult {
         };
         assert_eq!(
             monitor
-                .interrupt(ready(Ok(())), |_| ready(Ok(renewed)))
+                .interrupt(pin!(ready(Ok(()))), |_| ready(Ok(renewed)))
                 .await,
             Ok(())
         );
         assert_eq!(monitor.validity.get(), renewed);
         monitor.clock.advance(Duration::from_millis(40));
         assert_eq!(
-            monitor.interrupt(ready(Ok(())), |_| pending()).await,
+            monitor.interrupt(pin!(ready(Ok(()))), |_| pending()).await,
             Ok(())
         );
     });
@@ -189,7 +187,8 @@ fn cancellation_drops_monitor_without_session_effects() -> TestResult {
         let old = monitor(Duration::ZERO, Duration::from_secs(1));
         let current = monitor(Duration::from_secs(1), Duration::from_secs(2));
         let revalidating = Cell::new(false);
-        let operation = old.interrupt(pending::<Result<(), CloseOutcome>>(), |_| {
+        let work = pin!(pending::<Result<(), CloseOutcome>>());
+        let operation = old.interrupt(work, |_| {
             revalidating.set(true);
             pending()
         });
@@ -198,7 +197,7 @@ fn cancellation_drops_monitor_without_session_effects() -> TestResult {
         assert!(revalidating.get());
         drop(operation);
         assert_eq!(
-            current.interrupt(ready(Ok(())), |_| pending()).await,
+            current.interrupt(pin!(ready(Ok(()))), |_| pending()).await,
             Ok(())
         );
     });

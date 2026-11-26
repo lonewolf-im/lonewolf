@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 use std::future::{Future, poll_fn};
-use std::pin::pin;
+use std::pin::{Pin, pin};
 #[cfg(test)]
 use std::time::SystemTime;
 use std::time::{Duration, Instant};
@@ -27,14 +27,15 @@ use crate::s2s::validity::{LinkValidity, MonitorLog, ValidityMonitor, supervise}
 const CLOSE_BUDGET: Duration = Duration::from_secs(6);
 const FOOTER_GRACE: Duration = Duration::from_secs(5);
 
+/// Takes the work pinned so its future is not stored twice.
 async fn watch<T>(
     stop: Option<Stop>,
     validity: Option<&LinkValidity>,
     timeout: Duration,
     timeout_reason: StreamClose,
-    work: impl Future<Output = Result<T, S2sError>>,
+    work: Pin<&mut impl Future<Output = Result<T, S2sError>>>,
 ) -> Result<T, StreamClose> {
-    let work = async {
+    let work = pin!(async {
         compio::time::timeout(timeout, work)
             .await
             .map_err(|_| timeout_reason)?
@@ -43,14 +44,15 @@ async fn watch<T>(
                 S2sError::Timeout => StreamClose::StalledWrite,
                 _ => StreamClose::TransportError,
             })
-    };
+    });
     watch_control(stop, validity, work).await
 }
 
+/// Takes the work pinned so its future is not stored twice.
 async fn watch_control<T>(
     stop: Option<Stop>,
     validity: Option<&LinkValidity>,
-    work: impl Future<Output = Result<T, StreamClose>>,
+    work: Pin<&mut impl Future<Output = Result<T, StreamClose>>>,
 ) -> Result<T, StreamClose> {
     let stop = async {
         match stop {
@@ -64,7 +66,7 @@ async fn watch_control<T>(
             None => std::future::pending().await,
         }
     };
-    match select(pin!(stop), pin!(select(pin!(expiry), pin!(work)))).await {
+    match select(pin!(stop), pin!(select(pin!(expiry), work))).await {
         Either::Left(_) => Err(StreamClose::Shutdown),
         Either::Right((Either::Left((reason, _)), _)) => Err(reason),
         Either::Right((Either::Right((result, _)), _)) => result,
@@ -149,10 +151,10 @@ pub(super) async fn write<A: ChunkAllocator + Clone, W: AsyncWrite + Unpin>(
             Some(validity),
             timeout,
             StreamClose::StalledWrite,
-            poll_fn(|cx| {
+            pin!(poll_fn(|cx| {
                 drop(queued.reservation.take());
                 operation.as_mut().poll(cx)
-            }),
+            })),
         )
         .await
     };
@@ -207,7 +209,7 @@ pub(super) async fn flush_buffered<A: ChunkAllocator, W: AsyncWrite + Unpin>(
             Some(validity),
             Duration::from_secs(inner.limits.stalled_write_timeout_secs.get()),
             StreamClose::StalledWrite,
-            writer.flush(),
+            pin!(writer.flush()),
         )
         .await?;
         *buffered = false;
@@ -243,20 +245,23 @@ async fn graceful<
         validity,
         CLOSE_BUDGET,
         StreamClose::StalledWrite,
-        async {
-            compio::time::timeout(write_timeout, writer.close(condition))
+        pin!(async {
+            compio::time::timeout(write_timeout, pin!(writer.close(condition)))
                 .await
                 .map_err(|_| S2sError::Timeout)??;
             let mut peer_footer = matches!(reason, StreamClose::StreamEnd);
             if !peer_footer {
-                let _ = compio::time::timeout(FOOTER_GRACE, async {
-                    while let Ok(Some(event)) = reader.next_event().await {
-                        if matches!(event, StreamEvent::StreamEnd) {
-                            peer_footer = true;
-                            break;
+                let _ = compio::time::timeout(
+                    FOOTER_GRACE,
+                    pin!(async {
+                        while let Ok(Some(event)) = reader.next_event().await {
+                            if matches!(event, StreamEvent::StreamEnd) {
+                                peer_footer = true;
+                                break;
+                            }
                         }
-                    }
-                })
+                    }),
+                )
                 .await;
             }
             writer.shutdown().await?;
@@ -265,7 +270,7 @@ async fn graceful<
             } else {
                 Ok(())
             }
-        },
+        }),
     )
     .await
 }
@@ -349,7 +354,8 @@ async fn serve_with_clock<
                 }),
             }
         };
-        match watch_control(Some(inner.stopped.clone()), Some(validity), next).await {
+        let next = watch_control(Some(inner.stopped.clone()), Some(validity), pin!(next)).await;
+        match next {
             Ok(Next::Queued) => {
                 let Some(queued) = current.as_mut() else {
                     return Closed {

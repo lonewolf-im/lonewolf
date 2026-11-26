@@ -3,6 +3,7 @@
 use std::future::{Future, poll_fn};
 use std::io::Write;
 use std::panic::{AssertUnwindSafe, resume_unwind};
+use std::pin::pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::Poll;
@@ -102,13 +103,15 @@ impl WorkHandle {
 }
 
 impl WorkGuard {
-    pub(crate) async fn run<F: Future>(self, work: F) -> F::Output {
-        let result = AssertUnwindSafe(work).catch_unwind().await;
-        drop(self);
-        match result {
-            Ok(value) => value,
-            Err(payload) => resume_unwind(payload),
-        }
+    /// A combinator instead of an `async fn` keeps a single copy of `work` in the returned future.
+    pub(crate) fn run<F: Future>(self, work: F) -> impl Future<Output = F::Output> {
+        AssertUnwindSafe(work).catch_unwind().map(move |result| {
+            drop(self);
+            match result {
+                Ok(value) => value,
+                Err(payload) => resume_unwind(payload),
+            }
+        })
     }
 }
 
@@ -646,7 +649,7 @@ impl<A: ChunkAllocator + Clone + 'static> DeliveryHandle<A> for RouterDelivery<A
                 .route_full(RoutedStanza::from_parts(stanza, arena))
                 .await
                 .map_err(|_| DeliveryError)?;
-            match compio::time::timeout(timeout.min(MAX_TIMEOUT), pending.response()).await {
+            match compio::time::timeout(timeout.min(MAX_TIMEOUT), pin!(pending.response())).await {
                 Ok(Some(response)) => Ok(response),
                 Ok(None) | Err(_) => Err(DeliveryError),
             }

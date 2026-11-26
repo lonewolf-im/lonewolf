@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use std::pin::pin;
 use std::sync::Arc;
 
 use futures_channel::oneshot;
@@ -42,7 +43,9 @@ impl ResourcePresence {
             && let Some(gate) = router.service_presence_gate(source)
         {
             self.service_lease = Some(Arc::new(
-                outbox.drain_until(registration, gate.acquire()).await?,
+                outbox
+                    .drain_until(registration, pin!(gate.acquire()))
+                    .await?,
             ));
         }
         Ok(self.service_lease.as_ref().map(|lease| {

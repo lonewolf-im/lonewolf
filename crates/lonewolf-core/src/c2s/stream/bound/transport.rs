@@ -84,10 +84,10 @@ impl<A: ChunkAllocator + Clone> Transport<A> {
         let close = &*close;
         let monitor = monitor.as_ref();
         let reading = async {
-            let read = async {
+            let read = pin!(async {
                 link.read(reader, monitor).await;
                 Ok(())
-            };
+            });
             let result = match monitor {
                 Some(monitor) => monitor.interrupt(read).await,
                 None => read.await,

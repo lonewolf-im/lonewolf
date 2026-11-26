@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::future::Future;
-use std::pin::pin;
+use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -130,14 +130,15 @@ fn rejection(peer: &InboundPeer, stanza_kind: &'static str, closed: Closed) -> C
     closed
 }
 
+/// Takes the operation pinned so its future is not stored twice.
 async fn interrupt<T>(
     shutdown: ShutdownSignal,
     validity: &LinkValidity,
-    operation: impl Future<Output = T>,
+    operation: Pin<&mut impl Future<Output = T>>,
 ) -> Result<T, StreamErrorCondition> {
     match select(
         pin!(shutdown),
-        pin!(select(pin!(validity.wait()), pin!(operation))),
+        pin!(select(pin!(validity.wait()), operation)),
     )
     .await
     {
@@ -418,15 +419,19 @@ where
             .as_ref()
             .map_or(last_input, |physical| physical.last().max(last_input));
         let deadline = last_activity + settings.idle_timeout;
-        let event = interrupt(shutdown.clone(), validity, async {
-            if clock.now() >= deadline {
-                return Err(Closed::footer(StreamClose::Idle, false));
-            }
-            match select(pin!(clock.sleep_until(deadline)), pin!(reader.next_event())).await {
-                Either::Left(_) => Err(Closed::footer(StreamClose::Idle, false)),
-                Either::Right((result, _)) => result.map_err(Closed::reader_error),
-            }
-        })
+        let event = interrupt(
+            shutdown.clone(),
+            validity,
+            pin!(async {
+                if clock.now() >= deadline {
+                    return Err(Closed::footer(StreamClose::Idle, false));
+                }
+                match select(pin!(clock.sleep_until(deadline)), pin!(reader.next_event())).await {
+                    Either::Left(_) => Err(Closed::footer(StreamClose::Idle, false)),
+                    Either::Right((result, _)) => result.map_err(Closed::reader_error),
+                }
+            }),
+        )
         .await;
         let event = match event {
             Ok(Ok(Some(StreamEvent::StreamEnd))) => {
@@ -462,9 +467,13 @@ where
             context,
             false,
             async |stanza| {
-                interrupt(shutdown.clone(), validity, dispatch(context, peer, stanza))
-                    .await?
-                    .map_err(|_| StreamErrorCondition::InternalServerError)
+                interrupt(
+                    shutdown.clone(),
+                    validity,
+                    pin!(dispatch(context, peer, stanza)),
+                )
+                .await?
+                .map_err(|_| StreamErrorCondition::InternalServerError)
             },
         )
         .await;
@@ -518,15 +527,18 @@ async fn close<A, R, W>(
         writer.close(condition).await?;
         flushed();
         if !peer_closed {
-            let _ = compio::time::timeout(FOOTER_GRACE, async {
-                while let Some(event) = reader.next_event().await? {
-                    if matches!(event, StreamEvent::StreamEnd) {
-                        peer_closed = true;
-                        break;
+            let _ = compio::time::timeout(
+                FOOTER_GRACE,
+                pin!(async {
+                    while let Some(event) = reader.next_event().await? {
+                        if matches!(event, StreamEvent::StreamEnd) {
+                            peer_closed = true;
+                            break;
+                        }
                     }
-                }
-                Ok::<_, S2sError>(())
-            })
+                    Ok::<_, S2sError>(())
+                }),
+            )
             .await;
         }
         writer.shutdown().await?;

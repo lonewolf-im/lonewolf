@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::future::{Future, poll_fn};
-use std::pin::pin;
+use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::task::Poll;
 
@@ -227,19 +227,23 @@ impl<A: ChunkAllocator> LinkTransport<A> {
             }
             match command {
                 Command::Write(output) => {
-                    let write = writer.write(output);
+                    let write = pin!(writer.write(output));
                     #[cfg(feature = "test-support")]
-                    let write =
-                        crate::test_support::observe_write(self.probe_target.as_deref(), write);
+                    let write = pin!(crate::test_support::observe_write(
+                        self.probe_target.as_deref(),
+                        write
+                    ));
                     if let Some(Err(outcome)) = self.until_stopped(write).await {
                         self.fail(outcome);
                     }
                 }
                 Command::Flush { through, request } => {
-                    let flush = writer.flush(through);
+                    let flush = pin!(writer.flush(through));
                     #[cfg(feature = "test-support")]
-                    let flush =
-                        crate::test_support::observe_write(self.probe_target.as_deref(), flush);
+                    let flush = pin!(crate::test_support::observe_write(
+                        self.probe_target.as_deref(),
+                        flush
+                    ));
                     match self.until_stopped(flush).await {
                         Some(Ok(())) => {
                             {
@@ -338,11 +342,11 @@ impl<A: ChunkAllocator> LinkTransport<A> {
         .await
     }
 
+    /// Takes the operation pinned so its future is not stored twice.
     async fn until_stopped(
         &self,
-        operation: impl Future<Output = Result<(), CloseOutcome>>,
+        mut operation: Pin<&mut impl Future<Output = Result<(), CloseOutcome>>>,
     ) -> Option<Result<(), CloseOutcome>> {
-        let mut operation = pin!(operation);
         poll_fn(|context| {
             self.state.transport.register(context.waker());
             let stopped = self.state.progress.lock().stopped;

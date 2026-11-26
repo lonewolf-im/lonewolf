@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::future::{Future, poll_fn};
-use std::pin::pin;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Weak};
 use std::task::Poll;
@@ -304,13 +304,16 @@ impl Drop for WriteGuard {
     }
 }
 
-pub(crate) async fn observe_write<F: Future>(target: Option<&str>, future: F) -> F::Output {
+/// Takes the write pinned so its future is not stored twice.
+pub(crate) async fn observe_write<F: Future>(
+    target: Option<&str>,
+    mut future: Pin<&mut F>,
+) -> F::Output {
     let mut guard = WriteGuard {
         state: target.and_then(state),
         held: false,
         completed: false,
     };
-    let mut future = pin!(future);
     let result = poll_fn(|context| {
         if guard.held
             && let Some(state) = &guard.state

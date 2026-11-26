@@ -16,6 +16,7 @@ use openmetrics::{MetricSnapshot, derive_interval, parse_snapshot};
 use prometheus_client::{encoding::text::encode, registry::Registry};
 use serde::Serialize;
 use std::{
+    collections::BTreeMap,
     io::{self, Write},
     net::SocketAddr,
     sync::{
@@ -329,7 +330,6 @@ struct Resources {
     previous_steal: Option<(f64, u64)>,
 }
 impl Resources {
-    #[expect(clippy::cognitive_complexity)]
     fn observe(
         &mut self,
         snapshot: MetricSnapshot,
@@ -377,32 +377,60 @@ impl Resources {
             }
         }
         if let Some(cpu) = snapshot.cpu_seconds {
-            if let Some((previous, ps, pe)) = self.previous_cpu {
-                if cpu < previous {
-                    reason(report, ReasonCode::TelemetryPartial, "counter_decreased");
-                } else if let Some((ws, we)) = window
-                    && ws <= ps
-                    && end <= we
-                    && end > pe
-                {
-                    let seconds = self.cpu_seconds + (cpu - previous);
-                    let elapsed = self.cpu_elapsed + (end - pe) as f64 / 1e9;
-                    let average = seconds / elapsed;
-                    if average.is_finite() {
-                        self.cpu_seconds = seconds;
-                        self.cpu_elapsed = elapsed;
-                        self.cpu.value = Some(average);
-                        self.cpu.sample_count += 1;
-                        self.cpu.start_offset_ns.get_or_insert(pe);
-                        self.cpu.end_offset_ns = Some(end);
-                    } else {
-                        reason(report, ReasonCode::TelemetryPartial, "nonfinite_derivation");
-                    }
+            self.observe_cpu(cpu, (start, end), window, report);
+        }
+        self.observe_policy_rejections(snapshot.policy_rejections, server, report);
+        if let Some(current) = snapshot.dropped_logs {
+            if self
+                .previous_dropped
+                .is_some_and(|previous| previous > current)
+            {
+                reason(report, ReasonCode::TelemetryPartial, "counter_decreased");
+            }
+            self.previous_dropped = Some(current);
+        }
+    }
+
+    fn observe_cpu(
+        &mut self,
+        cpu: f64,
+        (start, end): (u64, u64),
+        window: Option<(u64, u64)>,
+        report: &mut TelemetryReport,
+    ) {
+        if let Some((previous, ps, pe)) = self.previous_cpu {
+            if cpu < previous {
+                reason(report, ReasonCode::TelemetryPartial, "counter_decreased");
+            } else if let Some((ws, we)) = window
+                && ws <= ps
+                && end <= we
+                && end > pe
+            {
+                let seconds = self.cpu_seconds + (cpu - previous);
+                let elapsed = self.cpu_elapsed + (end - pe) as f64 / 1e9;
+                let average = seconds / elapsed;
+                if average.is_finite() {
+                    self.cpu_seconds = seconds;
+                    self.cpu_elapsed = elapsed;
+                    self.cpu.value = Some(average);
+                    self.cpu.sample_count += 1;
+                    self.cpu.start_offset_ns.get_or_insert(pe);
+                    self.cpu.end_offset_ns = Some(end);
+                } else {
+                    reason(report, ReasonCode::TelemetryPartial, "nonfinite_derivation");
                 }
             }
-            self.previous_cpu = Some((cpu, start, end));
         }
-        for (key, current) in snapshot.policy_rejections {
+        self.previous_cpu = Some((cpu, start, end));
+    }
+
+    fn observe_policy_rejections(
+        &mut self,
+        rejections: BTreeMap<String, u64>,
+        server: bool,
+        report: &mut TelemetryReport,
+    ) {
+        for (key, current) in rejections {
             if let Some(previous) = self.previous_policies.insert(key.clone(), current) {
                 if let Some(delta) = current.checked_sub(previous) {
                     if server {
@@ -418,15 +446,21 @@ impl Resources {
                 }
             }
         }
-        if let Some(current) = snapshot.dropped_logs {
-            if self
-                .previous_dropped
-                .is_some_and(|previous| previous > current)
-            {
-                reason(report, ReasonCode::TelemetryPartial, "counter_decreased");
-            }
-            self.previous_dropped = Some(current);
+    }
+
+    fn observe_steal(&mut self, value: f64, end_ns: u64, window: Option<(u64, u64)>) {
+        if let Some((previous, at)) = self.previous_steal
+            && let Some((ws, we)) = window
+            && ws <= at
+            && end_ns <= we
+            && value >= previous
+        {
+            self.steal.value = Some(self.steal.value.unwrap_or(0.0) + value - previous);
+            self.steal.sample_count += 1;
+            self.steal.start_offset_ns.get_or_insert(at);
+            self.steal.end_offset_ns = Some(end_ns);
         }
+        self.previous_steal = Some((value, end_ns));
     }
     fn finish(self, achieved: u64) -> ResourceSummary {
         let mut incremental = if achieved > 0 {
@@ -504,7 +538,6 @@ impl ReadyBoundary {
     }
 }
 
-#[expect(clippy::cognitive_complexity)]
 async fn sample_loop(
     config: SamplerConfig,
     epoch: Instant,
@@ -515,11 +548,19 @@ async fn sample_loop(
 ) -> (TelemetryReport, Vec<u8>, Option<MetricSnapshot>) {
     let mut registry = Registry::default();
     registry.register_collector(Box::new(lonewolf_metrics::ProcessCollector::new()));
-    let mut report = TelemetryReport {
-        quality: TelemetryStatus::Complete,
-        ..TelemetryReport::default()
+    let mut sampling = Sampling {
+        report: TelemetryReport {
+            quality: TelemetryStatus::Complete,
+            ..TelemetryReport::default()
+        },
+        raw: Vec::new(),
+        server: Resources::default(),
+        generator: Resources::default(),
+        output_limited: false,
+        ready: ReadyBoundary {
+            completion: Some(ready_send),
+        },
     };
-    let mut raw = Vec::new();
     let interval = Duration::from_millis(config.timing.interval_ms);
     let mut next_tick = Instant::now() + interval;
     let mut initial_sample = true;
@@ -529,18 +570,12 @@ async fn sample_loop(
         window: None,
         achieved_connections: 0,
     };
-    let mut server = Resources::default();
-    let mut generator = Resources::default();
-    let mut output_limited = false;
     let mut end_sampled = false;
     let mut encoding = String::with_capacity(4096);
-    let mut ready = ReadyBoundary {
-        completion: Some(ready_send),
-    };
     loop {
         let nominal_end = current.window.map(|(_, end)| end).filter(|_| !end_sampled);
         if !initial_sample {
-            report.missed_ticks += skip_ticks(&mut next_tick, Instant::now(), interval);
+            sampling.report.missed_ticks += skip_ticks(&mut next_tick, Instant::now(), interval);
         }
         let scheduled = if initial_sample {
             initial_sample = false;
@@ -567,114 +602,194 @@ async fn sample_loop(
             .window
             .map(|(a, b)| (offset(epoch, a), offset(epoch, b)));
         for scope in ["generator", "server"] {
-            let sample_start = Instant::now();
-            let body = if scope == "generator" {
-                encoding.clear();
-                encode(&mut encoding, &registry)
-                    .map(|()| encoding.clone())
-                    .map_err(|_| "generator_encode")
-            } else if let Some(endpoint) = &config.endpoint {
-                scrape(
-                    endpoint,
-                    Duration::from_millis(config.timing.timeout_ms),
-                    &mut stopped,
-                )
-                .await
-            } else {
-                Err("endpoint_unavailable")
-            };
-            let steal = if scope == "generator" {
-                host_steal()
-            } else {
-                None
-            };
-            let sample_end = Instant::now();
-            let (ss, se) = (offset(epoch, sample_start), offset(epoch, sample_end));
-            let parsed = body
-                .as_ref()
-                .ok()
-                .and_then(|body| parse_snapshot(body).ok());
-            let error = body
-                .as_ref()
-                .err()
-                .copied()
-                .or_else(|| parsed.is_none().then_some("parse"));
-            if let Some(snapshot) = parsed {
-                report.samples_ok += 1;
-                if scope == "server" {
-                    ready.observe_server(&mut server, snapshot, (ss, se), window, &mut report);
-                } else {
-                    generator.observe(snapshot, (ss, se), window, false, false, &mut report);
-                    if let Some(value) = steal {
-                        if let Some((previous, at)) = generator.previous_steal
-                            && let Some((ws, we)) = window
-                            && ws <= at
-                            && se <= we
-                            && value >= previous
-                        {
-                            generator.steal.value =
-                                Some(generator.steal.value.unwrap_or(0.0) + value - previous);
-                            generator.steal.sample_count += 1;
-                            generator.steal.start_offset_ns.get_or_insert(at);
-                            generator.steal.end_offset_ns = Some(se);
-                        }
-                        generator.previous_steal = Some((value, se));
-                    }
-                }
-            } else {
-                report.samples_failed += 1;
-                reason(
-                    &mut report,
-                    ReasonCode::TelemetryPartial,
-                    error.unwrap_or("parse"),
-                );
-            }
-            let bytes = body.as_ref().map_or(0, String::len);
-            if !output_limited
-                && !append_raw(
-                    &mut raw,
-                    RAW_CAPACITY,
-                    &Sample {
-                        scope,
-                        scheduled_offset_ns: offset(epoch, scheduled),
-                        start_offset_ns: ss,
-                        end_offset_ns: se,
-                        phase: current.phase,
-                        status: if error.is_some() { "failed" } else { "ok" },
-                        error,
-                        bytes,
-                        duration_ns: se - ss,
-                        openmetrics: if error.is_none() {
-                            body.as_deref().ok()
-                        } else {
-                            None
-                        },
-                    },
-                )
-            {
-                output_limited = true;
-                reason(&mut report, ReasonCode::TelemetryPartial, "output_limit");
-            }
+            let sample = collect_sample(
+                scope,
+                epoch,
+                &config,
+                &registry,
+                &mut encoding,
+                &mut stopped,
+            )
+            .await;
+            sampling.record(&sample, offset(epoch, scheduled), window, current.phase);
         }
-        ready.complete();
+        sampling.ready.complete();
         if Instant::now().duration_since(start) > interval {
-            reason(&mut report, ReasonCode::TelemetryPartial, "slow_scrape");
+            reason(
+                &mut sampling.report,
+                ReasonCode::TelemetryPartial,
+                "slow_scrape",
+            );
         }
     }
-    report.queue_overflows = overflows.load(Ordering::Relaxed);
-    if report.queue_overflows > 0 {
-        reason(&mut report, ReasonCode::TelemetryPartial, "queue_overflow");
+    sampling.finish(
+        overflows.load(Ordering::Relaxed),
+        current.achieved_connections,
+    )
+}
+
+struct ScopeSample {
+    scope: &'static str,
+    body: Result<String, &'static str>,
+    steal: Option<f64>,
+    start_ns: u64,
+    end_ns: u64,
+}
+
+async fn collect_sample(
+    scope: &'static str,
+    epoch: Instant,
+    config: &SamplerConfig,
+    registry: &Registry,
+    encoding: &mut String,
+    stopped: &mut watch::Receiver<Option<Instant>>,
+) -> ScopeSample {
+    let sample_start = Instant::now();
+    let body = if scope == "generator" {
+        encoding.clear();
+        encode(encoding, registry)
+            .map(|()| encoding.clone())
+            .map_err(|_| "generator_encode")
+    } else if let Some(endpoint) = &config.endpoint {
+        scrape(
+            endpoint,
+            Duration::from_millis(config.timing.timeout_ms),
+            stopped,
+        )
+        .await
+    } else {
+        Err("endpoint_unavailable")
+    };
+    let steal = if scope == "generator" {
+        host_steal()
+    } else {
+        None
+    };
+    let sample_end = Instant::now();
+    ScopeSample {
+        scope,
+        body,
+        steal,
+        start_ns: offset(epoch, sample_start),
+        end_ns: offset(epoch, sample_end),
     }
-    if report.missed_ticks > 0 {
-        reason(&mut report, ReasonCode::TelemetryPartial, "missed_ticks");
+}
+
+struct Sampling {
+    report: TelemetryReport,
+    raw: Vec<u8>,
+    server: Resources,
+    generator: Resources,
+    output_limited: bool,
+    ready: ReadyBoundary,
+}
+
+impl Sampling {
+    fn record(
+        &mut self,
+        sample: &ScopeSample,
+        scheduled_ns: u64,
+        window: Option<(u64, u64)>,
+        phase: PhaseName,
+    ) {
+        let Self {
+            report,
+            raw,
+            server,
+            generator,
+            output_limited,
+            ready,
+        } = self;
+        let ScopeSample {
+            scope,
+            ref body,
+            start_ns: ss,
+            end_ns: se,
+            ..
+        } = *sample;
+        let parsed = body
+            .as_ref()
+            .ok()
+            .and_then(|body| parse_snapshot(body).ok());
+        let error = body
+            .as_ref()
+            .err()
+            .copied()
+            .or_else(|| parsed.is_none().then_some("parse"));
+        if let Some(snapshot) = parsed {
+            report.samples_ok += 1;
+            if scope == "server" {
+                ready.observe_server(server, snapshot, (ss, se), window, report);
+            } else {
+                generator.observe(snapshot, (ss, se), window, false, false, report);
+                if let Some(value) = sample.steal {
+                    generator.observe_steal(value, se, window);
+                }
+            }
+        } else {
+            report.samples_failed += 1;
+            reason(
+                report,
+                ReasonCode::TelemetryPartial,
+                error.unwrap_or("parse"),
+            );
+        }
+        let bytes = body.as_ref().map_or(0, String::len);
+        if !*output_limited
+            && !append_raw(
+                raw,
+                RAW_CAPACITY,
+                &Sample {
+                    scope,
+                    scheduled_offset_ns: scheduled_ns,
+                    start_offset_ns: ss,
+                    end_offset_ns: se,
+                    phase,
+                    status: if error.is_some() { "failed" } else { "ok" },
+                    error,
+                    bytes,
+                    duration_ns: se - ss,
+                    openmetrics: if error.is_none() {
+                        body.as_deref().ok()
+                    } else {
+                        None
+                    },
+                },
+            )
+        {
+            *output_limited = true;
+            reason(report, ReasonCode::TelemetryPartial, "output_limit");
+        }
     }
-    if report.samples_ok == 0 {
-        report.quality = TelemetryStatus::Unavailable;
+
+    fn finish(
+        self,
+        overflows: u64,
+        achieved_connections: u64,
+    ) -> (TelemetryReport, Vec<u8>, Option<MetricSnapshot>) {
+        let Self {
+            mut report,
+            raw,
+            server,
+            generator,
+            ready: _ready,
+            ..
+        } = self;
+        report.queue_overflows = overflows;
+        if report.queue_overflows > 0 {
+            reason(&mut report, ReasonCode::TelemetryPartial, "queue_overflow");
+        }
+        if report.missed_ticks > 0 {
+            reason(&mut report, ReasonCode::TelemetryPartial, "missed_ticks");
+        }
+        if report.samples_ok == 0 {
+            report.quality = TelemetryStatus::Unavailable;
+        }
+        let identity = server.identity.clone();
+        report.server = server.finish(achieved_connections);
+        report.generator = generator.finish(0);
+        (report, raw, Some(identity))
     }
-    let identity = server.identity.clone();
-    report.server = server.finish(current.achieved_connections);
-    report.generator = generator.finish(0);
-    (report, raw, Some(identity))
 }
 
 fn skip_ticks(next: &mut Instant, now: Instant, interval: Duration) -> u64 {

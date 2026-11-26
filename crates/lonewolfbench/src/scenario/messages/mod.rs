@@ -8,12 +8,12 @@ use crate::{
     config::ScenarioConfig,
     error::BenchResult,
     measurement::{
-        FinishReason, Ledger, LedgerContext, LedgerTopology, MeasurementResult, OperationEvent,
-        PhaseBarrier, RateSchedule, RejectedObservation, ReserveError, RouteIdentity,
-        ScheduledSlot, SkipReason, Termination,
+        DueSlots, FinishReason, Ledger, LedgerContext, LedgerTopology, MeasurementResult,
+        OperationEvent, PhaseBarrier, RateSchedule, RejectedObservation, ReserveError,
+        RouteIdentity, ScheduledSlot, SkipReason, Termination,
     },
     report::{ErrorCategory, PhaseName, PhaseStatus, ReasonCode},
-    run::{RunContext, events::RunEvent, failure, policy},
+    run::{RunContext, connections::ConnectionSet, events::RunEvent, failure, policy},
 };
 use std::{
     num::NonZeroU32,
@@ -358,7 +358,6 @@ fn within_dispatch_bounds(
     at >= slot.scheduled_at && at < tail_end && at.duration_since(slot.scheduled_at) <= lag
 }
 
-#[expect(clippy::cognitive_complexity)]
 async fn run_phase(
     context: &mut RunContext,
     settings: PhaseSettings,
@@ -367,7 +366,7 @@ async fn run_phase(
     let timeout = Duration::from_millis(context.config.measurement.operation_timeout_ms);
     let shutdown = Duration::from_millis(context.config.measurement.shutdown_timeout_ms);
     let dispatch_policy = policy(&context.config);
-    let mut schedule = RateSchedule::new(
+    let schedule = RateSchedule::new(
         start,
         settings.duration,
         NonZeroU32::new(settings.rate).ok_or_else(|| failure("message_rate"))?,
@@ -413,199 +412,283 @@ async fn run_phase(
         wire_bytes: 0,
         errors: Default::default(),
     });
-    let mut next_dispatch = Some(start);
-    let mut drain_index = None;
-    let drain_deadline = end + timeout;
-    let termination = loop {
-        context.consume_events();
-        if *context.interruption.borrow() {
-            break Termination::Cancelled;
-        }
-        if context.invalid.load(Ordering::Acquire) {
-            if let Some(phase) = &mut context.message_phase {
-                phase.observe(RunEvent::Invalid {
-                    index: 0,
-                    at: Instant::now(),
-                })?;
+    let mut run = MessageRun {
+        schedule,
+        next_dispatch: Some(start),
+        phase_index,
+        drain_index: None,
+        drain_name,
+        end,
+        drain_deadline: end + timeout,
+        timeout,
+        shutdown,
+        lag_allowance: dispatch_policy.lag_allowance,
+        traffic_phase: settings.phase,
+        measuring,
+        duration: settings.duration,
+        rate: settings.rate,
+        topology: settings.topology,
+    };
+    let termination = run.drive(context).await?;
+    run.conclude(context, termination).await
+}
+
+struct InvalidLedger;
+
+struct MessageRun {
+    schedule: RateSchedule,
+    next_dispatch: Option<Instant>,
+    phase_index: usize,
+    drain_index: Option<usize>,
+    drain_name: PhaseName,
+    end: Instant,
+    drain_deadline: Instant,
+    timeout: Duration,
+    shutdown: Duration,
+    lag_allowance: Duration,
+    traffic_phase: TrafficPhase,
+    measuring: bool,
+    duration: Duration,
+    rate: u32,
+    topology: LedgerTopology,
+}
+
+impl MessageRun {
+    async fn drive(&mut self, context: &mut RunContext) -> BenchResult<Termination> {
+        let termination = loop {
+            context.consume_events();
+            if *context.interruption.borrow() {
+                break Termination::Cancelled;
             }
-            break Termination::Failed;
-        }
-        let phase = context
-            .message_phase
-            .as_mut()
-            .ok_or_else(|| failure("message_phase_missing"))?;
-        if phase.fatal {
-            break Termination::Failed;
-        }
-        let now = Instant::now();
-        if phase.ledger.expire_through(now).is_err() {
-            break Termination::Failed;
-        }
-        if next_dispatch.is_some_and(|at| at <= now) {
-            let due = schedule.poll_due(now);
-            if phase
-                .ledger
-                .record_skipped(due.skipped, SkipReason::Scheduler)
-                .is_err()
+            if context.invalid.load(Ordering::Acquire) {
+                if let Some(phase) = &mut context.message_phase {
+                    phase.observe(RunEvent::Invalid {
+                        index: 0,
+                        at: Instant::now(),
+                    })?;
+                }
+                break Termination::Failed;
+            }
+            let phase = context
+                .message_phase
+                .as_mut()
+                .ok_or_else(|| failure("message_phase_missing"))?;
+            if phase.fatal {
+                break Termination::Failed;
+            }
+            let now = Instant::now();
+            if phase.ledger.expire_through(now).is_err() {
+                break Termination::Failed;
+            }
+            if self.next_dispatch.is_some_and(|at| at <= now) {
+                let due = self.schedule.poll_due(now);
+                if self.dispatch_due(phase, &context.connections, due).is_err() {
+                    break Termination::Failed;
+                }
+            }
+            if now >= self.end && self.drain_index.is_none() {
+                context.finish_phase(self.phase_index, PhaseStatus::Completed);
+                self.drain_index = Some(context.start_phase_at(
+                    self.drain_name,
+                    self.end,
+                    Some(self.drain_deadline),
+                ));
+            }
+            let settled = context
+                .message_phase
+                .as_ref()
+                .is_some_and(|phase| phase.ledger.is_settled());
+            if now >= self.end
+                && self.next_dispatch.is_none()
+                && (settled || now >= self.drain_deadline)
             {
-                break Termination::Failed;
+                break Termination::Completed;
             }
-            let mut invalid = false;
-            for sequence in due.dispatch {
-                let route = &phase.routes[sequence as usize % phase.routes.len()];
-                let slot = schedule.slot(sequence);
-                let operation = match phase.ledger.reserve(slot, route.identity()) {
-                    Ok(operation) => operation,
-                    Err(ReserveError::Skipped(_)) => continue,
-                    Err(ReserveError::Invalid(_)) => {
-                        invalid = true;
-                        break;
-                    }
-                };
-                let command = WriteCommand::Message(MessageCommand {
-                    operation,
-                    scheduled_at: slot.scheduled_at,
-                    route_index: (sequence % phase.routes.len() as u64) as u32,
-                    phase: settings.phase,
-                });
-                let admitted_at = Instant::now();
-                if !within_dispatch_bounds(
-                    slot,
-                    admitted_at,
-                    schedule.tail_end(),
-                    dispatch_policy.lag_allowance,
-                ) {
-                    if phase
-                        .ledger
-                        .rollback_reservation(operation, SkipReason::Scheduler)
-                        .is_err()
-                    {
-                        invalid = true;
-                        break;
-                    }
-                    continue;
-                }
-                let result = match context.connections.try_send(route.sender_index, command) {
-                    Ok(()) => phase.ledger.commit_dispatch(operation, admitted_at),
-                    Err(TrySendError::Full(_)) => phase
-                        .ledger
-                        .rollback_reservation(operation, SkipReason::WriterBusy),
-                    Err(TrySendError::Closed(_)) => phase
-                        .ledger
-                        .rollback_reservation(operation, SkipReason::Disconnected),
-                };
-                if result.is_err() {
-                    invalid = true;
-                    break;
-                }
+            let wake = self.wake(now);
+            tokio::select! {
+                biased;
+                _ = context.interruption.changed() => {},
+                event = context.events.recv() => if let Some(event) = event { context.consume(event); },
+                _ = sleep_until(wake) => {},
             }
-            if invalid {
-                break Termination::Failed;
-            }
-            next_dispatch = due.next_deadline;
-        }
-        if now >= end && drain_index.is_none() {
-            context.finish_phase(phase_index, PhaseStatus::Completed);
-            drain_index = Some(context.start_phase_at(drain_name, end, Some(drain_deadline)));
-        }
-        let settled = context
-            .message_phase
-            .as_ref()
-            .is_some_and(|phase| phase.ledger.is_settled());
-        if now >= end && next_dispatch.is_none() && (settled || now >= drain_deadline) {
-            break Termination::Completed;
-        }
-        let wake = next_dispatch.unwrap_or(drain_deadline).min(if now < end {
-            end
-        } else {
-            drain_deadline
-        });
-        tokio::select! {
-            biased;
-            _ = context.interruption.changed() => {},
-            event = context.events.recv() => if let Some(event) = event { context.consume(event); },
-            _ = sleep_until(wake) => {},
-        }
-    };
-    if drain_index.is_none() {
-        context.finish_phase(phase_index, PhaseStatus::Truncated);
-        drain_index = Some(context.start_phase(drain_name, Some(drain_deadline)));
+        };
+        Ok(termination)
     }
-    let settled = if termination == Termination::Completed
-        && !context.invalid.load(Ordering::Acquire)
-        && context
-            .message_phase
-            .as_ref()
-            .is_some_and(|phase| !phase.fatal)
-        && !*context.interruption.borrow()
-    {
-        context.settle_until(Instant::now() + timeout).await
-    } else {
-        Err(failure("message_phase_stopped"))
-    };
-    if let Some(index) = drain_index {
-        context.finish_phase(
-            index,
-            if termination == Termination::Completed {
-                PhaseStatus::Completed
+
+    fn dispatch_due(
+        &mut self,
+        phase: &mut MessagePhase,
+        connections: &ConnectionSet,
+        due: DueSlots,
+    ) -> Result<(), InvalidLedger> {
+        let Self {
+            schedule,
+            lag_allowance,
+            traffic_phase,
+            next_dispatch,
+            ..
+        } = self;
+        let (lag_allowance, traffic_phase) = (*lag_allowance, *traffic_phase);
+        if phase
+            .ledger
+            .record_skipped(due.skipped, SkipReason::Scheduler)
+            .is_err()
+        {
+            return Err(InvalidLedger);
+        }
+        for sequence in due.dispatch {
+            let route = &phase.routes[sequence as usize % phase.routes.len()];
+            let slot = schedule.slot(sequence);
+            let operation = match phase.ledger.reserve(slot, route.identity()) {
+                Ok(operation) => operation,
+                Err(ReserveError::Skipped(_)) => continue,
+                Err(ReserveError::Invalid(_)) => {
+                    return Err(InvalidLedger);
+                }
+            };
+            let command = WriteCommand::Message(MessageCommand {
+                operation,
+                scheduled_at: slot.scheduled_at,
+                route_index: (sequence % phase.routes.len() as u64) as u32,
+                phase: traffic_phase,
+            });
+            let admitted_at = Instant::now();
+            if !within_dispatch_bounds(slot, admitted_at, schedule.tail_end(), lag_allowance) {
+                if phase
+                    .ledger
+                    .rollback_reservation(operation, SkipReason::Scheduler)
+                    .is_err()
+                {
+                    return Err(InvalidLedger);
+                }
+                continue;
+            }
+            let result = match connections.try_send(route.sender_index, command) {
+                Ok(()) => phase.ledger.commit_dispatch(operation, admitted_at),
+                Err(TrySendError::Full(_)) => phase
+                    .ledger
+                    .rollback_reservation(operation, SkipReason::WriterBusy),
+                Err(TrySendError::Closed(_)) => phase
+                    .ledger
+                    .rollback_reservation(operation, SkipReason::Disconnected),
+            };
+            if result.is_err() {
+                return Err(InvalidLedger);
+            }
+        }
+        *next_dispatch = due.next_deadline;
+        Ok(())
+    }
+
+    fn wake(&self, now: Instant) -> Instant {
+        self.next_dispatch
+            .unwrap_or(self.drain_deadline)
+            .min(if now < self.end {
+                self.end
             } else {
-                PhaseStatus::Truncated
-            },
-        );
+                self.drain_deadline
+            })
     }
-    let barrier = if measuring || settled.is_err() {
-        context.close_connections(Instant::now() + shutdown).await;
-        PhaseBarrier::RetiredAndDrained
-    } else {
-        PhaseBarrier::Settled
-    };
-    let termination = if *context.interruption.borrow() {
-        Termination::Cancelled
-    } else if settled.is_err()
-        || context
-            .message_phase
-            .as_ref()
-            .is_some_and(|phase| phase.fatal)
-    {
-        Termination::Failed
-    } else {
-        termination
-    };
-    if context.invalid.load(Ordering::Acquire)
-        && let Some(phase) = &mut context.message_phase
-    {
-        let _ = phase.ledger.observe(OperationEvent::EventOverflow);
-    }
-    let result = context
-        .message_phase
-        .take()
-        .ok_or_else(|| failure("message_phase_missing"))?
-        .finish(termination, barrier);
-    let status = if result.status().measured() {
-        PhaseStatus::Completed
-    } else {
-        PhaseStatus::Failed
-    };
-    if let Some(index) = drain_index {
-        context.report.phases[index].status = status;
-    }
-    context.report.phases[phase_index].counters = result.counters.clone();
-    let rates = result.rates(settings.duration, settings.rate, settings.topology);
-    context.report.phases[phase_index].rates = rates.clone();
-    for reason in &result.reasons {
-        if measuring || !reason.code.status().measured() {
-            context.reason(reason.code, phase_context(reason.code));
+
+    async fn conclude(
+        self,
+        context: &mut RunContext,
+        termination: Termination,
+    ) -> BenchResult<MeasurementResult> {
+        let Self {
+            phase_index,
+            mut drain_index,
+            drain_name,
+            drain_deadline,
+            timeout,
+            shutdown,
+            measuring,
+            duration,
+            rate,
+            topology,
+            ..
+        } = self;
+        if drain_index.is_none() {
+            context.finish_phase(phase_index, PhaseStatus::Truncated);
+            drain_index = Some(context.start_phase(drain_name, Some(drain_deadline)));
         }
+        let settled = if termination == Termination::Completed
+            && !context.invalid.load(Ordering::Acquire)
+            && context
+                .message_phase
+                .as_ref()
+                .is_some_and(|phase| !phase.fatal)
+            && !*context.interruption.borrow()
+        {
+            context.settle_until(Instant::now() + timeout).await
+        } else {
+            Err(failure("message_phase_stopped"))
+        };
+        if let Some(index) = drain_index {
+            context.finish_phase(
+                index,
+                if termination == Termination::Completed {
+                    PhaseStatus::Completed
+                } else {
+                    PhaseStatus::Truncated
+                },
+            );
+        }
+        let barrier = if measuring || settled.is_err() {
+            context.close_connections(Instant::now() + shutdown).await;
+            PhaseBarrier::RetiredAndDrained
+        } else {
+            PhaseBarrier::Settled
+        };
+        let termination = if *context.interruption.borrow() {
+            Termination::Cancelled
+        } else if settled.is_err()
+            || context
+                .message_phase
+                .as_ref()
+                .is_some_and(|phase| phase.fatal)
+        {
+            Termination::Failed
+        } else {
+            termination
+        };
+        if context.invalid.load(Ordering::Acquire)
+            && let Some(phase) = &mut context.message_phase
+        {
+            let _ = phase.ledger.observe(OperationEvent::EventOverflow);
+        }
+        let result = context
+            .message_phase
+            .take()
+            .ok_or_else(|| failure("message_phase_missing"))?
+            .finish(termination, barrier);
+        let status = if result.status().measured() {
+            PhaseStatus::Completed
+        } else {
+            PhaseStatus::Failed
+        };
+        if let Some(index) = drain_index {
+            context.report.phases[index].status = status;
+        }
+        context.report.phases[phase_index].counters = result.counters.clone();
+        let rates = result.rates(duration, rate, topology);
+        context.report.phases[phase_index].rates = rates.clone();
+        for reason in &result.reasons {
+            if measuring || !reason.code.status().measured() {
+                context.reason(reason.code, phase_context(reason.code));
+            }
+        }
+        if measuring {
+            context.report.counters = result.counters.clone();
+            context.report.counters.requested_connections = context.config.account_count() as u64;
+            context.report.counters.established_connections =
+                context.connections.established() as u64;
+            context.report.rates = rates;
+            context.report.latencies = result.latencies.clone();
+            context.refresh_measurement();
+        }
+        Ok(result)
     }
-    if measuring {
-        context.report.counters = result.counters.clone();
-        context.report.counters.requested_connections = context.config.account_count() as u64;
-        context.report.counters.established_connections = context.connections.established() as u64;
-        context.report.rates = rates;
-        context.report.latencies = result.latencies.clone();
-        context.refresh_measurement();
-    }
-    Ok(result)
 }
 
 fn phase_context(code: ReasonCode) -> &'static str {

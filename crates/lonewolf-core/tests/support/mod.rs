@@ -7,7 +7,10 @@ use std::path::{Path, PathBuf};
 mod client;
 pub mod clock;
 pub mod component;
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "Each test target uses a different subset of this fixture."
+)]
 pub mod crl_gate;
 mod extensions;
 pub mod federation;

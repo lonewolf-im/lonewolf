@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-#![cfg_attr(test, allow(clippy::cognitive_complexity))]
-
 #[cfg(not(unix))]
 compile_error!("Lonewolf supports Unix targets only.");
 

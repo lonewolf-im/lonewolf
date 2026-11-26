@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
-#![cfg_attr(test, allow(clippy::cognitive_complexity))]
+#![cfg_attr(
+    test,
+    expect(
+        clippy::cognitive_complexity,
+        reason = "Keep each test scenario and its assertions together."
+    )
+)]
 
 pub mod accounts;
 pub mod cli;

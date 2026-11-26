@@ -854,11 +854,14 @@ fn transport_attempts_are_bounded_terminal_once_and_default_cancelled() -> Resul
     let output = render(&metrics)?;
     assert!(output.contains("# TYPE lonewolf_s2s_transport_attempts counter\n"));
     assert!(!output.contains("lonewolf_s2s_authentications_total"));
-    let samples: Vec<_> = output
-        .lines()
-        .filter(|line| line.starts_with("lonewolf_s2s_transport_attempts_total{"))
-        .collect();
-    assert_eq!(samples.len(), 2 * 2 * 24);
+
+    assert_eq!(
+        output
+            .lines()
+            .filter(|line| line.starts_with("lonewolf_s2s_transport_attempts_total{"))
+            .count(),
+        2 * 2 * 24
+    );
     for direction in Direction::ALL {
         for mode in TlsMode::ALL {
             for outcome in AuthOutcome::ALL

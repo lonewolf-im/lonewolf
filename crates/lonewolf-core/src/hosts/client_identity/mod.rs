@@ -522,7 +522,10 @@ pub(super) fn webpki_error(error: webpki::Error) -> rustls::Error {
         IssuerNotCrlSigner => CertRevocationListError::IssuerInvalidForCrl.into(),
 
         InvalidSignatureForPublicKey => CertificateError::BadSignature.into(),
-        #[allow(deprecated)]
+        #[expect(
+            deprecated,
+            reason = "Map legacy webpki error variants to their TLS errors."
+        )]
         UnsupportedSignatureAlgorithm | UnsupportedSignatureAlgorithmForPublicKey => {
             CertificateError::UnsupportedSignatureAlgorithm.into()
         }
@@ -542,7 +545,10 @@ pub(super) fn webpki_error(error: webpki::Error) -> rustls::Error {
         }
 
         InvalidCrlSignatureForPublicKey => CertRevocationListError::BadSignature.into(),
-        #[allow(deprecated)]
+        #[expect(
+            deprecated,
+            reason = "Map legacy webpki error variants to their TLS errors."
+        )]
         UnsupportedCrlSignatureAlgorithm | UnsupportedCrlSignatureAlgorithmForPublicKey => {
             CertRevocationListError::UnsupportedSignatureAlgorithm.into()
         }
@@ -561,7 +567,10 @@ pub(super) fn webpki_error(error: webpki::Error) -> rustls::Error {
             .into()
         }
 
-        #[allow(deprecated)]
+        #[expect(
+            deprecated,
+            reason = "Map legacy webpki error variants to their TLS errors."
+        )]
         RequiredEkuNotFound => CertificateError::InvalidPurpose.into(),
         RequiredEkuNotFoundContext(webpki::RequiredEkuNotFoundContext { required, present }) => {
             CertificateError::InvalidPurposeContext {

@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
+#![expect(
+    clippy::disallowed_macros,
+    reason = "The command reports results and errors on the console."
+)]
 use crate::{
     config::{RunConfig, absolute_path, validate_new_output},
     error::{BenchError, BenchResult, ErrorCode},

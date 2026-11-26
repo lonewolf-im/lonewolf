@@ -123,7 +123,7 @@ pub(super) struct Exchange {
 }
 
 impl Exchange {
-    pub fn new(account: &PreparedAccount) -> BenchResult<Self> {
+    pub(super) fn new(account: &PreparedAccount) -> BenchResult<Self> {
         let mut random = Zeroizing::new([0; 24]);
         getrandom::fill(&mut random[..]).map_err(|_| failure("random_failed"))?;
         Self::with_nonce(account, STANDARD.encode(&random[..]))
@@ -144,7 +144,7 @@ impl Exchange {
         Ok(Self { first, nonce, bare })
     }
 
-    pub fn challenge(&self, encoded: &str) -> BenchResult<Challenge> {
+    pub(super) fn challenge(&self, encoded: &str) -> BenchResult<Challenge> {
         let raw = decode(encoded, 4096)?;
         let message = std::str::from_utf8(&raw).map_err(|_| failure("scram_encoding"))?;
         let attributes = attributes(message)?;
@@ -187,7 +187,7 @@ impl Exchange {
         })
     }
 
-    pub async fn respond(
+    pub(super) async fn respond(
         self,
         account: &mut PreparedAccount,
         challenge: Challenge,
@@ -232,7 +232,7 @@ pub(super) struct Proof {
 }
 
 impl Proof {
-    pub fn verify(self, encoded: &str) -> BenchResult<()> {
+    pub(super) fn verify(self, encoded: &str) -> BenchResult<()> {
         let raw = decode(encoded, 4096)?;
         let message = std::str::from_utf8(&raw).map_err(|_| failure("scram_encoding"))?;
         let attributes = attributes(message)?;

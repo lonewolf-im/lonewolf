@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "Each test target uses a different subset of this fixture."
+)]
 #[path = "../support/ports.rs"]
 mod ports;
 

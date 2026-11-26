@@ -64,11 +64,10 @@ fn database(
         .create_with_backend(backend)
 }
 
-fn assert_worker_threads(backend: &ObservedBackend) -> TestResult {
-    let threads = backend.take_threads()?;
+fn assert_worker_threads(backend: &ObservedBackend) {
+    let threads = backend.take_threads();
     assert!(!threads.is_empty());
     assert!(threads.iter().all(|id| *id != thread::current().id()));
-    Ok(())
 }
 
 crate::tests::storage_contract_tests!(storage);
@@ -133,7 +132,7 @@ fn opening_a_database_without_blocklists_adds_an_empty_table_and_preserves_accou
         ELEMENTS.name(),
     ];
     let transaction = storage.as_ref().begin_write()?;
-    for table in transaction.list_tables()?.collect::<Vec<_>>() {
+    for table in transaction.list_tables()? {
         if !existing_tables.contains(&table.name()) {
             transaction.delete_table(table)?;
         }
@@ -502,25 +501,25 @@ fn all_operations_do_database_io_off_the_callers_thread() -> TestResult {
     let storage = RedbStorage::new(database(backend.clone(), 0)?)?;
     let alice = key("alice@example.com")?;
     let bob = jid("bob@example.com")?;
-    backend.take_threads()?;
+    backend.take_threads();
     block_on(async {
         let mut writer = storage.begin_write().await?;
         writer
             .create_account(new_account("alice@example.com", 10)?)
             .await?;
-        assert_worker_threads(&backend)?;
+        assert_worker_threads(&backend);
         assert!(writer.account(&alice).await?.is_some());
-        assert_worker_threads(&backend)?;
+        assert_worker_threads(&backend);
         assert_scram(writer.scram(&alice, ScramHash::Sha256).await?, 13)?;
-        assert_worker_threads(&backend)?;
+        assert_worker_threads(&backend);
         writer.replace_credentials(&alice, credentials(20)).await?;
-        assert_worker_threads(&backend)?;
+        assert_worker_threads(&backend);
         writer
             .replace_vcard(&alice, "worker vCard", VCardQuota::default())
             .await?;
-        assert_worker_threads(&backend)?;
+        assert_worker_threads(&backend);
         assert!(writer.vcard(&alice).await?.is_some());
-        assert_worker_threads(&backend)?;
+        assert_worker_threads(&backend);
         writer
             .update_private_xml(
                 &alice,
@@ -532,19 +531,19 @@ fn all_operations_do_database_io_off_the_callers_thread() -> TestResult {
                 PrivateXmlQuota::default(),
             )
             .await?;
-        assert_worker_threads(&backend)?;
+        assert_worker_threads(&backend);
         assert!(
             writer
                 .private_xml(&alice, "urn:worker", "worker")
                 .await?
                 .is_some()
         );
-        assert_worker_threads(&backend)?;
+        assert_worker_threads(&backend);
         assert_eq!(
             writer.accounts_after(None, NonZeroUsize::MAX).await?.len(),
             1
         );
-        assert_worker_threads(&backend)?;
+        assert_worker_threads(&backend);
         writer
             .put_roster_item(
                 &alice,
@@ -552,7 +551,7 @@ fn all_operations_do_database_io_off_the_callers_thread() -> TestResult {
                 RosterQuota::default(),
             )
             .await?;
-        assert_worker_threads(&backend)?;
+        assert_worker_threads(&backend);
         writer
             .put_pending_request(
                 &alice,
@@ -560,7 +559,7 @@ fn all_operations_do_database_io_off_the_callers_thread() -> TestResult {
                 std::num::NonZeroUsize::MAX,
             )
             .await?;
-        assert_worker_threads(&backend)?;
+        assert_worker_threads(&backend);
         assert_eq!(
             writer
                 .roster(&alice, RosterQuota::default())
@@ -569,33 +568,33 @@ fn all_operations_do_database_io_off_the_callers_thread() -> TestResult {
                 .len(),
             1
         );
-        assert_worker_threads(&backend)?;
+        assert_worker_threads(&backend);
         assert!(
             writer
                 .roster_item(&alice, &bob, RosterQuota::default())
                 .await?
                 .is_some()
         );
-        assert_worker_threads(&backend)?;
+        assert_worker_threads(&backend);
         assert_eq!(writer.pending_requests(&alice).await?.len(), 1);
-        assert_worker_threads(&backend)?;
+        assert_worker_threads(&backend);
         assert!(writer.pending_request(&alice, &bob).await?.is_some());
-        assert_worker_threads(&backend)?;
+        assert_worker_threads(&backend);
         writer.commit().await?;
-        assert_worker_threads(&backend)?;
+        assert_worker_threads(&backend);
 
         let reader = storage.begin_read().await?;
         assert!(reader.account(&alice).await?.is_some());
-        assert_worker_threads(&backend)?;
+        assert_worker_threads(&backend);
         assert!(reader.vcard(&alice).await?.is_some());
-        assert_worker_threads(&backend)?;
+        assert_worker_threads(&backend);
         assert_scram(reader.scram(&alice, ScramHash::Sha256).await?, 23)?;
-        assert_worker_threads(&backend)?;
+        assert_worker_threads(&backend);
         assert_eq!(
             reader.accounts_after(None, NonZeroUsize::MAX).await?.len(),
             1
         );
-        assert_worker_threads(&backend)?;
+        assert_worker_threads(&backend);
         assert_eq!(
             reader
                 .roster(&alice, RosterQuota::default())
@@ -604,35 +603,35 @@ fn all_operations_do_database_io_off_the_callers_thread() -> TestResult {
                 .len(),
             1
         );
-        assert_worker_threads(&backend)?;
+        assert_worker_threads(&backend);
         assert!(
             reader
                 .roster_item(&alice, &bob, RosterQuota::default())
                 .await?
                 .is_some()
         );
-        assert_worker_threads(&backend)?;
+        assert_worker_threads(&backend);
         assert_eq!(reader.pending_requests(&alice).await?.len(), 1);
-        assert_worker_threads(&backend)?;
+        assert_worker_threads(&backend);
         assert!(reader.pending_request(&alice, &bob).await?.is_some());
-        assert_worker_threads(&backend)?;
+        assert_worker_threads(&backend);
         drop(reader);
 
         let mut writer = storage.begin_write().await?;
         assert!(writer.remove_pending_request(&alice, &bob).await?);
-        assert_worker_threads(&backend)?;
+        assert_worker_threads(&backend);
         assert!(writer.remove_roster_item(&alice, &bob).await?.is_some());
-        assert_worker_threads(&backend)?;
+        assert_worker_threads(&backend);
         writer.clear_roster(&alice).await?;
-        assert_worker_threads(&backend)?;
+        assert_worker_threads(&backend);
         writer.delete_account(&alice).await?;
-        assert_worker_threads(&backend)?;
+        assert_worker_threads(&backend);
         writer.delete_vcard(&alice).await?;
-        assert_worker_threads(&backend)?;
+        assert_worker_threads(&backend);
         writer.clear_private_xml(&alice).await?;
-        assert_worker_threads(&backend)?;
+        assert_worker_threads(&backend);
         writer.commit().await?;
-        assert_worker_threads(&backend)?;
+        assert_worker_threads(&backend);
         Ok(())
     })
 }
@@ -718,7 +717,7 @@ fn a_committing_writer_and_queued_writers_do_not_block_reads() -> TestResult {
         .await?;
         let mut writer = storage.begin_write().await?;
         writer.create_account(new_account).await?;
-        let (entered, release) = backend.block_next_sync()?;
+        let (entered, release) = backend.block_next_sync();
         let mut commit = Box::pin(writer.commit());
         assert!(poll(commit.as_mut()).is_pending());
         entered.recv_timeout(TIMEOUT)?;
@@ -761,7 +760,7 @@ fn a_blocked_writer_does_not_block_writes_to_another_database() -> TestResult {
     block_on(async {
         let mut writer = storage.begin_write().await?;
         writer.create_account(account).await?;
-        let (entered, release) = backend.block_next_sync()?;
+        let (entered, release) = backend.block_next_sync();
         let mut commit = Box::pin(writer.commit());
         assert!(poll(commit.as_mut()).is_pending());
         entered.recv_timeout(TIMEOUT)?;
@@ -784,7 +783,7 @@ fn cancelling_a_submitted_commit_still_persists_the_write() -> TestResult {
     block_on(async {
         let mut writer = storage.begin_write().await?;
         writer.create_account(account).await?;
-        let (entered, release) = backend.block_next_sync()?;
+        let (entered, release) = backend.block_next_sync();
         let mut commit = Box::pin(writer.commit());
         assert!(poll(commit.as_mut()).is_pending());
         entered.recv_timeout(TIMEOUT)?;

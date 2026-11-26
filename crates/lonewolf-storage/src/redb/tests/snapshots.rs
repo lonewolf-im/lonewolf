@@ -83,7 +83,7 @@ fn cancelled_commit_retires_the_shared_snapshot() -> TestResult {
         let first = storage.begin_read().await?;
         let mut writer = storage.begin_write().await?;
         writer.create_account(account).await?;
-        let (entered, release) = backend.block_next_sync()?;
+        let (entered, release) = backend.block_next_sync();
         let mut commit = Box::pin(writer.commit());
         assert!(poll(commit.as_mut()).is_pending());
         entered.recv_timeout(TIMEOUT)?;

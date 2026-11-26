@@ -1456,7 +1456,6 @@ dependencies = [
  "time",
  "tokio",
  "x509-cert",
- "zeroize",
 ]
 
 [[package]]
@@ -1705,7 +1704,6 @@ dependencies = [
  "base64",
  "clap",
  "compio",
- "futures-executor",
  "futures-rustls",
  "getrandom 0.4.3",
  "hdrhistogram",
@@ -1715,8 +1713,6 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
- "idna",
- "lonewolf-acme",
  "lonewolf-auth",
  "lonewolf-core",
  "lonewolf-extension",
@@ -1742,7 +1738,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "toml",
- "tracing",
  "webpki-roots",
  "x509-cert",
  "zeroize",

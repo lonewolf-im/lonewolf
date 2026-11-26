@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::error::Error;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
@@ -67,21 +66,19 @@ struct SyncGate {
 }
 
 impl ObservedBackend {
-    pub(super) fn take_threads(&self) -> Result<Vec<ThreadId>, Box<dyn Error>> {
-        Ok(std::mem::take(&mut *self.threads.lock()))
+    pub(super) fn take_threads(&self) -> Vec<ThreadId> {
+        std::mem::take(&mut *self.threads.lock())
     }
 
     /// Returns a receiver that fires when the sync starts and a sender that lets it finish.
-    pub(crate) fn block_next_sync(
-        &self,
-    ) -> Result<(mpsc::Receiver<()>, mpsc::Sender<()>), Box<dyn Error>> {
+    pub(crate) fn block_next_sync(&self) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
         let (entered, started) = mpsc::channel();
         let (release, released) = mpsc::channel();
         *self.sync_gate.lock() = Some(SyncGate {
             entered,
             release: released,
         });
-        Ok((started, release))
+        (started, release)
     }
 
     fn record_thread(&self) {

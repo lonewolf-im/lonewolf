@@ -144,7 +144,7 @@ fn seed_mutual_subscription(directory: &Path) -> TestResult {
     })
 }
 
-fn assert_decoration(presence: &Element) -> TestResult {
+fn assert_decoration(presence: &Element) {
     presence.assert_name("jabber:client", "presence");
     let children = presence
         .children
@@ -153,7 +153,6 @@ fn assert_decoration(presence: &Element) -> TestResult {
         .collect::<Vec<_>>();
     assert_eq!(children.len(), 1, "{presence:?}");
     assert_eq!(children[0].attribute("n"), Some("1"), "{presence:?}");
-    Ok(())
 }
 
 #[test]
@@ -171,10 +170,10 @@ fn broadcast_presence_carries_the_decoration() -> TestResult {
     )?;
     let echo = alice.receive()?;
     assert_eq!(echo.attribute("id"), Some("alice"));
-    assert_decoration(&echo)?;
+    assert_decoration(&echo);
     let broadcast = bob.receive()?;
     assert_eq!(broadcast.attribute("id"), Some("alice"));
-    assert_decoration(&broadcast)?;
+    assert_decoration(&broadcast);
     assert_eq!(echo.children, broadcast.children);
     assert_eq!(alice.receive()?.attribute("id"), Some("bob"));
     alice.close()?;
@@ -193,9 +192,9 @@ fn failing_decorations_leave_the_presence_undecorated() -> TestResult {
     bob.send("<presence id='bob'/>")?;
     assert_eq!(bob.receive()?.attribute("id"), Some("bob"));
     alice.send("<presence id='alice'/>")?;
-    assert_decoration(&alice.receive()?)?;
+    assert_decoration(&alice.receive()?);
     let presence = bob.receive()?;
-    assert_decoration(&presence)?;
+    assert_decoration(&presence);
     assert!(
         !presence
             .children

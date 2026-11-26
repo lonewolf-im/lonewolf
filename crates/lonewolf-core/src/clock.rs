@@ -25,6 +25,10 @@ pub(crate) fn wall_now() -> std::time::SystemTime {
 pub(crate) fn unix_now() -> rustls::pki_types::UnixTime {
     #[cfg(feature = "test-support")]
     if let Some(clock) = crate::test_support::ManualClock::current() {
+        #[expect(
+            clippy::expect_used,
+            reason = "The manual TLS clock requires a representable Unix time."
+        )]
         return rustls::pki_types::UnixTime::since_unix_epoch(
             clock
                 .wall_now()

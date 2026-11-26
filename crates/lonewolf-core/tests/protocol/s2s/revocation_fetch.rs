@@ -28,10 +28,7 @@ fn crl_url(http: &CrlServer, mode: TlsMode, path: &str) -> String {
     }
 }
 
-fn assert_crl_host_dns(
-    dns: &super::super::support::federation::FakeDns,
-    mode: TlsMode,
-) -> TestResult {
+fn assert_crl_host_dns(dns: &super::super::support::federation::FakeDns, mode: TlsMode) {
     use hickory_proto::rr::RecordType;
     if mode == TlsMode::Direct {
         assert!(dns.query_count("crl.test", RecordType::A) > 0);
@@ -39,7 +36,6 @@ fn assert_crl_host_dns(
             assert_eq!(dns.query_count(service, RecordType::SRV), 0);
         }
     }
-    Ok(())
 }
 
 #[test]
@@ -106,7 +102,7 @@ fn revoked_peer_is_rejected_with_a_fetched_crl_in_both_directions_transport(
     assert_eq!(http.requests("revoked.crl"), 1);
 
     alice.close()?;
-    assert_crl_host_dns(&server.dns, mode)?;
+    assert_crl_host_dns(&server.dns, mode);
     server.stop()?;
     http.stop()?;
     Ok(())
@@ -255,7 +251,7 @@ fn peers_without_a_usable_crl_federate_with_an_unknown_status_transport(
     ] {
         assert_eq!(http.requests(path), 1);
     }
-    assert_crl_host_dns(&server.dns, mode)?;
+    assert_crl_host_dns(&server.dns, mode);
     server.stop()?;
     http.stop()?;
     Ok(())
@@ -348,7 +344,7 @@ fn unrevoked_peers_federate_with_fetched_crls_transport(mode: TlsMode) -> TestRe
     assert_eq!(http.requests("b.crl"), 1);
     alice.close()?;
     bob.close()?;
-    assert_crl_host_dns(&pair.dns, mode)?;
+    assert_crl_host_dns(&pair.dns, mode);
     pair.stop()?;
     http.stop()?;
     Ok(())
@@ -418,7 +414,7 @@ fn public_trust_policy_refuses_private_crl_destinations_transport(mode: TlsMode)
     }
     assert_eq!(http.requests("b.crl"), 0);
     assert_eq!(http.requests("c.crl"), 0);
-    assert_crl_host_dns(&server.dns, mode)?;
+    assert_crl_host_dns(&server.dns, mode);
     server.stop()?;
     http.stop()?;
     Ok(())
@@ -510,7 +506,7 @@ fn crl_arriving_after_the_handshake_wait_closes_the_revoked_link_transport(
         )?;
         checked(&server.suite, "inbound", "handshake", "revoked", "none", 1)?;
         assert_eq!(http.requests("late.crl"), 1);
-        assert_crl_host_dns(&server.dns, mode)?;
+        assert_crl_host_dns(&server.dns, mode);
         server.stop()?;
         http.stop()?;
         Ok(())
@@ -672,7 +668,7 @@ fn crl_refresh_revoking_a_live_peer_closes_its_links_transport(mode: TlsMode) ->
     assert_eq!(http.requests("a.crl"), requests);
     alice.close()?;
     bob.close()?;
-    assert_crl_host_dns(&pair.dns, mode)?;
+    assert_crl_host_dns(&pair.dns, mode);
     pair.stop()?;
     http.stop()?;
     Ok(())
@@ -803,7 +799,7 @@ fn stale_crls_still_reject_listed_peers_transport(mode: TlsMode) -> TestResult {
     y.close()?;
     z.close()?;
     alice.close()?;
-    assert_crl_host_dns(&server.dns, mode)?;
+    assert_crl_host_dns(&server.dns, mode);
     server.stop()?;
     http.stop()?;
     Ok(())
@@ -915,7 +911,7 @@ fn failing_crl_urls_back_off_and_share_one_fetch_transport(mode: TlsMode) -> Tes
         peer.close()?;
     }
     fourth.close()?;
-    assert_crl_host_dns(&server.dns, mode)?;
+    assert_crl_host_dns(&server.dns, mode);
     server.stop()?;
     http.stop()?;
     Ok(())

@@ -149,6 +149,10 @@ pub struct C2sSuite {
 }
 
 impl C2sSuite {
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "The ACME fixture implements this shared client interface with no override."
+    )]
     pub(super) fn client_domain_override(&self) -> Option<&str> {
         Some(&self.domain)
     }

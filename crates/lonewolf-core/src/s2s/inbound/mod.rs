@@ -100,7 +100,10 @@ impl AdmissionLimits {
 
 pub(crate) struct S2sListeners(ListenerSet);
 impl S2sListeners {
-    #[expect(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Pass each listener dependency with its required ownership."
+    )]
     pub(crate) async fn start<A: ChunkAllocator + Clone>(
         config: &S2sConfig,
         limits: &S2sLimits,

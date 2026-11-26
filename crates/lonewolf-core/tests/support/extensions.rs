@@ -1228,11 +1228,10 @@ async fn inspect_offline<A: ChunkAllocator>(
         None => None,
         Some(message) => {
             let mut parser = quick_xml::Reader::from_reader(message.stanza.as_ref());
-            let start = match parser.read_event().map_err(|_| condition)? {
-                quick_xml::events::Event::Start(start) | quick_xml::events::Event::Empty(start) => {
-                    start
-                }
-                _ => return Err(condition.into()),
+            let (quick_xml::events::Event::Start(start) | quick_xml::events::Event::Empty(start)) =
+                parser.read_event().map_err(|_| condition)?
+            else {
+                return Err(condition.into());
             };
             start
                 .attributes()

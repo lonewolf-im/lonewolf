@@ -259,7 +259,7 @@ fn cancelled_commit_still_updates_the_cache() -> TestResult {
         writer
             .change_blocklist(&owner, BlockChange::Block(&[jid(BOB)?]))
             .await?;
-        let (started, release) = backend.block_next_sync()?;
+        let (started, release) = backend.block_next_sync();
         {
             let mut commit = pin!(writer.commit());
             assert!(poll(commit.as_mut()).is_pending());

@@ -1448,9 +1448,8 @@ fn failed_restart_returns_the_unchanged_parser_and_unread_transport() -> TestRes
             config(4096)?,
             GlobalChunkAllocator,
         );
-        let mut parser = match parser.try_restart() {
-            Err((parser, ParseError::UnexpectedEvent)) => parser,
-            _ => return Err("expected initial restart rejection".into()),
+        let Err((mut parser, ParseError::UnexpectedEvent)) = parser.try_restart() else {
+            return Err("expected initial restart rejection".into());
         };
         open(&mut parser).await?;
         stanza(&mut parser).await?;
@@ -1458,9 +1457,8 @@ fn failed_restart_returns_the_unchanged_parser_and_unread_transport() -> TestRes
             parser.next_event().await?,
             Some(StreamEvent::StreamEnd)
         ));
-        let mut parser = match parser.try_restart() {
-            Err((parser, ParseError::UnexpectedEvent)) => parser,
-            _ => return Err("expected closed restart rejection".into()),
+        let Err((mut parser, ParseError::UnexpectedEvent)) = parser.try_restart() else {
+            return Err("expected closed restart rejection".into());
         };
         assert!(parser.next_event().await?.is_none());
         Ok(())
@@ -2432,10 +2430,10 @@ fn fatal_errors_override_recoverable_envelopes_and_release_the_pool() -> TestRes
 fn buffer_retention_reuses_small_events_and_releases_large_events() -> TestResult {
     let mut retained_capacities = Vec::new();
     for chunk in [4096, usize::MAX] {
-        for (name, sizes) in [
-            ("small_repeat", vec![1024; 32]),
-            ("large_then_small", vec![256 * 1024, 1024, 1024]),
-            ("consecutive_large", vec![256 * 1024; 4]),
+        for sizes in [
+            vec![1024; 32],
+            vec![256 * 1024, 1024, 1024],
+            vec![256 * 1024; 4],
         ] {
             block_on(async {
                 let mut input = String::from(OPEN);
@@ -2508,9 +2506,6 @@ fn buffer_retention_reuses_small_events_and_releases_large_events() -> TestResul
                     parser.next_event().await?,
                     Some(StreamEvent::StreamEnd)
                 ));
-                eprintln!(
-                    "parser retention case={name} chunk={chunk} payload_bytes={sizes:?} scratch_text_capacities={capacities:?}"
-                );
                 retained_capacities.extend(capacities);
                 Ok::<_, Box<dyn std::error::Error>>(())
             })?;

@@ -35,6 +35,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
         with:
           toolchain: stable
@@ -46,6 +47,17 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Check Rust license headers
         run: bash scripts/check-license-headers.sh
+      - name: Install Rust syntax parser
+        run: |
+          python3 -m venv "$RUNNER_TEMP/rust-syntax"
+          "$RUNNER_TEMP/rust-syntax/bin/pip" install --only-binary=:all: -r scripts/requirements.txt
+          echo "$RUNNER_TEMP/rust-syntax/bin" >> "$GITHUB_PATH"
+      - name: Test quality checks
+        run: python3 -B -m unittest discover -s scripts/tests
+      - name: Check added Rust comments and logging
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before || 'origin/main' }}
+        run: bash scripts/check-comments.sh "$BASE"
       - name: Build documentation
         run: cargo doc --workspace --all-features --no-deps --locked
 
@@ -89,6 +101,16 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: stable
+      - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c
+        with:
+          tool: cargo-shear@1.14.1
+      - name: Check unused dependencies
+        run: cargo shear --locked
+      - name: Check native dependencies on supported targets
+        run: python3 scripts/check-native-dependencies.py
       - uses: EmbarkStudios/cargo-deny-action@17aeb3c839e42274e2b8adf721c8c65edfdc74dd
         with:
           arguments: --workspace --all-features --locked

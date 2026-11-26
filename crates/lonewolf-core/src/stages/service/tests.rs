@@ -184,12 +184,12 @@ secret = 'component-test-secret-0002'",
         })
     }
 
-    fn target(&self, connection_id: u64) -> Option<ComponentReplyTarget<'_, GlobalChunkAllocator>> {
-        Some(ComponentReplyTarget {
+    fn target(&self, connection_id: u64) -> ComponentReplyTarget<'_, GlobalChunkAllocator> {
+        ComponentReplyTarget {
             registry: &self.registry,
             domain: "muc.localhost",
             connection_id,
-        })
+        }
     }
 }
 
@@ -296,7 +296,7 @@ fn component_dispatch_claims_one_correlated_result_or_error_per_request() -> Tes
                 &stage,
                 &route,
                 parsed(request).await?,
-                fixture.target(link.id()),
+                Some(fixture.target(link.id())),
             )
             .await
             .map_err(|_| "dispatch failed")?;
@@ -348,7 +348,7 @@ fn component_dispatch_rejects_uncorrelated_stanzas_and_requires_origin_context()
             &stage,
             &route,
             parsed(GET).await?,
-            fixture.target(link.id()),
+            Some(fixture.target(link.id())),
         )
         .await
         .map_err(|_| "dispatch failed")?;
@@ -373,19 +373,27 @@ fn component_dispatch_rejects_uncorrelated_stanzas_and_requires_origin_context()
         ));
 
         let nonrequest = parsed("<iq type='result' id='reply' from='visitor@muc.localhost/nick' to='room@echo.localhost/handler'/>").await?;
-        let outcome =
-            dispatch_with_component_reply(&stage, &route, nonrequest, fixture.target(link.id()))
-                .await
-                .map_err(|_| "dispatch failed")?;
+        let outcome = dispatch_with_component_reply(
+            &stage,
+            &route,
+            nonrequest,
+            Some(fixture.target(link.id())),
+        )
+        .await
+        .map_err(|_| "dispatch failed")?;
         assert!(matches!(outcome, ServiceOutcome::Handled));
 
         let other_origin = parsed("<iq type='get' id='reply' from='visitor@other.localhost/nick' to='room@echo.localhost/handler'><query xmlns='urn:test'/></iq>").await?;
         let other_reply = "<iq type='result' id='reply' from='room@echo.localhost/handler' to='visitor@other.localhost/nick'/>";
         let route = replying_route(&[(other_reply, false)], Err(HANDLER_FAILURE)).await?;
-        let outcome =
-            dispatch_with_component_reply(&stage, &route, other_origin, fixture.target(link.id()))
-                .await
-                .map_err(|_| "dispatch failed")?;
+        let outcome = dispatch_with_component_reply(
+            &stage,
+            &route,
+            other_origin,
+            Some(fixture.target(link.id())),
+        )
+        .await
+        .map_err(|_| "dispatch failed")?;
         assert!(matches!(
             outcome,
             ServiceOutcome::Rejected {
@@ -430,7 +438,7 @@ fn component_dispatch_consumes_one_full_queue_attempt_and_falls_back_after_detac
             &stage,
             &route,
             parsed(GET).await?,
-            fixture.target(origin),
+            Some(fixture.target(origin)),
         )
         .await
         .map_err(|_| "dispatch failed")?;
@@ -447,7 +455,7 @@ fn component_dispatch_consumes_one_full_queue_attempt_and_falls_back_after_detac
             &stage,
             &route,
             parsed(GET).await?,
-            fixture.target(origin),
+            Some(fixture.target(origin)),
         )
         .await
         .map_err(|_| "dispatch failed")?;

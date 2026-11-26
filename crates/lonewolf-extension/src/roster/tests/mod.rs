@@ -743,7 +743,7 @@ fn only_the_initial_transition_collects_granted_contacts() {
     })
     .unwrap_or_else(|error| panic!("{error}"));
     for (transition, expected) in [
-        (PresenceTransition::Initial, vec![bob_account.clone()]),
+        (PresenceTransition::Initial, vec![bob_account]),
         (PresenceTransition::Update, Vec::new()),
         (PresenceTransition::Unavailable, Vec::new()),
     ] {

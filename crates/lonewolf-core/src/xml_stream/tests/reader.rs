@@ -159,7 +159,7 @@ fn unpolled_read_and_idle_failed_restart_extraction_do_not_advance_input() -> Te
 }
 
 #[test]
-fn pending_restart_preserves_failed_flag_and_resumes_the_same_read() -> TestResult {
+fn pending_restart_preserves_failed_flag_and_resumes_the_same_read() {
     let open = Rc::new(Cell::new(false));
     let mut reader = gated_reader(
         &format!("{HEADER}<message/>"),
@@ -185,7 +185,6 @@ fn pending_restart_preserves_failed_flag_and_resumes_the_same_read() -> TestResu
         pin!(reader.read_event()).poll(&mut cx),
         Poll::Ready(Ok(Some(StreamEvent::Stanza(_))))
     ));
-    Ok(())
 }
 
 #[test]
@@ -210,7 +209,7 @@ fn reads_continue_after_a_rejected_idle_restart() {
 }
 
 #[test]
-fn terminal_reads_retain_input_without_replacement_allocations() -> TestResult {
+fn terminal_reads_retain_input_without_replacement_allocations() {
     for malformed in [false, true] {
         let ending = if malformed {
             "<message></presence>"
@@ -261,5 +260,4 @@ fn terminal_reads_retain_input_without_replacement_allocations() -> TestResult {
         ));
         assert!(!reader.has_input());
     }
-    Ok(())
 }

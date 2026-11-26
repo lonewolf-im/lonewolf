@@ -1,24 +1,36 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod ca;
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "Each test target uses a different subset of this fixture."
+)]
 #[path = "../client.rs"]
 mod client;
 pub mod clock;
 #[path = "../crl_gate.rs"]
 pub mod crl_gate;
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "Each test target uses a different subset of this fixture."
+)]
 pub mod federation;
 pub mod process;
 mod proxy;
 #[path = "../readiness.rs"]
 mod readiness;
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "Each test target uses a different subset of this fixture."
+)]
 #[path = "../tls.rs"]
 pub mod tls;
 #[path = "../wire.rs"]
 pub mod wire;
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "Each test target uses a different subset of this fixture."
+)]
 #[path = "../xml.rs"]
 pub mod xml;
 

@@ -7,7 +7,10 @@ use std::net::{Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 #[path = "../support/ports.rs"]
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "Each test target uses a different subset of this fixture."
+)]
 mod ports;
 
 fn direct_config(fixture: &Fixture) -> String {

@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-#![allow(clippy::cognitive_complexity)]
-
 use lonewolfbench::accounts::{
     CredentialSet, ProvisionSummary, generate_credentials, provision_accounts,
 };

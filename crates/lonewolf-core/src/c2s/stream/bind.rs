@@ -145,7 +145,10 @@ pub(super) async fn bind_resource<A: ChunkAllocator + Clone>(
     })
 }
 
-#[expect(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Binding needs the session and the services that own the new resource."
+)]
 async fn bind_session<A: ChunkAllocator + Clone>(
     session: &mut Session<A>,
     hosts: &Hosts,

@@ -1404,7 +1404,7 @@ fn component_tls_omits_host_client_auth_and_alpn_without_mutating_host_config() 
     compio::runtime::Runtime::new()?.block_on(async {
         let fixture = super::client_identity::tests::Fixture::new()?;
         let mut tls = test_tls_files(&fixture.directory, "localhost", "component")?;
-        tls.client_auth = Some(fixture.config.clone());
+        tls.client_auth = Some(fixture.config);
         let hosts = Hosts::new(
             &BTreeMap::from([(
                 "localhost".into(),

@@ -6,7 +6,7 @@ use clap::Parser;
 
 #[derive(Parser)]
 #[command(version, about)]
-pub struct Cli {
+pub(crate) struct Cli {
     #[arg(
         short,
         long,

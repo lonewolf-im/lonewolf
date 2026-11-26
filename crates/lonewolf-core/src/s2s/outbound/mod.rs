@@ -336,7 +336,10 @@ impl<A: ChunkAllocator> State<A> {
 }
 
 impl<A: ChunkAllocator + Clone> RemoteRouter<A> {
-    #[expect(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The router takes ownership of the services shared by its workers."
+    )]
     pub(crate) fn new(
         hosts: Hosts,
         peers: PeerVerification,

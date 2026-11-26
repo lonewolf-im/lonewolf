@@ -123,7 +123,7 @@ impl PeerRevocation {
         }))
     }
 
-    #[cfg_attr(not(test), expect(dead_code))]
+    #[cfg(test)]
     pub(crate) fn disabled() -> Arc<Self> {
         Arc::new(Self {
             source: Source::Disabled,
@@ -429,7 +429,13 @@ impl RevocationStatus {
 pub(crate) type FetchSignal = Shared<BoxFuture<'static, ()>>;
 
 #[derive(Clone)]
-pub(crate) struct CrlLease(#[cfg_attr(not(test), expect(dead_code))] pub(crate) Arc<()>);
+pub(crate) struct CrlLease(
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Holding the lease keeps the cached CRL alive.")
+    )]
+    pub(crate) Arc<()>,
+);
 
 #[derive(Clone)]
 pub(crate) struct RevocationVerdict {
@@ -441,7 +447,10 @@ pub(crate) struct RevocationVerdict {
     pub(crate) refresh_at: Option<SystemTime>,
     /// A ready signal still requires a recheck of the lookup snapshot.
     pub(crate) pending: Vec<FetchSignal>,
-    #[cfg_attr(not(test), expect(dead_code))]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Holding the lease keeps the cached CRL alive.")
+    )]
     pub(crate) leases: Vec<CrlLease>,
     /// False means that a recheck cannot change the outcome.
     pub(crate) recheckable: bool,

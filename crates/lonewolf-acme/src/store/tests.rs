@@ -357,7 +357,7 @@ fn replacement_intent_roundtrips_and_corrupt_intent_never_loads_or_overwrites() 
     )?
     .to_string();
     assert_eq!(expected, "AQID.AQ");
-    for intent in [None, Some(expected.clone())] {
+    for intent in [None, Some(expected)] {
         record.order.as_mut().ok_or("missing order")?.replaces = intent.clone();
         let store = open(&path)?;
         block_on(store.save_host(record.clone()))?;
@@ -501,7 +501,7 @@ fn failed_and_uncertain_commits_preserve_atomic_material_and_require_reopen() ->
         assert_material(&restored_host(&store)?, byte, pending)?;
         if expected == StateError::StateUncertain {
             assert_eq!(
-                block_on(store.clone().save_account(account(1))),
+                block_on(store.save_account(account(1))),
                 Err(StateError::StateUncertain)
             );
             assert_eq!(

@@ -15,7 +15,10 @@ use nix::unistd::Pid;
 #[path = "../../support/readiness.rs"]
 mod readiness;
 
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "Each test target uses a different subset of this fixture."
+)]
 #[path = "../../support/clock.rs"]
 pub(super) mod clock;
 
@@ -92,7 +95,6 @@ impl Server {
         }
     }
 
-    #[allow(dead_code)]
     pub(super) fn has_readiness(&self) -> std::io::Result<bool> {
         Ok(self.readiness.receive(Duration::from_millis(1))?.is_some())
     }

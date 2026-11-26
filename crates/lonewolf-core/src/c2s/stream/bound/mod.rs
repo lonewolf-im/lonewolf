@@ -1995,9 +1995,8 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> Outbox<'_, A, W> {
         ) {
             return Err(StoredRecordError::InvalidContent);
         }
-        let parsed = match parser.next_event().await? {
-            Some(StreamEvent::Stanza(parsed)) => parsed,
-            _ => return Err(StoredRecordError::InvalidContent),
+        let Some(StreamEvent::Stanza(parsed)) = parser.next_event().await? else {
+            return Err(StoredRecordError::InvalidContent);
         };
         let (stanza, arena) = parsed.into_parts();
         if matches!(kind, StoredKind::Message) {

@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
+#![expect(
+    clippy::disallowed_macros,
+    reason = "Cargo reads build directives from standard output."
+)]
 use std::{env, path::Path, process::Command};
 
 fn output(program: &str, args: &[&str]) -> Option<String> {

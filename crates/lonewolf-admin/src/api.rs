@@ -1425,9 +1425,8 @@ mod tests {
                     Arc::new(RecordDeleter::new(storage.clone())),
                     None,
                 );
-                let error = match api.list(Some("limit=2")).await {
-                    Err(error) => error,
-                    Ok(_) => return Err("listing should fail".into()),
+                let Err(error) = api.list(Some("limit=2")).await else {
+                    return Err("listing should fail".into());
                 };
                 let response = error.into_response();
                 assert_eq!(response.status(), status);

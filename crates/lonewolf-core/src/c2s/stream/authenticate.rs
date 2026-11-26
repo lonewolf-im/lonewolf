@@ -321,12 +321,9 @@ impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
     }
 
     async fn external(&mut self, initial: &[u8]) -> Result<Attempt, CloseOutcome> {
-        let identity = match std::str::from_utf8(initial) {
-            Ok(identity) => identity,
-            Err(_) => {
-                self.reject(SaslFailure::MalformedRequest).await?;
-                return Ok(Attempt::Rejected);
-            }
+        let Ok(identity) = std::str::from_utf8(initial) else {
+            self.reject(SaslFailure::MalformedRequest).await?;
+            return Ok(Attempt::Rejected);
         };
         let requested = if identity.is_empty() {
             None
@@ -471,12 +468,9 @@ impl<A: ChunkAllocator + Clone> Authentication<'_, A> {
             let Some(account) = identity.account else {
                 return Err(CloseOutcome::InternalError);
             };
-            let current = match self.auth.scram(&account, mechanism.hash()).await {
-                Ok(current) => current,
-                Err(_) => {
-                    self.reject(SaslFailure::TemporaryAuthFailure).await?;
-                    return Ok(Attempt::Rejected);
-                }
+            let Ok(current) = self.auth.scram(&account, mechanism.hash()).await else {
+                self.reject(SaslFailure::TemporaryAuthFailure).await?;
+                return Ok(Attempt::Rejected);
             };
             if current
                 .as_ref()

@@ -188,7 +188,7 @@ pub enum ScramVerifier {
 }
 
 impl ScramVerifier {
-    /// Requires a nonempty SASLprep password and the hash's minimum iteration count.
+    /// Requires a nonempty `SASLprep` password and the hash's minimum iteration count.
     /// The caller must erase its password buffer; salt generation can fail.
     pub fn generate(
         hash: ScramHash,
@@ -288,7 +288,7 @@ pub struct ScramCredentials {
 }
 
 impl ScramCredentials {
-    /// Requires at least 15 scalars and 3 distinct scalars after SASLprep.
+    /// Requires at least 15 scalars and 3 distinct scalars after `SASLprep`.
     /// Requires at least 10,000 iterations; the caller must erase its password buffer.
     pub fn provision(
         password: &str,

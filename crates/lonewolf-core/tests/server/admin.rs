@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
-#![allow(clippy::cognitive_complexity)]
+#![expect(
+    clippy::cognitive_complexity,
+    reason = "Keep each test scenario and its assertions together."
+)]
 
 use std::fs;
 use std::io::{Read, Write};

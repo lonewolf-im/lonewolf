@@ -23,7 +23,10 @@ pub(crate) enum Origin<'o, A: ChunkAllocator> {
     Session(&'o Registration<A>),
     Remote {
         local: &'o str,
-        #[expect(dead_code)]
+        #[expect(
+            dead_code,
+            reason = "The origin carries both authenticated stream identities."
+        )]
         remote: &'o str,
     },
     Service {

@@ -79,9 +79,8 @@ enum SrvAnswer {
 }
 
 fn classify_srv(answer: Result<Answer, QueryError>, tls_mode: TlsMode) -> SrvAnswer {
-    let answer = match answer {
-        Ok(answer) => answer,
-        Err(_) => return SrvAnswer::Unavailable,
+    let Ok(answer) = answer else {
+        return SrvAnswer::Unavailable;
     };
     if answer.records.is_empty() {
         return SrvAnswer::Absent;

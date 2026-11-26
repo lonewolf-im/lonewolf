@@ -78,15 +78,11 @@ pub(super) async fn escape_async<W: AsyncWrite + Unpin>(
         let Some(replacement) = escape_replacement(ch, attribute) else {
             continue;
         };
-        if start < index {
-            output.write_all(&text.as_bytes()[start..index]).await?;
-        }
+        output.write_all(&text.as_bytes()[start..index]).await?;
         output.write_all(replacement.as_bytes()).await?;
         start = index + ch.len_utf8();
     }
-    if start < text.len() {
-        output.write_all(&text.as_bytes()[start..]).await?;
-    }
+    output.write_all(&text.as_bytes()[start..]).await?;
     Ok(())
 }
 

@@ -49,7 +49,7 @@ pub type ExtensionFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 use account::AccountHandler;
 use archive::ArchiveHandler;
 use blocking::BlockingPresenceChange;
-use delivery::{Delivery, DeliveryFuture};
+use delivery::{DeliveryFuture, DeliveryHandle};
 use discovery::Discovery;
 use iq::{IqRegistry, IqRequestKey, IqRoute};
 use message::MessageHandler;
@@ -66,12 +66,12 @@ pub struct Effects<A> {
     local_blocklist_edit: Option<Arc<BlockingPresenceChange>>,
 }
 
-pub type Deliver<A> = Box<dyn for<'d> FnOnce(&'d dyn Delivery<A>) -> DeliveryFuture<'d>>;
+pub type Deliver<A> = Box<dyn for<'d> FnOnce(&'d dyn DeliveryHandle<A>) -> DeliveryFuture<'d>>;
 
 impl<A: ChunkAllocator> Effects<A> {
     pub fn new(
         accounts: Vec<AccountKey>,
-        deliver: impl for<'d> FnOnce(&'d dyn Delivery<A>) -> DeliveryFuture<'d> + 'static,
+        deliver: impl for<'d> FnOnce(&'d dyn DeliveryHandle<A>) -> DeliveryFuture<'d> + 'static,
     ) -> Self {
         Self {
             accounts,

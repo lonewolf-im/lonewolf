@@ -225,7 +225,7 @@ pub trait SessionLookup {
 }
 
 /// Every method runs on the connection worker of the request being handled.
-pub trait Delivery<A: ChunkAllocator>: HostLookup {
+pub trait DeliveryHandle<A: ChunkAllocator>: HostLookup {
     fn arena(&self) -> Result<Arena<A>, DeliveryError>;
 
     /// Sends an IQ get or set from a served domain to a bound resource and waits for its result or error.

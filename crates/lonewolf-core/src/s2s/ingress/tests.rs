@@ -9,7 +9,9 @@ use crate::s2s::log_domain;
 use lonewolf_extension::archive::{
     ArchiveDirection, ArchiveFuture, ArchiveHandler, ArchiveId, ArchiveOutcome, ArchiveRequest,
 };
-use lonewolf_extension::delivery::{Delivery, DeliveryFuture, HandlerError, SessionId, SessionTag};
+use lonewolf_extension::delivery::{
+    DeliveryFuture, DeliveryHandle, HandlerError, SessionId, SessionTag,
+};
 use lonewolf_extension::observer::{MessageEvent, MessageObserver, MessageOutcome, MessageRole};
 use lonewolf_extension::policy::{Direction, PolicyFuture, PolicyHandler, PolicyRequest, Verdict};
 use lonewolf_extension::{Extension, Extensions, RegistrationError, Slots};
@@ -304,7 +306,7 @@ impl MessageObserver<GlobalChunkAllocator, RedbStorage> for Messages {
         &'a self,
         event: MessageEvent<'a, GlobalChunkAllocator>,
         _: &'a RedbStorage,
-        _: &'a dyn Delivery<GlobalChunkAllocator>,
+        _: &'a dyn DeliveryHandle<GlobalChunkAllocator>,
     ) -> DeliveryFuture<'a> {
         assert_eq!(event.account.as_str(), "bob@example.com");
         assert_eq!(event.role, MessageRole::Received);

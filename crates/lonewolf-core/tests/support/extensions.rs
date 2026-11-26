@@ -14,7 +14,7 @@ use lonewolf_extension::archive::{
     ArchiveDirection, ArchiveFuture, ArchiveHandler, ArchiveId, ArchiveOutcome, ArchiveRequest,
 };
 use lonewolf_extension::delivery::{
-    Delivery, DeliveryError, DeliveryFuture, Failure, FailureKind, HandlerError, HostLookup,
+    DeliveryError, DeliveryFuture, DeliveryHandle, Failure, FailureKind, HandlerError, HostLookup,
     SessionTag,
 };
 use lonewolf_extension::discovery::{
@@ -2408,7 +2408,7 @@ impl<A: ChunkAllocator> MessageObserver<A, RedbStorage> for TestMessageObserver 
         &'a self,
         event: MessageEvent<'a, A>,
         _: &'a RedbStorage,
-        delivery: &'a dyn Delivery<A>,
+        delivery: &'a dyn DeliveryHandle<A>,
     ) -> DeliveryFuture<'a> {
         Box::pin(async move {
             self.events.lock().push((
@@ -2561,7 +2561,7 @@ impl<A: ChunkAllocator> SessionObserver<A, RedbStorage> for TestSessionObserver 
         &'a self,
         change: SessionChange<'a, A>,
         _: &'a RedbStorage,
-        _: &'a dyn Delivery<A>,
+        _: &'a dyn DeliveryHandle<A>,
     ) -> DeliveryFuture<'a> {
         Box::pin(async move {
             let kind = match change.event {

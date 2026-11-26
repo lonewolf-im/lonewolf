@@ -13,8 +13,8 @@ use futures_util::FutureExt;
 use futures_util::task::AtomicWaker;
 use lonewolf_extension::blocking::BlockingPresenceChange;
 use lonewolf_extension::delivery::{
-    BoundResource, CopyFactory, Delivery, DeliveryError, DeliveryFuture, Failure, FailureKind,
-    HandlerError, HostLookup, IqResponseFuture, SessionId, SessionLookup, SessionTag,
+    BoundResource, CopyFactory, DeliveryError, DeliveryFuture, DeliveryHandle, Failure,
+    FailureKind, HandlerError, HostLookup, IqResponseFuture, SessionId, SessionLookup, SessionTag,
     StanzaFactory,
 };
 use lonewolf_extension::message::MessageHandler;
@@ -438,7 +438,7 @@ pub(crate) fn commit_and_store<A: ChunkAllocator + Clone + 'static>(
     Pending { turned, done }
 }
 
-pub(crate) trait OrderedEffectsDelivery<A: ChunkAllocator>: Delivery<A> {
+pub(crate) trait OrderedEffectsDelivery<A: ChunkAllocator>: DeliveryHandle<A> {
     fn prepare_local_block(
         &mut self,
         _change: &Arc<BlockingPresenceChange>,
@@ -604,7 +604,7 @@ impl<A: ChunkAllocator + Clone> SessionLookup for RouterDelivery<A> {
     }
 }
 
-impl<A: ChunkAllocator + Clone + 'static> Delivery<A> for RouterDelivery<A> {
+impl<A: ChunkAllocator + Clone + 'static> DeliveryHandle<A> for RouterDelivery<A> {
     fn arena(&self) -> Result<Arena<A>, DeliveryError> {
         Arena::try_new_in(Default::default(), self.allocator.clone()).map_err(|_| DeliveryError)
     }

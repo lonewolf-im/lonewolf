@@ -28,7 +28,7 @@ use lonewolf_xmpp::stanza::{
 use super::{NAMESPACE, Roster};
 use crate::account::AccountHandler;
 use crate::delivery::{
-    BoundResource, Delivery, DeliveryError, DeliveryFuture, HandlerError, HostLookup,
+    BoundResource, DeliveryError, DeliveryFuture, DeliveryHandle, HandlerError, HostLookup,
     SessionLookup, SessionTag, StanzaFactory,
 };
 use crate::discovery::Discovery;
@@ -90,7 +90,7 @@ impl HostLookup for RecordingDelivery {
     }
 }
 
-impl Delivery<GlobalChunkAllocator> for RecordingDelivery {
+impl DeliveryHandle<GlobalChunkAllocator> for RecordingDelivery {
     fn to_remote<'a>(&'a self, stanza: RoutedStanza<GlobalChunkAllocator>) -> DeliveryFuture<'a> {
         self.events.borrow_mut().push("remote");
         let result = (|| {

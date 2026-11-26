@@ -11,7 +11,7 @@ use super::*;
 use crate::archive::ArchiveId;
 use crate::carbons::NAMESPACE;
 use crate::delivery::{
-    CopyFactory, Delivery, DeliveryError, DeliveryFuture, HostLookup, SessionId, SessionTag,
+    CopyFactory, DeliveryError, DeliveryFuture, DeliveryHandle, HostLookup, SessionId, SessionTag,
     StanzaFactory,
 };
 use crate::observer::{MessageEvent, MessageOutcome, MessageRole};
@@ -40,7 +40,7 @@ impl HostLookup for RecordingDelivery {
     }
 }
 
-impl Delivery<GlobalChunkAllocator> for RecordingDelivery {
+impl DeliveryHandle<GlobalChunkAllocator> for RecordingDelivery {
     fn arena(&self) -> Result<Arena<GlobalChunkAllocator>, DeliveryError> {
         Ok(Arena::try_new(ArenaConfig::default())?)
     }

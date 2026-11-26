@@ -13,7 +13,7 @@ use lonewolf_extension::archive::{
     ArchiveDirection, ArchiveFuture, ArchiveHandler, ArchiveId, ArchiveOutcome, ArchiveRequest,
 };
 use lonewolf_extension::blocking::{Blocking, NAME as BLOCKING};
-use lonewolf_extension::delivery::{Delivery, DeliveryError, DeliveryFuture, SessionId};
+use lonewolf_extension::delivery::{DeliveryError, DeliveryFuture, DeliveryHandle, SessionId};
 use lonewolf_extension::observer::{MessageEvent, MessageObserver, MessageOutcome, MessageRole};
 use lonewolf_extension::policy::{Direction, PolicyFuture, PolicyHandler, PolicyRequest, Verdict};
 use lonewolf_extension::{Extension, Extensions, RegistrationError, Slots};
@@ -128,7 +128,7 @@ impl MessageObserver<GlobalChunkAllocator, RedbStorage> for Recorder {
         &'a self,
         event: MessageEvent<'a, GlobalChunkAllocator>,
         _: &'a RedbStorage,
-        _: &'a dyn Delivery<GlobalChunkAllocator>,
+        _: &'a dyn DeliveryHandle<GlobalChunkAllocator>,
     ) -> DeliveryFuture<'a> {
         self.calls.lock().push(Call::Observe {
             account: event.account.as_str().into(),

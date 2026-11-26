@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+mod properties;
+
 use std::alloc::Layout;
 use std::future::Future;
 use std::io::{self, Cursor};

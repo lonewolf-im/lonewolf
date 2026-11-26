@@ -9,6 +9,7 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 
 use parking_lot::Mutex as PlMutex;
+use proptest::prelude::*;
 
 use crate::jid::{Jid, JidError, JidPart, JidRef, MAX_JID_LEN, MAX_PART_LEN};
 use lonewolf_util::arena::{
@@ -880,25 +881,44 @@ fn accepted_mutations_round_trip_without_changing_components() -> TestResult {
                 let mut input = base.to_owned();
                 input.insert(offset, inserted);
                 if let Ok(jid) = Jid::parse_in(&input, &mut arena) {
-                    let jid = jid.resolve(&arena)?;
-                    let reparsed = Jid::parse_in(jid.as_str(), &mut target)?;
-                    let from_parts = Jid::from_parts_in(
-                        jid.localpart(),
-                        jid.domainpart(),
-                        jid.resourcepart(),
-                        &mut target,
-                    )?;
-                    let reparsed = reparsed.resolve(&target)?;
-                    let from_parts = from_parts.resolve(&target)?;
-                    assert_eq!(reparsed, jid, "{input:?}");
-                    assert_eq!(from_parts, jid, "{input:?}");
-                    assert_eq!(reparsed.localpart(), jid.localpart());
-                    assert_eq!(reparsed.domainpart(), jid.domainpart());
-                    assert_eq!(reparsed.resourcepart(), jid.resourcepart());
-                    assert!(jid.as_str().len() <= MAX_JID_LEN);
+                    assert_round_trip(&input, jid.resolve(&arena)?, &mut target)?;
                 }
             }
         }
     }
     Ok(())
+}
+
+fn assert_round_trip(input: &str, jid: JidRef<'_>, target: &mut Arena) -> TestResult {
+    let reparsed = Jid::parse_in(jid.as_str(), target)?;
+    let rebuilt = Jid::from_parts_in(
+        jid.localpart(),
+        jid.domainpart(),
+        jid.resourcepart(),
+        target,
+    )?;
+    for result in [reparsed.resolve(target)?, rebuilt.resolve(target)?] {
+        assert_eq!(result, jid, "{input:?}");
+        assert_eq!(result.localpart(), jid.localpart());
+        assert_eq!(result.domainpart(), jid.domainpart());
+        assert_eq!(result.resourcepart(), jid.resourcepart());
+    }
+    assert!(jid.as_str().len() <= MAX_JID_LEN);
+    Ok(())
+}
+
+proptest! {
+    #[test]
+    #[ignore = "runs in the XMPP property workflow"]
+    fn property_jid_round_trip(input in concat!(
+        "(?:(?:[A-Za-z0-9ßΣＦ]|e\u{301}){1,16}@)?",
+        "(?:[A-Za-z0-9]{1,20}|BÜCHER|xn--bcher-kva)[.。](?:example|EXAMPLE)\\.?",
+        "(?:/(?:[a-zA-Z0-9@/ 李🐺\u{a0}]|e\u{301}){1,16})?",
+    )) {
+        let mut arena = Arena::try_new(ArenaConfig::default())?;
+        let mut target = Arena::try_new(ArenaConfig::default())?;
+        let jid = Jid::parse_in(&input, &mut arena)?;
+        assert_round_trip(&input, jid.resolve(&arena)?, &mut target)
+            .map_err(|err| TestCaseError::fail(err.to_string()))?;
+    }
 }

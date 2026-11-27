@@ -2,7 +2,7 @@
 
 use crate::support::{ALTERNATE_PASSWORD, OTHER_PASSWORD, PASSWORD};
 
-use super::support::{C2sSuite, TestResult};
+use super::support::{C2sSuite, Client, TestResult, barrier};
 
 #[test]
 fn ipv6_zone_destinations_return_recoverable_jid_malformed_errors() -> TestResult {
@@ -1556,6 +1556,89 @@ fn forwarded_error_conditions_and_peer_text_are_not_replaced_or_supplemented() -
             bob.expect_xml(&format!("<{kind} xmlns='jabber:client' type='error' id='peer-error' from='alice@localhost/desk' to='bob@localhost/phone' xml:lang='es'>{payload}{error}</{kind}>"))?;
         }
     }
+    alice.close()?;
+    bob.close()
+}
+
+const UNAVAILABLE: &str = "<error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error>";
+
+fn alice_and_available_bob(priority: i8) -> TestResult<(C2sSuite, Client, Client)> {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", PASSWORD)?;
+    suite.create_account("bob", PASSWORD)?;
+    let alice = suite.connect("alice", PASSWORD, "desk")?;
+    let mut bob = suite.connect("bob", PASSWORD, "desk")?;
+    bob.send(&format!(
+        "<presence><priority>{priority}</priority></presence>"
+    ))?;
+    bob.expect_xml(&format!("<presence xmlns='jabber:client' from='bob@localhost/desk' to='bob@localhost'><priority>{priority}</priority></presence>"))?;
+    Ok((suite, alice, bob))
+}
+
+#[test]
+fn pipelined_bare_and_full_jid_messages_keep_their_order() -> TestResult {
+    let (_suite, mut alice, mut bob) = alice_and_available_bob(0)?;
+    let targets = [
+        ("1", "bob@localhost"),
+        ("2", "bob@localhost/desk"),
+        ("3", "bob@localhost"),
+    ];
+    let mut batch = String::new();
+    for (id, to) in targets {
+        use std::fmt::Write;
+        write!(batch, "<message to='{to}' type='chat' id='{id}'/>")?;
+    }
+    alice.send(&batch)?;
+    for (id, to) in targets {
+        bob.expect_xml(&format!("<message xmlns='jabber:client' from='alice@localhost/desk' to='{to}' type='chat' id='{id}'/>"))?;
+    }
+    alice.close()?;
+    bob.close()
+}
+
+#[test]
+fn unhandled_bare_jid_iq_is_answered_for_an_available_account() -> TestResult {
+    let (_suite, mut alice, mut bob) = alice_and_available_bob(0)?;
+    alice
+        .send("<iq type='get' to='bob@localhost' id='u'><query xmlns='urn:test:unknown'/></iq>")?;
+    alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' id='u' from='bob@localhost'><query xmlns='urn:test:unknown'/>{UNAVAILABLE}</iq>"))?;
+    barrier(&mut bob)?;
+    alice.close()?;
+    bob.close()
+}
+
+#[test]
+fn unhandled_bare_jid_iq_is_answered_for_an_offline_account() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", PASSWORD)?;
+    suite.create_account("bob", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    alice
+        .send("<iq type='get' to='bob@localhost' id='u'><query xmlns='urn:test:unknown'/></iq>")?;
+    alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' id='u' from='bob@localhost'><query xmlns='urn:test:unknown'/>{UNAVAILABLE}</iq>"))?;
+    alice.close()
+}
+
+#[test]
+fn bare_groupchat_to_an_available_account_returns_service_unavailable() -> TestResult {
+    let (_suite, mut alice, mut bob) = alice_and_available_bob(0)?;
+    alice
+        .send("<message to='bob@localhost' type='groupchat' id='g'><body>Hello</body></message>")?;
+    alice.expect_xml(&format!("<message xmlns='jabber:client' type='error' id='g' from='bob@localhost' to='alice@localhost/desk'><body>Hello</body>{UNAVAILABLE}</message>"))?;
+    barrier(&mut bob)?;
+    alice.close()?;
+    bob.close()
+}
+
+#[test]
+fn bare_headline_to_an_only_negative_priority_resource_is_silently_ignored() -> TestResult {
+    let (_suite, mut alice, mut bob) = alice_and_available_bob(-1)?;
+    alice.send(
+        "<message to='bob@localhost' type='headline' id='news'><body>News</body></message>",
+    )?;
+    alice.send("<message to='alice@localhost/desk' type='normal' id='sentinel'/>")?;
+    alice.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost/desk' type='normal' id='sentinel'/>")?;
+    barrier(&mut bob)?;
     alice.close()?;
     bob.close()
 }

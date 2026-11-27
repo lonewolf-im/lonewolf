@@ -21,6 +21,8 @@ const ALL_SCRAM_MECHANISMS: &[&str] = &[
     "SCRAM-SHA-1",
 ];
 
+const NONCANONICAL_BASE64: [&str; 4] = ["=AAA", "BBBB=CCC", "QR==", "biwsbj1h\nbGljZSxyPW5vbmNl"];
+
 #[test]
 fn scram_sha256_authenticates() -> TestResult {
     let suite = C2sSuite::with_extensions("")?;
@@ -353,6 +355,32 @@ fn non_plus_listener_accepts_the_scram_y_flag() -> TestResult {
 }
 
 #[test]
+fn plus_listener_rejects_the_scram_y_flag_and_allows_a_retry() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut client = suite.tls_client()?;
+    let features = client.open()?;
+    assert!(
+        features
+            .child(SASL_NAMESPACE, "mechanisms")?
+            .children
+            .iter()
+            .any(|mechanism| mechanism.text == "SCRAM-SHA-256-PLUS")
+    );
+
+    client.send_sasl_auth("SCRAM-SHA-256", "y,,n=alice,r=nonce")?;
+    client.expect_xml(
+        "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><not-authorized/></failure>",
+    )?;
+
+    client.authenticate("alice", ALTERNATE_PASSWORD)?;
+    let mut client = client.restart();
+    client.open()?;
+    assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
+    client.close()
+}
+
+#[test]
 fn missing_mechanism_returns_invalid_mechanism() -> TestResult {
     let suite = C2sSuite::start()?;
     let mut client = suite.unauthenticated_client()?;
@@ -456,6 +484,43 @@ fn invalid_base64_returns_incorrect_encoding() -> TestResult {
         "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><incorrect-encoding/></failure>",
     )?;
     client.close()
+}
+
+#[test]
+fn noncanonical_base64_initial_responses_return_incorrect_encoding() -> TestResult {
+    let suite = C2sSuite::start()?;
+    for text in NONCANONICAL_BASE64 {
+        let mut client = suite.unauthenticated_client()?;
+
+        client.send(&format!(
+            "<auth xmlns='urn:ietf:params:xml:ns:xmpp-sasl' mechanism='SCRAM-SHA-256'>{text}</auth>"
+        ))?;
+        client.expect_xml(
+            "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><incorrect-encoding/></failure>",
+        )?;
+        client.close()?;
+    }
+    Ok(())
+}
+
+#[test]
+fn noncanonical_base64_responses_return_incorrect_encoding() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    for text in NONCANONICAL_BASE64 {
+        let mut client = suite.unauthenticated_client()?;
+        client.send_sasl_auth("SCRAM-SHA-256", "n,,n=alice,r=nonce")?;
+        client.receive_sasl_challenge()?;
+
+        client.send(&format!(
+            "<response xmlns='urn:ietf:params:xml:ns:xmpp-sasl'>{text}</response>"
+        ))?;
+        client.expect_xml(
+            "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><incorrect-encoding/></failure>",
+        )?;
+        client.close()?;
+    }
+    Ok(())
 }
 
 #[test]

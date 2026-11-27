@@ -2,7 +2,7 @@
 
 use crate::support::ALTERNATE_PASSWORD;
 
-use super::support::{C2sSuite, OPEN, TLS_NAMESPACE, TestResult};
+use super::support::{BIND_NAMESPACE, C2sSuite, OPEN, SASL_NAMESPACE, TLS_NAMESPACE, TestResult};
 
 const OPENINGS_WITH_ADJACENT_ATTRIBUTES: [&str; 4] = [
     "<stream:stream xmlns:stream='http://etherx.jabber.org/streams'xmlns='jabber:client' to='localhost' version='1.0'>",
@@ -599,6 +599,28 @@ fn restart_sender_must_match_the_authenticated_account() -> TestResult {
 
     client.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' from='bob@localhost' to='localhost' version='1.0'>"#)?;
     client.expect_stream_error("invalid-from")
+}
+
+#[test]
+fn sender_from_before_tls_is_discarded_after_tls() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut plain = suite.tcp_client()?;
+    let header = plain.open_with(r#"<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:client' from='bob@localhost' to='localhost' version='1.0'>"#)?;
+    assert_eq!(header.attribute("to"), Some("bob@localhost"));
+    plain.features()?.child(TLS_NAMESPACE, "starttls")?;
+    let mut client = plain.start_tls(&suite)?;
+
+    let header = client.open_with(OPEN)?;
+    assert_eq!(header.attribute("to"), None);
+    client.features()?.child(SASL_NAMESPACE, "mechanisms")?;
+    client.authenticate("alice", ALTERNATE_PASSWORD)?;
+    let mut client = client.restart();
+    let header = client.open_with(OPEN)?;
+    assert_eq!(header.attribute("to"), None);
+    client.features()?.child(BIND_NAMESPACE, "bind")?;
+    assert_eq!(client.bind(Some("desk"))?, "alice@localhost/desk");
+    client.close()
 }
 
 #[test]

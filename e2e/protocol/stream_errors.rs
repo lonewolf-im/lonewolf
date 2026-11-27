@@ -4,7 +4,7 @@ use crate::support::clock::{Clock, with_clock};
 
 use crate::support::ALTERNATE_PASSWORD;
 
-use super::support::{C2sSuite, TestResult};
+use super::support::{C2sSuite, OPEN, TestResult};
 use std::io::Read as _;
 use std::net::Shutdown;
 use std::time::Duration;
@@ -755,6 +755,36 @@ fn unknown_client_namespace_stanza_after_binding_closes_the_stream() -> TestResu
 
     client.send("<other/>")?;
     client.expect_stream_error("unsupported-stanza-type")
+}
+
+#[test]
+fn stream_restart_after_binding_closes_the_stream_and_withdraws_the_resource() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", ALTERNATE_PASSWORD)?;
+    let mut observer = suite.connect("alice", ALTERNATE_PASSWORD, "observer")?;
+    observer.send("<presence/>")?;
+    observer.expect_xml(
+        "<presence xmlns='jabber:client' from='alice@localhost/observer' to='alice@localhost'/>",
+    )?;
+    let mut client = suite.connect("alice", ALTERNATE_PASSWORD, "desktop")?;
+    client.send("<presence/>")?;
+    client.expect_xml(
+        "<presence xmlns='jabber:client' from='alice@localhost/observer' to='alice@localhost'/>",
+    )?;
+    client.expect_xml(
+        "<presence xmlns='jabber:client' from='alice@localhost/desktop' to='alice@localhost'/>",
+    )?;
+    observer.expect_xml(
+        "<presence xmlns='jabber:client' from='alice@localhost/desktop' to='alice@localhost'/>",
+    )?;
+
+    client.send(OPEN)?;
+    client.expect_stream_error("bad-format")?;
+    observer.expect_xml("<presence xmlns='jabber:client' from='alice@localhost/desktop' to='alice@localhost' type='unavailable'/>")?;
+
+    let mut replacement = suite.connect("alice", ALTERNATE_PASSWORD, "desktop")?;
+    replacement.close()?;
+    observer.close()
 }
 
 #[test]

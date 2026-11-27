@@ -485,7 +485,7 @@ fn raw_version_workflow(
     }
     phase(
         "inbound rejected negotiation close",
-        rejected.answer_close(),
+        rejected.expect_stream_error("policy-violation"),
     )?;
     suite.wait_for_metric(
         "lonewolf_s2s_authentications_total{direction=\"inbound\",outcome=\"invalid_authzid\"} 1",

@@ -628,7 +628,7 @@ fn mismatched_authzid_gets_invalid_authzid() -> TestResult {
             "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><invalid-authzid/></failure>",
         )?;
     }
-    peer.answer_close()?;
+    peer.expect_stream_error("policy-violation")?;
     authentication(&fixture.suite, "inbound", "invalid_authzid", 1)?;
     fixture
         .suite
@@ -675,6 +675,32 @@ fn badly_encoded_external_responses_get_incorrect_encoding_and_allow_a_retry() -
                 .wait_for_metric("lonewolf_s2s_streams{direction=\"inbound\"} 0")?;
         }
     }
+    fixture.stop()
+}
+
+#[test]
+fn second_failed_external_attempt_closes_the_stream_with_policy_violation() -> TestResult {
+    let mut fixture = SingleServer::start("")?;
+    let mut peer = fixture.connect()?;
+    peer.expect_starttls_features()?;
+    let mut peer = peer.start_tls(fixture.client_config()?)?;
+    peer.expect_external_offered()?;
+    peer.send("<auth xmlns='urn:ietf:params:xml:ns:xmpp-sasl' mechanism='EXTERNAL'>?</auth>")?;
+    peer.receive()?.assert_xml(
+        "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><incorrect-encoding/></failure>",
+    )?;
+    peer.auth_external(None)?;
+    peer.receive()?
+        .assert_xml("<challenge xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>")?;
+    peer.send("<response xmlns='urn:ietf:params:xml:ns:xmpp-sasl'>=AAA</response>")?;
+    peer.receive()?.assert_xml(
+        "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><incorrect-encoding/></failure>",
+    )?;
+    peer.expect_stream_error("policy-violation")?;
+    authentication(&fixture.suite, "inbound", "protocol", 1)?;
+    fixture
+        .suite
+        .wait_for_metric("lonewolf_s2s_connections{direction=\"inbound\"} 0")?;
     fixture.stop()
 }
 

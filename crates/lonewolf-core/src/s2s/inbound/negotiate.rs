@@ -717,15 +717,14 @@ async fn authenticate_sasl<A: ChunkAllocator + Clone>(
             Err(failure) => {
                 tls.send(&stream::sasl_failure_xml(failure)).await?;
                 if attempt == 1 {
-                    tls.close(None).await?;
-                    return Err(Failure {
-                        error: S2sError::Eof,
-                        outcome: match failure {
+                    return Err(reject(
+                        StreamErrorCondition::PolicyViolation,
+                        match failure {
                             SaslFailure::InvalidAuthzid => AuthOutcome::InvalidAuthzid,
                             SaslFailure::InvalidMechanism => AuthOutcome::InvalidMechanism,
                             _ => AuthOutcome::Protocol,
                         },
-                    });
+                    ));
                 }
             }
         }

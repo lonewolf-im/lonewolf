@@ -429,7 +429,7 @@ fn inbound_direct_tls_external_authzid_mismatch_rejects_and_cleans_up() -> TestR
             "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><invalid-authzid/></failure>",
         )?;
     }
-    inbound.answer_close()?;
+    inbound.expect_stream_error("policy-violation")?;
     authentication(&fixture.suite, "inbound", "invalid_authzid", 1)?;
     fixture
         .suite

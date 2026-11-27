@@ -1041,6 +1041,7 @@ fn optional_client_certificates_reject_invalid_presented_certificates() -> TestR
         "resource-bearing XmppAddr",
         certificates.malformed_xmpp_addr,
     ));
+    let attempts = u64::try_from(certificates.rejected.len() * 2)?;
     for (scenario, key) in certificates.rejected {
         for version in [&version::TLS12, &version::TLS13] {
             let mut plain = super::support::PlainClient::tcp(&suite)?;
@@ -1057,9 +1058,8 @@ fn optional_client_certificates_reject_invalid_presented_certificates() -> TestR
             );
         }
     }
-    let logs = suite.stop_with_logs()?;
-    assert!(!logs.contains("alice@localhost"), "{logs}");
-    Ok(())
+    suite.wait_for_closed("tls_failure", attempts)?;
+    suite.stop()
 }
 
 #[test]
@@ -1230,13 +1230,11 @@ fn blocked_handshake_crl_reload_obeys_shutdown() -> TestResult {
         super::support::TLS_NAMESPACE
     ))?;
     let _release = wait_for_crl_reader(&crls_path)?;
-    let logs = std::thread::scope(|scope| -> TestResult<String> {
-        let stopped = scope.spawn(|| suite.stop_with_logs().map_err(|error| error.to_string()));
+    std::thread::scope(|scope| -> TestResult {
+        let stopped = scope.spawn(|| suite.stop().map_err(|error| error.to_string()));
         plain.expect_stream_error("system-shutdown")?;
         Ok(stopped.join().map_err(|_| "shutdown worker panicked")??)
-    })?;
-    assert!(logs.contains("outcome=\"system_shutdown\""), "{logs}");
-    Ok(())
+    })
 }
 
 fn external_suite(

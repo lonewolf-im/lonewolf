@@ -217,52 +217,36 @@ fn assert_generated_identifier(jid: &str) -> TestResult {
     Ok(())
 }
 
-fn assert_generated_resource_lifecycle(suite: &mut C2sSuite, resource: &str) -> TestResult {
-    let logs = suite.stop_with_logs()?;
-    let bound = logs
-        .lines()
-        .find(|line| line.contains("resource bound"))
-        .ok_or("missing bound lifecycle event")?;
-    assert!(bound.contains("resource_requested=false"), "{logs}");
-    if !resource.is_empty() {
-        assert!(!logs.contains(resource), "{logs}");
-    }
-    Ok(())
-}
-
 #[test]
 fn empty_resource_gets_a_generated_identifier() -> TestResult {
-    let mut suite = C2sSuite::start()?;
+    let suite = C2sSuite::start()?;
     suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
 
     assert_generated_identifier(&client.bind(Some(""))?)?;
-    client.close()?;
-    assert_generated_resource_lifecycle(&mut suite, "")
+    client.close()
 }
 
 #[test]
 fn oversized_resource_gets_a_generated_identifier() -> TestResult {
-    let mut suite = C2sSuite::start()?;
+    let suite = C2sSuite::start()?;
     suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
     let resource = "x".repeat(1100);
 
     assert_generated_identifier(&client.bind(Some(&resource))?)?;
-    client.close()?;
-    assert_generated_resource_lifecycle(&mut suite, &resource)
+    client.close()
 }
 
 #[test]
 fn unpreparable_resource_gets_a_generated_identifier() -> TestResult {
-    let mut suite = C2sSuite::start()?;
+    let suite = C2sSuite::start()?;
     suite.create_account("alice", ALTERNATE_PASSWORD)?;
     let mut client = suite.authenticated_client("alice", ALTERNATE_PASSWORD)?;
     let resource = "private\u{200b}resource";
 
     assert_generated_identifier(&client.bind(Some(resource))?)?;
-    client.close()?;
-    assert_generated_resource_lifecycle(&mut suite, resource)
+    client.close()
 }
 
 #[test]

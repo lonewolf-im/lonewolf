@@ -606,6 +606,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn admin_commands_name_route_templates_and_ignore_concrete_paths() {
+        for (method, route, command) in [
+            (Method::GET, "/v1/accounts", "account_list"),
+            (Method::POST, "/v1/accounts", "account_create"),
+            (Method::GET, "/v1/accounts/{jid}", "account_get"),
+            (Method::DELETE, "/v1/accounts/{jid}", "account_delete"),
+            (
+                Method::PUT,
+                "/v1/accounts/{jid}/password",
+                "account_password",
+            ),
+        ] {
+            assert_eq!(admin_command(&method, Some(route)), Some(command));
+        }
+        for route in [
+            "/v1/accounts/private-account%40example.org",
+            "/v1/accounts?token=private-token",
+        ] {
+            assert_eq!(admin_command(&Method::GET, Some(route)), None);
+        }
+        assert_eq!(
+            admin_command(&Method::PATCH, Some("/v1/accounts/{jid}")),
+            None
+        );
+        assert_eq!(admin_command(&Method::GET, None), None);
+    }
+
     /// Read snapshots exclude staged writes until the single writer commits.
     #[derive(Clone)]
     struct MemoryStorage {

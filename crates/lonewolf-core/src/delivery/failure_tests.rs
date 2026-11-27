@@ -574,3 +574,18 @@ fn detached_effect_failure_logs_after_requester_cancellation() -> TestResult {
         Ok(())
     })
 }
+
+#[test]
+fn storage_failures_keep_only_the_error_kind_and_operation() {
+    for kind in KINDS {
+        let failure = storage_failure(seeded_error(kind), "offline_acknowledge");
+        assert_eq!(
+            failure,
+            Failure {
+                kind: FailureKind::Storage(kind),
+                operation: "offline_acknowledge",
+            }
+        );
+        assert!(!format!("{failure:?} {}", failure.kind.as_str()).contains(SENSITIVE_SOURCE));
+    }
+}

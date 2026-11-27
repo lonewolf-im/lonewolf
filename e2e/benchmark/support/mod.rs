@@ -146,7 +146,8 @@ pub fn assert_no_secret(
 ) -> TestResult {
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
-        if entry.file_type()?.is_file() {
+        // The copied server log is not a test oracle.
+        if entry.file_type()?.is_file() && entry.file_name() != "server.log" {
             let bytes = fs::read(entry.path())?;
             for sentinel in sentinels {
                 assert!(

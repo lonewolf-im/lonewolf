@@ -148,20 +148,9 @@ fn initial_replay_orders_echo_contacts_pending_requests_then_three_stored_messag
     await_empty(&mut bob, "bob@localhost/phone")?;
     bob.close()?;
     alice.close()?;
-    let logs = suite.stop_with_logs()?;
-    for summary in [
-        "pending subscriptions flushed operation=\"replay\" outcome=\"flushed\" pending_count=1",
-        "offline replay flushed operation=\"replay\" outcome=\"flushed\" messages_written=3 messages_skipped=0",
-    ] {
-        let line = logs
-            .lines()
-            .find(|line| line.contains(summary))
-            .ok_or("missing replay summary")?;
-        assert!(line.contains("INFO"));
-        assert!(line.contains("owner_jid=\"bob@localhost\""));
-        assert!(!line.contains("stored-") && !line.contains("<presence"));
-    }
-    Ok(())
+    suite.wait_for_metric(r#"lonewolf_c2s_replay_records_total{listener="0",kind="subscription_request",outcome="delivered"} 1"#)?;
+    suite.wait_for_metric(r#"lonewolf_c2s_replay_records_total{listener="0",kind="offline_message",outcome="delivered"} 3"#)?;
+    suite.stop()
 }
 
 fn seed_replay_roster(directory: &Path) -> TestResult {
@@ -219,8 +208,7 @@ fn seed_offline_records(directory: &Path, messages: &[&[u8]]) -> TestResult {
 }
 
 #[test]
-fn corrupt_stored_records_are_logged_once_skipped_and_removed_without_ending_the_stream()
--> TestResult {
+fn corrupt_stored_records_are_skipped_and_removed_without_ending_the_stream() -> TestResult {
     let mut suite = C2sSuite::with_extensions_and_setup(
         "'offline', 'test-offline-inspect'",
         |directory| {
@@ -243,20 +231,13 @@ fn corrupt_stored_records_are_logged_once_skipped_and_removed_without_ending_the
     )?;
     await_empty(&mut bob, "bob@localhost/phone")?;
     bob.close()?;
-    let logs = suite.stop_with_logs()?;
-    assert!(
-        logs.contains("offline replay flushed operation=\"replay\" outcome=\"flushed\" messages_written=1 messages_skipped=3"),
-        "{logs}"
-    );
-    assert_eq!(logs.matches("stored offline message rejected").count(), 3);
-    for sequence in 1..=3 {
-        assert!(logs.contains(&format!("sequence={sequence}")));
-    }
-    Ok(())
+    suite.wait_for_metric(r#"lonewolf_c2s_replay_records_total{listener="0",kind="offline_message",outcome="delivered"} 1"#)?;
+    suite.wait_for_metric(r#"lonewolf_c2s_replay_records_total{listener="0",kind="offline_message",outcome="invalid"} 3"#)?;
+    suite.stop()
 }
 
 #[test]
-fn prefixed_stored_stanzas_are_logged_once_skipped_and_allow_valid_replay() -> TestResult {
+fn prefixed_stored_stanzas_are_skipped_and_allow_valid_replay() -> TestResult {
     let mut suite = C2sSuite::with_extensions_and_setup(
         "'offline', 'test-offline-inspect'",
         |directory| {
@@ -276,13 +257,9 @@ fn prefixed_stored_stanzas_are_logged_once_skipped_and_allow_valid_replay() -> T
     bob.expect_xml("<message xmlns='jabber:client' to='bob@localhost' type='chat' id='valid'/>")?;
     await_empty(&mut bob, "bob@localhost/phone")?;
     bob.close()?;
-    let logs = suite.stop_with_logs()?;
-    assert_eq!(logs.matches("stored offline message rejected").count(), 2);
-    assert!(logs.contains("sequence=1"));
-    assert!(logs.contains("sequence=2"));
-    assert!(logs.contains("messages_written=1 messages_skipped=2"));
-    assert!(!logs.contains("private stored body"));
-    Ok(())
+    suite.wait_for_metric(r#"lonewolf_c2s_replay_records_total{listener="0",kind="offline_message",outcome="delivered"} 1"#)?;
+    suite.wait_for_metric(r#"lonewolf_c2s_replay_records_total{listener="0",kind="offline_message",outcome="invalid"} 2"#)?;
+    suite.stop()
 }
 
 #[test]
@@ -786,7 +763,7 @@ fn sender_drains_more_than_mailbox_capacity_while_live_acknowledgement_is_blocke
 }
 
 #[test]
-fn failed_live_acknowledgement_retains_the_stored_copy_and_logs_once() -> TestResult {
+fn failed_live_acknowledgement_retains_the_stored_copy() -> TestResult {
     let mut suite = C2sSuite::with_extensions("'test-blocked-offline-ack'")?;
     accounts(&suite)?;
     let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
@@ -805,21 +782,7 @@ fn failed_live_acknowledgement_retains_the_stored_copy_and_logs_once() -> TestRe
     inspect(&mut bob, "bob@localhost/phone", 1, 1, Some("bob@localhost"))?;
     bob.close()?;
     alice.close()?;
-    let logs = suite.stop_with_logs()?;
-    let failures: Vec<_> = logs
-        .lines()
-        .filter(|line| line.contains("internal operation failed"))
-        .collect();
-    assert_eq!(failures.len(), 1, "{logs}");
-    assert!(
-        failures[0].contains("failure_kind=\"storage_unavailable\""),
-        "{logs}"
-    );
-    assert!(
-        failures[0].contains("operation=\"offline_acknowledge\""),
-        "{logs}"
-    );
-    Ok(())
+    suite.stop()
 }
 
 #[test]

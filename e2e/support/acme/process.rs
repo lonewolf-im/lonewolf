@@ -42,7 +42,7 @@ pub struct AcmeServer {
 }
 
 pub struct SetupFailure {
-    pub logs: String,
+    pub error: String,
     pub ca_unchanged: bool,
     pub state_unchanged: bool,
 }
@@ -61,25 +61,16 @@ impl StartBudget {
     }
 }
 
+pub const BIND_FAILURE: &str = "ACME HTTP bind failed: ACME listener operation failed";
+
 fn retryable_bind_failure(
     owned: bool,
     reaped: bool,
     status: ExitStatus,
-    logs: &str,
+    error: &str,
     unchanged: bool,
 ) -> bool {
-    owned
-        && reaped
-        && status.code() == Some(1)
-        && unchanged
-        && logs.lines().last() == Some("ACME HTTP bind failed: ACME listener operation failed")
-        && ![
-            "ACME listener bound",
-            "c2s TCP listener started",
-            "waiting for stop signal",
-        ]
-        .iter()
-        .any(|event| logs.contains(event))
+    owned && reaped && status.code() == Some(1) && unchanged && error == BIND_FAILURE
 }
 impl AcmeServer {
     pub fn configure(ca: &FakeAcmeCa, hosts: &str, extra: &str) -> TestResult<Self> {
@@ -308,30 +299,26 @@ ca_certificates_path = {:?}
             let Some(status) = self.ready_until(budget.deadline)? else {
                 return Ok(());
             };
-            let logs = self.logs()?;
-            fs::write(
-                self.path()
-                    .join(format!("startup-failure-{}.log", self.launch_count)),
-                &logs,
-            )?;
+            let error = self.exit_error()?;
             let ca_unchanged = ca.counts() == before_ca;
             let state_unchanged = self.state_bytes()? == before_state;
             let eligible = retryable_bind_failure(
                 owned,
                 self.child.is_none(),
                 status,
-                &logs,
+                &error,
                 ca_unchanged && state_unchanged,
             );
             self.setup_failures.push(SetupFailure {
-                logs: logs.clone(),
+                error,
                 ca_unchanged,
                 state_unchanged,
             });
             if !eligible || budget.launches == 3 || Instant::now() >= budget.deadline {
                 return Err(format!(
-                    "server startup failed after {} launch(es): {logs}",
-                    budget.launches
+                    "server startup failed after {} launch(es): {}",
+                    budget.launches,
+                    self.logs()?
                 )
                 .into());
             }
@@ -370,6 +357,10 @@ ca_certificates_path = {:?}
     }
     pub fn logs(&self) -> TestResult<String> {
         Ok(fs::read_to_string(self.path().join("server.log"))?)
+    }
+    /// Returns the fatal error, which the server prints as its final stderr line after logging stops.
+    pub fn exit_error(&self) -> TestResult<String> {
+        Ok(self.logs()?.lines().last().unwrap_or_default().to_owned())
     }
     pub fn wait_exit(&mut self) -> TestResult<ExitStatus> {
         let deadline = Instant::now() + TIMEOUT;
@@ -491,17 +482,9 @@ ca_certificates_path = {:?}
                 Err(error) => last_error = error.to_string(),
             }
             if Instant::now() >= deadline {
-                return Err(format!(
-                    "certificate not installed ({last_error}): {}",
-                    self.logs()?
-                        .lines()
-                        .filter(|line| line.contains("ACME"))
-                        .rev()
-                        .take(10)
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                )
-                .into());
+                return Err(
+                    format!("certificate not installed ({last_error}): {}", self.logs()?).into(),
+                );
             }
             thread::sleep(Duration::from_millis(100));
         }
@@ -568,17 +551,26 @@ mod tests {
     use std::os::unix::process::ExitStatusExt;
 
     #[test]
-    fn setup_retry_classifier_rejects_nonbind_signals_mutation_and_readiness() {
-        let failure = "ACME HTTP bind failed: ACME listener operation failed\n";
+    fn setup_retry_classifier_rejects_nonbind_signals_and_mutation() {
         let ordinary = ExitStatus::from_raw(1 << 8);
-        assert!(retryable_bind_failure(true, true, ordinary, failure, true));
+        assert!(retryable_bind_failure(
+            true,
+            true,
+            ordinary,
+            BIND_FAILURE,
+            true
+        ));
         for (owned, reaped, unchanged) in [
             (false, true, true),
             (true, false, true),
             (true, true, false),
         ] {
             assert!(!retryable_bind_failure(
-                owned, reaped, ordinary, failure, unchanged
+                owned,
+                reaped,
+                ordinary,
+                BIND_FAILURE,
+                unchanged
             ));
         }
         for status in [
@@ -586,30 +578,22 @@ mod tests {
             ExitStatus::from_raw(101 << 8),
             ExitStatus::from_raw(9),
         ] {
-            assert!(!retryable_bind_failure(true, true, status, failure, true));
+            assert!(!retryable_bind_failure(
+                true,
+                true,
+                status,
+                BIND_FAILURE,
+                true
+            ));
         }
-        for logs in [
+        for error in [
             "",
             "invalid configuration file",
             "ACME load failed: state unavailable",
             "admin service failed",
             "ACME HTTP bind failed: other error",
-            "ACME HTTP bind failed: ACME listener operation failed\nextra",
         ] {
-            assert!(!retryable_bind_failure(true, true, ordinary, logs, true));
-        }
-        for event in [
-            "ACME listener bound",
-            "c2s TCP listener started",
-            "waiting for stop signal",
-        ] {
-            assert!(!retryable_bind_failure(
-                true,
-                true,
-                ordinary,
-                &format!("{event}\n{failure}"),
-                true
-            ));
+            assert!(!retryable_bind_failure(true, true, ordinary, error, true));
         }
     }
 

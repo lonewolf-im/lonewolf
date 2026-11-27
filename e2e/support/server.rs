@@ -20,10 +20,10 @@ use super::{Client, PlainClient, Signal, TIMEOUT, TestResult, tls};
 static ACTIVE_SERVERS: PlMutex<usize> = PlMutex::new(0);
 static SERVER_SLOT: PlCondvar = PlCondvar::new();
 
-const STARTUP_FAILURE: &str = "startup-failure.json";
+const RUN_FAILURE: &str = "run-failure.json";
 
 #[derive(serde::Deserialize, serde::Serialize)]
-enum StartupFailure {
+enum RunFailure {
     ComponentSecret {
         domain: String,
         message: String,
@@ -33,9 +33,12 @@ enum StartupFailure {
     ServiceDomain {
         domain: String,
     },
+    RouterFailed {
+        shard_id: usize,
+    },
 }
 
-impl StartupFailure {
+impl RunFailure {
     fn from_error(error: &lonewolf_core::RunError) -> Option<Self> {
         match error {
             lonewolf_core::RunError::ComponentSecret { domain, source } => {
@@ -49,6 +52,9 @@ impl StartupFailure {
             lonewolf_core::RunError::ServiceDomain { domain } => Some(Self::ServiceDomain {
                 domain: domain.clone(),
             }),
+            lonewolf_core::RunError::RouterFailed(failure) => Some(Self::RouterFailed {
+                shard_id: failure.shard_id,
+            }),
             _ => None,
         }
     }
@@ -56,6 +62,9 @@ impl StartupFailure {
     fn into_error(self) -> lonewolf_core::RunError {
         match self {
             Self::ServiceDomain { domain } => lonewolf_core::RunError::ServiceDomain { domain },
+            Self::RouterFailed { shard_id } => {
+                lonewolf_core::RunError::RouterFailed(lonewolf_core::RouterFailure { shard_id })
+            }
             Self::ComponentSecret {
                 domain,
                 message,
@@ -100,7 +109,7 @@ impl C2sSuitePermit {
 fn spawn_process(directory: &Path, readiness: &ReadinessSocket) -> TestResult<Child> {
     super::clock::prepare(directory)?;
     super::federation::remove_shutdown_receipt(directory)?;
-    match fs::remove_file(directory.join(STARTUP_FAILURE)) {
+    match fs::remove_file(directory.join(RUN_FAILURE)) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
@@ -257,21 +266,6 @@ impl C2sSuite {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(0),
             Err(error) => Err(error.into()),
         }
-    }
-
-    /// Returns the full log after a clean stop and fails if earlier lines were dropped.
-    pub fn stop_with_logs(&mut self) -> TestResult<String> {
-        let metrics = self.scrape_metrics()?;
-        assert!(
-            metrics
-                .lines()
-                .any(|line| line == "lonewolf_log_dropped_lines_total 0"),
-            "{metrics}"
-        );
-        self.stop()?;
-        Ok(fs::read_to_string(
-            self.directory.path().join("server.log"),
-        )?)
     }
 
     pub fn stop_with_s2s_state(
@@ -688,10 +682,10 @@ timeout_secs = 1
         loop {
             if let Some(status) = self.child.try_wait()? {
                 self.record_reaped(status);
-                match fs::read(self.directory.path().join(STARTUP_FAILURE)) {
+                match fs::read(self.directory.path().join(RUN_FAILURE)) {
                     Ok(bytes) => {
                         assert!(!status.success(), "{status}");
-                        let failure: StartupFailure = serde_json::from_slice(&bytes)?;
+                        let failure: RunFailure = serde_json::from_slice(&bytes)?;
                         return Err(failure.into_error().into());
                     }
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -726,14 +720,15 @@ timeout_secs = 1
             .ok_or("missing listener address")?)
     }
 
-    pub fn wait_for_failure(&mut self) -> TestResult<String> {
+    pub fn wait_for_failure(&mut self) -> TestResult<lonewolf_core::RunError> {
         let deadline = Instant::now() + TIMEOUT;
         loop {
             if let Some(status) = self.child.try_wait()? {
                 self.record_reaped(status);
-                let logs = fs::read_to_string(self.directory.path().join("server.log"))?;
-                assert_eq!(status.code(), Some(101), "status={status} logs={logs}");
-                return Ok(logs);
+                assert_eq!(status.code(), Some(101), "{status}");
+                let failure: RunFailure =
+                    serde_json::from_slice(&fs::read(self.directory.path().join(RUN_FAILURE))?)?;
+                return Ok(failure.into_error());
             }
             if Instant::now() >= deadline {
                 return Err("server did not exit after failure".into());
@@ -943,8 +938,8 @@ fn server_process() -> TestResult {
     ) {
         Ok(state) => state,
         Err(error) => {
-            if let Some(failure) = StartupFailure::from_error(&error) {
-                fs::write(STARTUP_FAILURE, serde_json::to_vec(&failure)?)?;
+            if let Some(failure) = RunFailure::from_error(&error) {
+                fs::write(RUN_FAILURE, serde_json::to_vec(&failure)?)?;
             }
             return Err(error.to_string().into());
         }

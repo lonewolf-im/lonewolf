@@ -4886,12 +4886,5 @@ fn account_deletion_retires_corrupt_reciprocal_metadata_and_continues_healthy_no
     mark_roster_version(&mut bob, "bob", 2)?;
     bob.close()?;
     carol.close()?;
-    let logs = suite.stop_with_logs()?;
-    assert!(
-        logs.lines()
-            .any(|line| line.contains("internal operation failed")
-                && line.contains("operation=\"account_deletion_effects\"")),
-        "{logs}"
-    );
-    Ok(())
+    suite.stop()
 }

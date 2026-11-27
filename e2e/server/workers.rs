@@ -67,10 +67,14 @@ fn storage_failure_stops_the_dispatcher_with_admin_disabled() -> TestResult {
         .output()?;
 
     assert_eq!(output.status.code(), Some(1));
-    let logs = std::str::from_utf8(&output.stderr)?;
-    assert!(logs.contains("core dispatcher started"));
-    assert!(logs.contains("core dispatcher stopped"));
-    assert!(logs.contains("cannot create parent directory"));
+    let error = std::str::from_utf8(&output.stderr)?
+        .lines()
+        .last()
+        .unwrap_or_default();
+    assert!(
+        error.starts_with("cannot create parent directory"),
+        "{error}"
+    );
     assert_eq!(
         fs::read_to_string(directory.path().join("not-directory"))?,
         "keep"

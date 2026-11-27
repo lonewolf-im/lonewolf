@@ -532,6 +532,27 @@ fn component_accept_stanza_address_rejections_keep_the_namespace() -> TestResult
 }
 
 #[test]
+fn parse_errors_display_no_input_content() -> TestResult {
+    block_on(async {
+        for content in [
+            "<c:message xmlns:c='jabber:client'><c:body>private-marker</c:body></c:message>",
+            "<message><private-marker></message>",
+            "<message id='private-marker' id='private-marker'/>",
+            "<message><body>private-marker&unknown;</body></message>",
+        ] {
+            let input = format!("{OPEN}{content}{CLOSE}");
+            let mut parser = XmppParser::new(input.as_bytes(), config(4096)?, GlobalChunkAllocator);
+            open(&mut parser).await?;
+            let Err(error) = parser.next_event().await else {
+                return Err(format!("accepted {content}").into());
+            };
+            assert!(!error.to_string().contains("private-marker"), "{content}");
+        }
+        Ok(())
+    })
+}
+
+#[test]
 fn stream_start_flags_extra_normalized_header_namespaces() -> TestResult {
     block_on(async {
         for chunk in [1, usize::MAX] {

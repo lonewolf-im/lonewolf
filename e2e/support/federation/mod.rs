@@ -15,8 +15,10 @@ pub mod crl_server;
 pub mod dns;
 pub mod peer;
 pub mod pki;
+pub(crate) mod single;
 #[path = "../tcp.rs"]
 mod tcp;
+pub(crate) mod workflow;
 
 pub use dns::FakeDns;
 pub use pki::FederationCa;

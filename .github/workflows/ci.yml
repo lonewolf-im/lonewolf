@@ -54,6 +54,8 @@ jobs:
           echo "$RUNNER_TEMP/rust-syntax/bin" >> "$GITHUB_PATH"
       - name: Test quality checks
         run: python3 -B -m unittest discover -s scripts/tests
+      - name: Check documentation line links
+        run: python3 -B scripts/check-doc-links.py
       - name: Check added Rust comments and logging
         env:
           BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before || 'origin/main' }}

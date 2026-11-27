@@ -82,6 +82,28 @@ mod unit {
             self.assertEqual(result.stdout.splitlines(), ["e2e/flow.rs:2: error: test step comment"])
 
 
+class DocLinksTest(unittest.TestCase):
+    def test_rust_line_links_must_land_on_a_function(self):
+        with tempfile.TemporaryDirectory() as work:
+            root = Path(work)
+            (root / "src").mkdir()
+            (root / "src" / "flows.rs").write_text("#[test]\nfn flow() {}\n    pub(crate) async fn helper() {}\n")
+            (root / "notes.txt").write_text("one\n")
+            (root / "docs").mkdir()
+            (root / "docs" / "guide.md").write_text(
+                "[Flow](../src/flows.rs#L2) [Helper](../src/flows.rs#L3) [Text](../notes.txt#L1)\n"
+                "[Attribute](../src/flows.rs#L1) [Past](../src/flows.rs#L9) [Gone](../src/gone.rs#L1)\n"
+            )
+            result = subprocess.run([sys.executable, SCRIPTS / "check-doc-links.py", "docs/guide.md"],
+                                    cwd=root, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertEqual(result.stderr.splitlines(), [
+                "docs/guide.md:2: ../src/flows.rs#L1: not a function declaration",
+                "docs/guide.md:2: ../src/flows.rs#L9: line out of range",
+                "docs/guide.md:2: ../src/gone.rs#L1: missing file",
+            ])
+
+
 class NativeDependenciesTest(unittest.TestCase):
     def test_only_enabled_native_build_edges_and_links_fail(self):
         with tempfile.TemporaryDirectory() as work:

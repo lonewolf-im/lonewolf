@@ -1646,7 +1646,12 @@ impl<A: ChunkAllocator + Clone, W: OutboxWriter<A>> BoundSession<'_, A, W> {
                 Jid::from_trusted_parts_in(Some(account.username()), account.domain(), None, arena)
             })
             .transpose()?;
+        let served = |domain: &str| self.router.serves_domain(domain);
+        let forged = ingress::delay::carries_forged(&stanza.resolve(arena)?, served)?;
         let mut builder = stanza.derive_in(arena)?.from(Some(from))?;
+        if forged {
+            builder = ingress::delay::discard_forged_from(builder, served)?;
+        }
         if let Some(to) = to {
             builder = builder.to(Some(to))?;
         }

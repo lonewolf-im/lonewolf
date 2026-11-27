@@ -45,6 +45,7 @@
 # Keep roster in this host's extension list when configuring these limits.
 # [hosts."example.com".roster]
 # Increase this positive count for larger address books. Each item allows up to eight groups.
+# Contact names and group names allow up to 1023 bytes each.
 # max_items = 1000
 # Increase this positive byte budget for larger names and groups; stored contact keys also count.
 # max_bytes = 2097152

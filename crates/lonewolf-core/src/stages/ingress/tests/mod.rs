@@ -485,6 +485,46 @@ fn destination_error_uses_authenticated_account_before_stamping() -> TestResult 
 }
 
 #[test]
+fn destination_rejection_error_carries_no_request_payload() -> TestResult {
+    const MARKER: &str = "PRIVATE-PAYLOAD-MARKER";
+    let fixture = Fixture::new(true)?;
+    let owner = account("alice@localhost")?;
+    let mut arena = Arena::try_new(Default::default())?;
+    let to = Jid::parse_in("bob@localhost", &mut arena)?;
+    let field =
+        lonewolf_xmpp::stanza::Element::builder_in(MARKER, "urn:test:destination", &mut arena)?
+            .attribute(MARKER, "", MARKER)?
+            .text(MARKER)?
+            .build()?;
+    let child =
+        lonewolf_xmpp::stanza::Element::builder_in("guarded", "urn:test:destination", &mut arena)?
+            .attribute("value", "", MARKER)?
+            .text(MARKER)?
+            .child(field)?
+            .build()?;
+    let request = Stanza::builder_in(
+        StanzaType::Iq(lonewolf_xmpp::stanza::IqType::Set),
+        StanzaNamespace::Client,
+        &mut arena,
+    )
+    .id(Some("guarded"))?
+    .to(Some(to))?
+    .child(child)?
+    .build()?;
+    let error = crate::stages::iq::destination_error(
+        &fixture.handle,
+        Some(&owner),
+        &request.resolve(&arena)?,
+    )
+    .map_err(|_| "destination failed")?
+    .ok_or("destination accepted")?;
+    assert!(error.failure().is_none());
+    assert!(!format!("{error:?}").contains(MARKER), "{error:?}");
+    Runtime::new()?.block_on(fixture.router.shutdown())?;
+    Ok(())
+}
+
+#[test]
 fn same_account_with_only_policy_routes_without_a_recipient_key_or_policy_calls() -> TestResult {
     use crate::router::metrics::MessageOutcome as MetricOutcome;
     use crate::stages::ingress::message::{MessageDisposition, handle};

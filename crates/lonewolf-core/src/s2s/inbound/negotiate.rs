@@ -73,6 +73,7 @@ struct Negotiation<A: ChunkAllocator> {
     connection: Option<Connection<A>>,
     peer_footer: bool,
     response_from: Box<str>,
+    response_version: stream::ResponseVersion,
 }
 
 enum Connection<A: ChunkAllocator> {
@@ -211,6 +212,7 @@ pub(super) async fn negotiate<A: ChunkAllocator + Clone>(
         connection,
         peer_footer: false,
         response_from,
+        response_version: stream::ResponseVersion::Current,
     };
     let deadline = accounting.started + settings.timeout;
     let mut close_deadline = None;
@@ -290,6 +292,7 @@ pub(super) async fn negotiate<A: ChunkAllocator + Clone>(
                 mut connection,
                 mut peer_footer,
                 response_from,
+                response_version,
             } = flow;
             if let Some(connection) = &mut connection {
                 let deadline = close_deadline
@@ -297,7 +300,10 @@ pub(super) async fn negotiate<A: ChunkAllocator + Clone>(
                 let _ = crate::clock::timeout_at(deadline, async {
                     if connection.needs_header() {
                         connection
-                            .send_header(&stream::response_header_xml(&response_from, None)?)
+                            .send_header(&stream::rejection_header_xml(
+                                &response_from,
+                                &response_version,
+                            )?)
                             .await?;
                     }
                     let condition = match failure.error {
@@ -343,7 +349,10 @@ async fn expected<A: ChunkAllocator + Clone>(
     }
 }
 
-fn header<A: ChunkAllocator>(event: StreamEvent<A>) -> Result<stream::InitialHeader, Failure> {
+fn header<A: ChunkAllocator>(
+    event: StreamEvent<A>,
+    response_version: &mut stream::ResponseVersion,
+) -> Result<stream::InitialHeader, Failure> {
     let StreamEvent::StreamStart {
         header,
         content_namespace,
@@ -355,6 +364,7 @@ fn header<A: ChunkAllocator>(event: StreamEvent<A>) -> Result<stream::InitialHea
             AuthOutcome::Protocol,
         ));
     };
+    *response_version = stream::response_version(&header);
     stream::validate_initial_header(&header, &content_namespace).map_err(|condition| {
         reject(
             condition,
@@ -437,6 +447,7 @@ async fn run<A: ChunkAllocator + Clone>(
     let Negotiation {
         connection,
         peer_footer,
+        response_version,
         ..
     } = flow;
     *connection = Some(Connection::Tls(reader, S2sWriter::new(output)));
@@ -445,7 +456,7 @@ async fn run<A: ChunkAllocator + Clone>(
     crate::test_support::ManualClock::record(
         crate::test_support::ClockEvent::ReadingProtectedHeader,
     );
-    let restarted = header(expected(tls, peer_footer).await?)?;
+    let restarted = header(expected(tls, peer_footer).await?, response_version)?;
     if restarted.to != local {
         return Err(reject(
             StreamErrorCondition::HostUnknown,
@@ -494,7 +505,7 @@ async fn run<A: ChunkAllocator + Clone>(
         reader.restart()?;
         writer.restart();
     }
-    let final_header = header(expected(tls, peer_footer).await?)?;
+    let final_header = header(expected(tls, peer_footer).await?, response_version)?;
     if final_header.from.as_deref() != Some(&remote) {
         return Err(reject(
             StreamErrorCondition::InvalidFrom,
@@ -574,9 +585,10 @@ async fn accept_starttls<A: ChunkAllocator + Clone>(
         connection,
         peer_footer,
         response_from,
+        response_version,
     } = flow;
     let plain = connection.as_mut().ok_or(S2sError::Internal)?;
-    let initial = header(expected(plain, peer_footer).await?)?;
+    let initial = header(expected(plain, peer_footer).await?, response_version)?;
     if !settings.services.router.federates_domain(&initial.to) {
         let response = stream::response_header_xml(
             settings.hosts.default_host_name(),
@@ -717,15 +729,14 @@ async fn authenticate_sasl<A: ChunkAllocator + Clone>(
             Err(failure) => {
                 tls.send(&stream::sasl_failure_xml(failure)).await?;
                 if attempt == 1 {
-                    tls.close(None).await?;
-                    return Err(Failure {
-                        error: S2sError::Eof,
-                        outcome: match failure {
+                    return Err(reject(
+                        StreamErrorCondition::PolicyViolation,
+                        match failure {
                             SaslFailure::InvalidAuthzid => AuthOutcome::InvalidAuthzid,
                             SaslFailure::InvalidMechanism => AuthOutcome::InvalidMechanism,
                             _ => AuthOutcome::Protocol,
                         },
-                    });
+                    ));
                 }
             }
         }
@@ -816,7 +827,7 @@ fn challenge_response<A: ChunkAllocator>(
         STANDARD
             .decode(text)
             .map(Auth::Response)
-            .map_err(|_| SaslFailure::MalformedRequest)
+            .map_err(|_| SaslFailure::IncorrectEncoding)
     })
 }
 

@@ -9,6 +9,7 @@ use lonewolf_xmpp::stream::StreamErrorCondition;
 use super::{InboundPeer, IngressContext};
 use crate::router::RoutedStanza;
 use crate::s2s::metrics::{S2sMetrics, StreamClose};
+use crate::stages::ingress::delay;
 
 pub(crate) fn violation_close(condition: StreamErrorCondition) -> StreamClose {
     match condition {
@@ -102,6 +103,11 @@ where
             let (stanza, mut arena) = parsed.into_parts();
             let stanza = stanza
                 .rescope_derive_in(StanzaNamespace::Client, &mut arena)
+                .and_then(|stanza| {
+                    delay::discard_forged(stanza, &mut arena, |domain| {
+                        context.router.serves_domain(domain)
+                    })
+                })
                 .map_err(|_| StreamErrorCondition::InternalServerError)?;
             deliver(RoutedStanza::from_parts(stanza, arena)).await
         }

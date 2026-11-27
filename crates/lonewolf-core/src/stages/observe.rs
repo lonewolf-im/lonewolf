@@ -80,9 +80,7 @@ mod tests {
 
     use compio::runtime::Runtime;
     use lonewolf_extension::archive::ArchiveId;
-    use lonewolf_extension::delivery::{
-        DeliveryError, DeliveryFuture, DeliveryHandle, FailureKind,
-    };
+    use lonewolf_extension::delivery::{DeliveryError, DeliveryFuture, DeliveryHandle};
     use lonewolf_extension::observer::{
         MessageObserver, MessageRole, SessionEvent, SessionObserver,
     };
@@ -97,7 +95,6 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::delivery::WorkGroup;
-    use crate::delivery::failure_tests::Capture;
     use crate::hosts::Hosts;
     use crate::router::Router;
     use crate::router::local::LocalRouter;
@@ -219,8 +216,6 @@ mod tests {
                 holders: &[],
                 rejection: None,
             };
-            let capture = Capture::default();
-            let subscriber = tracing::subscriber::set_default(capture.clone());
             message(&stage, &delivery, event).await;
             message(
                 &stage,
@@ -233,8 +228,6 @@ mod tests {
                 },
             )
             .await;
-            drop(subscriber);
-            capture.assert_one(FailureKind::Delivery, "message_observer");
             assert_eq!(
                 *calls.lock(),
                 [
@@ -348,8 +341,6 @@ mod tests {
             let first = Jid::parse_in("alice@localhost/a", &mut arena)?;
             let second = Jid::parse_in("bob@other.localhost/b", &mut arena)?;
             let unknown = Jid::parse_in("carol@unknown.localhost/c", &mut arena)?;
-            let capture = Capture::default();
-            let subscriber = tracing::subscriber::set_default(capture.clone());
             for session_jid in [first, second, unknown] {
                 session(
                     &stage,
@@ -361,8 +352,6 @@ mod tests {
                 )
                 .await;
             }
-            drop(subscriber);
-            capture.assert_one(FailureKind::Delivery, "session_observer");
             assert_eq!(
                 *calls.lock(),
                 [

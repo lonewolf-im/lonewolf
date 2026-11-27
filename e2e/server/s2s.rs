@@ -230,6 +230,11 @@ fn external_empty_challenge_abort_and_two_attempt_limit() -> Result {
             "invalid-mechanism",
             "invalid_mechanism",
         ),
+        (
+            "<auth xmlns='urn:ietf:params:xml:ns:xmpp-sasl' mechanism='EXTERNAL'>=AAA</auth>",
+            "incorrect-encoding",
+            "protocol",
+        ),
     ] {
         let (mut peer, _) = start_tls(address, fixture.client(Some("peer.test"), false)?)?;
         external(&mut peer, HEADER)?;
@@ -237,7 +242,7 @@ fn external_empty_challenge_abort_and_two_attempt_limit() -> Result {
         assert!(until(&mut peer, "</failure>")?.contains(second));
         peer.write_all(first.as_bytes())?;
         assert!(until(&mut peer, "</failure>")?.contains(second));
-        assert_eq!(until(&mut peer, FOOTER)?, FOOTER);
+        stream_error(&mut peer, "policy-violation")?;
         peer.write_all(FOOTER.as_bytes())?;
         assert_eq!(peer.read(&mut [0])?, 0);
         wait_sample(&server, &auth_sample(outcome), 1)?;

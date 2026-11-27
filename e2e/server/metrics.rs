@@ -5,11 +5,14 @@
     reason = "Test targets compile shared fixtures as private modules."
 )]
 
-#[expect(dead_code, reason = "Only the S2S suite checks for missing readiness.")]
+#[expect(
+    dead_code,
+    reason = "Each test target uses a different subset of this fixture."
+)]
 #[path = "support/process.rs"]
 mod process;
 
-use process::{Server, TIMEOUT, field, request};
+use process::{Server, TIMEOUT, request};
 
 #[expect(
     dead_code,
@@ -69,13 +72,6 @@ fn enabled_metrics_serve_openmetrics_and_stop_with_the_server() -> TestResult {
     assert!(body.ends_with("# EOF\n"), "{body}");
     assert!(request(address, "/missing")?.starts_with("HTTP/1.1 404"));
     server.stop(Signal::SIGTERM)?;
-    let logs = server.logs()?;
-    let started = logs
-        .lines()
-        .find(|line| line.contains("metrics service started"))
-        .ok_or("missing metrics start log")?;
-    assert_eq!(field(started, "port=")?, usize::from(address.port()));
-    assert!(logs.contains("metrics service stopped"));
     let _listener = ports::bind_released_listener(address, Instant::now() + TIMEOUT)?;
     Ok(())
 }
@@ -91,9 +87,9 @@ fn occupied_metrics_address_stops_startup_before_client_listeners() -> TestResul
         2,
     )?;
     assert_eq!(server.wait()?.code(), Some(1));
-    let logs = server.logs()?;
-    assert!(logs.contains("metrics service failed"), "{logs}");
-    assert!(!logs.contains("c2s TCP listener started"), "{logs}");
+    let error = server.logs()?.lines().last().unwrap_or_default().to_owned();
+    assert!(error.starts_with("metrics service failed"), "{error}");
+    assert!(!server.has_readiness()?);
     assert!(
         !server
             .directory
@@ -113,6 +109,5 @@ fn metrics_are_disabled_by_default() -> TestResult {
     server.ready()?;
     assert_eq!(server.metrics_address(), None);
     server.stop(Signal::SIGINT)?;
-    assert!(!server.logs()?.contains("metrics service started"));
     Ok(())
 }

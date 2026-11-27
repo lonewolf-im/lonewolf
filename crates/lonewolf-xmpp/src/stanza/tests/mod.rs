@@ -320,6 +320,44 @@ fn filtered_copy_does_not_allocate_removed_children() -> TestResult {
 }
 
 #[test]
+fn retained_children_share_storage_until_a_removal_shifts_a_child() -> TestResult {
+    let mut arena = Arena::try_new(ArenaConfig::default())?;
+    let first = body(&mut arena, "first")?;
+    let second = Element::builder_in("delay", "urn:xmpp:delay", &mut arena)?.build()?;
+    let stanza = Stanza::builder_in(
+        StanzaType::Message(MessageType::Normal),
+        StanzaNamespace::Client,
+        &mut arena,
+    )
+    .child(first)?
+    .child(second)?
+    .build()?;
+    let before = stanza_xml(stanza, &arena)?;
+    let used = arena.stats().used_bytes;
+    let trailing = stanza
+        .derive_in(&mut arena)?
+        .retain_children(|child| Ok(child.name() != "delay"))?
+        .build()?;
+    let trailing_growth = arena.stats().used_bytes - used;
+    let used = arena.stats().used_bytes;
+    let leading = stanza
+        .derive_in(&mut arena)?
+        .retain_children(|child| Ok(child.name() != "body"))?
+        .build()?;
+    assert!(trailing_growth < arena.stats().used_bytes - used);
+    assert_eq!(stanza_xml(stanza, &arena)?, before);
+    assert_eq!(
+        stanza_xml(trailing, &arena)?,
+        "<message xmlns=\"jabber:client\"><body>first</body></message>"
+    );
+    assert_eq!(
+        stanza_xml(leading, &arena)?,
+        "<message xmlns=\"jabber:client\"><delay xmlns=\"urn:xmpp:delay\"/></message>"
+    );
+    Ok(())
+}
+
+#[test]
 fn filtered_copy_propagates_predicate_access_errors() -> TestResult {
     let mut source = Arena::try_new(ArenaConfig::default())?;
     let child = body(&mut source, "hello")?;

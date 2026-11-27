@@ -490,8 +490,10 @@ fn subscription_request_reaches_an_available_contact_and_updates_the_roster() ->
     )?;
     alice.send(&format!("<iq type='result' id='{push}'/>"))?;
     alice.send("<presence type='subscribe' id='repeat' to='bob@localhost'/>")?;
-    bob.expect_xml("<presence xmlns='jabber:client' type='subscribe' id='repeat' from='alice@localhost' to='bob@localhost'/>")?;
-    bob_tablet.expect_xml("<presence xmlns='jabber:client' type='subscribe' id='repeat' from='alice@localhost' to='bob@localhost'/>")?;
+    alice.send("<message to='bob@localhost/phone' id='sentinel'/>")?;
+    bob.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost/phone' id='sentinel'/>")?;
+    alice.send("<message to='bob@localhost/tablet' id='sentinel'/>")?;
+    bob_tablet.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost/tablet' id='sentinel'/>")?;
     request_roster(
         &mut alice,
         "pending-roster",
@@ -502,6 +504,76 @@ fn subscription_request_reaches_an_available_contact_and_updates_the_roster() ->
     bob.close()?;
     bob_tablet.expect_xml("<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost' type='unavailable'/>")?;
     bob_tablet.close()
+}
+
+#[test]
+fn repeated_subscription_request_is_not_delivered_again() -> TestResult {
+    const STORED_REQUEST: &str = "<presence xmlns='jabber:client' type='subscribe' from='alice@localhost' to='bob@localhost'/>";
+    for (alice_view, bob_view, alice_item, bob_items) in [
+        (
+            subscription(SubscriptionState::None, true),
+            None,
+            "<item jid='bob@localhost' subscription='none' ask='subscribe'/>",
+            "",
+        ),
+        (
+            subscription(SubscriptionState::From, true),
+            Some(subscription(SubscriptionState::To, false)),
+            "<item jid='bob@localhost' subscription='from' ask='subscribe'/>",
+            "<item jid='alice@localhost' subscription='to'/>",
+        ),
+    ] {
+        let suite = C2sSuite::with_extensions_and_setup("'roster'", |directory| {
+            seed_alice_and_bob(directory, alice_view, bob_view)
+        })?;
+        let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+        let mut bob = suite.connect("bob", PASSWORD, "phone")?;
+        mark_roster_version(&mut alice, "alice", 1)?;
+        request_roster(
+            &mut bob,
+            "bob-roster",
+            &format!(
+                "<iq xmlns='jabber:client' type='result' id='bob-roster' to='bob@localhost/phone'><query xmlns='jabber:iq:roster'>{bob_items}</query></iq>"
+            ),
+        )?;
+        bob.send("<presence/>")?;
+        bob.expect_xml(
+            "<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'/>",
+        )?;
+        bob.expect_xml(STORED_REQUEST)?;
+
+        alice.send("<presence type='subscribe' id='repeat' to='bob@localhost'/>")?;
+        alice.send("<message to='bob@localhost/phone' id='sentinel'/>")?;
+        bob.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost/phone' id='sentinel'/>")?;
+        request_roster(
+            &mut alice,
+            "unchanged-alice-roster",
+            &format!(
+                "<iq xmlns='jabber:client' type='result' id='unchanged-alice-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'>{alice_item}</query></iq>"
+            ),
+        )?;
+        request_roster(
+            &mut bob,
+            "unchanged-bob-roster",
+            &format!(
+                "<iq xmlns='jabber:client' type='result' id='unchanged-bob-roster' to='bob@localhost/phone'><query xmlns='jabber:iq:roster'>{bob_items}</query></iq>"
+            ),
+        )?;
+        bob.close()?;
+
+        let mut bob = suite.connect("bob", PASSWORD, "tablet")?;
+        bob.send("<presence/>")?;
+        bob.expect_xml(
+            "<presence xmlns='jabber:client' from='bob@localhost/tablet' to='bob@localhost'/>",
+        )?;
+        bob.expect_xml(STORED_REQUEST)?;
+        alice.send("<message to='bob@localhost/tablet' id='sentinel'/>")?;
+        bob.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost/tablet' id='sentinel'/>")?;
+
+        alice.close()?;
+        bob.close()?;
+    }
+    Ok(())
 }
 
 #[test]
@@ -3004,6 +3076,88 @@ fn roster_set_with_an_empty_group_returns_not_acceptable_without_mutating() -> T
 }
 
 #[test]
+fn roster_set_with_an_oversized_name_returns_not_acceptable_without_mutating() -> TestResult {
+    let suite = C2sSuite::with_extensions("'roster'")?;
+    suite.create_account("alice", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let name = "n".repeat(1024);
+
+    request_roster(
+        &mut alice,
+        "initial-roster",
+        "<iq xmlns='jabber:client' type='result' id='initial-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/></iq>",
+    )?;
+    alice.send(&format!("<iq type='set' id='long-name'><query xmlns='jabber:iq:roster'><item jid='bob@localhost' name='{name}'><group>Friends</group></item></query></iq>"))?;
+    alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' id='long-name' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'><item jid='bob@localhost' name='{name}'><group>Friends</group></item></query><error type='modify'><not-acceptable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>A roster contact name can have at most 1023 bytes. Shorten the contact name.</text></error></iq>"))?;
+    request_roster(
+        &mut alice,
+        "unchanged-roster",
+        "<iq xmlns='jabber:client' type='result' id='unchanged-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/></iq>",
+    )?;
+
+    alice.close()
+}
+
+#[test]
+fn roster_set_with_an_oversized_group_returns_not_acceptable_without_mutating() -> TestResult {
+    let suite = C2sSuite::with_extensions("'roster'")?;
+    suite.create_account("alice", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let group = "g".repeat(1024);
+
+    request_roster(
+        &mut alice,
+        "initial-roster",
+        "<iq xmlns='jabber:client' type='result' id='initial-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/></iq>",
+    )?;
+    alice.send(&format!("<iq type='set' id='long-group'><query xmlns='jabber:iq:roster'><item jid='bob@localhost' name='Bob'><group>Friends</group><group>{group}</group></item></query></iq>"))?;
+    alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' id='long-group' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'><item jid='bob@localhost' name='Bob'><group>Friends</group><group>{group}</group></item></query><error type='modify'><not-acceptable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>A roster group name can have at most 1023 bytes. Shorten the group name.</text></error></iq>"))?;
+    request_roster(
+        &mut alice,
+        "unchanged-roster",
+        "<iq xmlns='jabber:client' type='result' id='unchanged-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/></iq>",
+    )?;
+
+    alice.close()
+}
+
+#[test]
+fn roster_set_with_a_name_and_group_at_the_size_limit_is_accepted() -> TestResult {
+    let suite = C2sSuite::with_extensions("'roster'")?;
+    suite.create_account("alice", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let name = "n".repeat(1023);
+    let group = "g".repeat(1023);
+
+    request_roster(
+        &mut alice,
+        "initial-roster",
+        "<iq xmlns='jabber:client' type='result' id='initial-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/></iq>",
+    )?;
+    alice.send(&format!("<iq type='set' id='limit-item'><query xmlns='jabber:iq:roster'><item jid='bob@localhost' name='{name}'><group>{group}</group></item></query></iq>"))?;
+    alice.expect_xml(
+        "<iq xmlns='jabber:client' type='result' id='limit-item' to='alice@localhost/desk'/>",
+    )?;
+    let push = expect_roster_push(
+        &mut alice,
+        "alice@localhost/desk",
+        &format!(
+            "<item xmlns='jabber:iq:roster' jid='bob@localhost' name='{name}' subscription='none'><group>{group}</group></item>"
+        ),
+    )?;
+    alice.send(&format!("<iq type='result' id='{push}'/>"))?;
+    request_roster(
+        &mut alice,
+        "stored-roster",
+        &format!(
+            "<iq xmlns='jabber:client' type='result' id='stored-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'><item jid='bob@localhost' name='{name}' subscription='none'><group>{group}</group></item></query></iq>"
+        ),
+    )?;
+
+    alice.close()
+}
+
+#[test]
 fn roster_set_for_another_account_returns_forbidden_without_mutating() -> TestResult {
     let suite = C2sSuite::with_extensions("'roster'")?;
     suite.create_account("alice", PASSWORD)?;
@@ -4133,7 +4287,8 @@ fn full_subscription_controls_ignore_missing_resources_and_process_existing_reso
         )?;
         alice.send(&format!("<iq type='result' id='{pending}'/>"))?;
         alice.send("<presence type='subscribe' to='bob@localhost/phone'/>")?;
-        bob.expect_xml("<presence xmlns='jabber:client' type='subscribe' from='alice@localhost' to='bob@localhost'/>")?;
+        alice.send("<message to='bob@localhost/phone' id='sentinel'/>")?;
+        bob.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost/phone' id='sentinel'/>")?;
 
         if kind == "unsubscribe" {
             alice.send("<presence type='unsubscribe' to='bob@localhost/missing'/>")?;
@@ -4731,12 +4886,5 @@ fn account_deletion_retires_corrupt_reciprocal_metadata_and_continues_healthy_no
     mark_roster_version(&mut bob, "bob", 2)?;
     bob.close()?;
     carol.close()?;
-    let logs = suite.stop_with_logs()?;
-    assert!(
-        logs.lines()
-            .any(|line| line.contains("internal operation failed")
-                && line.contains("operation=\"account_deletion_effects\"")),
-        "{logs}"
-    );
-    Ok(())
+    suite.stop()
 }

@@ -1642,3 +1642,17 @@ fn bare_headline_to_an_only_negative_priority_resource_is_silently_ignored() -> 
     alice.close()?;
     bob.close()
 }
+
+const DELAYS: &str = "<delay xmlns='urn:xmpp:delay' from='localhost' stamp='2000-01-01T00:00:00Z'/><delay xmlns='urn:xmpp:delay' from='muc.example' stamp='2001-01-01T00:00:00Z'/><delay xmlns='urn:xmpp:delay' stamp='2002-01-01T00:00:00Z'/>";
+const KEPT_DELAYS: &str = "<delay xmlns='urn:xmpp:delay' from='muc.example' stamp='2001-01-01T00:00:00Z'/><delay xmlns='urn:xmpp:delay' stamp='2002-01-01T00:00:00Z'/>";
+
+#[test]
+fn client_delays_claiming_the_server_are_discarded_before_delivery() -> TestResult {
+    let (_suite, mut alice, mut bob) = alice_and_available_bob(0)?;
+    alice.send(&format!(
+        "<message to='bob@localhost' type='chat' id='d'><body>Hello</body>{DELAYS}</message>"
+    ))?;
+    bob.expect_xml(&format!("<message xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost' type='chat' id='d'><body>Hello</body>{KEPT_DELAYS}</message>"))?;
+    alice.close()?;
+    bob.close()
+}

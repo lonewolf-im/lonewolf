@@ -805,3 +805,16 @@ fn directed_presence_quota_rejects_without_delivery_or_visibility_and_recovers()
     bob.close()?;
     carol.close()
 }
+
+#[test]
+fn presence_broadcasts_omit_client_delays_claiming_the_server() -> TestResult {
+    let suite = C2sSuite::start()?;
+    suite.create_account("alice", PASSWORD)?;
+    let mut desk = suite.connect("alice", PASSWORD, "desk")?;
+    let kept = "<delay xmlns='urn:xmpp:delay' from='muc.example' stamp='2001-01-01T00:00:00Z'/><delay xmlns='urn:xmpp:delay' stamp='2002-01-01T00:00:00Z'/>";
+    desk.send(&format!("<presence><delay xmlns='urn:xmpp:delay' from='localhost' stamp='2000-01-01T00:00:00Z'/>{kept}</presence>"))?;
+    desk.expect_xml(&format!(
+        "<presence xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost'>{kept}</presence>"
+    ))?;
+    desk.close()
+}

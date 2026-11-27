@@ -1227,3 +1227,27 @@ fn client_errors_answering_headlines_are_copied_without_strict_rules() -> TestRe
     desk.close()?;
     phone.close()
 }
+
+#[test]
+fn sent_copies_omit_client_delays_claiming_the_server() -> TestResult {
+    let suite = C2sSuite::start()?;
+    accounts(&suite)?;
+    let mut desk = suite.connect("alice", PASSWORD, "desk")?;
+    let mut phone = suite.connect("alice", PASSWORD, "phone")?;
+    let mut bob = suite.connect("bob", PASSWORD, "desk")?;
+    available(&mut bob, "bob@localhost/desk", 0)?;
+    enable(&mut phone, "alice@localhost/phone")?;
+    desk.send("<message to='bob@localhost' type='chat' id='d'><body>one</body><delay xmlns='urn:xmpp:delay' from='localhost' stamp='2000-01-01T00:00:00Z'/><delay xmlns='urn:xmpp:delay' from='muc.example' stamp='2001-01-01T00:00:00Z'/><delay xmlns='urn:xmpp:delay' stamp='2002-01-01T00:00:00Z'/></message>")?;
+    let delivered = "<message xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost' type='chat' id='d'><body>one</body><delay xmlns='urn:xmpp:delay' from='muc.example' stamp='2001-01-01T00:00:00Z'/><delay xmlns='urn:xmpp:delay' stamp='2002-01-01T00:00:00Z'/></message>";
+    bob.expect_xml(delivered)?;
+    copy(
+        &mut phone,
+        "alice@localhost/phone",
+        "sent",
+        " type='chat'",
+        delivered,
+    )?;
+    desk.close()?;
+    phone.close()?;
+    bob.close()
+}

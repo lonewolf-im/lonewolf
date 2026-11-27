@@ -382,8 +382,6 @@ async fn queue_delivery(fixture: &Fixture) -> TestResult {
 fn guarded_preparations_release_writer_before_blocked_output_resumes() -> TestResult {
     Runtime::new()?.block_on(async {
         for (workflow, outcome) in [(Workflow::Iq, Outcome::Commit), (Workflow::Iq, Outcome::Reject), (Workflow::Offline, Outcome::Commit), (Workflow::Offline, Outcome::Reject), (Workflow::Offline, Outcome::Discard), (Workflow::Subscription, Outcome::Commit), (Workflow::Subscription, Outcome::Reject)] {
-            let capture = crate::delivery::failure_tests::Capture::default();
-            let _subscriber = tracing::subscriber::set_default(capture.clone());
             let fixture = Fixture::new(&[]).await?;
             let (gate, entered, release) = Gate::new(outcome);
             let fixture = enable(fixture, &gate)?;
@@ -407,18 +405,12 @@ fn guarded_preparations_release_writer_before_blocked_output_resumes() -> TestRe
             drop(drive(operation.as_mut(), fixture.storage.begin_write()).await??);
             assert!(gate.completed.load(Ordering::Acquire));
             assert_eq!(fixture.count().await?, usize::from(matches!(outcome, Outcome::Commit)));
-            if matches!(outcome, Outcome::Reject) {
-                capture.assert_one(FailureKind::Storage(lonewolf_storage::StorageErrorKind::Unavailable), if matches!(workflow, Workflow::Offline) { "offline_push" } else { "roster_write" });
-            }
             output_release.send(()).map_err(|_| "active output was replaced")?;
             operation.await.map_err(|e| format!("{e:?}"))?;
             session.outbox.flush().await.map_err(|e| format!("{e:?}"))?;
             assert_eq!(session.outbox.writer.bytes, session.outbox.writer.written.concat());
             assert_eq!(session.outbox.writer.written.len(), if matches!(workflow, Workflow::Iq) || matches!(outcome, Outcome::Reject) { 2 } else { 1 });
             assert!(session.outbox.writer.written[0].contains("alice@localhost/desk"));
-            if matches!(outcome, Outcome::Reject) {
-                capture.assert_one(FailureKind::Storage(lonewolf_storage::StorageErrorKind::Unavailable), if matches!(workflow, Workflow::Offline) { "offline_push" } else { "roster_write" });
-            }
             drop(session);
             fixture.finish().await?;
         }

@@ -20,6 +20,12 @@ pub type PendingPage = StoredPage<RosterJid>;
 /// Bounds XML node metadata independently of stored string bytes.
 pub const MAX_GROUPS_PER_ITEM: usize = 8;
 
+/// Roster sets enforce this limit, but stored items may exceed it.
+pub const MAX_ITEM_NAME_BYTES: usize = 1023;
+
+/// Roster sets enforce this limit, but stored items may exceed it.
+pub const MAX_GROUP_NAME_BYTES: usize = 1023;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RosterQuota {
     pub max_items: NonZeroUsize,

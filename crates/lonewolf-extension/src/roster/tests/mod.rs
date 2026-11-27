@@ -705,6 +705,63 @@ fn subscription_request_effects_name_both_local_parties() {
 }
 
 #[test]
+fn local_repeated_subscription_requests_keep_one_request_and_are_not_delivered_again()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (contact_state, contact_pending_out) in [
+        (SubscriptionState::None, false),
+        (SubscriptionState::None, true),
+        (SubscriptionState::To, false),
+    ] {
+        let (_directory, roster) = roster();
+        let alice = account("alice@example.com");
+        let bob = account("bob@example.com");
+        create_account(&roster, &alice);
+        create_account(&roster, &bob);
+        let label = format!("{contact_state:?} pending_out={contact_pending_out}");
+        if contact_state != SubscriptionState::None || contact_pending_out {
+            let mut contact_item = subscribed(RosterJid::from(&alice), contact_state);
+            contact_item.subscription.pending_out = contact_pending_out;
+            let requester_state = if contact_state == SubscriptionState::To {
+                SubscriptionState::From
+            } else {
+                SubscriptionState::None
+            };
+            block_on(async {
+                let mut tx = roster.storage.begin_write().await?;
+                tx.put_roster_item(&bob, &contact_item, RosterQuota::default())
+                    .await?;
+                tx.put_roster_item(
+                    &alice,
+                    &subscribed(RosterJid::from(&bob), requester_state),
+                    RosterQuota::default(),
+                )
+                .await?;
+                tx.commit().await?;
+                Ok::<_, Box<dyn std::error::Error>>(())
+            })?;
+        }
+        let delivery = RecordingDelivery::default();
+        receive_subscribe(&roster, "alice@example.com", "bob@example.com", &delivery)
+            .map_err(|error| format!("{error:?}"))?;
+        assert_eq!(delivery.available.borrow().len(), 1, "{label}");
+        assert_eq!(delivery.pushes.borrow().len(), 1, "{label}");
+        let requests = pending(&roster, &bob);
+        let alice_version = snapshot(&roster, &alice).version;
+        let bob_version = snapshot(&roster, &bob).version;
+
+        receive_subscribe(&roster, "alice@example.com", "bob@example.com", &delivery)
+            .map_err(|error| format!("{error:?}"))?;
+        assert_eq!(delivery.available.borrow().len(), 1, "{label}");
+        assert_eq!(delivery.pushes.borrow().len(), 1, "{label}");
+        assert_eq!(pending(&roster, &bob), requests, "{label}");
+        assert_eq!(requests.len(), 1, "{label}");
+        assert_eq!(snapshot(&roster, &alice).version, alice_version, "{label}");
+        assert_eq!(snapshot(&roster, &bob).version, bob_version, "{label}");
+    }
+    Ok(())
+}
+
+#[test]
 fn only_the_initial_transition_collects_granted_contacts() {
     let (_directory, roster) = roster();
     let mut arena =

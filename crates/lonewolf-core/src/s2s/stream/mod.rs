@@ -79,10 +79,18 @@ pub(crate) enum Auth {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SaslFailure {
     Aborted,
+    IncorrectEncoding,
     InvalidAuthzid,
     InvalidMechanism,
     MalformedRequest,
     NotAuthorized,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum ResponseVersion {
+    Omitted,
+    Current,
+    ZeroMajor(Box<str>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -106,9 +114,24 @@ pub(crate) fn initial_header_xml(from: &str, to: &str) -> String {
 }
 
 pub(crate) fn response_header_xml(from: &str, to: Option<&str>) -> Result<String, S2sError> {
+    header_xml(from, to, &ResponseVersion::Current)
+}
+
+pub(crate) fn rejection_header_xml(
+    from: &str,
+    version: &ResponseVersion,
+) -> Result<String, S2sError> {
+    header_xml(from, None, version)
+}
+
+fn header_xml(from: &str, to: Option<&str>, version: &ResponseVersion) -> Result<String, S2sError> {
     let mut id = [0_u8; 16];
     aws_lc_rs::rand::fill(&mut id).map_err(|_| S2sError::Internal)?;
-    let mut xml = String::with_capacity(224 + from.len() + to.map_or(0, str::len));
+    let minor_bytes = match version {
+        ResponseVersion::ZeroMajor(minor) => minor.len(),
+        _ => 0,
+    };
+    let mut xml = String::with_capacity(224 + from.len() + to.map_or(0, str::len) + minor_bytes);
     xml.push_str(HEADER_PREFIX);
     escape_attribute(&mut xml, from);
     xml.push_str("' id='");
@@ -119,8 +142,32 @@ pub(crate) fn response_header_xml(from: &str, to: Option<&str>) -> Result<String
         escape_attribute(&mut xml, to);
         xml.push('\'');
     }
-    xml.push_str(" version='1.0' xml:lang='en'>");
+    match version {
+        ResponseVersion::Omitted => {}
+        ResponseVersion::Current => xml.push_str(" version='1.0'"),
+        ResponseVersion::ZeroMajor(minor) => {
+            xml.push_str(" version='0.");
+            xml.push_str(minor);
+            xml.push('\'');
+        }
+    }
+    xml.push_str(" xml:lang='en'>");
     Ok(xml)
+}
+
+/// Negotiates the lower of the peer's version and 1.0, and omits the version when the peer does.
+pub(crate) fn response_version<A: ChunkAllocator>(header: &Parsed<Element, A>) -> ResponseVersion {
+    let Ok(header) = header.value().resolve(header.arena()) else {
+        return ResponseVersion::Current;
+    };
+    match header.attribute("version", "") {
+        Ok(None) => ResponseVersion::Omitted,
+        Ok(Some(version)) => match version_components(version) {
+            Some(("0", minor)) => ResponseVersion::ZeroMajor(minor.into()),
+            _ => ResponseVersion::Current,
+        },
+        Err(_) => ResponseVersion::Current,
+    }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -291,7 +338,7 @@ pub(crate) fn parse_auth<A: ChunkAllocator>(
         Some(text) => {
             let decoded = STANDARD
                 .decode(text)
-                .map_err(|_| SaslFailure::MalformedRequest)?;
+                .map_err(|_| SaslFailure::IncorrectEncoding)?;
             std::str::from_utf8(&decoded).map_err(|_| SaslFailure::MalformedRequest)?;
             Ok(Auth::Response(decoded))
         }
@@ -301,6 +348,7 @@ pub(crate) fn parse_auth<A: ChunkAllocator>(
 pub(crate) fn sasl_failure_xml(failure: SaslFailure) -> String {
     let name = match failure {
         SaslFailure::Aborted => "aborted",
+        SaslFailure::IncorrectEncoding => "incorrect-encoding",
         SaslFailure::InvalidAuthzid => "invalid-authzid",
         SaslFailure::InvalidMechanism => "invalid-mechanism",
         SaslFailure::MalformedRequest => "malformed-request",

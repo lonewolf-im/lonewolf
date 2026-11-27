@@ -1070,11 +1070,17 @@ impl<A: ChunkAllocator> StanzaBuilder<'_, A> {
         Ok(self)
     }
 
-    pub fn remove_children(mut self, name: &str, namespace: &str) -> Result<Self, BuildError> {
-        self.children.retain(self.arena, |child, arena| {
-            let child = child.resolve(arena)?;
-            Ok(child.name() != name || child.namespace() != namespace)
-        })?;
+    pub fn remove_children(self, name: &str, namespace: &str) -> Result<Self, BuildError> {
+        self.retain_children(|child| Ok(child.name() != name || child.namespace() != namespace))
+    }
+
+    /// Copies shared child storage only when a removal shifts a retained child.
+    pub fn retain_children(
+        mut self,
+        mut keep: impl FnMut(&ElementRef<'_, Arena<A>>) -> Result<bool, HandleError>,
+    ) -> Result<Self, BuildError> {
+        self.children
+            .retain(self.arena, |child, arena| keep(&child.resolve(arena)?))?;
         Ok(self)
     }
 

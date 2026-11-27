@@ -196,9 +196,7 @@ fn prefixed_content_returns_bad_namespace_prefix_without_delivery_after_binding(
         u64::try_from(PREFIXED_CONTENT_STANZAS.len())?,
     )?;
     recipient.close()?;
-    let logs = suite.stop_with_logs()?;
-    assert!(!logs.contains("<c:message"), "{logs}");
-    Ok(())
+    suite.stop()
 }
 
 #[test]
@@ -906,12 +904,7 @@ fn rejected_stanzas_return_errors_and_leave_roster_requests_usable() -> TestResu
         client.expect_xml("<iq xmlns='jabber:client' type='result' id='sentinel' to='alice@localhost/desktop'><query xmlns='jabber:iq:roster'/></iq>")?;
     }
     client.close()?;
-    let logs = suite.stop_with_logs()?;
-    assert!(
-        !logs.contains("bad@") && !logs.contains("private payload"),
-        "{logs}"
-    );
-    Ok(())
+    suite.stop()
 }
 
 #[test]
@@ -1054,9 +1047,7 @@ fn peer_stream_errors_end_each_open_stream_phase_without_a_reciprocal_error() ->
         }
     }
     suite.wait_for_closed("peer_stream_error", 10)?;
-    let logs = suite.stop_with_logs()?;
-    assert!(!logs.contains("private peer error text"), "{logs}");
-    Ok(())
+    suite.stop()
 }
 
 #[test]

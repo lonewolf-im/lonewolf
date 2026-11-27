@@ -795,3 +795,143 @@ fn client_from_and_profile_identity_never_replace_authenticated_storage_owner() 
         Ok(())
     })
 }
+
+const MARKER: &str = "PRIVATE-VCARD-MARKER";
+
+fn assert_card_free(error: &IqError) {
+    assert!(!format!("{error:?}").contains(MARKER), "{error:?}");
+    if let Some(failure) = error.failure() {
+        assert!(!failure.kind.as_str().contains(MARKER));
+        assert!(!failure.operation.contains(MARKER));
+    }
+}
+
+#[test]
+fn rejected_set_errors_carry_no_card_content() -> TestResult {
+    block_on(async {
+        let mut test = TestVCard::new().await?;
+        for xml in [
+            format!("<vCard xmlns='vcard-temp'>{MARKER}</vCard>"),
+            format!("<vCard xmlns='vcard-temp' xml:space='{MARKER}'><FN>{MARKER}</FN></vCard>"),
+            format!("<vCard xmlns='vcard-temp' xml:space=''><FN>{MARKER}</FN></vCard>"),
+            format!("<vCard xmlns='vcard-temp'><FN xml:space='{MARKER}'>{MARKER}</FN></vCard>"),
+        ] {
+            assert_card_free(&condition(
+                test.set("alice@example.com/desk", "alice@example.com", &xml, true)
+                    .await?,
+                StanzaErrorCondition::BadRequest,
+            )?);
+        }
+        let card = format!("<vCard xmlns='vcard-temp'><FN>{MARKER}</FN></vCard>");
+        for target in ["bob@example.com", "alice@example.com/desk", "example.com"] {
+            assert_card_free(&condition(
+                test.set("alice@example.com/desk", target, &card, true)
+                    .await?,
+                StanzaErrorCondition::Forbidden,
+            )?);
+        }
+        assert_card_free(&condition(
+            test.set("absent@example.com/desk", "absent@example.com", &card, true)
+                .await?,
+            StanzaErrorCondition::ServiceUnavailable,
+        )?);
+        test.extension = VCard::new(BTreeMap::from([("example.com".into(), quota(16)?)]));
+        assert_card_free(&condition(
+            test.set("alice@example.com/desk", "alice@example.com", &card, true)
+                .await?,
+            StanzaErrorCondition::ResourceConstraint,
+        )?);
+        test.extension = VCard::default();
+        let declarations = (0..120)
+            .map(|index| format!(" xmlns:p{index}='urn:{index}'"))
+            .collect::<String>();
+        let attributes = (0..134)
+            .map(|index| format!(" a{index}='{MARKER}'"))
+            .collect::<String>();
+        let parsed = payload(&format!(
+            "<wrapper{declarations}><vCard xmlns='vcard-temp'{attributes}/></wrapper>"
+        ))
+        .await?;
+        let element = parsed
+            .value()
+            .resolve(parsed.arena())?
+            .child("vCard", NAMESPACE)?
+            .ok_or("card")?
+            .handle();
+        let mut call = Call::with_payload("alice@example.com/desk", "alice@example.com", parsed)?;
+        call.payload_element = element;
+        assert_card_free(&condition(
+            test.set_call(&call, true).await?,
+            StanzaErrorCondition::ResourceConstraint,
+        )?);
+        assert!(test.stored("alice@example.com").await?.is_none());
+        Ok(())
+    })
+}
+
+#[test]
+fn absent_and_corrupt_card_read_errors_carry_no_card_content() -> TestResult {
+    block_on(async {
+        let test = TestVCard::new().await?;
+        let selector = format!("<vCard xmlns='vcard-temp' xml:space='{MARKER}'>{MARKER}</vCard>");
+        for (sender, requester, expected) in [
+            (
+                "alice@example.com/desk",
+                Requester::Owner,
+                StanzaErrorCondition::ItemNotFound,
+            ),
+            (
+                "bob@example.com/desk",
+                Requester::Other,
+                StanzaErrorCondition::ServiceUnavailable,
+            ),
+        ] {
+            assert_card_free(&condition(
+                test.get(sender, "alice@example.com", &selector, Some(requester))
+                    .await?,
+                expected,
+            )?);
+        }
+        for corrupt in [
+            format!("{MARKER} not XML"),
+            format!("<vCard xmlns='vcard-temp'><FN>{MARKER}</FN></vCard>"),
+            format!("<{MARKER} xmlns='vcard-temp' xml:lang='' xml:space='default'/>"),
+            format!("<vCard xmlns='vcard-temp' xml:lang='' xml:space='{MARKER}'/>"),
+            format!("<vCard xmlns='vcard-temp' xml:lang='' xml:space='default'>{MARKER}</vCard>"),
+            format!(
+                "<vCard xmlns='vcard-temp' xml:lang='' xml:space='default'><FN xml:space='{MARKER}'>{MARKER}</FN></vCard>"
+            ),
+            format!("<vCard xmlns='vcard-temp' xml:lang='' xml:space='default'><FN>{MARKER}</FN>"),
+        ] {
+            let mut transaction = test.storage.begin_write().await?;
+            transaction
+                .replace_vcard(&key("alice@example.com")?, &corrupt, VCardQuota::default())
+                .await?;
+            transaction.commit().await?;
+            let error = condition(
+                test.get(
+                    "bob@example.com/desk",
+                    "alice@example.com",
+                    EMPTY,
+                    Some(Requester::Other),
+                )
+                .await?,
+                StanzaErrorCondition::InternalServerError,
+            )?;
+            assert!(error.failure().is_some());
+            assert_card_free(&error);
+        }
+        for kind in StorageErrorKind::ALL {
+            for operation in ["vcard_read", "vcard_write"] {
+                assert_card_free(&IqError::without_payload(super::storage_error(
+                    lonewolf_storage::vcard::VCardError::Storage(StorageError::with_source(
+                        kind,
+                        std::io::Error::other(MARKER),
+                    )),
+                    operation,
+                )));
+            }
+        }
+        Ok(())
+    })
+}

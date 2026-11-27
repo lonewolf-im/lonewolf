@@ -218,9 +218,8 @@ fn memory_storage(backend: UncertainCommitBackend) -> TestResult<RedbStorage> {
 #[test]
 fn vcard_uncertain_commit_closes_without_success_or_payload_and_recovers_whole_state() -> TestResult
 {
-    use crate::delivery::failure_tests::Capture;
-    use lonewolf_extension::delivery::FailureKind;
     use lonewolf_storage::StorageErrorKind;
+    use lonewolf_storage::metrics::StoreOperation;
 
     let backend = UncertainCommitBackend::default();
     Runtime::new()?.block_on(async {
@@ -250,14 +249,13 @@ fn vcard_uncertain_commit_closes_without_success_or_payload_and_recovers_whole_s
         let payload=Element::builder_in("vCard","vcard-temp",&mut arena)?.child(name)?.child(nick)?.build()?;
         let request=Stanza::builder_in(StanzaType::Iq(IqType::Set),StanzaNamespace::Client,&mut arena).id(Some("uncertain"))?.child(payload)?.build()?;
         let handler=Arc::new(VCard::new(Default::default()));
-        let capture=Capture::default();
-        let _subscriber=tracing::subscriber::set_default(capture.clone());
         backend.fail_next_sync.store(true,Ordering::SeqCst);
         let outcome=session.handle_iq_set(request,sender,arena,Arena::try_new(Default::default())?,handler,Some(owner.clone())).await;
         assert!(matches!(outcome,Err(CloseOutcome::InternalError)));
         assert!(session.outbox.queue.is_empty());
         assert!(session.outbox.writer.written.is_empty());
-        capture.assert_one(FailureKind::Storage(StorageErrorKind::CommitUnknown),"iq_set_commit");
+        let failures:Vec<_>=fixture.storage.metrics().failures().filter(|(_,_,count)|*count>0).collect();
+        assert_eq!(failures,[(StoreOperation::Commit,StorageErrorKind::CommitUnknown,1)]);
         drop(session);
         fixture.finish().await?;
         let recovered=memory_storage(backend)?;

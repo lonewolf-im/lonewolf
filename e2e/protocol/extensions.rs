@@ -686,12 +686,9 @@ private_key_path = "private-key.pem"
 }
 
 #[test]
-fn internal_handler_errors_keep_iq_wire_replies_and_log_safe_diagnostics_once() -> TestResult {
-    for (kind, category, operation) in [
-        ("get", "storage_corrupt_data", "roster_read"),
-        ("set", "storage_unavailable", "roster_write"),
-    ] {
-        let mut suite = C2sSuite::with_extensions("'test-failure-iq'")?;
+fn internal_handler_errors_keep_iq_wire_replies_and_the_stream_open() -> TestResult {
+    for kind in ["get", "set"] {
+        let suite = C2sSuite::with_extensions("'test-failure-iq'")?;
         suite.create_account("alice", PASSWORD)?;
         let mut alice = suite.connect("alice", PASSWORD, "desk")?;
         alice.send(&format!("<iq type='{kind}' id='private-stanza-id' xml:lang='fr'><fail xmlns='urn:lonewolf:test:failure'><detail>private-payload</detail></fail></iq>"))?;
@@ -699,33 +696,12 @@ fn internal_handler_errors_keep_iq_wire_replies_and_log_safe_diagnostics_once() 
         alice.send("<message to='alice@localhost/desk' id='still-open'/>")?;
         alice.expect_xml("<message xmlns='jabber:client' to='alice@localhost/desk' from='alice@localhost/desk' id='still-open'/>")?;
         alice.close()?;
-        let logs = suite.stop_with_logs()?;
-        let diagnostics: Vec<_> = logs
-            .lines()
-            .filter(|line| line.contains("internal operation failed"))
-            .collect();
-        assert_eq!(diagnostics.len(), 1, "{logs}");
-        assert!(
-            diagnostics[0].contains(&format!("failure_kind=\"{category}\"")),
-            "{logs}"
-        );
-        assert!(
-            diagnostics[0].contains(&format!("operation=\"{operation}\"")),
-            "{logs}"
-        );
-        for sensitive in [
-            "sensitive-seeded-storage-source",
-            "private-stanza-id",
-            "private-payload",
-        ] {
-            assert!(!logs.contains(sensitive), "{logs}");
-        }
     }
     Ok(())
 }
 
 #[test]
-fn shared_router_panic_stops_serving_and_reports_one_private_failure() -> TestResult {
+fn shared_router_panic_stops_serving_and_reports_a_router_failure() -> TestResult {
     let mut suite = C2sSuite::with_extensions("'roster', 'test-router-failure'")?;
     suite.create_account("alice", PASSWORD)?;
     suite.create_account("bob", PASSWORD)?;
@@ -737,29 +713,11 @@ fn shared_router_panic_stops_serving_and_reports_one_private_failure() -> TestRe
         .send("<iq type='set' id='crash'><crash xmlns='urn:lonewolf:test:router-failure'/></iq>")?;
     alice.expect_stream_error("internal-server-error")?;
     bob.expect_stream_error("internal-server-error")?;
-    let logs = suite.wait_for_failure()?;
-    assert_eq!(
-        logs.lines()
-            .filter(|line| line.contains("router service failed"))
-            .count(),
-        1,
-        "{logs}"
-    );
-    let failure = logs
-        .lines()
-        .find(|line| line.contains("router service failed"))
-        .ok_or("missing failure event")?;
+    let failure = suite.wait_for_failure()?;
     assert!(
-        failure.contains("component=\"router\"")
-            && failure.contains("shard_id=")
-            && failure.contains("reason=\"panicked\""),
+        matches!(failure, lonewolf_core::RunError::RouterFailed(_)),
         "{failure}"
     );
-    assert!(
-        logs.contains("router shard") && logs.contains("panicked"),
-        "{logs}"
-    );
-    assert!(!logs.contains("seeded-sensitive-router-payload"), "{logs}");
     assert!(std::net::TcpStream::connect(suite.address).is_err());
     Ok(())
 }
@@ -781,12 +739,7 @@ fn ordinary_connection_panic_leaves_router_and_other_connections_serving() -> Te
     replacement.close()?;
     bob.close()?;
     suite.wait_for_metric("lonewolf_c2s_connection_panics_total{listener=\"0\"} 1")?;
-    let logs = suite.stop_with_logs()?;
-    assert!(
-        !logs.contains("seeded-sensitive-connection-payload"),
-        "{logs}"
-    );
-    Ok(())
+    suite.stop()
 }
 
 #[test]

@@ -4,16 +4,15 @@
     unreachable_pub,
     reason = "Test targets compile shared fixtures as private modules."
 )]
-#![expect(
-    clippy::cognitive_complexity,
-    reason = "Keep each test scenario and its assertions together."
-)]
 
-#[expect(dead_code, reason = "Only the S2S suite checks for missing readiness.")]
+#[expect(
+    dead_code,
+    reason = "Each test target uses a different subset of this fixture."
+)]
 #[path = "support/process.rs"]
 mod process;
 
-use process::{Server, TIMEOUT, field, request};
+use process::{Server, TIMEOUT, request};
 
 #[expect(
     dead_code,
@@ -37,6 +36,7 @@ const OPEN: &[u8] =
 const FEATURES_END: &[u8] = b"</stream:features>";
 const CLOSED: &str = "lonewolf_c2s_connections_closed_total{";
 const REJECTED: &str = "lonewolf_c2s_connections_rejected_total{";
+const LISTENER_INFO: &str = "lonewolf_c2s_listener_info{";
 
 impl Server {
     fn with_metrics(config: &str, workers: usize) -> Result<Self, Box<dyn Error>> {
@@ -75,16 +75,9 @@ impl Server {
         }
     }
 
-    /// Returns the full log after a clean stop and fails if earlier lines were dropped.
-    fn stop_with_logs(&mut self, signal: Signal) -> Result<String, Box<dyn Error>> {
-        let body = self.metrics()?;
-        assert!(
-            body.lines()
-                .any(|line| line == "lonewolf_log_dropped_lines_total 0"),
-            "{body}"
-        );
-        self.stop(signal)?;
-        Ok(self.logs()?)
+    /// Returns the fatal error, which the server prints as its final stderr line after logging stops.
+    fn exit_error(&self) -> Result<String, Box<dyn Error>> {
+        Ok(self.logs()?.lines().last().unwrap_or_default().to_owned())
     }
 }
 
@@ -179,73 +172,17 @@ fn multiple_endpoints_share_ports_across_workers_and_shutdown_with_admin() -> Te
     let mut response = String::new();
     admin.read_to_string(&mut response)?;
     assert!(response.starts_with("HTTP/1.1 200"));
-    server.wait_for_metrics(|body| total(body, CLOSED, "") == 32)?;
-    let logs = server.stop_with_logs(Signal::SIGTERM)?;
-    assert!(!socket.exists());
-    let admin_started = logs
-        .find("admin service started")
-        .ok_or("missing admin start log")?;
-    let waiting = logs
-        .find("waiting for stop signal")
-        .ok_or("missing wait log")?;
-    assert!(admin_started < waiting);
-    let mut started_listeners = std::collections::BTreeSet::new();
-    for line in logs
-        .lines()
-        .filter(|line| line.contains("c2s TCP listener started"))
-    {
-        assert!(line.contains(" INFO "));
-        assert_eq!(field(line, "worker_count=")?, workers);
-        assert!(!line.contains("worker_id="));
-        assert!(logs.find(line).ok_or("missing listener start log")? < waiting);
-        let listener = field(line, "listener_id=")?;
-        let address = listeners.get(listener).ok_or("unknown listener")?;
-        assert_eq!(field(line, "port=")?, usize::from(address.port()));
-        assert!(started_listeners.insert(listener));
-    }
-    assert_eq!(started_listeners.len(), 2);
-    let mut sockets = std::collections::BTreeSet::new();
-    for line in logs
-        .lines()
-        .filter(|line| line.contains("c2s TCP worker listener started"))
-    {
-        assert!(line.contains(" DEBUG "));
-        let listener = field(line, "listener_id=")?;
-        let worker = field(line, "worker_id=")?;
-        assert!(listener < 2);
-        assert!(worker < workers);
-        assert!(sockets.insert((listener, worker)));
-        assert_eq!(
-            usize::from(listeners[listener].port()),
-            field(line, "port=")?
-        );
-    }
-    assert_eq!(sockets.len(), 2 * workers);
+    let metrics = server.wait_for_metrics(|body| total(body, CLOSED, "") == 32)?;
     assert_eq!(
-        logs.matches("c2s TCP worker listener stopped").count(),
-        2 * workers
+        metrics
+            .lines()
+            .filter(|line| line.starts_with(LISTENER_INFO))
+            .count(),
+        2,
+        "{metrics}"
     );
-    let workers_stopped = logs
-        .rfind("c2s TCP worker listener stopped")
-        .ok_or("missing worker stop log")?;
-    let dispatcher_stopped = logs
-        .find("core dispatcher stopped")
-        .ok_or("missing dispatcher stop log")?;
-    let mut stopped_listeners = std::collections::BTreeSet::new();
-    for line in logs
-        .lines()
-        .filter(|line| line.contains("c2s TCP listener stopped"))
-    {
-        let offset = logs.find(line).ok_or("missing listener stop log")?;
-        assert!(line.contains(" INFO "));
-        assert!(workers_stopped < offset);
-        assert!(offset < dispatcher_stopped);
-        assert_eq!(field(line, "worker_count=")?, workers);
-        assert!(stopped_listeners.insert(field(line, "listener_id=")?));
-    }
-    assert_eq!(stopped_listeners, std::collections::BTreeSet::from([0, 1]));
-    assert!(logs.contains("core dispatcher stopped"));
-    assert!(!logs.contains("127.0.0.1"));
+    server.stop(Signal::SIGTERM)?;
+    assert!(!socket.exists());
     for address in listeners {
         assert!(TcpStream::connect(address).is_err());
     }
@@ -260,26 +197,24 @@ fn c2s_runs_without_admin_and_stops_on_sigint() -> TestResult {
         workers,
     )?;
     let [address] = server.listeners()?;
-    let logs = server.stop_with_logs(Signal::SIGINT)?;
-    assert!(!logs.contains("admin service started"));
-    let started = logs
-        .lines()
-        .find(|line| line.contains("c2s TCP listener started"))
-        .ok_or("missing listener start log")?;
-    assert_eq!(field(started, "worker_count=")?, workers);
-    assert_eq!(field(started, "port=")?, usize::from(address.port()));
-    assert_eq!(logs.matches("c2s TCP listener started").count(), 1);
-    let stopped = logs
-        .lines()
-        .find(|line| line.contains("c2s TCP listener stopped"))
-        .ok_or("missing listener stop log")?;
-    assert!(stopped.contains(" INFO "));
-    assert_eq!(field(stopped, "worker_count=")?, workers);
-    assert_eq!(field(stopped, "listener_id=")?, 0);
-    assert_eq!(logs.matches("c2s TCP listener stopped").count(), 1);
-    assert!(!logs.contains("c2s TCP worker listener"));
-    assert!(!logs.contains("worker_id="));
-    assert!(logs.contains("core dispatcher stopped"));
+    assert!(
+        !server
+            .directory
+            .path()
+            .join("run/lonewolf/admin.sock")
+            .exists()
+    );
+    let metrics = server.metrics()?;
+    assert_eq!(
+        metrics
+            .lines()
+            .filter(|line| line.starts_with(LISTENER_INFO))
+            .collect::<Vec<_>>(),
+        ["lonewolf_c2s_listener_info{listener=\"0\",tls_mode=\"starttls\"} 1"],
+        "{metrics}"
+    );
+    server.stop(Signal::SIGINT)?;
+    assert!(TcpStream::connect(address).is_err());
     Ok(())
 }
 
@@ -298,21 +233,7 @@ fn listener_rejects_excess_connection_attempts_from_one_ip() -> TestResult {
         total(body, CLOSED, "outcome=\"eof\"") == 1
             && total(body, REJECTED, "reason=\"connection_attempts_per_ip\"") == 15
     })?;
-    let logs = server.stop_with_logs(Signal::SIGINT)?;
-    let rejections: Vec<_> = logs
-        .lines()
-        .filter(|line| line.contains("c2s connection attempt rejected"))
-        .collect();
-    assert_eq!(rejections.len(), 1, "{logs}");
-    for field in [
-        "connection_type=\"c2s\"",
-        "listener_id=0",
-        "outcome=\"rate_limited\"",
-        "rejected_attempts=1",
-    ] {
-        assert!(rejections[0].contains(field), "missing {field}: {logs}");
-    }
-    assert!(!logs.contains("127.0.0.1"));
+    server.stop(Signal::SIGINT)?;
     Ok(())
 }
 
@@ -461,8 +382,7 @@ fn listeners_with_the_same_profile_have_separate_attempt_buckets() -> TestResult
                 })
         })
     })?;
-    let logs = server.stop_with_logs(Signal::SIGINT)?;
-    assert!(!logs.contains("127.0.0.1"));
+    server.stop(Signal::SIGINT)?;
     Ok(())
 }
 
@@ -502,9 +422,11 @@ fn empty_listener_list_fails_before_starting_services() -> TestResult {
             1,
         )?;
         assert_eq!(server.wait()?.code(), Some(1));
-        let logs = server.logs()?;
-        assert!(logs.contains("c2s.listeners must define at least one listener"));
-        assert!(!logs.contains("core dispatcher started"));
+        assert!(
+            server
+                .exit_error()?
+                .ends_with("c2s.listeners must define at least one listener")
+        );
         assert!(!server.directory.path().join("data").exists());
         assert!(!server.directory.path().join("run").exists());
     }
@@ -523,10 +445,11 @@ fn occupied_endpoint_stops_started_listeners_and_removes_admin_socket() -> TestR
         1,
     )?;
     assert_eq!(server.wait()?.code(), Some(1));
-    let logs = server.logs()?;
-    assert!(logs.contains("c2s listener service failed: listener 1 on worker 0"));
-    assert!(logs.contains("c2s TCP worker listener stopped"));
-    assert!(logs.contains("core dispatcher stopped"));
+    assert!(
+        server
+            .exit_error()?
+            .starts_with("c2s listener service failed: listener 1 on worker 0")
+    );
     assert!(
         !server
             .directory

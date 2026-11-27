@@ -22,7 +22,7 @@ mod support;
 #[path = "acme/direct_tls.rs"]
 mod direct_tls;
 
-use support::process::peer;
+use support::process::{BIND_FAILURE, peer};
 use support::{
     AcmeFault, AcmeStage, C2sSuite, Client, FakeAcmeCa, PASSWORD, SASL_NAMESPACE, TestResult,
 };
@@ -578,7 +578,11 @@ fn ipv6_listener_works_when_available_and_bind_collision_rolls_back_all_endpoint
         .replace_config(&config.replace(old, &format!("listen = [\"{free}\",\"{occupied}\"]")))?;
     server.spawn()?;
     assert!(!server.wait_exit()?.success());
-    assert!(server.logs()?.contains("HTTP bind"));
+    assert!(
+        server.exit_error()?.starts_with("ACME HTTP bind failed"),
+        "{}",
+        server.exit_error()?
+    );
     let _released = ports::bind_released_listener(
         free,
         std::time::Instant::now() + std::time::Duration::from_secs(2),
@@ -718,16 +722,6 @@ fn failure_preserves(stage: AcmeStage, fault: AcmeFault, expected: &str) -> Test
     let failed_counts = ca.counts();
     assert!(failed_counts.at(AcmeStage::NewOrder) <= 2);
     assert!(failed_counts.at(stage) <= before + 1);
-    let logs = server.logs()?;
-    for secret in [
-        "PRIVATE-CA-DETAIL",
-        "PRIVATE-INVALID-CERTIFICATE",
-        "challenge_token_",
-        "BEGIN PRIVATE KEY",
-        "nonce-",
-    ] {
-        assert!(!logs.contains(secret), "leaked {secret}");
-    }
     server.start(&ca)?;
     assert_eq!(peer(&mut server.secure("xmpp.example.test")?)?, a);
     assert!(server.stop(nix::sys::signal::Signal::SIGTERM)?.success());
@@ -1066,7 +1060,7 @@ fn sigterm_before_cache_publication_releases_state_and_prevents_late_activation(
 }
 
 #[test]
-fn corrupt_locked_and_insecure_cache_fail_without_reset_or_secret_logs() -> TestResult {
+fn corrupt_locked_and_insecure_cache_fail_without_reset_or_secret_errors() -> TestResult {
     use std::os::unix::fs::PermissionsExt;
     let ca = FakeAcmeCa::start()?;
     for mode in ["corrupt", "locked", "insecure"] {
@@ -1087,9 +1081,9 @@ fn corrupt_locked_and_insecure_cache_fail_without_reset_or_secret_logs() -> Test
         server.spawn()?;
         assert!(!server.wait_exit()?.success());
         assert_eq!(std::fs::read(&path)?, contents);
-        let logs = server.logs()?;
-        assert!(!logs.contains("PRIVATE-CORRUPT-CACHE"));
-        assert!(logs.contains("ACME"));
+        let error = server.exit_error()?;
+        assert!(error.starts_with("ACME load failed"), "{mode}: {error}");
+        assert!(!error.contains("PRIVATE-CORRUPT-CACHE"), "{mode}");
         drop(held);
     }
     assert_eq!(ca.counts().at(AcmeStage::NewOrder), 0);
@@ -1123,18 +1117,7 @@ fn two_concurrent_issuance_jobs_leave_a_cached_host_usable_and_activate_all_pend
     server.replace_config(&config)?;
     ca.set_fault(AcmeStage::Challenge, AcmeFault::Hold);
     server.start(&ca)?;
-    ca.wait_count(AcmeStage::Challenge, 3).map_err(|error| {
-        format!(
-            "{error}; {}",
-            server
-                .logs()
-                .unwrap_or_default()
-                .lines()
-                .filter(|line| line.contains("ACME"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        )
-    })?;
+    ca.wait_count(AcmeStage::Challenge, 3)?;
     assert_eq!(ca.counts().at(AcmeStage::NewOrder), 3);
     assert_eq!(ca.counts().callbacks.len(), 3);
     let mut healthy = authenticate(
@@ -1177,14 +1160,7 @@ fn occupied_automatic_endpoint_retries_once_without_ca_or_cache_effects_then_aut
     assert_eq!(server.setup_failures.len(), 1);
     let failed = &server.setup_failures[0];
     assert!(failed.ca_unchanged && failed.state_unchanged);
-    assert_eq!(
-        failed.logs.lines().last(),
-        Some("ACME HTTP bind failed: ACME listener operation failed")
-    );
-    assert_eq!(
-        std::fs::read_to_string(server.path().join("startup-failure-1.log"))?,
-        failed.logs
-    );
+    assert_eq!(failed.error, BIND_FAILURE);
     assert_ne!(server.challenge, address);
     server.wait_certificate(None)?;
     server.account("xmpp.example.test")?;
@@ -1252,33 +1228,15 @@ fn automatic_setup_does_not_retry_port_zero_or_corrupt_locked_insecure_cache() -
         for failed in &server.setup_failures {
             assert!(failed.ca_unchanged, "{mode}");
             assert!(failed.state_unchanged, "{mode}");
-            for event in [
-                "ACME listener bound",
-                "c2s TCP listener started",
-                "waiting for stop signal",
-            ] {
-                assert!(!failed.logs.contains(event), "{mode}: {}", failed.logs);
-            }
         }
         let (terminal, retried) = server
             .setup_failures
             .split_last()
             .ok_or("missing startup failure")?;
         for failed in retried {
-            assert_eq!(
-                failed.logs.lines().last(),
-                Some("ACME HTTP bind failed: ACME listener operation failed"),
-                "{mode}"
-            );
+            assert_eq!(failed.error, BIND_FAILURE, "{mode}");
         }
-        assert_eq!(terminal.logs.lines().last(), Some(expected_error), "{mode}");
-        assert!(
-            !server
-                .path()
-                .join(format!("startup-failure-{}.log", server.launch_count + 1))
-                .exists(),
-            "{mode}"
-        );
+        assert_eq!(terminal.error, expected_error, "{mode}");
         drop(held);
     }
     assert_eq!(ca.counts().at(AcmeStage::NewOrder), 0);

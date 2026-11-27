@@ -640,6 +640,45 @@ fn mismatched_authzid_gets_invalid_authzid() -> TestResult {
 }
 
 #[test]
+fn badly_encoded_external_responses_get_incorrect_encoding_and_allow_a_retry() -> TestResult {
+    let mut fixture = SingleServer::start("")?;
+    let mut authenticated = 0;
+    for encoded in ["?", "=AAA"] {
+        for after_empty_challenge in [false, true] {
+            let mut peer = fixture.connect()?;
+            peer.expect_starttls_features()?;
+            let mut peer = peer.start_tls(fixture.client_config()?)?;
+            peer.expect_external_offered()?;
+            if after_empty_challenge {
+                peer.auth_external(None)?;
+                peer.receive()?
+                    .assert_xml("<challenge xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>")?;
+                peer.send(&format!(
+                    "<response xmlns='urn:ietf:params:xml:ns:xmpp-sasl'>{encoded}</response>"
+                ))?;
+            } else {
+                peer.send(&format!(
+                    "<auth xmlns='urn:ietf:params:xml:ns:xmpp-sasl' mechanism='EXTERNAL'>{encoded}</auth>"
+                ))?;
+            }
+            peer.receive()?.assert_xml(
+                "<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><incorrect-encoding/></failure>",
+            )?;
+            peer.auth_external(Some("b.test"))?;
+            peer.expect_sasl_success()?;
+            let mut peer = peer.restart("b.test", "a.test")?;
+            authenticated += 1;
+            authentication(&fixture.suite, "inbound", "success", authenticated)?;
+            peer.close()?;
+            fixture
+                .suite
+                .wait_for_metric("lonewolf_s2s_streams{direction=\"inbound\"} 0")?;
+        }
+    }
+    fixture.stop()
+}
+
+#[test]
 fn spoofed_stanza_from_gets_invalid_from() -> TestResult {
     let mut fixture = SingleServer::start("")?;
     let mut peer = fixture.connect()?;

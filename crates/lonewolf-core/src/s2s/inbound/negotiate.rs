@@ -816,7 +816,7 @@ fn challenge_response<A: ChunkAllocator>(
         STANDARD
             .decode(text)
             .map(Auth::Response)
-            .map_err(|_| SaslFailure::MalformedRequest)
+            .map_err(|_| SaslFailure::IncorrectEncoding)
     })
 }
 

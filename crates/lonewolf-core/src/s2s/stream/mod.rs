@@ -79,6 +79,7 @@ pub(crate) enum Auth {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SaslFailure {
     Aborted,
+    IncorrectEncoding,
     InvalidAuthzid,
     InvalidMechanism,
     MalformedRequest,
@@ -291,7 +292,7 @@ pub(crate) fn parse_auth<A: ChunkAllocator>(
         Some(text) => {
             let decoded = STANDARD
                 .decode(text)
-                .map_err(|_| SaslFailure::MalformedRequest)?;
+                .map_err(|_| SaslFailure::IncorrectEncoding)?;
             std::str::from_utf8(&decoded).map_err(|_| SaslFailure::MalformedRequest)?;
             Ok(Auth::Response(decoded))
         }
@@ -301,6 +302,7 @@ pub(crate) fn parse_auth<A: ChunkAllocator>(
 pub(crate) fn sasl_failure_xml(failure: SaslFailure) -> String {
     let name = match failure {
         SaslFailure::Aborted => "aborted",
+        SaslFailure::IncorrectEncoding => "incorrect-encoding",
         SaslFailure::InvalidAuthzid => "invalid-authzid",
         SaslFailure::InvalidMechanism => "invalid-mechanism",
         SaslFailure::MalformedRequest => "malformed-request",

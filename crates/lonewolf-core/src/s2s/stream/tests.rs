@@ -360,6 +360,7 @@ fn constants_and_negotiation_builders_emit_exact_xml() {
     );
     for (failure, name) in [
         (SaslFailure::Aborted, "aborted"),
+        (SaslFailure::IncorrectEncoding, "incorrect-encoding"),
         (SaslFailure::InvalidAuthzid, "invalid-authzid"),
         (SaslFailure::InvalidMechanism, "invalid-mechanism"),
         (SaslFailure::MalformedRequest, "malformed-request"),
@@ -410,7 +411,13 @@ fn external_auth_distinguishes_absent_empty_encoded_and_malformed_responses() ->
                 "EXTERNAL",
                 Ok(Auth::Response("é".as_bytes().to_vec())),
             ),
-            ("?", "EXTERNAL", Err(SaslFailure::MalformedRequest)),
+            ("?", "EXTERNAL", Err(SaslFailure::IncorrectEncoding)),
+            ("=AAA", "EXTERNAL", Err(SaslFailure::IncorrectEncoding)),
+            (
+                "cGVlci50ZXN0=",
+                "EXTERNAL",
+                Err(SaslFailure::IncorrectEncoding),
+            ),
             ("/w==", "EXTERNAL", Err(SaslFailure::MalformedRequest)),
             (
                 "cGVlci50ZXN0",

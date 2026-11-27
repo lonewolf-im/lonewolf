@@ -180,6 +180,21 @@ fn component_chat_delivers_received_carbons_to_the_other_enabled_resource() -> T
 }
 
 #[test]
+fn component_delays_claiming_the_server_or_another_component_are_discarded() -> TestResult {
+    let mut suite = C2sSuite::with_components(CONFIG)?;
+    suite.create_account("alice", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let mut component = ComponentClient::authenticated(&suite, DOMAIN, SECRET)?;
+    let kept = "<delay xmlns='urn:xmpp:delay' from='muc.localhost' stamp='2001-01-01T00:00:00Z'/><delay xmlns='urn:xmpp:delay' from='muc.example' stamp='2002-01-01T00:00:00Z'/><delay xmlns='urn:xmpp:delay' stamp='2003-01-01T00:00:00Z'/>";
+    component.send(&format!("<message type='chat' from='room@muc.localhost/nick' to='alice@localhost/desk' id='delayed'><body>history</body><delay xmlns='urn:xmpp:delay' from='localhost' stamp='2000-01-01T00:00:00Z'/><delay xmlns='urn:xmpp:delay' from='pubsub.localhost' stamp='2000-01-01T00:00:00Z'/>{kept}</message>"))?;
+    alice.expect_xml(&format!("<message xmlns='jabber:client' type='chat' from='room@muc.localhost/nick' to='alice@localhost/desk' id='delayed'><body>history</body>{kept}</message>"))?;
+    traffic(&suite, "message", 1, 0)?;
+    component.close()?;
+    alice.close()?;
+    suite.stop()
+}
+
+#[test]
 fn component_server_and_public_account_iqs_use_handlers_but_private_xml_is_forbidden() -> TestResult
 {
     let mut suite = C2sSuite::with_components(CONFIG)?;

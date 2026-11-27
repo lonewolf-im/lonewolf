@@ -416,6 +416,19 @@ fn prepare_resourcepart(input: &str) -> Result<Cow<'_, str>, JidError> {
     Ok(output)
 }
 
+/// Normalizes a domainpart as JID parsing does, borrowing the input when it is already canonical.
+///
+/// # Errors
+///
+/// Returns [`JidError::EmptyPart`], [`JidError::PartTooLong`], or
+/// [`JidError::InvalidPart`] when the input is not a valid domainpart.
+pub fn normalize_domainpart<'input>(
+    input: &'input str,
+    ip_buffer: &'input mut [u8; MAX_PART_LEN],
+) -> Result<Cow<'input, str>, JidError> {
+    prepare_domainpart(input, ip_buffer)
+}
+
 fn prepare_domainpart<'input>(
     input: &'input str,
     ip_buffer: &'input mut [u8; MAX_PART_LEN],

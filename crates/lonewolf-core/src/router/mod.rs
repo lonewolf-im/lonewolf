@@ -512,6 +512,10 @@ impl<A: ChunkAllocator + Clone> RouterHandle<A> {
         self.hosts.is_local_host(domain)
     }
 
+    pub(crate) fn serves_domain(&self, domain: &str) -> bool {
+        self.hosts.is_local_host(domain) || self.services.contains_key(domain)
+    }
+
     pub(crate) fn destination(&self, to: JidRef<'_>) -> Destination {
         if !self.hosts.is_local_host(to.domainpart()) {
             return if self.services.contains_key(to.domainpart()) {

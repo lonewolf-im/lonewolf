@@ -159,6 +159,7 @@
         <xmpp:status>complete</xmpp:status>
         <xmpp:version>2.0</xmpp:version>
         <xmpp:since>0.1.0</xmpp:since>
+        <xmpp:note xml:lang="en">Stamps offline messages and saved presence replies, and discards incoming notations that claim a served domain. Discarding forged notations is not in a release yet.</xmpp:note>
       </xmpp:SupportedXep>
     </implements>
     <implements>

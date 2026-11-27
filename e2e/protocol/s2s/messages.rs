@@ -384,3 +384,30 @@ fn language_alternatives_keep_their_inherited_and_explicit_languages() -> TestRe
     pair.stop()?;
     Ok(())
 }
+
+#[test]
+fn federated_delays_claiming_the_receiving_server_are_discarded() -> TestResult {
+    let (ad, an, bd, bn) = ACCOUNTS;
+    let mut pair = FederatedPair::start(ad, bd, workflow_options())?;
+    pair.a.create_account(an, PASSWORD)?;
+    pair.b.create_account(bn, PASSWORD)?;
+    let aj = format!("{an}@{ad}");
+    let bj = format!("{bn}@{bd}");
+    let mut a = pair.a.connect(an, PASSWORD, "desk")?;
+    let mut b = pair.b.connect(bn, PASSWORD, "phone")?;
+    available(&mut b, &bj, "phone")?;
+    let kept = "<delay xmlns='urn:xmpp:delay' from='muc.example' stamp='2001-01-01T00:00:00Z'/><delay xmlns='urn:xmpp:delay' stamp='2002-01-01T00:00:00Z'/>";
+    a.send(&format!(
+        "<message type='chat' id='delayed' to='{bj}'><body>Hello</body><delay xmlns='urn:xmpp:delay' from='{bd}' stamp='2000-01-01T00:00:00Z'/>{kept}</message>"
+    ))?;
+    b.expect_xml(&format!("<message xmlns='jabber:client' type='chat' id='delayed' from='{aj}/desk' to='{bj}' xml:lang='en'><body>Hello</body>{kept}</message>"))?;
+    traffic(
+        &pair,
+        "federated_delays_claiming_the_receiving_server_are_discarded",
+        [1, 0, 0],
+        [0, 0, 0],
+    )?;
+    a.close()?;
+    b.close()?;
+    pair.stop()
+}

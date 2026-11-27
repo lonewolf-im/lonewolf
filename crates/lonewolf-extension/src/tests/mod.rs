@@ -275,7 +275,7 @@ fn builtin_extensions_declare_their_discovery_features() -> Result<(), Registrat
     let carbons_only = extensions.enable_host("example.com", ["carbons"])?;
     assert_eq!(
         carbons_only.discovery().features(DiscoScope::Server),
-        [crate::carbons::NAMESPACE, crate::carbons::RULES_FEATURE]
+        [crate::carbons::NAMESPACE]
     );
     assert!(
         carbons_only

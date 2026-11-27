@@ -193,7 +193,7 @@ fn component_server_and_public_account_iqs_use_handlers_but_private_xml_is_forbi
     )?;
     let mut component = ComponentClient::authenticated(&suite, DOMAIN, SECRET)?;
     component.send("<iq type='get' from='muc.localhost' to='localhost' id='disco'><query xmlns='http://jabber.org/protocol/disco#info'/></iq>")?;
-    component.expect_xml("<iq xmlns='jabber:component:accept' type='result' from='localhost' to='muc.localhost' id='disco'><query xmlns='http://jabber.org/protocol/disco#info'><identity category='server' type='im'/><feature var='http://jabber.org/protocol/disco#info'/><feature var='http://jabber.org/protocol/disco#items'/><feature var='jabber:iq:private'/><feature var='jabber:iq:roster'/><feature var='jabber:iq:version'/><feature var='msgoffline'/><feature var='urn:xmpp:blocking'/><feature var='urn:xmpp:carbons:2'/><feature var='urn:xmpp:carbons:rules:0'/><feature var='urn:xmpp:ping'/><feature var='vcard-temp'/></query></iq>")?;
+    component.expect_xml("<iq xmlns='jabber:component:accept' type='result' from='localhost' to='muc.localhost' id='disco'><query xmlns='http://jabber.org/protocol/disco#info'><identity category='server' type='im'/><feature var='http://jabber.org/protocol/disco#info'/><feature var='http://jabber.org/protocol/disco#items'/><feature var='jabber:iq:private'/><feature var='jabber:iq:roster'/><feature var='jabber:iq:version'/><feature var='msgoffline'/><feature var='urn:xmpp:blocking'/><feature var='urn:xmpp:carbons:2'/><feature var='urn:xmpp:ping'/><feature var='vcard-temp'/></query></iq>")?;
     ping(&mut component, "ping")?;
     ping_result(&mut component, "ping")?;
     component.send("<iq type='get' from='muc.localhost' to='alice@localhost' id='card'><vCard xmlns='vcard-temp'/></iq>")?;

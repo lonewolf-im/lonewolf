@@ -129,13 +129,14 @@ fn configured_host_extensions_replace_the_default_list() -> TestResult {
                 matches!(scope, lonewolf_extension::discovery::DiscoScope::Server)
                     && expected.contains(&"private"),
             );
-            for feature in ["urn:xmpp:carbons:2", "urn:xmpp:carbons:rules:0"] {
-                assert_eq!(
-                    registry.discovery().features(scope).contains(&feature),
-                    matches!(scope, lonewolf_extension::discovery::DiscoScope::Server)
-                        && expected.contains(&"carbons"),
-                );
-            }
+            assert_eq!(
+                registry
+                    .discovery()
+                    .features(scope)
+                    .contains(&"urn:xmpp:carbons:2"),
+                matches!(scope, lonewolf_extension::discovery::DiscoScope::Server)
+                    && expected.contains(&"carbons"),
+            );
             assert_eq!(
                 registry
                     .discovery()

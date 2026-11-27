@@ -1,10 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use super::bidi::authenticated;
+use super::negotiation::SingleServer;
 use super::{ACCOUNTS, available, iq_reply, stanza_error, traffic, workflow_options};
 use super::{presence, push, roster};
+use crate::blocking::external::envelope;
 use crate::support::federation::FederatedPair;
 use crate::support::federation::subscribe_mutually;
-use crate::support::{PASSWORD, TestResult};
+use crate::support::{PASSWORD, TestResult, barrier};
+
+const SERVER: &str = "jabber:server";
 
 #[test]
 fn subscription_request_and_approval() -> TestResult {
@@ -261,4 +266,68 @@ fn account_deletion_notifies_remote_contacts() -> TestResult {
     b.close()?;
     pair.stop()?;
     Ok(())
+}
+
+#[test]
+fn repeated_subscribe_from_a_subscribed_remote_user_is_answered_by_the_server() -> TestResult {
+    let mut fixture = SingleServer::start_bidirectional_with_extensions("", "'roster','ping'")?;
+    let mut peer = authenticated(&fixture)?;
+    fixture.suite.create_account("alice", PASSWORD)?;
+    let mut alice = fixture.suite.connect("alice", PASSWORD, "desk")?;
+    roster(&mut alice)?;
+    available(&mut alice, "alice@a.test", "desk")?;
+    peer.send("<presence type='subscribe' from='bob@b.test' to='alice@a.test' id='first'/>")?;
+    presence(&mut alice, "bob@b.test", "alice@a.test", Some("subscribe"))?;
+    alice.send("<presence type='subscribed' to='bob@b.test'/>")?;
+    push(&mut alice, "bob@b.test", "from", None)?;
+    envelope(
+        &peer.receive()?,
+        SERVER,
+        "presence",
+        "alice@a.test",
+        "bob@b.test",
+        Some("subscribed"),
+    );
+    envelope(
+        &peer.receive()?,
+        SERVER,
+        "presence",
+        "alice@a.test/desk",
+        "bob@b.test",
+        None,
+    );
+    peer.send("<presence type='subscribe' from='bob@b.test' to='alice@a.test' id='repeat'/>")?;
+    envelope(
+        &peer.receive()?,
+        SERVER,
+        "presence",
+        "alice@a.test",
+        "bob@b.test",
+        Some("subscribed"),
+    );
+    peer.send(
+        "<iq from='b.test' to='a.test' type='get' id='boundary'><ping xmlns='urn:xmpp:ping'/></iq>",
+    )?;
+    peer.receive()?.assert_xml(
+        "<iq xmlns='jabber:server' from='a.test' to='b.test' type='result' id='boundary'/>",
+    )?;
+    barrier(&mut alice)?;
+    let reply = roster(&mut alice)?;
+    let item = reply
+        .child("jabber:iq:roster", "query")?
+        .child("jabber:iq:roster", "item")?;
+    assert_eq!(item.attribute("jid"), Some("bob@b.test"));
+    assert_eq!(item.attribute("subscription"), Some("from"));
+    assert_eq!(item.attribute("ask"), None);
+    alice.close()?;
+    envelope(
+        &peer.receive()?,
+        SERVER,
+        "presence",
+        "alice@a.test/desk",
+        "bob@b.test",
+        Some("unavailable"),
+    );
+    peer.close()?;
+    fixture.stop()
 }

@@ -2,11 +2,13 @@
 
 use std::sync::Arc;
 
+use super::super::support::component::tcp;
 use super::super::support::federation::{
     FakeDns, FederatedHost, FederatedPair, FederationCa, PairOptions,
     peer::{self, RawS2sPeer},
 };
-use super::super::support::{C2sSuite, PASSWORD, TestResult, tls};
+use super::super::support::xml::{STREAM_NAMESPACE, XmlStream};
+use super::super::support::{C2sSuite, PASSWORD, STREAM_ERRORS, TestResult, tls};
 
 pub(super) struct SingleServer {
     pub suite: C2sSuite,
@@ -534,6 +536,63 @@ fn unknown_to_gets_host_unknown() -> TestResult {
     fixture
         .suite
         .wait_for_metric("lonewolf_s2s_streams{direction=\"inbound\"} 0")?;
+    fixture.stop()
+}
+
+#[test]
+fn rejected_initial_headers_get_a_response_header_before_the_stream_error() -> TestResult {
+    let mut fixture = SingleServer::start("")?;
+    for (content_namespace, attributes, condition) in [
+        (
+            "jabber:client",
+            "from='b.test' to='a.test' version='1.0'",
+            "invalid-namespace",
+        ),
+        (
+            "jabber:server",
+            "from='b.test' to='a.test'",
+            "unsupported-version",
+        ),
+        (
+            "jabber:server",
+            "from='b.test' to='a.test' version='0.9'",
+            "unsupported-version",
+        ),
+        (
+            "jabber:server",
+            "from='bob@b.test' to='a.test' version='1.0'",
+            "invalid-from",
+        ),
+    ] {
+        let opening = format!(
+            "<stream:stream xmlns:stream='{STREAM_NAMESPACE}' xmlns='{content_namespace}' {attributes}>"
+        );
+        let mut stream = XmlStream::new(tcp(fixture.suite.s2s_addresses()?[0])?);
+        let header = stream.open_with(&opening)?;
+        assert_eq!(header.attribute("from"), Some("a.test"), "{opening}");
+        stream.expect_stream_error(condition)?;
+        fixture
+            .suite
+            .wait_for_metric("lonewolf_s2s_connections{direction=\"inbound\"} 0")?;
+    }
+    fixture.stop()
+}
+
+#[test]
+fn wrong_stream_namespace_gets_a_response_header_and_invalid_namespace() -> TestResult {
+    let mut fixture = SingleServer::start("")?;
+    let mut stream = XmlStream::new(tcp(fixture.suite.s2s_addresses()?[0])?);
+    let header = stream.open_with("<stream:stream xmlns:stream='http://wrong.namespace.example.org/' xmlns='jabber:server' from='b.test' to='a.test' version='1.0'>")?;
+    assert_eq!(header.attribute("from"), Some("a.test"));
+    let error = stream.receive()?;
+    error.assert_name(STREAM_NAMESPACE, "error");
+    assert_eq!(error.children.len(), 1, "{error:?}");
+    error.child(STREAM_ERRORS, "invalid-namespace")?;
+    stream.expect_footer()?;
+    stream.expect_eof()?;
+    fixture
+        .suite
+        .wait_for_metric("lonewolf_s2s_connections{direction=\"inbound\"} 0")?;
     fixture.stop()
 }
 

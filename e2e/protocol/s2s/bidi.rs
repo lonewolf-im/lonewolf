@@ -407,6 +407,55 @@ fn reverse_stanza_from_another_domain_closes_the_link_with_invalid_from() -> Tes
 }
 
 #[test]
+fn bidi_stream_carries_only_its_authenticated_local_domain() -> TestResult {
+    let mut fixture = SingleServer::start_bidirectional_with_extensions("", "'ping'")?;
+    fixture.ca.server(
+        fixture.suite.fixture_path(),
+        "host",
+        &["a.test", "other.test"],
+    )?;
+    let path = fixture.suite.fixture_path().join("lonewolf.toml");
+    let mut config = std::fs::read_to_string(&path)?;
+    config.push_str("\n[hosts.'other.test'.tls]\ncertificate_chain_path='certificate-host.pem'\nprivate_key_path='private-key-host.pem'\n");
+    std::fs::write(path, config)?;
+    fixture.suite.restart()?;
+    let mut bidi = authenticated(&fixture)?;
+    let listener = RawS2sListener::bind()?;
+    fixture.dns.srv(
+        "b.test",
+        &[(0, 0, listener.address()?.port(), "server.b.test")],
+    );
+    fixture.dns.a("server.b.test", Ipv4Addr::LOCALHOST);
+    let config = peer::server_config(
+        &fixture.ca,
+        fixture
+            .ca
+            .server(fixture.directory.path(), "listener", &["b.test"])?,
+        "other.test",
+    )?;
+    fixture
+        .suite
+        .create_account_jid("carol@other.test", PASSWORD)?;
+    fixture.suite.domain = "other.test".into();
+    let mut carol = fixture.suite.connect("carol", PASSWORD, "desk")?;
+    fixture.suite.domain = "a.test".into();
+    carol.send("<message type='chat' to='bob@b.test/phone'><body>other host</body></message>")?;
+    let mut outbound = listener.accept("b.test", "other.test", config, true)?;
+    outbound.receive()?.assert_xml("<message xmlns='jabber:server' from='carol@other.test/desk' to='bob@b.test/phone' type='chat'><body>other host</body></message>")?;
+    bidi.send(
+        "<iq from='b.test' to='a.test' type='get' id='boundary'><ping xmlns='urn:xmpp:ping'/></iq>",
+    )?;
+    bidi.receive()?.assert_xml(
+        "<iq xmlns='jabber:server' from='a.test' to='b.test' type='result' id='boundary'/>",
+    )?;
+    authentication(&fixture.suite, "outbound", "success", 1)?;
+    outbound.close()?;
+    carol.close()?;
+    bidi.close()?;
+    fixture.stop()
+}
+
+#[test]
 fn bidi_link_stays_open_while_the_peer_sends() -> TestResult {
     let mut fixture =
         with_clock(|| SingleServer::start_bidirectional("[limits.s2s]\nidle_timeout_secs = 2"))?;

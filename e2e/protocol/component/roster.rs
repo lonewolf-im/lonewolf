@@ -172,6 +172,7 @@ macro_rules! subscription_scenarios {
 subscription_scenarios!(
     client_subscription_to_component_contact_is_approved_and_pushes_to,
     component_subscription_request_is_stored_and_approval_grants_from,
+    repeated_component_request_under_a_grant_is_answered_without_a_prompt,
     client_preapproval_completes_a_later_component_request_without_a_prompt,
     client_denial_and_revocation_reach_the_component,
     component_cancellation_and_unsubscribe_update_the_client_roster,
@@ -242,6 +243,28 @@ fn component_subscription_request_is_stored_and_approval_grants_from(contact: &s
     component_presence(&mut component, ALICE, contact, Some("subscribed"))?;
     component_presence(&mut component, DESK, contact, None)?;
     push(&mut alice, contact, "from", None, false)?;
+    traffic(&suite, "presence", 2, 3)?;
+    component.close()?;
+    alice.close()?;
+    suite.stop()
+}
+
+fn repeated_component_request_under_a_grant_is_answered_without_a_prompt(
+    contact: &str,
+) -> TestResult {
+    let (mut suite, mut alice, mut component) = online()?;
+    request_from_component(&mut component, contact, "first")?;
+    client_receives(&mut alice, contact, "subscribe")?;
+    alice.send(&format!("<presence type='subscribed' to='{contact}'/>"))?;
+    component_presence(&mut component, ALICE, contact, Some("subscribed"))?;
+    component_presence(&mut component, DESK, contact, None)?;
+    push(&mut alice, contact, "from", None, false)?;
+
+    request_from_component(&mut component, contact, "repeat")?;
+    component_presence(&mut component, ALICE, contact, Some("subscribed"))?;
+    component_barrier(&mut component)?;
+    barrier(&mut alice)?;
+    assert_item(&get_roster(&mut alice)?, contact, "from", None, false)?;
     traffic(&suite, "presence", 2, 3)?;
     component.close()?;
     alice.close()?;

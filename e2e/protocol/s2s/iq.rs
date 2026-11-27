@@ -5,6 +5,9 @@ use crate::support::federation::subscribe_mutually;
 use crate::support::federation::{FederatedPair, PairOptions};
 use crate::support::{PASSWORD, TestResult, barrier};
 
+const DISCO_INFO: &str = "http://jabber.org/protocol/disco#info";
+const DISCO_ITEMS: &str = "http://jabber.org/protocol/disco#items";
+
 #[test]
 fn disco_info_of_remote_server() -> TestResult {
     let (ad, an, bd, bn) = ACCOUNTS;
@@ -82,6 +85,71 @@ fn ping_remote_account_requires_subscription() -> TestResult {
     a.close()?;
     super::presence(&mut b, &format!("{aj}/desk"), &bj, Some("unavailable"))?;
     b.close()?;
+    pair.stop()?;
+    Ok(())
+}
+
+#[test]
+fn remote_account_discovery_requires_presence_authorization() -> TestResult {
+    let (ad, an, bd, bn) = ACCOUNTS;
+    let mut pair = FederatedPair::start(ad, bd, workflow_options())?;
+    pair.a.create_account(an, PASSWORD)?;
+    pair.b.create_account(bn, PASSWORD)?;
+    let aj = format!("{an}@{ad}");
+    let bj = format!("{bn}@{bd}");
+    let phone = format!("{bj}/phone");
+    let mut a = pair.a.connect(an, PASSWORD, "desk")?;
+    let mut b = pair.b.connect(bn, PASSWORD, "phone")?;
+    super::available(&mut a, &aj, "desk")?;
+    b.send(&format!(
+        "<iq type='get' id='private-info' to='{aj}'><query xmlns='{DISCO_INFO}'/></iq>"
+    ))?;
+    stanza_error(
+        &iq_reply(&mut b, "private-info", "error", &aj, &phone)?,
+        "service-unavailable",
+    )?;
+    b.send(&format!(
+        "<iq type='get' id='private-items' to='{aj}'><query xmlns='{DISCO_ITEMS}'/></iq>"
+    ))?;
+    let items = iq_reply(&mut b, "private-items", "result", &aj, &phone)?;
+    assert!(items.child(DISCO_ITEMS, "query")?.children.is_empty());
+    subscribe_mutually(&mut a, &aj, &mut b, &bj)?;
+    b.send(&format!(
+        "<iq type='get' id='authorized-info' to='{aj}'><query xmlns='{DISCO_INFO}'/></iq>"
+    ))?;
+    let info = iq_reply(&mut b, "authorized-info", "result", &aj, &phone)?;
+    let query = info.child(DISCO_INFO, "query")?;
+    let identity = query.child(DISCO_INFO, "identity")?;
+    assert_eq!(identity.attribute("category"), Some("account"));
+    assert_eq!(identity.attribute("type"), Some("registered"));
+    for feature in [DISCO_INFO, DISCO_ITEMS] {
+        assert!(
+            query
+                .children
+                .iter()
+                .any(|child| child.name == "feature" && child.attribute("var") == Some(feature)),
+            "{query:?}"
+        );
+    }
+    b.send(&format!(
+        "<iq type='get' id='authorized-items' to='{aj}'><query xmlns='{DISCO_ITEMS}'/></iq>"
+    ))?;
+    let items = iq_reply(&mut b, "authorized-items", "result", &aj, &phone)?;
+    let query = items.child(DISCO_ITEMS, "query")?;
+    assert_eq!(query.children.len(), 1, "{query:?}");
+    assert_eq!(
+        query.child(DISCO_ITEMS, "item")?.attribute("jid"),
+        Some(format!("{aj}/desk").as_str())
+    );
+    traffic(
+        &pair,
+        "remote_account_discovery_requires_presence_authorization",
+        [0, 4, 3],
+        [0, 4, 3],
+    )?;
+    b.close()?;
+    super::presence(&mut a, &phone, &aj, Some("unavailable"))?;
+    a.close()?;
     pair.stop()?;
     Ok(())
 }

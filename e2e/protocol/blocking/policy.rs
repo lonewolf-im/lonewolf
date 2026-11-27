@@ -2,6 +2,7 @@
 
 use super::addressed::{checked_error, send_terminal_stanzas};
 use super::change_rule;
+use super::mutations::assert_result;
 use crate::carbons::{copy, enable};
 use crate::offline::{await_empty, receive_stored};
 use crate::support::{C2sSuite, Client, PASSWORD, TestResult, barrier};
@@ -113,6 +114,138 @@ fn stanza_matrix() -> TestResult {
     other.send("<message to='carol@localhost/desk' id='allowed'/>")?;
     carol.expect_xml("<message xmlns='jabber:client' from='bob@localhost/phone' to='carol@localhost/desk' id='allowed'/>")?;
     for mut client in [copy_target, alice, other, carol, bob] {
+        client.close()?;
+    }
+    suite.stop()
+}
+
+fn available(client: &mut Client, full: &str) -> TestResult {
+    client.send("<presence/>")?;
+    client.expect_xml(&format!(
+        "<presence xmlns='jabber:client' from='{full}' to='alice@localhost'/>"
+    ))
+}
+
+#[test]
+fn blocked_bare_chat_reaches_no_resource_and_no_carbon() -> TestResult {
+    let mut suite = C2sSuite::with_extensions("'blocking', 'carbons', 'roster'")?;
+    for name in ["alice", "bob", "carol"] {
+        suite.create_account(name, PASSWORD)?;
+    }
+    let mut desk = suite.connect("alice", PASSWORD, "desk")?;
+    let mut phone = suite.connect("alice", PASSWORD, "phone")?;
+    let mut bob = suite.connect("bob", PASSWORD, "desk")?;
+    let mut carol = suite.connect("carol", PASSWORD, "desk")?;
+    available(&mut desk, "alice@localhost/desk")?;
+    phone.send("<presence/>")?;
+    phone.expect_xml(
+        "<presence xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost'/>",
+    )?;
+    phone.expect_xml(
+        "<presence xmlns='jabber:client' from='alice@localhost/phone' to='alice@localhost'/>",
+    )?;
+    desk.expect_xml(
+        "<presence xmlns='jabber:client' from='alice@localhost/phone' to='alice@localhost'/>",
+    )?;
+    enable(&mut desk, "alice@localhost/desk")?;
+    enable(&mut phone, "alice@localhost/phone")?;
+    change_rule(&mut desk, "block", "bob@localhost")?;
+
+    bob.send(
+        "<message type='chat' to='alice@localhost' id='attempt'><body>blocked</body></message>",
+    )?;
+    let reply = checked_error(&mut bob, "message", false)?;
+    assert_eq!(
+        reply.attribute("from"),
+        Some("alice@localhost"),
+        "{reply:?}"
+    );
+    carol.send(
+        "<message type='chat' to='alice@localhost' id='allowed'><body>allowed</body></message>",
+    )?;
+    let allowed = "<message xmlns='jabber:client' type='chat' from='carol@localhost/desk' to='alice@localhost' id='allowed'><body>allowed</body></message>";
+    desk.expect_xml(allowed)?;
+    copy(
+        &mut phone,
+        "alice@localhost/phone",
+        "received",
+        " type='chat'",
+        allowed,
+    )?;
+    barrier(&mut desk)?;
+    barrier(&mut phone)?;
+    phone.close()?;
+    desk.expect_xml("<presence xmlns='jabber:client' from='alice@localhost/phone' to='alice@localhost' type='unavailable'/>")?;
+    for mut client in [desk, bob, carol] {
+        client.close()?;
+    }
+    suite.stop()
+}
+
+#[test]
+fn blocked_chat_to_an_offline_owner_is_not_stored() -> TestResult {
+    let mut suite =
+        C2sSuite::with_extensions("'blocking', 'offline', 'roster', 'test-offline-inspect'")?;
+    for name in ["alice", "bob", "carol"] {
+        suite.create_account(name, PASSWORD)?;
+    }
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    change_rule(&mut alice, "block", "bob@localhost")?;
+    alice.close()?;
+    suite.wait_for_closed("stream_end", 1)?;
+
+    let mut bob = suite.connect("bob", PASSWORD, "desk")?;
+    let mut carol = suite.connect("carol", PASSWORD, "desk")?;
+    bob.send(
+        "<message type='chat' to='alice@localhost' id='attempt'><body>blocked</body></message>",
+    )?;
+    let reply = checked_error(&mut bob, "message", false)?;
+    assert_eq!(
+        reply.attribute("from"),
+        Some("alice@localhost"),
+        "{reply:?}"
+    );
+    carol.send(
+        "<message type='chat' to='alice@localhost' id='keep'><body>stored</body></message>",
+    )?;
+    barrier(&mut carol)?;
+
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    expect_backlog(&mut alice, "1")?;
+    available(&mut alice, "alice@localhost/desk")?;
+    receive_stored(
+        &mut alice,
+        "<message xmlns='jabber:client' type='chat' from='carol@localhost/desk' to='alice@localhost' id='keep'><body>stored</body></message>",
+    )?;
+    await_empty(&mut alice, "alice@localhost/desk")?;
+    for mut client in [alice, bob, carol] {
+        client.close()?;
+    }
+    suite.stop()
+}
+
+#[test]
+fn block_takes_effect_for_a_message_pipelined_after_it() -> TestResult {
+    let mut suite = C2sSuite::with_extensions("'blocking'")?;
+    suite.create_account("alice", PASSWORD)?;
+    suite.create_account("bob", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let mut bob = suite.connect("bob", PASSWORD, "desk")?;
+    alice.send("<message to='bob@localhost/desk' id='before'/>")?;
+    bob.expect_xml(
+        "<message xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost/desk' id='before'/>",
+    )?;
+
+    alice.send("<iq type='set' id='change'><block xmlns='urn:xmpp:blocking'><item jid='bob@localhost'/></block></iq><message to='bob@localhost/desk' id='attempt'><body>after</body></message>")?;
+    assert_result(&alice.receive()?);
+    let reply = checked_error(&mut alice, "message", true)?;
+    assert_eq!(
+        reply.attribute("from"),
+        Some("bob@localhost/desk"),
+        "{reply:?}"
+    );
+    barrier(&mut bob)?;
+    for mut client in [alice, bob] {
         client.close()?;
     }
     suite.stop()

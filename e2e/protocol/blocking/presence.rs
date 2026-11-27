@@ -291,3 +291,39 @@ fn polite_transitions() -> TestResult {
     }
     suite.stop()
 }
+
+fn expect_empty_roster(client: &mut Client) -> TestResult {
+    client.send("<iq type='get' id='roster'><query xmlns='jabber:iq:roster'/></iq>")?;
+    client.expect_xml("<iq xmlns='jabber:client' type='result' id='roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/></iq>")
+}
+
+#[test]
+fn subscription_request_from_a_blocked_contact_is_not_stored() -> TestResult {
+    use super::change_rule;
+    let mut suite = C2sSuite::with_extensions("'roster', 'blocking'")?;
+    suite.create_account("alice", PASSWORD)?;
+    suite.create_account("bob", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    change_rule(&mut alice, "block", BOB)?;
+    alice.close()?;
+    suite.wait_for_closed("stream_end", 1)?;
+
+    let mut bob = suite.connect("bob", PASSWORD, "desk")?;
+    bob.send("<presence type='subscribe' to='alice@localhost'/>")?;
+    barrier(&mut bob)?;
+
+    for (unblock, closed) in [(false, 2), (true, 3)] {
+        let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+        if unblock {
+            change_rule(&mut alice, "unblock", BOB)?;
+        }
+        expect_empty_roster(&mut alice)?;
+        alice.send("<presence id='online'/>")?;
+        presence(&mut alice, "alice@localhost/desk", ALICE, "id='online'")?;
+        barrier(&mut alice)?;
+        alice.close()?;
+        suite.wait_for_closed("stream_end", closed)?;
+    }
+    bob.close()?;
+    suite.stop()
+}

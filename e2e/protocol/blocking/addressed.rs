@@ -9,7 +9,7 @@ use lonewolf_xmpp::jid::Jid;
 
 use super::mutations::{assert_result, send_change};
 use crate::support::xml::Element;
-use crate::support::{C2sSuite, Client, PASSWORD, TestResult, barrier};
+use crate::support::{C2sSuite, Client, PASSWORD, TestResult, barrier, mutually_subscribe};
 
 const ALICE: &str = "alice@localhost/desk";
 const BOB: &str = "bob@localhost/desk";
@@ -298,4 +298,66 @@ fn blocked_traffic_precedes_account_and_message_side_effects() -> TestResult {
         assert_eq!(store.begin_read().await?.offline_count(&account).await?, 0);
         Ok(())
     })
+}
+
+fn expect_bob_items(bob: &mut Client, items: &str) -> TestResult {
+    bob.send("<iq type='get' to='alice@localhost' id='items'><query xmlns='http://jabber.org/protocol/disco#items'/></iq>")?;
+    bob.expect_xml(&format!("<iq xmlns='jabber:client' type='result' id='items' from='alice@localhost' to='bob@localhost/desk'><query xmlns='http://jabber.org/protocol/disco#items'>{items}</query></iq>"))
+}
+
+#[test]
+fn blocked_contact_gets_service_unavailable_from_bare_jid_services() -> TestResult {
+    let mut suite = C2sSuite::with_extensions("'roster', 'disco', 'vcard', 'ping', 'blocking'")?;
+    suite.create_account("alice", PASSWORD)?;
+    suite.create_account("bob", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let mut bob = suite.connect("bob", PASSWORD, "desk")?;
+    mutually_subscribe(&mut alice, "alice", &mut bob, "bob")?;
+    alice.send("<iq type='set' id='card'><vCard xmlns='vcard-temp'><FN>Alice</FN></vCard></iq>")?;
+    alice.expect_xml(
+        "<iq xmlns='jabber:client' type='result' id='card' to='alice@localhost/desk'/>",
+    )?;
+    alice.send("<presence id='online'/>")?;
+    alice.expect_xml("<presence xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost' id='online'/>")?;
+    barrier(&mut alice)?;
+    let requests = [
+        "<query xmlns='http://jabber.org/protocol/disco#items'/>",
+        "<query xmlns='http://jabber.org/protocol/disco#info'/>",
+        "<ping xmlns='urn:xmpp:ping'/>",
+        "<vCard xmlns='vcard-temp'/>",
+    ];
+    for payload in requests {
+        bob.send(&format!(
+            "<iq type='get' to='alice@localhost' id='allowed'>{payload}</iq>"
+        ))?;
+        let reply = bob.receive()?;
+        reply.assert_name("jabber:client", "iq");
+        assert_eq!(reply.attribute("type"), Some("result"), "{reply:?}");
+        assert_eq!(reply.attribute("id"), Some("allowed"), "{reply:?}");
+    }
+    expect_bob_items(&mut bob, "<item jid='alice@localhost/desk'/>")?;
+
+    change(&mut alice, "block", BLOCK_BOB)?;
+    for payload in requests {
+        bob.send(&format!(
+            "<iq type='get' to='alice@localhost' id='attempt'>{payload}</iq>"
+        ))?;
+        let reply = checked_error(&mut bob, "iq", false)?;
+        assert_eq!(
+            reply.attribute("from"),
+            Some("alice@localhost"),
+            "{reply:?}"
+        );
+    }
+    alice
+        .send("<iq type='get' to='bob@localhost' id='attempt'><vCard xmlns='vcard-temp'/></iq>")?;
+    let reply = checked_error(&mut alice, "iq", true)?;
+    assert_eq!(reply.attribute("from"), Some("bob@localhost"), "{reply:?}");
+    barrier(&mut bob)?;
+
+    change(&mut alice, "unblock", BLOCK_BOB)?;
+    expect_bob_items(&mut bob, "<item jid='alice@localhost/desk'/>")?;
+    alice.close()?;
+    bob.close()?;
+    suite.stop()
 }

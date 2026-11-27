@@ -343,7 +343,20 @@ fn plaintext_after_starttls_proceed_is_rejected_as_a_tls_failure() -> TestResult
         Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
         Err(error) => return Err(error.into()),
     }
-    assert!(!received.windows(7).any(|bytes| bytes == b"<stream"));
+    let mut records = received.as_slice();
+    while let [content_type, _, _, high, low, rest @ ..] = records {
+        assert_eq!(
+            *content_type, 21,
+            "expected only TLS alert records, received {received:?}"
+        );
+        records = rest
+            .get(usize::from(u16::from_be_bytes([*high, *low]))..)
+            .ok_or("truncated TLS record")?;
+    }
+    assert!(
+        records.is_empty(),
+        "expected only TLS alert records, received {received:?}"
+    );
     suite.wait_for_closed("tls_failure", 1)?;
     Ok(())
 }

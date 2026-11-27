@@ -287,6 +287,49 @@ fn received_copies_for_full_jid_messages_skip_only_the_addressed_resource() -> T
 }
 
 #[test]
+fn received_copies_skip_every_resource_a_bare_headline_reaches() -> TestResult {
+    let suite = C2sSuite::start()?;
+    accounts(&suite)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let mut desk = suite.connect("bob", PASSWORD, "desk")?;
+    let mut phone = suite.connect("bob", PASSWORD, "phone")?;
+    let mut tablet = suite.connect("bob", PASSWORD, "tablet")?;
+    for (client, full) in [
+        (&mut desk, "bob@localhost/desk"),
+        (&mut phone, "bob@localhost/phone"),
+        (&mut tablet, "bob@localhost/tablet"),
+    ] {
+        enable(client, full)?;
+    }
+    available(&mut desk, "bob@localhost/desk", 0)?;
+    phone.send("<presence><priority>0</priority></presence>")?;
+    phone.expect_xml("<presence xmlns='jabber:client' from='bob@localhost/desk' to='bob@localhost'><priority>0</priority></presence>")?;
+    phone.expect_xml("<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'><priority>0</priority></presence>")?;
+    desk.expect_xml("<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'><priority>0</priority></presence>")?;
+
+    alice.send("<message to='bob@localhost' type='headline' id='notice'><active xmlns='http://jabber.org/protocol/chatstates'/></message>")?;
+    let original = "<message xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost' type='headline' id='notice'><active xmlns='http://jabber.org/protocol/chatstates'/></message>";
+    desk.expect_xml(original)?;
+    phone.expect_xml(original)?;
+    copy(
+        &mut tablet,
+        "bob@localhost/tablet",
+        "received",
+        " type='headline'",
+        original,
+    )?;
+    barrier(&mut alice)?;
+    sentinel(&mut desk, "bob@localhost/desk")?;
+    sentinel(&mut phone, "bob@localhost/phone")?;
+    sentinel(&mut tablet, "bob@localhost/tablet")?;
+    desk.close()?;
+    phone.expect_xml("<presence xmlns='jabber:client' from='bob@localhost/desk' to='bob@localhost' type='unavailable'/>")?;
+    phone.close()?;
+    tablet.close()?;
+    alice.close()
+}
+
+#[test]
 fn missing_full_chat_falls_back_and_copies_around_the_new_recipient() -> TestResult {
     let suite = C2sSuite::start()?;
     accounts(&suite)?;

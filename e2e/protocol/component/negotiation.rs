@@ -103,6 +103,20 @@ fn invalid_handshakes_reject_secret_children_and_early_stanzas() -> TestResult {
 }
 
 #[test]
+fn invalid_handshake_closes_the_tcp_connection_without_the_component_footer() -> TestResult {
+    let mut suite = C2sSuite::with_components(CONFIG)?;
+    let mut client = ComponentClient::connect(suite.component_address(0)?)?;
+    let header = client.open(DOMAIN, None)?;
+    client.send_handshake_for("different-component-test-secret", &header.id)?;
+    client.expect_stream_error("not-authorized")?;
+    client.expect_footer()?;
+    client.expect_eof()?;
+    authentication(&suite, "not_authorized", 1)?;
+    suite.wait_for_metric("lonewolf_component_connections 0")?;
+    suite.stop()
+}
+
+#[test]
 fn unknown_missing_and_non_domain_addresses_omit_response_from() -> TestResult {
     let mut suite = C2sSuite::with_components(CONFIG)?;
     for (index, to) in [

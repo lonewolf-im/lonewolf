@@ -357,7 +357,7 @@ fn stored_messages_copy_to_enabled_resources_without_eligible_priority() -> Test
 }
 
 #[test]
-fn rejected_messages_copy_the_server_error_after_the_sent_copy() -> TestResult {
+fn server_errors_follow_the_original_messages_carbon_eligibility() -> TestResult {
     let suite = C2sSuite::start()?;
     accounts(&suite)?;
     let mut desk = suite.connect("alice", PASSWORD, "desk")?;
@@ -381,6 +381,13 @@ fn rejected_messages_copy_the_server_error_after_the_sent_copy() -> TestResult {
             "<message xmlns='jabber:client' from='bob@localhost/absent' to='alice@localhost/desk' type='error' id='r1'><body>lost</body>{UNAVAILABLE}</message>"
         ),
     )?;
+    barrier(&mut desk)?;
+    sentinel(&mut phone, "alice@localhost/phone")?;
+
+    desk.send(
+        "<message type='headline' to='bob@localhost/absent' id='r2'><body>lost</body></message>",
+    )?;
+    desk.expect_xml(&format!("<message xmlns='jabber:client' from='bob@localhost/absent' to='alice@localhost/desk' type='error' id='r2'><body>lost</body>{UNAVAILABLE}</message>"))?;
     barrier(&mut desk)?;
     sentinel(&mut phone, "alice@localhost/phone")?;
     desk.close()?;
@@ -750,7 +757,7 @@ fn errors_answering_copies_reach_nobody() -> TestResult {
 }
 
 #[test]
-fn routed_errors_are_copied_unless_addressed_to_the_account() -> TestResult {
+fn client_errors_answering_eligible_chats_are_copied() -> TestResult {
     let suite = C2sSuite::start()?;
     accounts(&suite)?;
     let mut desk = suite.connect("alice", PASSWORD, "desk")?;
@@ -759,22 +766,42 @@ fn routed_errors_are_copied_unless_addressed_to_the_account() -> TestResult {
     let mut bob_phone = suite.connect("bob", PASSWORD, "phone")?;
     enable(&mut phone, "alice@localhost/phone")?;
     enable(&mut bob_phone, "bob@localhost/phone")?;
-    for hint in ["", "<no-copy xmlns='urn:xmpp:hints'/>"] {
-        bob.send(&format!("<message type='error' to='alice@localhost/desk' id='e1'>{hint}<error type='cancel'><item-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>"))?;
-        desk.expect_xml(&format!("<message xmlns='jabber:client' from='bob@localhost/desk' to='alice@localhost/desk' type='error' id='e1'>{hint}<error type='cancel'><item-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>"))?;
+    for (id, hint) in [
+        ("chat", ""),
+        ("chat-with-hint", "<no-copy xmlns='urn:xmpp:hints'/>"),
+    ] {
+        desk.send(&format!(
+            "<message type='chat' to='bob@localhost/desk' id='{id}'/>"
+        ))?;
+        let original = format!(
+            "<message xmlns='jabber:client' type='chat' from='alice@localhost/desk' to='bob@localhost/desk' id='{id}'/>"
+        );
+        bob.expect_xml(&original)?;
+        copy(
+            &mut phone,
+            "alice@localhost/phone",
+            "sent",
+            " type='chat'",
+            &original,
+        )?;
+        copy(
+            &mut bob_phone,
+            "bob@localhost/phone",
+            "received",
+            " type='chat'",
+            &original,
+        )?;
+
+        bob.send(&format!("<message type='error' to='alice@localhost/desk' id='{id}'>{hint}<error type='cancel'><item-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>"))?;
+        let error = format!(
+            "<message xmlns='jabber:client' from='bob@localhost/desk' to='alice@localhost/desk' type='error' id='{id}'>{hint}<error type='cancel'><item-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>"
+        );
+        desk.expect_xml(&error)?;
         for (client, full, direction) in [
             (&mut phone, "alice@localhost/phone", "received"),
             (&mut bob_phone, "bob@localhost/phone", "sent"),
         ] {
-            copy(
-                client,
-                full,
-                direction,
-                "",
-                &format!(
-                    "<message xmlns='jabber:client' from='bob@localhost/desk' to='alice@localhost/desk' type='error' id='e1'>{hint}<error type='cancel'><item-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></message>"
-                ),
-            )?;
+            copy(client, full, direction, "", &error)?;
         }
         barrier(&mut bob)?;
         sentinel(&mut phone, "alice@localhost/phone")?;
@@ -1141,4 +1168,43 @@ fn carbons_and_disco_are_independently_selectable() -> TestResult {
         bob.close()?;
     }
     Ok(())
+}
+
+#[test]
+fn client_error_for_an_ineligible_headline_is_not_copied() -> TestResult {
+    let suite = C2sSuite::with_extensions("'disco', 'carbons'")?;
+    accounts(&suite)?;
+    let mut desk = suite.connect("alice", PASSWORD, "desk")?;
+    let mut phone = suite.connect("alice", PASSWORD, "phone")?;
+    let mut bob = suite.connect("bob", PASSWORD, "desk")?;
+    let mut bob_phone = suite.connect("bob", PASSWORD, "phone")?;
+    // Advertising rules:0 makes the original message's eligibility binding under XEP-0280 §§6.1–6.2.
+    discovery(
+        &mut desk,
+        "alice@localhost/desk",
+        "localhost",
+        true,
+        FEATURES,
+    )?;
+    enable(&mut phone, "alice@localhost/phone")?;
+    enable(&mut bob_phone, "bob@localhost/phone")?;
+
+    desk.send("<message type='headline' to='bob@localhost/desk' id='notice'><body>notice</body></message>")?;
+    bob.expect_xml("<message xmlns='jabber:client' type='headline' from='alice@localhost/desk' to='bob@localhost/desk' id='notice'><body>notice</body></message>")?;
+    barrier(&mut desk)?;
+    sentinel(&mut phone, "alice@localhost/phone")?;
+    sentinel(&mut bob_phone, "bob@localhost/phone")?;
+
+    let error = "<body>notice</body><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>";
+    bob.send(&format!(
+        "<message type='error' to='alice@localhost/desk' id='notice'>{error}</message>"
+    ))?;
+    desk.expect_xml(&format!("<message xmlns='jabber:client' type='error' from='bob@localhost/desk' to='alice@localhost/desk' id='notice'>{error}</message>"))?;
+    barrier(&mut bob)?;
+    sentinel(&mut phone, "alice@localhost/phone")?;
+    sentinel(&mut bob_phone, "bob@localhost/phone")?;
+    bob_phone.close()?;
+    bob.close()?;
+    desk.close()?;
+    phone.close()
 }

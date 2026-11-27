@@ -25,7 +25,13 @@ const ALL_SCRAM_MECHANISMS: &[&str] = &[
 fn scram_sha256_authenticates() -> TestResult {
     let suite = C2sSuite::with_extensions("")?;
     suite.create_account("alice", ALTERNATE_PASSWORD)?;
-    let mut client = suite.unauthenticated_client()?;
+    let mut client = suite.tls_client()?;
+    let initial = client.open_with(OPEN)?;
+    let initial_id = initial
+        .attribute("id")
+        .filter(|id| !id.is_empty())
+        .ok_or("missing pre-SASL stream ID")?;
+    client.features()?.child(SASL_NAMESPACE, "mechanisms")?;
 
     client
         .scram("Alice", ALTERNATE_PASSWORD, "SCRAM-SHA-256", None)?
@@ -33,6 +39,14 @@ fn scram_sha256_authenticates() -> TestResult {
     let mut client = client.restart();
     let header = client.open_with(OPEN)?;
     assert_eq!(header.attribute("from"), Some("localhost"));
+    let restarted_id = header
+        .attribute("id")
+        .filter(|id| !id.is_empty())
+        .ok_or("missing post-SASL stream ID")?;
+    assert_ne!(
+        initial_id, restarted_id,
+        "RFC 6120 §6.4.6 requires a fresh stream ID after SASL success"
+    );
 
     client.features()?.assert_xml(
         "<stream:features xmlns:stream='http://etherx.jabber.org/streams'>

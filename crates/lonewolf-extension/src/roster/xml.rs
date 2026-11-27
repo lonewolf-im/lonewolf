@@ -1,16 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use lonewolf_storage::account::AccountKey;
-use lonewolf_storage::roster::{RosterItem, RosterJid, RosterVersion, SubscriptionState};
+use lonewolf_storage::roster::{
+    MAX_GROUP_NAME_BYTES, MAX_ITEM_NAME_BYTES, RosterItem, RosterJid, RosterVersion,
+    SubscriptionState,
+};
 use lonewolf_util::arena::{Arena, ChunkAllocator};
 use lonewolf_xmpp::jid::{Jid, JidError};
 use lonewolf_xmpp::stanza::{
     BuildError, Element, ElementRef, IqType, NodeRef, PresenceType, RoutedStanza, Stanza,
-    StanzaErrorCondition, StanzaNamespace, StanzaType,
+    StanzaErrorCondition, StanzaErrorText, StanzaNamespace, StanzaType,
 };
 
 use super::NAMESPACE;
-use crate::delivery::DeliveryError;
+use crate::delivery::{DeliveryError, HandlerError};
 
 pub(super) struct RosterItemUpdate {
     pub(super) jid: RosterJid,
@@ -46,7 +49,7 @@ pub(super) fn parse_get<'a, A: ChunkAllocator>(
 pub(super) fn parse_set<A: ChunkAllocator>(
     payload: ElementRef<'_, Arena<A>>,
     response: &mut Arena<A>,
-) -> Result<RosterSet, StanzaErrorCondition> {
+) -> Result<RosterSet, HandlerError> {
     let mut item = None;
     for child in payload
         .children()
@@ -58,7 +61,7 @@ pub(super) fn parse_set<A: ChunkAllocator>(
             && child.namespace() == NAMESPACE
         {
             if item.is_some() {
-                return Err(StanzaErrorCondition::BadRequest);
+                return Err(StanzaErrorCondition::BadRequest.into());
             }
             item = Some(child);
         }
@@ -70,7 +73,7 @@ pub(super) fn parse_set<A: ChunkAllocator>(
         .ok_or(StanzaErrorCondition::BadRequest)?;
     let jid = Jid::parse_in(jid, response).map_err(jid_error)?;
     if jid.is_full() {
-        return Err(StanzaErrorCondition::BadRequest);
+        return Err(StanzaErrorCondition::BadRequest.into());
     }
     let jid = RosterJid::from(
         jid.resolve(response)
@@ -86,8 +89,15 @@ pub(super) fn parse_set<A: ChunkAllocator>(
     let name = item
         .attribute("name", "")
         .map_err(|_| StanzaErrorCondition::InternalServerError)?
-        .filter(|name| !name.is_empty())
-        .map(Box::from);
+        .filter(|name| !name.is_empty());
+    if name.is_some_and(|name| name.len() > MAX_ITEM_NAME_BYTES) {
+        return Err(oversized(
+            "A roster contact name can have at most ",
+            MAX_ITEM_NAME_BYTES,
+            " bytes. Shorten the contact name.",
+        ));
+    }
+    let name = name.map(Box::from);
     let mut groups: Vec<Box<str>> = Vec::new();
     for child in item
         .children()
@@ -106,12 +116,30 @@ pub(super) fn parse_set<A: ChunkAllocator>(
             .map_err(|_| StanzaErrorCondition::InternalServerError)?
             .filter(|group| !group.is_empty())
             .ok_or(StanzaErrorCondition::NotAcceptable)?;
+        if group.len() > MAX_GROUP_NAME_BYTES {
+            return Err(oversized(
+                "A roster group name can have at most ",
+                MAX_GROUP_NAME_BYTES,
+                " bytes. Shorten the group name.",
+            ));
+        }
         if groups.iter().any(|existing| existing.as_ref() == group) {
-            return Err(StanzaErrorCondition::BadRequest);
+            return Err(StanzaErrorCondition::BadRequest.into());
         }
         groups.push(Box::from(group));
     }
     Ok(RosterSet::Update(RosterItemUpdate { jid, name, groups }))
+}
+
+const fn oversized(prefix: &'static str, max: usize, suffix: &'static str) -> HandlerError {
+    HandlerError::described(
+        StanzaErrorCondition::NotAcceptable,
+        StanzaErrorText::Limit {
+            prefix,
+            max,
+            suffix,
+        },
+    )
 }
 
 pub(super) fn build_response<A: ChunkAllocator>(
@@ -276,5 +304,115 @@ const fn jid_error(error: JidError) -> StanzaErrorCondition {
         JidError::EmptyPart(_) | JidError::PartTooLong(_) | JidError::InvalidPart(_) => {
             StanzaErrorCondition::BadRequest
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+    use std::num::NonZeroUsize;
+
+    use futures_executor::block_on;
+    use lonewolf_storage::roster::{MAX_GROUP_NAME_BYTES, MAX_ITEM_NAME_BYTES};
+    use lonewolf_util::arena::{Arena, ArenaConfig, GlobalChunkAllocator};
+    use lonewolf_xmpp::parser::{ParserConfig, parse_element};
+    use lonewolf_xmpp::stanza::{StanzaErrorCondition, StanzaErrorText};
+
+    use super::{RosterItemUpdate, RosterSet, parse_set};
+    use crate::delivery::HandlerError;
+
+    type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+
+    const NAME_TOO_LONG: HandlerError = HandlerError::described(
+        StanzaErrorCondition::NotAcceptable,
+        StanzaErrorText::Limit {
+            prefix: "A roster contact name can have at most ",
+            max: MAX_ITEM_NAME_BYTES,
+            suffix: " bytes. Shorten the contact name.",
+        },
+    );
+
+    const GROUP_TOO_LONG: HandlerError = HandlerError::described(
+        StanzaErrorCondition::NotAcceptable,
+        StanzaErrorText::Limit {
+            prefix: "A roster group name can have at most ",
+            max: MAX_GROUP_NAME_BYTES,
+            suffix: " bytes. Shorten the group name.",
+        },
+    );
+
+    fn parse_item(item: &str) -> TestResult<Result<RosterItemUpdate, HandlerError>> {
+        let query = format!("<query xmlns='jabber:iq:roster'>{item}</query>");
+        let parsed = block_on(parse_element(
+            query.as_bytes(),
+            ParserConfig {
+                max_stanza_bytes: NonZeroUsize::new(65_536).ok_or("zero maximum")?,
+                arena: ArenaConfig::default(),
+            },
+            GlobalChunkAllocator,
+        ))?;
+        let mut response = Arena::try_new(ArenaConfig::default())?;
+        let payload = parsed.value().resolve(parsed.arena())?;
+        match parse_set(payload, &mut response) {
+            Ok(RosterSet::Update(update)) => Ok(Ok(update)),
+            Ok(RosterSet::Remove(_)) => Err("unexpected roster removal".into()),
+            Err(error) => Ok(Err(error)),
+        }
+    }
+
+    #[test]
+    fn name_longer_than_the_byte_limit_is_not_acceptable() -> TestResult {
+        for name in [
+            "n".repeat(MAX_ITEM_NAME_BYTES + 1),
+            "é".repeat(MAX_ITEM_NAME_BYTES / 2 + 1),
+        ] {
+            let item = format!("<item jid='bob@example.com' name='{name}'><group>g</group></item>");
+            assert_eq!(parse_item(&item)?.err(), Some(NAME_TOO_LONG));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn group_longer_than_the_byte_limit_is_not_acceptable() -> TestResult {
+        let long = "g".repeat(MAX_GROUP_NAME_BYTES + 1);
+        let multibyte = "é".repeat(MAX_GROUP_NAME_BYTES / 2 + 1);
+        for groups in [
+            format!("<group>{long}</group>"),
+            format!("<group>{multibyte}</group>"),
+            format!("<group>short</group><group>{long}</group>"),
+            format!("<group>{long}</group><group>{long}</group>"),
+        ] {
+            let item = format!("<item jid='bob@example.com'>{groups}</item>");
+            assert_eq!(parse_item(&item)?.err(), Some(GROUP_TOO_LONG), "{groups}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn empty_group_is_reported_before_an_oversized_group() -> TestResult {
+        let long = "g".repeat(MAX_GROUP_NAME_BYTES + 1);
+        let item = format!("<item jid='bob@example.com'><group/><group>{long}</group></item>");
+        assert_eq!(
+            parse_item(&item)?.err(),
+            Some(HandlerError::Stanza(StanzaErrorCondition::NotAcceptable))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn name_and_groups_at_the_byte_limit_are_accepted() -> TestResult {
+        let name = "n".repeat(MAX_ITEM_NAME_BYTES);
+        let first = "a".repeat(MAX_GROUP_NAME_BYTES);
+        let second = format!("{}b", "é".repeat((MAX_GROUP_NAME_BYTES - 1) / 2));
+        let item = format!(
+            "<item jid='bob@example.com' name='{name}'><group>{first}</group><group>{second}</group></item>"
+        );
+        let update = parse_item(&item)?.map_err(|error| format!("{error:?}"))?;
+        assert_eq!(update.name.as_deref(), Some(name.as_str()));
+        assert_eq!(
+            update.groups,
+            [first.into_boxed_str(), second.into_boxed_str()]
+        );
+        Ok(())
     }
 }

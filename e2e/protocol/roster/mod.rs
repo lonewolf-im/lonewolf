@@ -3004,6 +3004,88 @@ fn roster_set_with_an_empty_group_returns_not_acceptable_without_mutating() -> T
 }
 
 #[test]
+fn roster_set_with_an_oversized_name_returns_not_acceptable_without_mutating() -> TestResult {
+    let suite = C2sSuite::with_extensions("'roster'")?;
+    suite.create_account("alice", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let name = "n".repeat(1024);
+
+    request_roster(
+        &mut alice,
+        "initial-roster",
+        "<iq xmlns='jabber:client' type='result' id='initial-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/></iq>",
+    )?;
+    alice.send(&format!("<iq type='set' id='long-name'><query xmlns='jabber:iq:roster'><item jid='bob@localhost' name='{name}'><group>Friends</group></item></query></iq>"))?;
+    alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' id='long-name' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'><item jid='bob@localhost' name='{name}'><group>Friends</group></item></query><error type='modify'><not-acceptable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>A roster contact name can have at most 1023 bytes. Shorten the contact name.</text></error></iq>"))?;
+    request_roster(
+        &mut alice,
+        "unchanged-roster",
+        "<iq xmlns='jabber:client' type='result' id='unchanged-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/></iq>",
+    )?;
+
+    alice.close()
+}
+
+#[test]
+fn roster_set_with_an_oversized_group_returns_not_acceptable_without_mutating() -> TestResult {
+    let suite = C2sSuite::with_extensions("'roster'")?;
+    suite.create_account("alice", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let group = "g".repeat(1024);
+
+    request_roster(
+        &mut alice,
+        "initial-roster",
+        "<iq xmlns='jabber:client' type='result' id='initial-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/></iq>",
+    )?;
+    alice.send(&format!("<iq type='set' id='long-group'><query xmlns='jabber:iq:roster'><item jid='bob@localhost' name='Bob'><group>Friends</group><group>{group}</group></item></query></iq>"))?;
+    alice.expect_xml(&format!("<iq xmlns='jabber:client' type='error' id='long-group' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'><item jid='bob@localhost' name='Bob'><group>Friends</group><group>{group}</group></item></query><error type='modify'><not-acceptable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>A roster group name can have at most 1023 bytes. Shorten the group name.</text></error></iq>"))?;
+    request_roster(
+        &mut alice,
+        "unchanged-roster",
+        "<iq xmlns='jabber:client' type='result' id='unchanged-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/></iq>",
+    )?;
+
+    alice.close()
+}
+
+#[test]
+fn roster_set_with_a_name_and_group_at_the_size_limit_is_accepted() -> TestResult {
+    let suite = C2sSuite::with_extensions("'roster'")?;
+    suite.create_account("alice", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let name = "n".repeat(1023);
+    let group = "g".repeat(1023);
+
+    request_roster(
+        &mut alice,
+        "initial-roster",
+        "<iq xmlns='jabber:client' type='result' id='initial-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'/></iq>",
+    )?;
+    alice.send(&format!("<iq type='set' id='limit-item'><query xmlns='jabber:iq:roster'><item jid='bob@localhost' name='{name}'><group>{group}</group></item></query></iq>"))?;
+    alice.expect_xml(
+        "<iq xmlns='jabber:client' type='result' id='limit-item' to='alice@localhost/desk'/>",
+    )?;
+    let push = expect_roster_push(
+        &mut alice,
+        "alice@localhost/desk",
+        &format!(
+            "<item xmlns='jabber:iq:roster' jid='bob@localhost' name='{name}' subscription='none'><group>{group}</group></item>"
+        ),
+    )?;
+    alice.send(&format!("<iq type='result' id='{push}'/>"))?;
+    request_roster(
+        &mut alice,
+        "stored-roster",
+        &format!(
+            "<iq xmlns='jabber:client' type='result' id='stored-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'><item jid='bob@localhost' name='{name}' subscription='none'><group>{group}</group></item></query></iq>"
+        ),
+    )?;
+
+    alice.close()
+}
+
+#[test]
 fn roster_set_for_another_account_returns_forbidden_without_mutating() -> TestResult {
     let suite = C2sSuite::with_extensions("'roster'")?;
     suite.create_account("alice", PASSWORD)?;

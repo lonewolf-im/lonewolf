@@ -167,7 +167,7 @@
         <xmpp:status>partial</xmpp:status>
         <xmpp:version>1.0.1</xmpp:version>
         <xmpp:since>0.2.0</xmpp:since>
-        <xmpp:note xml:lang="en">Copies local and federated messages across sessions that enable Carbons. Private group-chat messages receive no special handling.</xmpp:note>
+        <xmpp:note xml:lang="en">Copies local and federated messages across sessions that enable Carbons. Private group-chat messages receive no special handling. Errors from other entities are copied without checking the original message, so the strict copying rules are not advertised.</xmpp:note>
       </xmpp:SupportedXep>
     </implements>
     <implements>

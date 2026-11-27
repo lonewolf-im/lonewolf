@@ -4,7 +4,7 @@ use lonewolf_storage::RedbStorage;
 use lonewolf_xmpp::stanza::{StanzaErrorCondition, StanzaErrorText};
 
 use super::*;
-use crate::carbons::{NAME, NAMESPACE, RULES_FEATURE};
+use crate::carbons::{NAME, NAMESPACE};
 use crate::delivery::{BoundResource, DeliveryError, SessionLookup, SessionTag, TagChange};
 use crate::discovery::{DiscoScope, INFO_NAMESPACE, ITEMS_NAMESPACE};
 use crate::iq::{IqErrorPayload, IqRequest, IqRequestType, IqScope};
@@ -64,7 +64,7 @@ fn assert_selection(registry: &Registry, names: &[&str]) {
             features.extend([INFO_NAMESPACE, ITEMS_NAMESPACE]);
         }
         if carbons && scope == DiscoScope::Server {
-            features.extend([NAMESPACE, RULES_FEATURE]);
+            features.push(NAMESPACE);
         }
         features.sort_unstable();
         assert_eq!(registry.discovery().features(scope), features);

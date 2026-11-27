@@ -7,8 +7,7 @@ use rustls::pki_types::ServerName;
 use crate::support::{C2sSuite, Client, OPEN, PASSWORD, TestResult, barrier};
 
 const UNAVAILABLE: &str = "<error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error>";
-const FEATURES: &str =
-    "<feature var='urn:xmpp:carbons:2'/><feature var='urn:xmpp:carbons:rules:0'/>";
+const FEATURES: &str = "<feature var='urn:xmpp:carbons:2'/>";
 
 fn accounts(suite: &C2sSuite) -> TestResult {
     suite.create_account("alice", PASSWORD)?;
@@ -1141,4 +1140,47 @@ fn carbons_and_disco_are_independently_selectable() -> TestResult {
         bob.close()?;
     }
     Ok(())
+}
+
+#[test]
+fn client_errors_answering_headlines_are_copied_without_strict_rules() -> TestResult {
+    let suite = C2sSuite::with_extensions("'disco', 'carbons'")?;
+    accounts(&suite)?;
+    let mut desk = suite.connect("alice", PASSWORD, "desk")?;
+    let mut phone = suite.connect("alice", PASSWORD, "phone")?;
+    let mut bob = suite.connect("bob", PASSWORD, "desk")?;
+    let mut bob_phone = suite.connect("bob", PASSWORD, "phone")?;
+    discovery(
+        &mut desk,
+        "alice@localhost/desk",
+        "localhost",
+        true,
+        "<feature var='urn:xmpp:carbons:2'/>",
+    )?;
+    enable(&mut phone, "alice@localhost/phone")?;
+    enable(&mut bob_phone, "bob@localhost/phone")?;
+
+    desk.send("<message type='headline' to='bob@localhost/desk' id='notice'><body>notice</body></message>")?;
+    bob.expect_xml("<message xmlns='jabber:client' type='headline' from='alice@localhost/desk' to='bob@localhost/desk' id='notice'><body>notice</body></message>")?;
+    barrier(&mut desk)?;
+    sentinel(&mut phone, "alice@localhost/phone")?;
+    sentinel(&mut bob_phone, "bob@localhost/phone")?;
+
+    let payload = "<body>notice</body><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error>";
+    bob.send(&format!(
+        "<message type='error' to='alice@localhost/desk' id='notice'>{payload}</message>"
+    ))?;
+    let error = format!(
+        "<message xmlns='jabber:client' type='error' from='bob@localhost/desk' to='alice@localhost/desk' id='notice'>{payload}</message>"
+    );
+    desk.expect_xml(&error)?;
+    copy(&mut phone, "alice@localhost/phone", "received", "", &error)?;
+    copy(&mut bob_phone, "bob@localhost/phone", "sent", "", &error)?;
+    barrier(&mut bob)?;
+    sentinel(&mut phone, "alice@localhost/phone")?;
+    sentinel(&mut bob_phone, "bob@localhost/phone")?;
+    bob_phone.close()?;
+    bob.close()?;
+    desk.close()?;
+    phone.close()
 }

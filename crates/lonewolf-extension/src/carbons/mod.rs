@@ -14,7 +14,6 @@ use crate::{Extension, RegistrationError, Slots};
 
 pub const NAME: &str = "carbons";
 pub const NAMESPACE: &str = "urn:xmpp:carbons:2";
-pub const RULES_FEATURE: &str = "urn:xmpp:carbons:rules:0";
 
 pub mod copy;
 pub mod rules;
@@ -35,7 +34,6 @@ impl<A: ChunkAllocator, S: Storage> Extension<A, S> for Carbons {
         slots.session_iq(NAMESPACE, "enable", self.clone())?;
         slots.session_iq(NAMESPACE, "disable", self.clone())?;
         slots.disco_feature(DiscoScope::Server, NAMESPACE);
-        slots.disco_feature(DiscoScope::Server, RULES_FEATURE);
         slots.message_observer(self);
         Ok(())
     }

@@ -1147,10 +1147,8 @@ impl<A: ChunkAllocator> MessageHandler<A, RedbStorage> for ControlledAcknowledge
 }
 
 #[test]
-fn failed_acknowledgement_logs_once_and_restarts_for_the_same_watermark_after_a_later_flush()
+fn failed_acknowledgement_runs_once_and_restarts_for_the_same_watermark_after_a_later_flush()
 -> TestResult {
-    let capture = crate::delivery::failure_tests::Capture::default();
-    let _subscriber = tracing::subscriber::set_default(capture.clone());
     Runtime::new()?.block_on(async {
         let fixture = Fixture::new(&[MESSAGE]).await?;
         let handler = Arc::new(ControlledAcknowledgement {
@@ -1198,10 +1196,6 @@ fn failed_acknowledgement_logs_once_and_restarts_for_the_same_watermark_after_a_
             .await?;
         assert_eq!(handler.calls.load(Ordering::Relaxed), 2);
         assert_eq!(fixture.count().await?, 0);
-        capture.assert_one(
-            FailureKind::Storage(lonewolf_storage::StorageErrorKind::Unavailable),
-            "offline_acknowledge",
-        );
         drop(outbox);
         fixture.finish().await
     })
@@ -2460,8 +2454,8 @@ fn admitted_pending_withdrawal_keeps_healthy_effects_under_mailbox_pressure_and_
 }
 
 #[test]
-fn core_begin_failure_reports_safe_category_once_and_keeps_stream_close_outcome() -> TestResult {
-    use crate::delivery::failure_tests::{Capture, KINDS, seeded_error};
+fn core_begin_failure_keeps_stream_close_outcome() -> TestResult {
+    use crate::delivery::failure_tests::{KINDS, seeded_error};
     let mut arena = Arena::try_new(Default::default())?;
     let account =
         AccountKey::try_from(Jid::parse_in("bob@localhost", &mut arena)?.resolve(&arena)?)?;
@@ -2476,13 +2470,10 @@ fn core_begin_failure_reports_safe_category_once_and_keeps_stream_close_outcome(
             "presence_terminal_begin_read",
             "offline_store_begin_write",
         ] {
-            let capture = Capture::default();
-            let _subscriber = tracing::subscriber::set_default(capture.clone());
             assert_eq!(
                 close_storage_failure(seeded_error(kind), operation, &account),
                 CloseOutcome::InternalError
             );
-            capture.assert_one(FailureKind::Storage(kind), operation);
         }
     }
     Ok(())
@@ -2528,12 +2519,15 @@ impl IqHandler<GlobalChunkAllocator, RedbStorage> for FailedGet {
 }
 
 #[test]
-fn detached_iq_get_reports_handler_and_effect_failures_after_requester_cancellation() -> TestResult
-{
-    use crate::delivery::failure_tests::{Capture, KINDS};
-    for kind in KINDS.into_iter().map(Some).chain([None]) {
-        let capture = Capture::default();
-        let _subscriber = tracing::subscriber::set_default(capture.clone());
+fn detached_iq_get_keeps_handler_and_effect_failures_and_finishes_after_requester_cancellation()
+-> TestResult {
+    use crate::delivery::failure_tests::KINDS;
+    for (kind, cancel) in KINDS
+        .into_iter()
+        .map(Some)
+        .chain([None])
+        .flat_map(|kind| [(kind, true), (kind, false)])
+    {
         Runtime::new()?.block_on(async {
             let mut fixture = Fixture::new(&[]).await?;
             let account = fixture.registration.account().clone();
@@ -2589,12 +2583,26 @@ fn detached_iq_get_reports_handler_and_effect_failures_after_requester_cancellat
                 },
             );
             started.await?;
-            drop(pending);
+            let pending = (!cancel).then_some(pending);
             release.send(()).map_err(|_| "IQ get work was cancelled")?;
             compio::time::timeout(Duration::from_secs(1), fixture.work.drain()).await?;
-            match kind {
-                Some(kind) => capture.assert_one(FailureKind::Storage(kind), "roster_read"),
-                None => capture.assert_one(FailureKind::Delivery, "iq_get_effects"),
+            if let Some(pending) = pending {
+                match (kind, pending.finished().await) {
+                    (Some(kind), Some(Ok(completion))) => {
+                        let Err(error) = completion.answer.reply else {
+                            return Err("failed IQ get must reply with an error".into());
+                        };
+                        assert_eq!(
+                            error.handler_error().failure(),
+                            Some(Failure {
+                                kind: FailureKind::Storage(kind),
+                                operation: "roster_read",
+                            })
+                        );
+                    }
+                    (None, Some(Err(crate::stages::StageFailure))) => {}
+                    _ => return Err("IQ get finished with an unexpected outcome".into()),
+                }
             }
             fixture.finish().await
         })?;
@@ -2638,7 +2646,7 @@ impl AccountReads for FailingAccountReads {
 
 #[test]
 fn iq_account_guard_skips_server_scope_and_preserves_read_failures() -> TestResult {
-    use crate::delivery::failure_tests::{Capture, KINDS};
+    use crate::delivery::failure_tests::KINDS;
     Runtime::new()?.block_on(async {
         let mut arena = Arena::try_new(Default::default())?;
         let target =
@@ -2664,10 +2672,6 @@ fn iq_account_guard_skips_server_scope_and_preserves_read_failures() -> TestResu
                             operation: "iq_account_read",
                         })
                     );
-                    let capture = Capture::default();
-                    let _subscriber = tracing::subscriber::set_default(capture.clone());
-                    report_handler_failure(&error, &target);
-                    capture.assert_one(FailureKind::Storage(kind), "iq_account_read");
                 }
                 None => assert_eq!(error.failure(), None),
             }

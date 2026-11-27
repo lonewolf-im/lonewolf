@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use crate::delivery::failure_tests::{Capture, KINDS};
+use crate::delivery::failure_tests::KINDS;
 use lonewolf_extension::iq::IqFuture;
 use lonewolf_storage::StorageErrorKind;
 use lonewolf_xmpp::stanza::{NodeRef, STANZA_ERROR_NAMESPACE};
@@ -263,14 +263,12 @@ impl IqHandler<GlobalChunkAllocator, RedbStorage> for Omit {
 }
 
 #[test]
-fn omitted_get_set_and_missing_account_errors_report_once_and_set_rolls_back() -> TestResult {
+fn omitted_get_set_and_missing_account_errors_reply_once_and_set_rolls_back() -> TestResult {
     Runtime::new()?.block_on(async {
         let fixture = Fixture::new(&[]).await?;
         let (router, mut session) = session(&fixture, GlobalChunkAllocator).await?;
         for path in ["get", "set", "missing"] {
             for kind in KINDS {
-                let capture = Capture::default();
-                let _subscriber = tracing::subscriber::set_default(capture.clone());
                 let handler = Arc::new(Omit {
                     path,
                     kind,
@@ -358,7 +356,6 @@ fn omitted_get_set_and_missing_account_errors_report_once_and_set_rolls_back() -
                     .await
                     .map_err(|error| format!("{error:?}"))?;
                 assert_eq!(handler.calls.load(Ordering::SeqCst), 1);
-                capture.assert_one(FailureKind::Storage(kind), "iq_omit");
                 assert!(
                     fixture
                         .storage

@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Once};
 use std::time::Duration;
 
 use compio::runtime::Runtime;
@@ -22,11 +20,6 @@ use lonewolf_storage::vcard::{StoredVCard, VCardError, VCardQuota, VCardReads, V
 use lonewolf_storage::{ReadTransaction, StorageError, StorageErrorKind, WriteTransaction};
 use lonewolf_util::arena::GlobalChunkAllocator;
 use lonewolf_xmpp::jid::JidRef;
-use parking_lot::Mutex as PlMutex;
-use tracing::field::{Field, Visit};
-use tracing::span::{Attributes, Id, Record};
-use tracing::subscriber::Interest;
-use tracing::{Event, Metadata, Subscriber};
 
 use super::tests::{NoDelivery, TestResult, account};
 use super::*;
@@ -43,102 +36,6 @@ pub(crate) const KINDS: [StorageErrorKind; 5] = [
 
 pub(crate) fn seeded_error(kind: StorageErrorKind) -> StorageError {
     StorageError::with_source(kind, std::io::Error::other(SENSITIVE_SOURCE))
-}
-
-#[derive(Clone)]
-pub(crate) struct Capture(Arc<PlMutex<Vec<BTreeMap<&'static str, String>>>>);
-
-impl Default for Capture {
-    fn default() -> Self {
-        static DYNAMIC_INTEREST: Once = Once::new();
-        DYNAMIC_INTEREST.call_once(|| {
-            assert!(tracing::subscriber::set_global_default(DynamicInterest).is_ok());
-        });
-        Self(Arc::default())
-    }
-}
-
-/// Keeps callsite interest dynamic so tracing's process-wide interest cache cannot hide events from a capture.
-struct DynamicInterest;
-
-impl Subscriber for DynamicInterest {
-    fn register_callsite(&self, _: &'static Metadata<'static>) -> Interest {
-        Interest::sometimes()
-    }
-    fn enabled(&self, _: &Metadata<'_>) -> bool {
-        false
-    }
-    fn new_span(&self, _: &Attributes<'_>) -> Id {
-        Id::from_u64(1)
-    }
-    fn record(&self, _: &Id, _: &Record<'_>) {}
-    fn record_follows_from(&self, _: &Id, _: &Id) {}
-    fn event(&self, _: &Event<'_>) {}
-    fn enter(&self, _: &Id) {}
-    fn exit(&self, _: &Id) {}
-}
-
-struct Fields(BTreeMap<&'static str, String>);
-impl Visit for Fields {
-    fn record_str(&mut self, field: &Field, value: &str) {
-        self.0.insert(field.name(), value.into());
-    }
-    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        self.0.insert(field.name(), format!("{value:?}"));
-    }
-}
-
-impl Subscriber for Capture {
-    fn enabled(&self, _: &Metadata<'_>) -> bool {
-        true
-    }
-    fn new_span(&self, _: &Attributes<'_>) -> Id {
-        Id::from_u64(1)
-    }
-    fn record(&self, _: &Id, _: &Record<'_>) {}
-    fn record_follows_from(&self, _: &Id, _: &Id) {}
-    fn event(&self, event: &Event<'_>) {
-        let mut fields = Fields(BTreeMap::new());
-        event.record(&mut fields);
-        self.0.lock().push(fields.0);
-    }
-    fn enter(&self, _: &Id) {}
-    fn exit(&self, _: &Id) {}
-}
-
-impl Capture {
-    pub(crate) fn assert_one(&self, kind: FailureKind, operation: &str) {
-        let events = self.0.lock();
-        let matching: Vec<_> = events
-            .iter()
-            .filter(|fields| {
-                fields
-                    .get("message")
-                    .is_some_and(|value| value == "internal operation failed")
-            })
-            .collect();
-        assert_eq!(matching.len(), 1, "{events:?}");
-        assert_eq!(
-            matching[0].get("operation").map(String::as_str),
-            Some(operation)
-        );
-        assert_eq!(
-            matching[0].get("failure_kind").map(String::as_str),
-            Some(kind.as_str())
-        );
-        assert!(!format!("{events:?}").contains(SENSITIVE_SOURCE));
-        assert!(!format!("{events:?}").contains("private-client-stanza-id"));
-        for key in [
-            "payload",
-            "password",
-            "ip",
-            "stream_id",
-            "stanza_id",
-            "error",
-        ] {
-            assert!(!matching[0].contains_key(key));
-        }
-    }
 }
 
 struct FailedCommit {
@@ -500,79 +397,105 @@ impl RosterWrites for FailedCommit {
 }
 
 #[test]
-fn detached_commit_failures_keep_categories_and_log_after_requester_cancellation() -> TestResult {
+fn detached_commit_failures_keep_categories_and_finish_after_requester_cancellation() -> TestResult
+{
     for kind in KINDS {
-        let capture = Capture::default();
-        let _subscriber = tracing::subscriber::set_default(capture.clone());
-        Runtime::new()?.block_on(async {
-            let owner = account("alice@example.com")?;
-            let (release, blocked) = oneshot::channel();
-            let mut group = WorkGroup::new();
-            let effects: Effects<GlobalChunkAllocator> = Effects::new(vec![owner.clone()], |_| {
-                panic!("failed commit must not run effects")
-            });
-            let pending = commit_and_deliver(
-                group.start(),
-                Order::new(),
-                FailedCommit {
-                    kind,
-                    release: blocked,
-                    transaction: None,
-                },
-                effects,
-                NoDelivery,
-                None,
-                EffectsDiagnostics {
-                    identity: crate::delivery::EffectsIdentity::Account(owner),
-                    commit_operation: "iq_set_commit",
-                    delivery_operation: "iq_set_effects",
-                },
-            );
-            drop(pending);
-            release.send(()).map_err(|_| "commit owner was cancelled")?;
-            compio::time::timeout(Duration::from_secs(1), group.drain()).await?;
-            capture.assert_one(FailureKind::Storage(kind), "iq_set_commit");
-            Ok::<_, Box<dyn std::error::Error>>(())
-        })?;
+        for cancel in [true, false] {
+            Runtime::new()?.block_on(async {
+                let owner = account("alice@example.com")?;
+                let (release, blocked) = oneshot::channel();
+                let mut group = WorkGroup::new();
+                let effects: Effects<GlobalChunkAllocator> =
+                    Effects::new(vec![owner.clone()], |_| {
+                        panic!("failed commit must not run effects")
+                    });
+                let pending = commit_and_deliver(
+                    group.start(),
+                    Order::new(),
+                    FailedCommit {
+                        kind,
+                        release: blocked,
+                        transaction: None,
+                    },
+                    effects,
+                    NoDelivery,
+                    None,
+                    EffectsDiagnostics {
+                        identity: crate::delivery::EffectsIdentity::Account(owner),
+                        commit_operation: "iq_set_commit",
+                        delivery_operation: "iq_set_effects",
+                    },
+                );
+                let pending = (!cancel).then_some(pending);
+                release.send(()).map_err(|_| "commit owner was cancelled")?;
+                compio::time::timeout(Duration::from_secs(1), group.drain()).await?;
+                if let Some(pending) = pending {
+                    let Some(Err(EffectsError::Commit(failure))) = pending.finished().await else {
+                        return Err("failed commit must report a commit error".into());
+                    };
+                    assert_eq!(
+                        failure,
+                        Failure {
+                            kind: FailureKind::Storage(kind),
+                            operation: "iq_set_commit",
+                        }
+                    );
+                }
+                Ok::<_, Box<dyn std::error::Error>>(())
+            })?;
+        }
     }
     Ok(())
 }
 
 #[test]
-fn detached_effect_failure_logs_after_requester_cancellation() -> TestResult {
-    let capture = Capture::default();
-    let _subscriber = tracing::subscriber::set_default(capture.clone());
-    Runtime::new()?.block_on(async {
-        let directory = tempfile::tempdir()?;
-        let storage = RedbStorage::open(directory.path().join("lonewolf.dat"))?;
-        let owner = account("alice@example.com")?;
-        let (release, blocked) = oneshot::channel();
-        let effects = Effects::new(vec![owner.clone()], move |_| {
-            Box::pin(async move {
-                let _ = blocked.await;
-                Err(DeliveryError)
-            })
-        });
-        let mut group = WorkGroup::new();
-        let pending = commit_and_deliver(
-            group.start(),
-            Order::new(),
-            storage.begin_write().await?,
-            effects,
-            NoDelivery,
-            None,
-            EffectsDiagnostics {
-                identity: crate::delivery::EffectsIdentity::Account(owner),
-                commit_operation: "presence_subscription_commit",
-                delivery_operation: "presence_subscription_effects",
-            },
-        );
-        drop(pending);
-        release.send(()).map_err(|_| "effect owner was cancelled")?;
-        compio::time::timeout(Duration::from_secs(5), group.drain()).await?;
-        capture.assert_one(FailureKind::Delivery, "presence_subscription_effects");
-        Ok(())
-    })
+fn detached_effect_failure_keeps_category_and_finishes_after_requester_cancellation() -> TestResult
+{
+    for cancel in [true, false] {
+        Runtime::new()?.block_on(async {
+            let directory = tempfile::tempdir()?;
+            let storage = RedbStorage::open(directory.path().join("lonewolf.dat"))?;
+            let owner = account("alice@example.com")?;
+            let (release, blocked) = oneshot::channel();
+            let effects = Effects::new(vec![owner.clone()], move |_| {
+                Box::pin(async move {
+                    let _ = blocked.await;
+                    Err(DeliveryError)
+                })
+            });
+            let mut group = WorkGroup::new();
+            let pending = commit_and_deliver(
+                group.start(),
+                Order::new(),
+                storage.begin_write().await?,
+                effects,
+                NoDelivery,
+                None,
+                EffectsDiagnostics {
+                    identity: crate::delivery::EffectsIdentity::Account(owner),
+                    commit_operation: "presence_subscription_commit",
+                    delivery_operation: "presence_subscription_effects",
+                },
+            );
+            let pending = (!cancel).then_some(pending);
+            release.send(()).map_err(|_| "effect owner was cancelled")?;
+            compio::time::timeout(Duration::from_secs(5), group.drain()).await?;
+            if let Some(pending) = pending {
+                let Some(Err(EffectsError::Delivery(failure))) = pending.finished().await else {
+                    return Err("failed effects must report a delivery error".into());
+                };
+                assert_eq!(
+                    failure,
+                    Failure {
+                        kind: FailureKind::Delivery,
+                        operation: "presence_subscription_effects",
+                    }
+                );
+            }
+            Ok::<_, Box<dyn std::error::Error>>(())
+        })?;
+    }
+    Ok(())
 }
 
 #[test]

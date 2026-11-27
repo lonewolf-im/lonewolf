@@ -542,25 +542,41 @@ fn unknown_to_gets_host_unknown() -> TestResult {
 #[test]
 fn rejected_initial_headers_get_a_response_header_before_the_stream_error() -> TestResult {
     let mut fixture = SingleServer::start("")?;
-    for (content_namespace, attributes, condition) in [
+    for (content_namespace, attributes, version, condition) in [
         (
             "jabber:client",
             "from='b.test' to='a.test' version='1.0'",
+            Some("1.0"),
             "invalid-namespace",
         ),
         (
             "jabber:server",
             "from='b.test' to='a.test'",
+            None,
             "unsupported-version",
         ),
         (
             "jabber:server",
             "from='b.test' to='a.test' version='0.9'",
+            Some("0.9"),
+            "unsupported-version",
+        ),
+        (
+            "jabber:server",
+            "from='b.test' to='a.test' version='00.009'",
+            Some("0.9"),
+            "unsupported-version",
+        ),
+        (
+            "jabber:server",
+            "from='b.test' to='a.test' version='1.x'",
+            Some("1.0"),
             "unsupported-version",
         ),
         (
             "jabber:server",
             "from='bob@b.test' to='a.test' version='1.0'",
+            Some("1.0"),
             "invalid-from",
         ),
     ] {
@@ -570,11 +586,37 @@ fn rejected_initial_headers_get_a_response_header_before_the_stream_error() -> T
         let mut stream = XmlStream::new(tcp(fixture.suite.s2s_addresses()?[0])?);
         let header = stream.open_with(&opening)?;
         assert_eq!(header.attribute("from"), Some("a.test"), "{opening}");
+        assert_eq!(header.attribute("version"), version, "{opening}");
         stream.expect_stream_error(condition)?;
         fixture
             .suite
             .wait_for_metric("lonewolf_s2s_connections{direction=\"inbound\"} 0")?;
     }
+    fixture.stop()
+}
+
+#[test]
+fn rejected_final_headers_negotiate_the_response_version() -> TestResult {
+    let mut fixture = SingleServer::start("")?;
+    for (version_attribute, version) in [("", None), (" version='0.9'", Some("0.9"))] {
+        let mut peer = fixture.connect()?;
+        peer.expect_starttls_features()?;
+        let mut peer = peer.start_tls(fixture.client_config()?)?;
+        peer.expect_external_offered()?;
+        peer.auth_external(Some("b.test"))?;
+        peer.expect_sasl_success()?;
+        peer.restart_rejected(
+            &format!(
+                "<stream:stream xmlns:stream='{STREAM_NAMESPACE}' xmlns='jabber:server' from='b.test' to='a.test'{version_attribute}>"
+            ),
+            version,
+            "unsupported-version",
+        )?;
+        fixture
+            .suite
+            .wait_for_metric("lonewolf_s2s_connections{direction=\"inbound\"} 0")?;
+    }
+    authentication(&fixture.suite, "inbound", "protocol", 2)?;
     fixture.stop()
 }
 

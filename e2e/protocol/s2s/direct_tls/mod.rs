@@ -438,6 +438,31 @@ fn inbound_direct_tls_external_authzid_mismatch_rejects_and_cleans_up() -> TestR
 }
 
 #[test]
+fn inbound_direct_tls_rejected_headers_negotiate_the_response_version() -> TestResult {
+    use super::super::support::federation::peer::RawS2sPeer;
+    let mut fixture = inbound_fixture("", false)?;
+    for (version_attribute, version) in [("", None), (" version='0.9'", Some("0.9"))] {
+        let mut inbound = RawS2sPeer::tls_first(
+            fixture.suite.s2s_addresses()?[1],
+            "b.test",
+            "a.test",
+            fixture.client_config()?,
+        )?;
+        inbound.open_rejected(
+            &format!(
+                "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:server' from='b.test' to='a.test'{version_attribute}>"
+            ),
+            version,
+            "unsupported-version",
+        )?;
+        fixture
+            .suite
+            .wait_for_metric("lonewolf_s2s_connections{direction=\"inbound\"} 0")?;
+    }
+    fixture.stop()
+}
+
+#[test]
 fn inbound_direct_tls_rejects_untrusted_and_client_auth_only_certificates() -> TestResult {
     use super::super::support::federation::peer::RawS2sPeer;
     for kind in ["untrusted", "client_auth_only"] {

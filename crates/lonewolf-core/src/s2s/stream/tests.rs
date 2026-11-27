@@ -320,6 +320,39 @@ fn header_builders_escape_attributes_and_generate_fresh_lowercase_hex_ids() -> T
 }
 
 #[test]
+fn rejection_headers_answer_with_the_lower_version_or_none() -> TestResult {
+    Runtime::new()?.block_on(async {
+        for (version_attribute, expected, wire_version) in [
+            ("", ResponseVersion::Omitted, None),
+            (" version='0.9'", ResponseVersion::ZeroMajor("9".into()), Some("0.9")),
+            (" version='00.009'", ResponseVersion::ZeroMajor("9".into()), Some("0.9")),
+            (" version='0.0'", ResponseVersion::ZeroMajor("0".into()), Some("0.0")),
+            (" version='1.0'", ResponseVersion::Current, Some("1.0")),
+            (" version='2.5'", ResponseVersion::Current, Some("1.0")),
+            (" version='1.x'", ResponseVersion::Current, Some("1.0")),
+        ] {
+            let (parsed, _) = header(&format!(
+                "<stream:stream xmlns:stream='http://etherx.jabber.org/streams' xmlns='jabber:server' to='local.test'{version_attribute}>"
+            ))
+            .await?;
+            let version = response_version(&parsed);
+            assert_eq!(version, expected, "{version_attribute}");
+            let xml = success(rejection_header_xml("local.test", &version))?;
+            let (response, _) = header(&xml).await?;
+            let view = response.value().resolve(response.arena())?;
+            assert_eq!(view.attribute("from", "")?, Some("local.test"));
+            assert_eq!(view.attribute("to", "")?, None);
+            assert_eq!(
+                view.attribute("version", "")?,
+                wire_version,
+                "{version_attribute}"
+            );
+        }
+        Ok(())
+    })
+}
+
+#[test]
 fn constants_and_negotiation_builders_emit_exact_xml() {
     assert_eq!(
         STARTTLS_REQUIRED_FEATURES,

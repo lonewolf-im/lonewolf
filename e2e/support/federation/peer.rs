@@ -177,6 +177,22 @@ impl RawS2sPeer {
         Ok(())
     }
 
+    pub fn open_rejected(
+        &mut self,
+        header: &str,
+        version: Option<&str>,
+        condition: &str,
+    ) -> TestResult {
+        let response = self.stream.open_with(header)?;
+        assert_eq!(
+            response.attribute("from"),
+            Some(self.to.as_str()),
+            "{response:?}"
+        );
+        assert_eq!(response.attribute("version"), version, "{response:?}");
+        self.expect_stream_error(condition)
+    }
+
     pub fn alpn_protocol(&mut self) -> Option<&[u8]> {
         match self.stream.transport() {
             PeerTransport::Plain(_) => None,
@@ -289,6 +305,15 @@ impl RawS2sPeer {
             self.local_limits_xml()
         ))?;
         Ok(self)
+    }
+    pub fn restart_rejected(
+        mut self,
+        header: &str,
+        version: Option<&str>,
+        condition: &str,
+    ) -> TestResult {
+        self.stream = self.stream.restart();
+        self.open_rejected(header, version, condition)
     }
     pub fn send(&mut self, xml: &str) -> TestResult {
         self.stream.send(xml)

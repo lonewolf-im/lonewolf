@@ -2596,6 +2596,79 @@ fn roster_set_updates_editable_fields_and_preserves_subscription_state() -> Test
 }
 
 #[test]
+fn roster_set_clears_the_name_and_all_groups() -> TestResult {
+    // RFC 6121 §§2.1.2.6 and 2.4.1 define how omitted fields clear existing roster data.
+    for (id, update, expected_name, expected_groups) in [
+        (
+            "omitted-name",
+            "<item jid='bob@localhost'><group>Work</group></item>",
+            "",
+            &["Work"][..],
+        ),
+        ("empty-name", "<item jid='bob@localhost' name=''/>", "", &[]),
+        (
+            "no-groups",
+            "<item jid='bob@localhost' name='Bob Smith'/>",
+            "Bob Smith",
+            &[],
+        ),
+    ] {
+        let suite = C2sSuite::with_extensions_and_setup("'roster'", seed_roster)?;
+        let mut desk = suite.connect("alice", PASSWORD, "desk")?;
+        let mut phone = suite.connect("alice", PASSWORD, "phone")?;
+        request_roster(
+            &mut phone,
+            "before",
+            "<iq xmlns='jabber:client' type='result' id='before' to='alice@localhost/phone'><query xmlns='jabber:iq:roster'><item jid='bob@localhost' name='Bob Smith' subscription='both' ask='subscribe' approved='true'><group>Friends</group><group>Work</group></item></query></iq>",
+        )?;
+
+        desk.send(&format!(
+            "<iq type='set' id='{id}'><query xmlns='{ROSTER_NAMESPACE}'>{update}</query></iq>"
+        ))?;
+        desk.expect_xml(&format!(
+            "<iq xmlns='jabber:client' type='result' id='{id}' to='alice@localhost/desk'/>"
+        ))?;
+        let push = phone.receive()?;
+        push.assert_name("jabber:client", "iq");
+        assert_eq!(push.attribute("type"), Some("set"));
+        assert_eq!(push.attribute("to"), Some("alice@localhost/phone"));
+        let push_id = push.attribute("id").ok_or("roster push has no ID")?;
+        phone.send(&format!("<iq type='result' id='{push_id}'/>"))?;
+
+        desk.send(&format!(
+            "<iq type='get' id='after'><query xmlns='{ROSTER_NAMESPACE}'/></iq>"
+        ))?;
+        let roster = desk.receive()?;
+        roster.assert_name("jabber:client", "iq");
+        assert_eq!(roster.attribute("type"), Some("result"));
+        assert_eq!(roster.attribute("id"), Some("after"));
+        for reply in [&push, &roster] {
+            let query = reply.child(ROSTER_NAMESPACE, "query")?;
+            assert_eq!(query.children.len(), 1, "{id}: {query:?}");
+            let item = query.child(ROSTER_NAMESPACE, "item")?;
+            assert_eq!(item.attribute("jid"), Some("bob@localhost"));
+            assert_eq!(
+                item.attribute("name").unwrap_or_default(),
+                expected_name,
+                "{id}"
+            );
+            let groups = item
+                .children
+                .iter()
+                .filter(|child| child.namespace == ROSTER_NAMESPACE && child.name == "group")
+                .map(|group| group.text.as_str());
+            assert!(groups.eq(expected_groups.iter().copied()), "{id}: {item:?}");
+            assert_eq!(item.attribute("subscription"), Some("both"));
+            assert_eq!(item.attribute("ask"), Some("subscribe"));
+            assert_eq!(item.attribute("approved"), Some("true"));
+        }
+        desk.close()?;
+        phone.close()?;
+    }
+    Ok(())
+}
+
+#[test]
 fn roster_set_with_multiple_items_returns_bad_request_without_mutating() -> TestResult {
     let suite = C2sSuite::with_extensions("'roster'")?;
     suite.create_account("alice", PASSWORD)?;

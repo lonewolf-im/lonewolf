@@ -6,7 +6,7 @@ use rustls::pki_types::ServerName;
 
 use lonewolf_extension::discovery::{INFO_NAMESPACE, ITEMS_NAMESPACE};
 
-use crate::support::{C2sSuite, OPEN, PASSWORD, TestResult, mutually_subscribe, toggle};
+use crate::support::{C2sSuite, OPEN, PASSWORD, TestResult, barrier, mutually_subscribe, toggle};
 
 #[test]
 fn default_hosts_answer_discovery() -> TestResult {
@@ -281,6 +281,54 @@ fn account_items_list_resources_by_relationship() -> TestResult {
     alice_desk.close()?;
     bob.close()?;
     carol.close()
+}
+
+#[test]
+fn account_discovery_follows_a_one_way_presence_subscription() -> TestResult {
+    let suite = C2sSuite::with_extensions("'roster', 'disco'")?;
+    suite.create_account("alice", PASSWORD)?;
+    suite.create_account("bob", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let mut bob = suite.connect("bob", PASSWORD, "phone")?;
+    bob.send("<presence type='subscribed' to='alice@localhost'/>")?;
+    barrier(&mut bob)?;
+    alice.send("<presence type='subscribe' to='bob@localhost'/>")?;
+    barrier(&mut alice)?;
+
+    alice.send("<presence/>")?;
+    alice.expect_xml(
+        "<presence xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost'/>",
+    )?;
+    bob.send("<presence/>")?;
+    bob.expect_xml(
+        "<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'/>",
+    )?;
+    alice.expect_xml(
+        "<presence xmlns='jabber:client' from='bob@localhost/phone' to='alice@localhost'/>",
+    )?;
+
+    alice.send(&format!(
+        "<iq type='get' to='bob@localhost' id='info'><query xmlns='{INFO_NAMESPACE}'/></iq>"
+    ))?;
+    alice.expect_xml(&format!("<iq xmlns='jabber:client' type='result' from='bob@localhost' to='alice@localhost/desk' id='info'><query xmlns='{INFO_NAMESPACE}'><identity category='account' type='registered'/><feature var='{INFO_NAMESPACE}'/><feature var='{ITEMS_NAMESPACE}'/></query></iq>"))?;
+    alice.send(&format!(
+        "<iq type='get' to='bob@localhost' id='items'><query xmlns='{ITEMS_NAMESPACE}'/></iq>"
+    ))?;
+    alice.expect_xml(&format!("<iq xmlns='jabber:client' type='result' from='bob@localhost' to='alice@localhost/desk' id='items'><query xmlns='{ITEMS_NAMESPACE}'><item jid='bob@localhost/phone'/></query></iq>"))?;
+
+    // XEP-0030 §8 requires different replies for the two queries from a non-subscriber.
+    bob.send(&format!("<iq type='get' to='alice@localhost' id='reverse-info'><query xmlns='{INFO_NAMESPACE}'/></iq>"))?;
+    let denied = bob.receive()?;
+    denied.assert_name("jabber:client", "iq");
+    assert_eq!(denied.attribute("id"), Some("reverse-info"));
+    assert_eq!(denied.attribute("type"), Some("error"));
+    denied
+        .child("jabber:client", "error")?
+        .child("urn:ietf:params:xml:ns:xmpp-stanzas", "service-unavailable")?;
+    bob.send(&format!("<iq type='get' to='alice@localhost' id='reverse-items'><query xmlns='{ITEMS_NAMESPACE}'/></iq>"))?;
+    bob.expect_xml(&format!("<iq xmlns='jabber:client' type='result' from='alice@localhost' to='bob@localhost/phone' id='reverse-items'><query xmlns='{ITEMS_NAMESPACE}'/></iq>"))?;
+    alice.close()?;
+    bob.close()
 }
 
 #[test]

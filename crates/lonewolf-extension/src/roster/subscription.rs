@@ -329,36 +329,29 @@ pub(super) async fn receive_remote<A: ChunkAllocator, W: WriteTransaction>(
             .map_err(|error| roster_error(error, "roster_write"))
         }
         PresenceRequestType::Subscribe => {
-            if !transaction
-                .pending_request_exists(&owner, &contact)
-                .await
-                .map_err(|error| roster_error(error, "roster_write"))?
-            {
-                let limits = roster
-                    .limits
-                    .get(owner.domain())
-                    .copied()
-                    .unwrap_or_default();
-                let mut stored = String::new();
-                request
-                    .stanza
-                    .resolve()
-                    .map_err(|_| StanzaErrorCondition::InternalServerError)?
-                    .write_xml(&mut stored)
-                    .map_err(|_| StanzaErrorCondition::InternalServerError)?;
-                transaction
-                    .put_pending_request(
-                        &owner,
-                        PendingSubscription {
-                            sender: contact.clone(),
-                            stanza: stored.into_bytes().into_boxed_slice(),
-                        },
-                        limits.max_pending_subscription_requests,
-                    )
-                    .await
-                    .map_err(|error| roster_error(error, "roster_write"))?;
-                deliver = true;
-            }
+            let limits = roster
+                .limits
+                .get(owner.domain())
+                .copied()
+                .unwrap_or_default();
+            let mut stored = String::new();
+            request
+                .stanza
+                .resolve()
+                .map_err(|_| StanzaErrorCondition::InternalServerError)?
+                .write_xml(&mut stored)
+                .map_err(|_| StanzaErrorCondition::InternalServerError)?;
+            deliver = state::store_first_request(
+                transaction,
+                &owner,
+                PendingSubscription {
+                    sender: contact.clone(),
+                    stanza: stored.into_bytes().into_boxed_slice(),
+                },
+                limits.max_pending_subscription_requests,
+            )
+            .await
+            .map_err(|error| roster_error(error, "roster_write"))?;
             Ok(None)
         }
         PresenceRequestType::Subscribed => {
@@ -516,6 +509,9 @@ pub(super) async fn request_subscription<A: ChunkAllocator, W: WriteTransaction>
     Ok(Effects::new(accounts, move |delivery| {
         let (outcome_name, item_count) = match &outcome {
             RequestOutcome::Pending { push } => ("pending", usize::from(push.is_some())),
+            RequestOutcome::AlreadyPending { push } => {
+                ("already_pending", usize::from(push.is_some()))
+            }
             RequestOutcome::AutoApproved { approved: Some(_) } => ("auto_approved", 1),
             RequestOutcome::PreApproved { grantor, requester } => (
                 "pre_approved",
@@ -539,7 +535,9 @@ pub(super) async fn request_subscription<A: ChunkAllocator, W: WriteTransaction>
             let auto_changed =
                 matches!(&outcome, RequestOutcome::AutoApproved { approved: Some(_) });
             match &mut outcome {
-                RequestOutcome::Pending { push } => retirements.extract(&sender, push),
+                RequestOutcome::Pending { push } | RequestOutcome::AlreadyPending { push } => {
+                    retirements.extract(&sender, push);
+                }
                 RequestOutcome::AutoApproved { approved } => retirements.extract(&sender, approved),
                 RequestOutcome::PreApproved { grantor, requester } => {
                     retirements.extract(&target, grantor);
@@ -551,6 +549,12 @@ pub(super) async fn request_subscription<A: ChunkAllocator, W: WriteTransaction>
                 match outcome {
                     RequestOutcome::Pending { push } => {
                         delivery.to_available(stanza).await?;
+                        if let Some(mutation) = push {
+                            push_change(&sender, mutation, delivery).await?;
+                        }
+                        Ok(())
+                    }
+                    RequestOutcome::AlreadyPending { push } => {
                         if let Some(mutation) = push {
                             push_change(&sender, mutation, delivery).await?;
                         }

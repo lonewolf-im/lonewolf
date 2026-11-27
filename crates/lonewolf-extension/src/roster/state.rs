@@ -31,6 +31,10 @@ pub(super) enum RequestOutcome {
     Pending {
         push: ItemMutation,
     },
+    /// The contact already holds a request from the requester, so the repeat is not delivered.
+    AlreadyPending {
+        push: ItemMutation,
+    },
     ContactMissing,
 }
 
@@ -219,6 +223,25 @@ async fn write_subscription<W: WriteTransaction>(
     })))
 }
 
+/// Keeps the first pending request from a sender and returns whether `request` was stored.
+pub(super) async fn store_first_request<W: WriteTransaction>(
+    transaction: &mut W,
+    owner: &AccountKey,
+    request: PendingSubscription,
+    max_pending_subscription_requests: NonZeroUsize,
+) -> Result<bool, RosterError> {
+    if transaction
+        .pending_request_exists(owner, &request.sender)
+        .await?
+    {
+        return Ok(false);
+    }
+    transaction
+        .put_pending_request(owner, request, max_pending_subscription_requests)
+        .await?;
+    Ok(true)
+}
+
 /// Leaves storage unchanged when no request was pending.
 pub(super) async fn resolve_pending<W: WriteTransaction>(
     roster: &super::Roster,
@@ -292,36 +315,28 @@ pub(super) async fn request_subscription<W: WriteTransaction>(
         .await?;
         return Ok(RequestOutcome::PreApproved { grantor, requester });
     }
-    let stored = transaction
-        .put_pending_request(
-            contact,
-            PendingSubscription {
-                sender: requester_jid,
-                stanza,
-            },
-            max_pending_subscription_requests,
-        )
-        .await;
-    match stored {
-        Ok(()) => {}
+    let stored = store_first_request(
+        transaction,
+        contact,
+        PendingSubscription {
+            sender: requester_jid,
+            stanza,
+        },
+        max_pending_subscription_requests,
+    )
+    .await;
+    let stored = match stored {
+        Ok(stored) => stored,
         Err(RosterError::NoAccount) => return Ok(RequestOutcome::ContactMissing),
         Err(error) => return Err(error),
-    }
-    let push = update_subscription(
-        roster,
-        transaction,
-        requester,
-        contact_jid,
-        |mut subscription| {
-            if subscription.pending_out || subscribed_to(subscription.state) {
-                return None;
-            }
-            subscription.pending_out = true;
-            Some(subscription)
-        },
-    )
-    .await?;
-    Ok(RequestOutcome::Pending { push })
+    };
+    let push =
+        update_subscription(roster, transaction, requester, contact_jid, set_pending_out).await?;
+    Ok(if stored {
+        RequestOutcome::Pending { push }
+    } else {
+        RequestOutcome::AlreadyPending { push }
+    })
 }
 
 /// Also denies pending requests; `subscriber` identifies the contact's local account.

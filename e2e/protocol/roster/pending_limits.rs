@@ -41,8 +41,8 @@ fn available(client: &mut Client, full: &str, bare: &str) -> TestResult {
 }
 
 #[test]
-fn duplicate_resources_refresh_one_pending_request_and_disconnect_keeps_capacity_used() -> TestResult
-{
+fn duplicate_resources_keep_the_first_pending_request_and_disconnect_keeps_capacity_used()
+-> TestResult {
     let suite = C2sSuite::with_hosts(CAP_ONE)?;
     accounts(&suite)?;
     let mut alice = suite.connect("alice", PASSWORD, "desk")?;
@@ -50,7 +50,7 @@ fn duplicate_resources_refresh_one_pending_request_and_disconnect_keeps_capacity
     let mut carol = suite.connect("carol", PASSWORD, "desk")?;
     subscribe(&mut alice, "bob@localhost", "first")?;
     barrier(&mut alice, "alice@localhost/desk")?;
-    subscribe(&mut alice_phone, "bob@localhost", "refreshed")?;
+    subscribe(&mut alice_phone, "bob@localhost", "repeated")?;
     barrier(&mut alice_phone, "alice@localhost/phone")?;
     alice.close()?;
     alice_phone.close()?;
@@ -68,7 +68,7 @@ fn duplicate_resources_refresh_one_pending_request_and_disconnect_keeps_capacity
     )?;
     let mut bob = suite.connect("bob", PASSWORD, "phone")?;
     available(&mut bob, "bob@localhost/phone", "bob@localhost")?;
-    bob.expect_xml("<presence xmlns='jabber:client' from='alice@localhost' to='bob@localhost' type='subscribe' id='refreshed'/>")?;
+    bob.expect_xml("<presence xmlns='jabber:client' from='alice@localhost' to='bob@localhost' type='subscribe' id='first'/>")?;
     barrier(&mut bob, "bob@localhost/phone")?;
     barrier(&mut carol, "carol@localhost/desk")?;
     bob.close()?;

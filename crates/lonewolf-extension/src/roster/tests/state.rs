@@ -382,26 +382,83 @@ fn subscription_request_updates_the_sender_and_recipient_in_one_transaction() ->
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].sender, alice_jid);
     assert_eq!(requests[0].stanza.as_ref(), b"<presence id='first'/>");
+    Ok(())
+}
 
-    let repeated = write(&roster, async |tx| {
-        state::request_subscription(
-            &crate::roster::Roster::default(),
-            tx,
-            &alice,
-            RosterJid::from(&alice),
-            &bob,
-            &bob_jid,
-            stanza(b"<presence id='last'/>"),
-            std::num::NonZeroUsize::MAX,
-        )
-        .await
-    })?;
-    assert!(matches!(repeated, RequestOutcome::Pending { push: None }));
-    assert_eq!(version(&roster, &alice), 1);
-    assert_eq!(
-        pending(&roster, &bob)[0].stanza.as_ref(),
-        b"<presence id='last'/>"
-    );
+#[test]
+fn repeated_subscription_requests_keep_the_first_request_without_state_changes() -> TestResult {
+    let (_directory, roster) = roster();
+    for (index, contact_state, contact_pending_out) in [
+        (0, SubscriptionState::None, false),
+        (1, SubscriptionState::None, true),
+        (2, SubscriptionState::To, false),
+    ] {
+        let alice = account(&format!("alice{index}@example.com"));
+        let bob = account(&format!("bob{index}@example.com"));
+        create_account(&roster, &alice);
+        create_account(&roster, &bob);
+        let alice_jid = RosterJid::from(&alice);
+        let bob_jid = RosterJid::from(&bob);
+        if contact_state != SubscriptionState::None || contact_pending_out {
+            set_subscription(
+                &roster,
+                &bob,
+                &alice_jid,
+                RosterSubscription {
+                    state: contact_state,
+                    pending_out: contact_pending_out,
+                    approved: false,
+                },
+            )?;
+        }
+        let first = write(&roster, async |tx| {
+            state::request_subscription(
+                &crate::roster::Roster::default(),
+                tx,
+                &alice,
+                alice_jid.clone(),
+                &bob,
+                &bob_jid,
+                stanza(b"<presence id='first'/>"),
+                std::num::NonZeroUsize::MIN,
+            )
+            .await
+        })?;
+        assert!(
+            matches!(first, RequestOutcome::Pending { push: Some(_) }),
+            "{index}"
+        );
+        let alice_version = version(&roster, &alice);
+        let bob_version = version(&roster, &bob);
+
+        let repeated = write(&roster, async |tx| {
+            state::request_subscription(
+                &crate::roster::Roster::default(),
+                tx,
+                &alice,
+                alice_jid.clone(),
+                &bob,
+                &bob_jid,
+                stanza(b"<presence id='repeat'/>"),
+                std::num::NonZeroUsize::MIN,
+            )
+            .await
+        })?;
+        assert!(
+            matches!(repeated, RequestOutcome::AlreadyPending { push: None }),
+            "{index}"
+        );
+        assert_eq!(version(&roster, &alice), alice_version, "{index}");
+        assert_eq!(version(&roster, &bob), bob_version, "{index}");
+        let requests = pending(&roster, &bob);
+        assert_eq!(requests.len(), 1, "{index}");
+        assert_eq!(requests[0].sender, alice_jid, "{index}");
+        assert_eq!(
+            requests[0].stanza.as_ref(),
+            b"<presence id='first'/>",
+            "{index}"
+        );
+    }
     Ok(())
 }
 

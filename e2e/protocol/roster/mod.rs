@@ -490,8 +490,10 @@ fn subscription_request_reaches_an_available_contact_and_updates_the_roster() ->
     )?;
     alice.send(&format!("<iq type='result' id='{push}'/>"))?;
     alice.send("<presence type='subscribe' id='repeat' to='bob@localhost'/>")?;
-    bob.expect_xml("<presence xmlns='jabber:client' type='subscribe' id='repeat' from='alice@localhost' to='bob@localhost'/>")?;
-    bob_tablet.expect_xml("<presence xmlns='jabber:client' type='subscribe' id='repeat' from='alice@localhost' to='bob@localhost'/>")?;
+    alice.send("<message to='bob@localhost/phone' id='sentinel'/>")?;
+    bob.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost/phone' id='sentinel'/>")?;
+    alice.send("<message to='bob@localhost/tablet' id='sentinel'/>")?;
+    bob_tablet.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost/tablet' id='sentinel'/>")?;
     request_roster(
         &mut alice,
         "pending-roster",
@@ -502,6 +504,76 @@ fn subscription_request_reaches_an_available_contact_and_updates_the_roster() ->
     bob.close()?;
     bob_tablet.expect_xml("<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost' type='unavailable'/>")?;
     bob_tablet.close()
+}
+
+#[test]
+fn repeated_subscription_request_is_not_delivered_again() -> TestResult {
+    const STORED_REQUEST: &str = "<presence xmlns='jabber:client' type='subscribe' from='alice@localhost' to='bob@localhost'/>";
+    for (alice_view, bob_view, alice_item, bob_items) in [
+        (
+            subscription(SubscriptionState::None, true),
+            None,
+            "<item jid='bob@localhost' subscription='none' ask='subscribe'/>",
+            "",
+        ),
+        (
+            subscription(SubscriptionState::From, true),
+            Some(subscription(SubscriptionState::To, false)),
+            "<item jid='bob@localhost' subscription='from' ask='subscribe'/>",
+            "<item jid='alice@localhost' subscription='to'/>",
+        ),
+    ] {
+        let suite = C2sSuite::with_extensions_and_setup("'roster'", |directory| {
+            seed_alice_and_bob(directory, alice_view, bob_view)
+        })?;
+        let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+        let mut bob = suite.connect("bob", PASSWORD, "phone")?;
+        mark_roster_version(&mut alice, "alice", 1)?;
+        request_roster(
+            &mut bob,
+            "bob-roster",
+            &format!(
+                "<iq xmlns='jabber:client' type='result' id='bob-roster' to='bob@localhost/phone'><query xmlns='jabber:iq:roster'>{bob_items}</query></iq>"
+            ),
+        )?;
+        bob.send("<presence/>")?;
+        bob.expect_xml(
+            "<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'/>",
+        )?;
+        bob.expect_xml(STORED_REQUEST)?;
+
+        alice.send("<presence type='subscribe' id='repeat' to='bob@localhost'/>")?;
+        alice.send("<message to='bob@localhost/phone' id='sentinel'/>")?;
+        bob.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost/phone' id='sentinel'/>")?;
+        request_roster(
+            &mut alice,
+            "unchanged-alice-roster",
+            &format!(
+                "<iq xmlns='jabber:client' type='result' id='unchanged-alice-roster' to='alice@localhost/desk'><query xmlns='jabber:iq:roster'>{alice_item}</query></iq>"
+            ),
+        )?;
+        request_roster(
+            &mut bob,
+            "unchanged-bob-roster",
+            &format!(
+                "<iq xmlns='jabber:client' type='result' id='unchanged-bob-roster' to='bob@localhost/phone'><query xmlns='jabber:iq:roster'>{bob_items}</query></iq>"
+            ),
+        )?;
+        bob.close()?;
+
+        let mut bob = suite.connect("bob", PASSWORD, "tablet")?;
+        bob.send("<presence/>")?;
+        bob.expect_xml(
+            "<presence xmlns='jabber:client' from='bob@localhost/tablet' to='bob@localhost'/>",
+        )?;
+        bob.expect_xml(STORED_REQUEST)?;
+        alice.send("<message to='bob@localhost/tablet' id='sentinel'/>")?;
+        bob.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost/tablet' id='sentinel'/>")?;
+
+        alice.close()?;
+        bob.close()?;
+    }
+    Ok(())
 }
 
 #[test]
@@ -4215,7 +4287,8 @@ fn full_subscription_controls_ignore_missing_resources_and_process_existing_reso
         )?;
         alice.send(&format!("<iq type='result' id='{pending}'/>"))?;
         alice.send("<presence type='subscribe' to='bob@localhost/phone'/>")?;
-        bob.expect_xml("<presence xmlns='jabber:client' type='subscribe' from='alice@localhost' to='bob@localhost'/>")?;
+        alice.send("<message to='bob@localhost/phone' id='sentinel'/>")?;
+        bob.expect_xml("<message xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost/phone' id='sentinel'/>")?;
 
         if kind == "unsubscribe" {
             alice.send("<presence type='unsubscribe' to='bob@localhost/missing'/>")?;

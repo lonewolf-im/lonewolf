@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use std::time::SystemTime;
-
 use lonewolf_extension::delivery::{HandlerError, SessionId};
 use lonewolf_extension::message::{StoreOutcome, UndeliverableMessage};
 use lonewolf_extension::policy::{Direction, Verdict};
@@ -351,7 +349,7 @@ async fn store<A: ChunkAllocator + Clone + 'static>(
                 UndeliverableMessage {
                     recipient: &recipient,
                     stanza: &routed,
-                    received_at: SystemTime::now(),
+                    received_at: crate::clock::wall_now(),
                 },
                 &mut transaction,
                 &mut scratch,

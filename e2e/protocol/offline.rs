@@ -23,7 +23,9 @@ use lonewolf_storage::roster::{
 use lonewolf_storage::{RedbStorage, Storage, WriteTransaction};
 use lonewolf_util::arena::{Arena, ArenaConfig};
 use lonewolf_xmpp::jid::Jid;
+use time::macros::datetime;
 
+use super::support::clock::{Clock, with_clock};
 use super::support::{C2sSuite, Client, Signal, TestResult};
 
 fn accounts(suite: &C2sSuite) -> TestResult {
@@ -952,5 +954,30 @@ fn pending_requests_larger_than_one_page_replay_in_sender_order_and_drop_refused
     ))?;
     suite.wait_for_metric(r#"lonewolf_c2s_replay_records_total{listener="0",kind="subscription_request",outcome="delivered"} 4"#)?;
     suite.wait_for_metric(r#"lonewolf_c2s_replay_records_total{listener="0",kind="subscription_request",outcome="blocked"} 1"#)?;
+    bob.close()
+}
+
+#[test]
+fn replay_after_midnight_keeps_the_original_delay_stamp() -> TestResult {
+    let suite = with_clock(C2sSuite::start)?;
+    let clock = Clock::at(suite.fixture_path());
+    clock.set_wall_before_handshake(datetime!(2026-01-31 23:59:58 UTC).into())?;
+    accounts(&suite)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
+    alice
+        .send("<message to='bob@localhost' type='chat' id='stored'><body>Hello</body></message>")?;
+    barrier(&mut alice, "alice@localhost/desk")?;
+
+    clock.advance_ms(3_000)?;
+    let mut bob = suite.connect("bob", OTHER_PASSWORD, "phone")?;
+    bob.send("<presence/>")?;
+    bob.expect_xml(
+        "<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'/>",
+    )?;
+    bob.expect_xml(
+        "<message xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost' type='chat' id='stored'><body>Hello</body><delay xmlns='urn:xmpp:delay' from='localhost' stamp='2026-01-31T23:59:58Z'/></message>",
+    )?;
+    barrier(&mut bob, "bob@localhost/phone")?;
+    alice.close()?;
     bob.close()
 }

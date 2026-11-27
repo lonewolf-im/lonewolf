@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::io::Write;
-use std::time::SystemTime;
 
 use lonewolf_extension::archive::{ArchiveDirection, ArchiveId, ArchiveOutcome, ArchiveRequest};
 use lonewolf_storage::account::AccountKey;
@@ -57,7 +56,7 @@ pub(crate) async fn archive_addressed<A: ChunkAllocator + Clone>(
             received: None,
         }));
     }
-    let received_at = SystemTime::now();
+    let received_at = crate::clock::wall_now();
     let sent_request = sender
         .zip(sent_handler)
         .map(|(owner, handler)| {

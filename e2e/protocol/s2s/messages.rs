@@ -356,3 +356,31 @@ fn carbons_copy_federated_messages() -> TestResult {
     pair.stop()?;
     Ok(())
 }
+
+#[test]
+fn language_alternatives_keep_their_inherited_and_explicit_languages() -> TestResult {
+    let (ad, an, bd, bn) = ACCOUNTS;
+    let mut pair = FederatedPair::start(ad, bd, workflow_options())?;
+    pair.a.create_account(an, PASSWORD)?;
+    pair.b.create_account(bn, PASSWORD)?;
+    let aj = format!("{an}@{ad}");
+    let bj = format!("{bn}@{bd}");
+    let mut a = pair.a.connect(an, PASSWORD, "desk")?;
+    let mut b = pair.b.connect(bn, PASSWORD, "phone")?;
+    available(&mut b, &bj, "phone")?;
+    let translations = "<subject>Demain</subject><subject xml:lang='es'>Mañana</subject><body>À midi</body><body xml:lang='es'>Al mediodía</body>";
+    a.send(&format!(
+        "<message type='chat' id='languages' to='{bj}' xml:lang='fr'>{translations}</message>"
+    ))?;
+    b.expect_xml(&format!("<message xmlns='jabber:client' type='chat' id='languages' from='{aj}/desk' to='{bj}' xml:lang='fr'>{translations}</message>"))?;
+    traffic(
+        &pair,
+        "language_alternatives_keep_their_inherited_and_explicit_languages",
+        [1, 0, 0],
+        [0, 0, 0],
+    )?;
+    a.close()?;
+    b.close()?;
+    pair.stop()?;
+    Ok(())
+}

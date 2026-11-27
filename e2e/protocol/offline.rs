@@ -88,9 +88,7 @@ pub(super) fn await_empty(client: &mut Client, owner: &str) -> TestResult {
 
 #[test]
 fn default_host_answers_roster_get_and_delivers_offline_messages_on_login() -> TestResult {
-    let suite = with_clock(C2sSuite::start)?;
-    let clock = Clock::at(suite.fixture_path());
-    clock.set_wall_before_handshake(datetime!(2026-01-31 23:59:58 UTC).into())?;
+    let suite = C2sSuite::start()?;
     accounts(&suite)?;
     let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
     alice.send("<iq type='get' id='roster'><query xmlns='jabber:iq:roster'/></iq>")?;
@@ -99,15 +97,14 @@ fn default_host_answers_roster_get_and_delivers_offline_messages_on_login() -> T
         .send("<message to='bob@localhost' type='chat' id='stored'><body>Hello</body></message>")?;
     barrier(&mut alice, "alice@localhost/desk")?;
 
-    // XEP-0203 §2 requires the original UTC timestamp even when replay occurs on another day.
-    clock.advance_ms(3_000)?;
     let mut bob = suite.connect("bob", OTHER_PASSWORD, "phone")?;
     bob.send("<presence/>")?;
     bob.expect_xml(
         "<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'/>",
     )?;
-    bob.expect_xml(
-        "<message xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost' type='chat' id='stored'><body>Hello</body><delay xmlns='urn:xmpp:delay' from='localhost' stamp='2026-01-31T23:59:58Z'/></message>",
+    receive_stored(
+        &mut bob,
+        "<message xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost' type='chat' id='stored'><body>Hello</body></message>",
     )?;
     barrier(&mut bob, "bob@localhost/phone")?;
     alice.close()?;
@@ -957,5 +954,30 @@ fn pending_requests_larger_than_one_page_replay_in_sender_order_and_drop_refused
     ))?;
     suite.wait_for_metric(r#"lonewolf_c2s_replay_records_total{listener="0",kind="subscription_request",outcome="delivered"} 4"#)?;
     suite.wait_for_metric(r#"lonewolf_c2s_replay_records_total{listener="0",kind="subscription_request",outcome="blocked"} 1"#)?;
+    bob.close()
+}
+
+#[test]
+fn replay_after_midnight_keeps_the_original_delay_stamp() -> TestResult {
+    let suite = with_clock(C2sSuite::start)?;
+    let clock = Clock::at(suite.fixture_path());
+    clock.set_wall_before_handshake(datetime!(2026-01-31 23:59:58 UTC).into())?;
+    accounts(&suite)?;
+    let mut alice = suite.connect("alice", ALTERNATE_PASSWORD, "desk")?;
+    alice
+        .send("<message to='bob@localhost' type='chat' id='stored'><body>Hello</body></message>")?;
+    barrier(&mut alice, "alice@localhost/desk")?;
+
+    clock.advance_ms(3_000)?;
+    let mut bob = suite.connect("bob", OTHER_PASSWORD, "phone")?;
+    bob.send("<presence/>")?;
+    bob.expect_xml(
+        "<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'/>",
+    )?;
+    bob.expect_xml(
+        "<message xmlns='jabber:client' from='alice@localhost/desk' to='bob@localhost' type='chat' id='stored'><body>Hello</body><delay xmlns='urn:xmpp:delay' from='localhost' stamp='2026-01-31T23:59:58Z'/></message>",
+    )?;
+    barrier(&mut bob, "bob@localhost/phone")?;
+    alice.close()?;
     bob.close()
 }

@@ -274,10 +274,17 @@ fn extension_payloads_keep_their_namespaces() -> TestResult {
     let mut b = pair.b.connect(bn, PASSWORD, "phone")?;
     available(&mut b, &bj, "phone")?;
     let extension = "<forwarded xmlns='urn:xmpp:forward:0'><message xmlns='jabber:client' from='original@example.test' to='target@example.test' type='chat'><body>Nested client body</body><x xmlns='urn:test:extension'><message xmlns='jabber:server'><body>Server namespace below an extension</body></message></x></message></forwarded>";
-    // RFC 6121 §§5.2.3 and 5.2.4 allow each alternative to inherit or specify its language.
-    let translations = "<subject>Demain</subject><subject xml:lang='es'>Mañana</subject><body>À midi</body><body xml:lang='es'>Al mediodía</body>";
-    a.send(&format!("<message type='chat' id='namespaces' to='{bj}' xml:lang='fr'>{translations}{extension}</message>"))?;
-    b.expect_xml(&format!("<message xmlns='jabber:client' type='chat' id='namespaces' from='{aj}/desk' to='{bj}' xml:lang='fr'>{translations}{extension}</message>"))?;
+    a.send(&format!("<message type='chat' id='namespaces' to='{bj}'><body>Outer client body</body>{extension}</message>"))?;
+    let reply = b.receive()?;
+    reply.assert_name("jabber:client", "message");
+    assert_eq!(reply.attribute("from"), Some(format!("{aj}/desk").as_str()));
+    assert_eq!(
+        reply.child("jabber:client", "body")?.text,
+        "Outer client body"
+    );
+    reply
+        .child("urn:xmpp:forward:0", "forwarded")?
+        .assert_xml(extension)?;
     traffic(
         &pair,
         "extension_payloads_keep_their_namespaces",
@@ -341,6 +348,34 @@ fn carbons_copy_federated_messages() -> TestResult {
     traffic(
         &pair,
         "carbons_copy_federated_messages",
+        [1, 0, 0],
+        [0, 0, 0],
+    )?;
+    a.close()?;
+    b.close()?;
+    pair.stop()?;
+    Ok(())
+}
+
+#[test]
+fn language_alternatives_keep_their_inherited_and_explicit_languages() -> TestResult {
+    let (ad, an, bd, bn) = ACCOUNTS;
+    let mut pair = FederatedPair::start(ad, bd, workflow_options())?;
+    pair.a.create_account(an, PASSWORD)?;
+    pair.b.create_account(bn, PASSWORD)?;
+    let aj = format!("{an}@{ad}");
+    let bj = format!("{bn}@{bd}");
+    let mut a = pair.a.connect(an, PASSWORD, "desk")?;
+    let mut b = pair.b.connect(bn, PASSWORD, "phone")?;
+    available(&mut b, &bj, "phone")?;
+    let translations = "<subject>Demain</subject><subject xml:lang='es'>Mañana</subject><body>À midi</body><body xml:lang='es'>Al mediodía</body>";
+    a.send(&format!(
+        "<message type='chat' id='languages' to='{bj}' xml:lang='fr'>{translations}</message>"
+    ))?;
+    b.expect_xml(&format!("<message xmlns='jabber:client' type='chat' id='languages' from='{aj}/desk' to='{bj}' xml:lang='fr'>{translations}</message>"))?;
+    traffic(
+        &pair,
+        "language_alternatives_keep_their_inherited_and_explicit_languages",
         [1, 0, 0],
         [0, 0, 0],
     )?;

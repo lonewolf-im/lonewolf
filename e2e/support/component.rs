@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+pub(crate) mod room;
+
 use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -13,6 +15,23 @@ use super::wire::{WireCounters, WireIo};
 use super::xml::{Element, XmlStream};
 use super::{C2sSuite, Client, TIMEOUT, TestResult};
 
+pub(crate) const SECRET_FILE_DOMAIN: &str =
+    "[components.domains.'muc.localhost']\nsecret_file='component-secret'";
+
+pub(crate) fn write_secret(directory: &std::path::Path) -> TestResult {
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    fs::write(
+        directory.join("component-secret"),
+        "component-test-secret-0001\n",
+    )?;
+    fs::set_permissions(
+        directory.join("component-secret"),
+        fs::Permissions::from_mode(0o600),
+    )?;
+    Ok(())
+}
+
 pub fn tcp(address: SocketAddr) -> TestResult<TcpStream> {
     let socket = TcpStream::connect_timeout(&address, TIMEOUT)?;
     socket.set_read_timeout(Some(TIMEOUT))?;
@@ -22,6 +41,63 @@ pub fn tcp(address: SocketAddr) -> TestResult<TcpStream> {
 
 pub const TEST_TIMEOUT: std::time::Duration = TIMEOUT;
 pub const NAMESPACE: &str = "jabber:component:accept";
+
+pub(crate) fn available_pair(desk: &mut Client, phone: &mut Client) -> TestResult {
+    desk.send("<presence/>")?;
+    desk.expect_xml(
+        "<presence xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost'/>",
+    )?;
+    phone.send("<presence/>")?;
+    phone.expect_xml(
+        "<presence xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost'/>",
+    )?;
+    phone.expect_xml(
+        "<presence xmlns='jabber:client' from='alice@localhost/phone' to='alice@localhost'/>",
+    )?;
+    desk.expect_xml(
+        "<presence xmlns='jabber:client' from='alice@localhost/phone' to='alice@localhost'/>",
+    )
+}
+
+pub(crate) fn close_available_pair(mut desk: Client, mut phone: Client) -> TestResult {
+    phone.close()?;
+    desk.expect_xml("<presence xmlns='jabber:client' type='unavailable' from='alice@localhost/phone' to='alice@localhost'/>")?;
+    desk.close()
+}
+
+pub(crate) fn assert_counter(metrics: &str, sample: &str, expected: u64) -> TestResult {
+    let value = metrics
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix(sample)
+                .and_then(|value| value.strip_prefix(' '))
+        })
+        .unwrap_or("0")
+        .parse::<u64>()?;
+    assert_eq!(value, expected, "{sample}");
+    Ok(())
+}
+
+pub(crate) fn traffic(suite: &C2sSuite, kind: &str, received: u64, sent: u64) -> TestResult {
+    for (direction, count) in [("received", received), ("sent", sent)] {
+        let sample = format!("lonewolf_component_stanzas_{direction}_total{{kind=\"{kind}\"}}");
+        if count > 0 {
+            suite.wait_for_metric(&format!("{sample} {count}"))?;
+        } else {
+            let metrics = suite.scrape_metrics()?;
+            let value = metrics
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix(&sample)
+                        .and_then(|value| value.strip_prefix(' '))
+                })
+                .unwrap_or("0")
+                .parse::<u64>()?;
+            assert_eq!(value, 0, "{sample}");
+        }
+    }
+    Ok(())
+}
 
 /// Counts locally completed stanzas, including unflushed output.
 pub fn completed_stanzas(metrics: &str) -> TestResult<usize> {

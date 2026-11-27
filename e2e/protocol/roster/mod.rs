@@ -1,28 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 
-use lonewolf_storage::roster::RosterQuota;
-
-use crate::support::PASSWORD;
-
+pub(crate) mod component;
 mod pending_limits;
+mod s2s;
 
 use std::fs;
 use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::support::{C2sSuite, Client, TestResult};
 use compio::runtime::Runtime;
 use lonewolf_auth::scram::{
     SCRAM_POLICY_ITERATIONS, ScramCredentials, ScramHash, ScramIterations, ScramVerifier,
 };
 use lonewolf_storage::account::{AccountKey, AccountWrites, NewAccount};
+use lonewolf_storage::roster::RosterQuota;
 use lonewolf_storage::roster::{
     PendingSubscription, RosterItem, RosterJid, RosterSubscription, RosterWrites, SubscriptionState,
 };
 use lonewolf_storage::{RedbStorage, RedbWrite, Storage, WriteTransaction};
 use lonewolf_util::arena::{Arena, ArenaConfig};
 use lonewolf_xmpp::jid::Jid;
+
+use crate::support::PASSWORD;
+use crate::support::{C2sSuite, Client, TestResult};
 
 const ROSTER_NAMESPACE: &str = "jabber:iq:roster";
 const PROBE_NAMESPACE: &str = "urn:lonewolf:test:stream-probe";
@@ -4887,4 +4888,39 @@ fn account_deletion_retires_corrupt_reciprocal_metadata_and_continues_healthy_no
     bob.close()?;
     carol.close()?;
     suite.stop()
+}
+
+#[test]
+fn roster_subscription_authorizes_full_jid_iq_until_revoked() -> TestResult {
+    let suite = C2sSuite::with_extensions("'roster'")?;
+    suite.create_account("alice", PASSWORD)?;
+    suite.create_account("bob", PASSWORD)?;
+    let mut alice = suite.connect("alice", PASSWORD, "desk")?;
+    let mut bob = suite.connect("bob", PASSWORD, "phone")?;
+    alice.send("<presence/>")?;
+    alice.expect_xml(
+        "<presence xmlns='jabber:client' from='alice@localhost/desk' to='alice@localhost'/>",
+    )?;
+    bob.send("<presence/>")?;
+    bob.expect_xml(
+        "<presence xmlns='jabber:client' from='bob@localhost/phone' to='bob@localhost'/>",
+    )?;
+    alice.send("<presence type='subscribe' to='bob@localhost'/>")?;
+    bob.expect_xml("<presence xmlns='jabber:client' type='subscribe' from='alice@localhost' to='bob@localhost'/>")?;
+    bob.send("<presence type='subscribed' to='alice@localhost'/>")?;
+    alice.expect_xml(
+        "<presence xmlns='jabber:client' from='bob@localhost/phone' to='alice@localhost'/>",
+    )?;
+    alice.send(
+        "<iq type='get' to='bob@localhost/phone' id='allowed'><query xmlns='urn:test:iq'/></iq>",
+    )?;
+    bob.expect_xml("<iq xmlns='jabber:client' type='get' from='alice@localhost/desk' to='bob@localhost/phone' id='allowed'><query xmlns='urn:test:iq'/></iq>")?;
+    bob.send("<presence type='unsubscribed' to='alice@localhost'/>")?;
+    alice.expect_xml("<presence xmlns='jabber:client' type='unavailable' from='bob@localhost/phone' to='alice@localhost'/>")?;
+    alice.send(
+        "<iq type='set' to='bob@localhost/phone' id='revoked'><query xmlns='urn:test:iq'/></iq>",
+    )?;
+    alice.expect_xml("<iq xmlns='jabber:client' type='error' from='bob@localhost/phone' to='alice@localhost/desk' id='revoked'><query xmlns='urn:test:iq'/><error type='cancel'><service-unavailable xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/><text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas' xml:lang='en'>The requested service or operation is unavailable for this target. Check the address and requested feature.</text></error></iq>")?;
+    alice.close()?;
+    bob.close()
 }
